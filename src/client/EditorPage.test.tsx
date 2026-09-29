@@ -42,6 +42,8 @@ vi.mock("./collaboration", () => ({
     doc: {
       getMap: vi.fn(() => new Map()),
       getXmlFragment: vi.fn(() => ({})),
+      on: vi.fn(),
+      off: vi.fn(),
     },
     provider: mocks.provider,
     ready: mocks.ready,
@@ -219,8 +221,8 @@ describe("EditorPage close reconciliation", () => {
       await Promise.resolve();
     });
 
-    expect(localStorage.getItem("notes:recovery:workspace-1:page-1")).toBe(
-      JSON.stringify({ key: "workspace-1:page-1:1:1", epoch: 1 }),
+    expect(localStorage.getItem("notes:recovery:user-1:workspace-1:page-1")).toBe(
+      JSON.stringify({ key: "account:user-1:workspace-1:page-1:1:2", epoch: 1 }),
     );
   });
 

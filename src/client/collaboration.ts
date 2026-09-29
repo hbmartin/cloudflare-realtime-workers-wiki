@@ -6,6 +6,7 @@ import { parseWorkspaceEvent } from "../shared/validation";
 import { CollaborationDurability } from "./collaboration-durability";
 import { connectionRetryDelay } from "./retry";
 import { reportClientError } from "./telemetry";
+import { offlineDocumentKey } from "./offline-catalog";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -77,9 +78,11 @@ export function createCollaboration(
   pageId: string,
   epoch: number,
   onStatus: (status: "offline" | "connecting" | "connected") => void,
+  userId: string,
+  beforeConnect?: () => Promise<boolean>,
 ): CollaborationBundle {
   const doc = new Y.Doc();
-  const key = `${workspaceId}:${pageId}:${epoch}:1`;
+  const key = offlineDocumentKey(userId, workspaceId, pageId, epoch);
   const indexeddb = new IndexeddbPersistence(key, doc);
   const provider = new YProvider(window.location.host, `${pageId}~${epoch}`, doc, {
     party: "document",
@@ -96,15 +99,21 @@ export function createCollaboration(
     if (destroyed) return;
     if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
     connectionTimer = undefined;
-    void provider.connect().then(
-      () => {
+    onStatus("connecting");
+    void (async () => {
+      try {
+        if (beforeConnect && !(await beforeConnect())) {
+          onStatus("offline");
+          return;
+        }
+        if (destroyed) return;
+        await provider.connect();
         if (destroyed) {
           provider.disconnect();
           return;
         }
         connectionAttempt = 0;
-      },
-      (error) => {
+      } catch (error) {
         if (destroyed) return;
         onStatus("offline");
         console.error("Failed to connect document collaboration", error);
@@ -112,8 +121,8 @@ export function createCollaboration(
         if (document.visibilityState !== "hidden") {
           connectionTimer = window.setTimeout(connect, connectionRetryDelay(connectionAttempt++));
         }
-      },
-    );
+      }
+    })();
   };
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {

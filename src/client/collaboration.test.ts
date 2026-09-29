@@ -5,6 +5,7 @@ import { createCollaboration, createNetworkCollaboration, createWorkspaceEvents 
 
 const mocks = vi.hoisted(() => ({
   whenSynced: new Promise<void>(() => undefined),
+  persistenceNames: [] as string[],
   providers: [] as Array<{
     synced: boolean;
     sendMessage: ReturnType<typeof vi.fn>;
@@ -25,6 +26,9 @@ function deferred<T>() {
 
 vi.mock("y-indexeddb", () => ({
   IndexeddbPersistence: class {
+    constructor(name: string) {
+      mocks.persistenceNames.push(name);
+    }
     whenSynced = mocks.whenSynced;
     destroy = vi.fn(async () => undefined);
   },
@@ -90,6 +94,7 @@ describe("collaboration durability barriers", () => {
     vi.spyOn(Math, "random").mockReturnValue(1);
     mocks.whenSynced = new Promise<void>(() => undefined);
     mocks.providers.length = 0;
+    mocks.persistenceNames.length = 0;
   });
 
   afterEach(() => {
@@ -99,7 +104,7 @@ describe("collaboration durability barriers", () => {
   });
 
   it("preserves the original deadline when a barrier cannot yet be sent", async () => {
-    const bundle = createCollaboration("workspace", "page", 1, vi.fn());
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user");
     const doc = bundle.doc as typeof bundle.doc & { emitUpdate: (origin: unknown) => void };
     const provider = mocks.providers[0]!;
 
@@ -114,6 +119,14 @@ describe("collaboration durability barriers", () => {
 
     expect(provider.sendMessage).toHaveBeenCalledOnce();
     bundle.destroy();
+  });
+
+  it("separates local Yjs stores by account", () => {
+    const first = createCollaboration("workspace", "page", 1, vi.fn(), "user-a");
+    const second = createCollaboration("workspace", "page", 1, vi.fn(), "user-b");
+    expect(mocks.persistenceNames).toEqual(["account:user-a:workspace:page:1:2", "account:user-b:workspace:page:1:2"]);
+    first.destroy();
+    second.destroy();
   });
 
   it("bounds diagram durability latency while retaining the quiet-period debounce", async () => {
@@ -162,7 +175,7 @@ describe("collaboration durability barriers", () => {
     const onStatus = vi.fn();
     const error = new Error("token refresh failed");
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const bundle = createCollaboration("workspace", "page", 1, onStatus);
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
     const provider = mocks.providers[0]!;
     provider.connect.mockRejectedValueOnce(error);
 
@@ -183,7 +196,7 @@ describe("collaboration durability barriers", () => {
     mocks.whenSynced = Promise.reject(error);
     const onStatus = vi.fn();
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const bundle = createCollaboration("workspace", "page", 1, onStatus);
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
     const provider = mocks.providers[0]!;
 
     await expect(bundle.ready).rejects.toBe(error);
@@ -197,7 +210,7 @@ describe("collaboration durability barriers", () => {
   it("disconnects a collaboration connection that completes after destroy", async () => {
     const connection = deferred<void>();
     mocks.whenSynced = Promise.resolve();
-    const bundle = createCollaboration("workspace", "page", 1, vi.fn());
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user");
     const provider = mocks.providers[0]!;
     provider.connect.mockReturnValue(connection.promise);
 

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,7 +27,7 @@ function includeChunk(key) {
   if (!chunk?.file) throw new Error(`Missing client bundle entry: ${key}`);
   assetFiles.add(chunk.file);
   for (const path of chunk.css ?? []) assetFiles.add(path);
-  for (const path of chunk.assets ?? []) if (path.endsWith(".woff2")) assetFiles.add(path);
+  for (const path of chunk.assets ?? []) if (/\.woff2?$/.test(path)) assetFiles.add(path);
   for (const dependency of chunk.imports ?? []) includeChunk(dependency);
 }
 includeChunk("index.html");
@@ -37,7 +37,7 @@ const paths = [
   ...staticFiles.map((name) => ({ path: join(clientRoot, name), url: name === "index.html" ? "/" : `/${name}` })),
   ...[...assetFiles].map((name) => ({
     path: join(clientRoot, name),
-    url: `/${name.split("/").map(encodeURIComponent).join("/")}`,
+    url: new URL(name, "https://noteflare.invalid/").pathname,
   })),
 ];
 paths.sort((left, right) => (left.url < right.url ? -1 : left.url > right.url ? 1 : 0));
@@ -59,3 +59,4 @@ await writeFile(
     .replace("__SHELL_ASSETS__", () => JSON.stringify(urls)),
 );
 execFileSync(process.execPath, ["--check", workerPath]);
+await unlink(join(clientRoot, ".vite/manifest.json"));

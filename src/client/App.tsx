@@ -69,6 +69,17 @@ import { SlackSettings } from "./SlackSettings";
 import { ThemeControl } from "./ThemeControl";
 import { ShareControl } from "./ShareControl";
 import { IntegrationsSettings } from "./IntegrationsSettings";
+import {
+  forgetOfflineAccount,
+  latestOfflineAccount,
+  listOfflinePages,
+  markOfflineAccountPurging,
+  offlineAccountKey,
+  rememberOfflineAccount,
+  type OfflineAccount,
+  type OfflinePage,
+} from "./offline-catalog";
+import { OfflineWorkspace } from "./OfflineWorkspace";
 
 const DiagramPage = lazy(() => import("./DiagramPage").then((module) => ({ default: module.DiagramPage })));
 
@@ -83,7 +94,12 @@ type AppState =
   | { screen: "security"; status: SecurityStatus }
   | { screen: "signin"; message?: string }
   | { screen: "invite"; token: string }
-  | { screen: "workspace"; member: ClientMemberContext };
+  | { screen: "workspace"; member: ClientMemberContext }
+  | { screen: "offline-locked" }
+  | { screen: "signout-cleanup"; accountKey: string; message: string }
+  | { screen: "offline"; account: OfflineAccount; pages: OfflinePage[] };
+
+type InstallPromptEvent = Event & { prompt: () => Promise<void> };
 
 type WorkspaceErrorSource =
   | "archive"
@@ -677,6 +693,29 @@ async function stateAfterUnauthorized(failure: ApiClientError): Promise<AppState
   return null;
 }
 
+async function authenticatedWorkspace(member: ClientMemberContext): Promise<AppState> {
+  const locallySignedOut = localStorage.getItem("notes:local-signout");
+  if (locallySignedOut === offlineAccountKey(member)) return { screen: "signin" };
+  if (locallySignedOut) localStorage.removeItem("notes:local-signout");
+  await rememberOfflineAccount(member).catch((error) =>
+    console.error("Unable to remember this account for offline use", error),
+  );
+  return { screen: "workspace", member };
+}
+
+async function offlineStateAfterConnectionFailure(cause: unknown): Promise<AppState | null> {
+  if (
+    !(cause instanceof TypeError) &&
+    !(cause instanceof ApiClientError && cause.status >= 500) &&
+    !isSuccessfulJsonResponseBodyError(cause)
+  )
+    return null;
+  if (localStorage.getItem("notes:local-signout")) return { screen: "signin" };
+  const account = await latestOfflineAccount();
+  if (!account) return { screen: "offline-locked" };
+  return { screen: "offline", account, pages: await listOfflinePages(account.key) };
+}
+
 async function resolveAppState(): Promise<AppState> {
   const invite = new URLSearchParams(window.location.search).get("invite") || sessionStorage.getItem("pending-invite");
   const install = await api<{ initialized: boolean }>("/api/install");
@@ -705,7 +744,7 @@ async function resolveAppState(): Promise<AppState> {
   }
   try {
     const member = await api<ClientMemberContext>("/api/me");
-    return { screen: "workspace", member };
+    return await authenticatedWorkspace(member);
   } catch (error) {
     if (error instanceof ApiClientError && error.status === 401) {
       if (error.code === "workspace_required" && inviteFailure) {
@@ -714,7 +753,7 @@ async function resolveAppState(): Promise<AppState> {
       const next = await stateAfterUnauthorized(error);
       if (next) return next;
       const member = await api<ClientMemberContext>("/api/me");
-      return { screen: "workspace", member };
+      return await authenticatedWorkspace(member);
     }
     throw error;
   }
@@ -730,9 +769,41 @@ export function App() {
     stateTransition.current += 1;
     setState(next);
   }, []);
-  const signOut = useCallback(() => {
-    invalidateUnauthorizedRequests();
-    showState({ screen: "signin" });
+  const signOut = useCallback(
+    async (accountKey: string) => {
+      localStorage.setItem("notes:local-signout", accountKey);
+      invalidateUnauthorizedRequests();
+      await markOfflineAccountPurging(accountKey).catch((error) =>
+        console.error("Unable to mark local sign-out", error),
+      );
+      showState({ screen: "loading" });
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+      const serverSignOut = authClient
+        .signOut()
+        .catch((error) => console.error("Server sign-out is unavailable", error));
+      try {
+        await forgetOfflineAccount(accountKey);
+      } catch (error) {
+        showState({
+          screen: "signout-cleanup",
+          accountKey,
+          message: apiErrorMessage(error, "Close other NoteFlare tabs, then retry local data removal."),
+        });
+        return;
+      }
+      await Promise.race([serverSignOut, new Promise<void>((resolve) => window.setTimeout(resolve, 2_000))]);
+      showState({ screen: "signin" });
+    },
+    [showState],
+  );
+  useEffect(() => {
+    const onLocalSignOut = (event: StorageEvent) => {
+      if (event.key !== "notes:local-signout" || !event.newValue) return;
+      invalidateUnauthorizedRequests();
+      showState({ screen: "signin" });
+    };
+    window.addEventListener("storage", onLocalSignOut);
+    return () => window.removeEventListener("storage", onLocalSignOut);
   }, [showState]);
   const sessionExpired = useCallback(
     (failure: ApiClientError) => {
@@ -760,6 +831,12 @@ export function App() {
           } catch (statusCause) {
             return startupError(statusCause, "Unable to open the workspace. Try again.");
           }
+        }
+        try {
+          const offline = await offlineStateAfterConnectionFailure(cause);
+          if (offline) return offline;
+        } catch (storageError) {
+          console.error("Unable to open offline catalog", storageError);
         }
         return startupError(cause, "Unable to open the workspace. Try again.");
       })
@@ -790,6 +867,31 @@ export function App() {
         <p role="alert">{state.message}</p>
         <button type="button" onClick={() => void load()}>
           Try again
+        </button>
+      </AuthLayout>
+    );
+  if (state.screen === "offline-locked")
+    return (
+      <AuthLayout
+        eyebrow="Offline access"
+        title="Offline access locked"
+        copy="Open NoteFlare while signed in and online before using this device offline. No account copy is available here."
+      >
+        <button type="button" onClick={() => void load()}>
+          Try connecting again
+        </button>
+      </AuthLayout>
+    );
+  if (state.screen === "signout-cleanup")
+    return (
+      <AuthLayout
+        eyebrow="Signing out"
+        title="Finish removing local copies"
+        copy="Your account is closed in this tab. Local document copies still need to be removed from this device."
+      >
+        <p role="alert">{state.message}</p>
+        <button type="button" onClick={() => void signOut(state.accountKey)}>
+          Retry removal
         </button>
       </AuthLayout>
     );
@@ -837,8 +939,29 @@ export function App() {
         }}
       />
     );
-  if (state.screen === "signin") return <SignInScreen onComplete={load} initialError={state.message} />;
-  return <Workspace member={state.member} onSignOut={signOut} />;
+  if (state.screen === "signin")
+    return (
+      <SignInScreen
+        onComplete={async () => {
+          localStorage.removeItem("notes:local-signout");
+          await load();
+        }}
+        initialError={state.message}
+      />
+    );
+  if (state.screen === "offline")
+    return (
+      <OfflineWorkspace
+        account={state.account}
+        pages={state.pages}
+        onRetry={() => {
+          showState({ screen: "loading" });
+          void load();
+        }}
+        onSignOut={() => void signOut(state.account.key)}
+      />
+    );
+  return <Workspace member={state.member} onSignOut={() => void signOut(offlineAccountKey(state.member))} />;
 }
 
 function AuthLayout({
@@ -1035,6 +1158,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
             onClick={() => {
               setBusy(true);
               setError("");
+              localStorage.removeItem("notes:local-signout");
               void authClient.signIn
                 .social({ provider: "slack", callbackURL: "/", errorCallbackURL: "/?slackAuth=callback" })
                 .then((result) => {
@@ -1093,6 +1217,24 @@ export function useCommittedRef<T>(value: T) {
 }
 
 function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
+  const [installTip, setInstallTip] = useState(false);
+  useEffect(() => {
+    const offerInstall = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as InstallPromptEvent);
+    };
+    const installed = () => {
+      setInstallPrompt(null);
+      setInstallTip(false);
+    };
+    window.addEventListener("beforeinstallprompt", offerInstall);
+    window.addEventListener("appinstalled", installed);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", offerInstall);
+      window.removeEventListener("appinstalled", installed);
+    };
+  }, []);
   const preferencesKey = `notes:ui:${member.workspace.id}:${member.user.id}`;
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readPreference(`${preferencesKey}:collapsed`, false));
   const [sidebarWidth, setSidebarWidth] = useState(() =>
@@ -3559,6 +3701,19 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           </button>
         </div>
         <div className="sidebar-bottom-nav">
+          {import.meta.env.PROD && (
+            <>
+              <button
+                onClick={() => {
+                  if (installPrompt) void installPrompt.prompt();
+                  else setInstallTip((shown) => !shown);
+                }}
+              >
+                <Icon name="download" /> Install app
+              </button>
+              {installTip && <p className="install-tip">Use your browser’s Install or Add to Home Screen menu.</p>}
+            </>
+          )}
           <button onClick={() => showView("templates")}>
             <Icon name="page" />
             Templates
@@ -3580,15 +3735,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         </div>
         <footer className="sidebar-footer">
           <ThemeControl compact />
-          <button
-            onClick={async () => {
-              invalidateUnauthorizedRequests();
-              await authClient.signOut();
-              onSignOut();
-            }}
-          >
-            Sign out
-          </button>
+          <button onClick={onSignOut}>Sign out</button>
           <button
             className="desktop-sidebar-toggle icon-button"
             aria-label="Collapse sidebar"
@@ -3906,6 +4053,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               }
               metadata={metadata}
               member={activeMember}
+              spaceName={activeSpace?.name ?? "Space"}
               onPageChanged={updatePage}
               onPageUnavailable={pageUnavailable}
               onAccessDenied={documentAccessDenied}

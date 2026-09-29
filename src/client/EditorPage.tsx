@@ -18,9 +18,9 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
-import type { ClientMemberContext } from "../shared/types";
+import type { ClientMemberContext, Space } from "../shared/types";
 import type { MentionSuggestion, Page } from "../shared/types";
-import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { projectDocument, serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { diffBlockIds } from "../shared/block-diff";
 import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
@@ -32,12 +32,20 @@ import { notesCommentSchema, notesSchema } from "./mentions";
 import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 import { useEffectiveColorScheme } from "./ThemeControl";
+import {
+  getOfflinePage,
+  markOfflinePagePending,
+  offlineAccountKey,
+  offlineDocumentKey,
+  rememberOfflinePage,
+} from "./offline-catalog";
 
 export type EditorPageProps = {
   page: Page;
   metadata?: ReactNode;
   taskList?: Page | undefined;
   member: ClientMemberContext;
+  spaceName?: string;
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
   onAccessDenied: (pageId: string, error: ApiClientError) => void;
@@ -51,6 +59,7 @@ export function EditorPage({
   metadata,
   taskList,
   member,
+  spaceName = "Space",
   onPageChanged,
   onPageUnavailable,
   onAccessDenied,
@@ -60,13 +69,15 @@ export function EditorPage({
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
+  const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
+  const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [attachmentsOpen, setAttachmentsOpen] = useState(false);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
-  const recoveryKey = `notes:recovery:${member.workspace.id}:${page.id}`;
+  const recoveryKey = `notes:recovery:${member.user.id}:${member.workspace.id}:${page.id}`;
   const [recovery, setRecovery] = useState<{ key: string; epoch: number } | null>(() => {
     try {
       return JSON.parse(localStorage.getItem(recoveryKey) ?? "null");
@@ -83,9 +94,28 @@ export function EditorPage({
   const titlePageIdRef = useRef(page.id);
   const titleRevisionRef = useRef(page.revision);
   const titleDirtyRef = useRef(false);
-  const editable = member.role !== "viewer" && !sizeWarning?.readOnly && !storageError;
+  const editable = member.role !== "viewer" && !sizeWarning?.readOnly && !storageError && !accessQuarantine;
   const commentsVisible = commentsOpen;
   const [panelTarget, setPanelTarget] = useState<HTMLDivElement | null>(null);
+  const offlineMetadata = useRef({ page, spaceName });
+  const offlineMember = useRef(member);
+  useEffect(() => {
+    offlineMetadata.current = { page, spaceName };
+  }, [page, spaceName]);
+  useEffect(() => {
+    offlineMember.current = member;
+  }, [member]);
+  const offlineTitle = page.title;
+  const offlineRole = member.role;
+  useEffect(() => {
+    if (!hasConfirmedSync) return;
+    void rememberOfflinePage(
+      offlineMember.current,
+      { ...offlineMetadata.current.page, title: offlineTitle },
+      spaceName,
+      offlineRole !== "viewer",
+    ).catch((error) => console.error("Unable to remember this document for offline use", error));
+  }, [hasConfirmedSync, offlineTitle, spaceName, offlineRole]);
 
   useEffect(() => {
     if (titlePageIdRef.current !== page.id) {
@@ -105,23 +135,88 @@ export function EditorPage({
   }, [page.id, page.revision, page.title]);
 
   useEffect(() => {
-    const next = createCollaboration(member.workspace.id, page.id, page.contentEpoch, setStatus);
     let active = true;
+    const quarantine = () => {
+      const value = {
+        key: offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch),
+        epoch: page.contentEpoch,
+      };
+      const serialized = JSON.stringify(value);
+      if (localStorage.getItem(recoveryKey) !== serialized) localStorage.setItem(recoveryKey, serialized);
+      setRecovery((current) => (current?.key === value.key && current.epoch === value.epoch ? current : value));
+    };
+    let next: CollaborationBundle;
+    const beforeConnect = async () => {
+      const accountKey = offlineAccountKey(offlineMember.current);
+      const catalogPage = await getOfflinePage(accountKey, page.id);
+      const hasLocalDraft = catalogPage?.pendingChanges === true || (!catalogPage && next.hasUnsyncedChanges);
+      try {
+        const currentMember = await api<ClientMemberContext>("/api/me");
+        if (currentMember.user.id !== member.user.id || currentMember.workspace.id !== member.workspace.id) {
+          window.location.reload();
+          return false;
+        }
+        const [{ page: currentPage }, { spaces }] = await Promise.all([
+          api<{ page: Page }>(`/api/pages/${encodeURIComponent(page.id)}`),
+          api<{ spaces: Space[] }>("/api/spaces"),
+        ]);
+        if (!active) return false;
+        if (currentPage.contentEpoch !== page.contentEpoch) {
+          if (hasLocalDraft) quarantine();
+          onPageChanged(currentPage);
+          return false;
+        }
+        const space = spaces.find((item) => item.id === currentPage.spaceId);
+        if (!space || (space.effectiveRole === "viewer" && hasLocalDraft)) {
+          if (hasLocalDraft) {
+            quarantine();
+            setAccessQuarantine(true);
+          } else {
+            onPageUnavailable(page.id);
+          }
+          return false;
+        }
+        return true;
+      } catch (error) {
+        if (error instanceof ApiClientError && [401, 403, 404, 410].includes(error.status)) {
+          if (hasLocalDraft) {
+            quarantine();
+            setAccessQuarantine(true);
+          } else if (error.status === 403 || error.status === 401) onAccessDenied(page.id, error);
+          else onPageUnavailable(page.id);
+          return false;
+        }
+        throw error;
+      }
+    };
+    next = createCollaboration(
+      member.workspace.id,
+      page.id,
+      page.contentEpoch,
+      setStatus,
+      member.user.id,
+      beforeConnect,
+    );
+    let pendingWrite = Promise.resolve();
+    const writePending = (pending: boolean) => {
+      pendingWrite = pendingWrite
+        .then(() => markOfflinePagePending(offlineAccountKey(offlineMember.current), page.id, pending))
+        .catch((error) => console.error("Unable to update offline sync state", error));
+    };
+    const documentUpdate = (_update: Uint8Array, origin: unknown) => {
+      if (origin !== next.provider && origin !== next.indexeddb) writePending(true);
+    };
+    next.doc.on("update", documentUpdate);
     const customMessage = (message: string) => {
       try {
         const value = JSON.parse(message) as { type: string; bytes: number; readOnly: boolean };
         if (value.type === "document-size") setSizeWarning(value);
+        if (value.type === "document-update-ack" && !next.hasUnsyncedChanges) writePending(false);
       } catch {
         // Ignore custom messages from future server versions.
       }
     };
     next.provider.on("custom-message", customMessage);
-    const quarantine = () => {
-      const value = { key: `${member.workspace.id}:${page.id}:${page.contentEpoch}:1`, epoch: page.contentEpoch };
-      const serialized = JSON.stringify(value);
-      if (localStorage.getItem(recoveryKey) !== serialized) localStorage.setItem(recoveryKey, serialized);
-      setRecovery((current) => (current?.key === value.key && current.epoch === value.epoch ? current : value));
-    };
     const closeReconciler = createDocumentCloseReconciler({
       page: { id: page.id, contentEpoch: page.contentEpoch },
       provider: next.provider,
@@ -133,7 +228,10 @@ export function EditorPage({
       onAccessDenied,
     });
     const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
-    const connectionSync = (synced: boolean) => closeReconciler.handleSync(synced);
+    const connectionSync = (synced: boolean) => {
+      closeReconciler.handleSync(synced);
+      if (synced && active) setHasConfirmedSync(true);
+    };
     next.provider.on("connection-close", connectionClose);
     next.provider.on("sync", connectionSync);
     void (async () => {
@@ -151,11 +249,13 @@ export function EditorPage({
       next.provider.off("custom-message", customMessage);
       next.provider.off("connection-close", connectionClose);
       next.provider.off("sync", connectionSync);
+      next.doc.off("update", documentUpdate);
       next.destroy();
       setBundle(null);
     };
   }, [
     member.role,
+    member.user.id,
     member.workspace.id,
     onAccessDenied,
     onPageChanged,
@@ -291,11 +391,15 @@ export function EditorPage({
         </div>
       )}
       {storageError && <div className="notice notice-danger">{storageError}</div>}
-      {recovery && recovery.epoch !== page.contentEpoch && !storageError && (
+      {recovery && (recovery.epoch !== page.contentEpoch || accessQuarantine) && !storageError && (
         <div className="notice recovery-notice">
           <div>
             <strong>Offline copy quarantined</strong>
-            <span>Edits from epoch {recovery.epoch} were not merged after this page was restored.</span>
+            <span>
+              {accessQuarantine
+                ? "Current access could not be confirmed for these edits. They were not sent to the server."
+                : `Edits from epoch ${recovery.epoch} were not merged after this page was restored.`}
+            </span>
           </div>
           <button
             className="quiet-button"
@@ -311,32 +415,43 @@ export function EditorPage({
             className="quiet-button"
             onClick={async () => {
               const doc = await loadOfflineCopy(recovery.key);
-              const bytes = Y.encodeStateAsUpdate(doc);
-              const blob = new Blob(
-                [bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer],
-                { type: "application/vnd.yjs" },
-              );
+              const projection = yXmlFragmentToProsemirrorJSON(doc.getXmlFragment("document-store")) as ProseMirrorJson;
+              const markdown = `# ${page.title.replaceAll("\n", " ")}\n\n${serializeDocument(projection).markdown}`;
+              const blob = new Blob([markdown], { type: "text/markdown; charset=utf-8" });
               const url = URL.createObjectURL(blob);
               const anchor = document.createElement("a");
               anchor.href = url;
-              anchor.download = `${page.title}-offline-epoch-${recovery.epoch}.yjs`;
+              anchor.download = `${page.title.replaceAll(/[\\/:*?"<>|]/g, "-")}-offline-epoch-${recovery.epoch}.md`;
               anchor.click();
-              URL.revokeObjectURL(url);
+              window.setTimeout(() => URL.revokeObjectURL(url), 0);
               doc.destroy();
             }}
           >
-            Export
+            Export Markdown
           </button>
           <button
             className="quiet-button"
-            onClick={() => {
-              localStorage.removeItem(recoveryKey);
-              setRecovery(null);
-              setRecoveryPreview("");
+            onClick={async () => {
+              const doc = await loadOfflineCopy(recovery.key);
+              const projection = yXmlFragmentToProsemirrorJSON(doc.getXmlFragment("document-store")) as ProseMirrorJson;
+              await navigator.clipboard.writeText(serializeDocument(projection).markdown);
+              doc.destroy();
             }}
           >
-            Dismiss
+            Copy Markdown
           </button>
+          {!accessQuarantine && (
+            <button
+              className="quiet-button"
+              onClick={() => {
+                localStorage.removeItem(recoveryKey);
+                setRecovery(null);
+                setRecoveryPreview("");
+              }}
+            >
+              Dismiss
+            </button>
+          )}
           {recoveryPreview && <p>{recoveryPreview}</p>}
         </div>
       )}

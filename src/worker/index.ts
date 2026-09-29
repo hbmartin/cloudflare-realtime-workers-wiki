@@ -1521,7 +1521,10 @@ app.get("/api/me", async (c) => {
     user: member.user,
     workspace: member.workspace,
     role: member.role,
-    features: { expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true" },
+    features: {
+      expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true",
+      offlineEditing: c.env.OFFLINE_EDITING_ENABLED === "true",
+    },
   };
   return c.json(context);
 });
