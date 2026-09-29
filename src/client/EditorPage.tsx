@@ -42,7 +42,6 @@ import {
   offlineDocumentKey,
   pendingKeysOf,
   persistPendingDocumentUpdate,
-  rememberOfflineAccount,
   rememberOfflinePage,
   storageEpoch,
 } from "./offline-catalog";
@@ -250,10 +249,6 @@ export function EditorPage({
           return false;
         }
         offlineMember.current = currentMember;
-        await rememberOfflineAccount(currentMember).catch((error) => {
-          console.error("Unable to refresh offline account catalog", error);
-          if (active) setCatalogWarning("The offline page list could not be updated yet.");
-        });
         if (catalogNeedsRepair) {
           writePending(true);
           await pendingWrite;

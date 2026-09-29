@@ -596,6 +596,22 @@ test("can finish offline sign-out when database enumeration is unavailable", asy
   await page.locator(".bn-editor").click();
   await page.keyboard.type("Cached before sign-out");
   await expect(page.locator(".bn-editor")).toContainText("Cached before sign-out");
+  await expect
+    .poll(async () =>
+      page.evaluate(async () => {
+        const opened = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          opened.addEventListener("success", () => resolve(opened.result)),
+        );
+        const request = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const entries = await new Promise<Array<{ title: string }>>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        db.close();
+        return entries.some((entry) => entry.title === "Enumeration fallback draft");
+      }),
+    )
+    .toBe(true);
   await context.setOffline(true);
   await page.reload();
   await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
@@ -619,6 +635,27 @@ test("can finish offline sign-out when database enumeration is unavailable", asy
       return (await indexedDB.databases()).filter((entry) => entry.name?.startsWith("account:")).length;
     }),
   ).toBe(0);
+});
+
+test("removes document copies despite a corrupt legacy registry when enumeration works", async ({ page }) => {
+  await signInOwner(page);
+  await expect
+    .poll(() => page.evaluate(() => Object.keys(localStorage).some((key) =>
+      key.startsWith("noteflare-document-keys:") && key.includes("\u0000"),
+    )))
+    .toBe(true);
+  await page.evaluate(() => {
+    const entry = Object.keys(localStorage).find((key) =>
+      key.startsWith("noteflare-document-keys:") && key.includes("\u0000"),
+    )!;
+    const accountKey = entry.slice("noteflare-document-keys:".length).split("\u0000").slice(0, 2).join("\u0000");
+    localStorage.setItem(`noteflare-document-keys:${accountKey}`, "corrupt legacy entry");
+  });
+  await page.getByRole("button", { name: "Sign out" }).click();
+  await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+  expect(await page.evaluate(async () =>
+    (await indexedDB.databases()).filter((entry) => entry.name?.startsWith("account:")).length,
+  )).toBe(0);
 });
 
 test("retains drafts from both epochs in the sign-out review", async ({ page, context }) => {

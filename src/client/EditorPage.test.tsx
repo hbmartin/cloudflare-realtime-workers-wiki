@@ -24,6 +24,8 @@ const mocks = vi.hoisted(() => {
   return {
     api: vi.fn(),
     destroy: vi.fn(),
+    stop: vi.fn(),
+    storeUpdate: vi.fn(),
     handlers,
     provider,
     ready: Promise.resolve() as Promise<void>,
@@ -46,11 +48,13 @@ vi.mock("./collaboration", () => ({
       off: vi.fn(),
     },
     provider: mocks.provider,
+    indexeddb: { _storeUpdate: mocks.storeUpdate, db: null, _dbsize: 0 },
     ready: mocks.ready,
     get hasUnsyncedChanges() {
       return mocks.unsynced;
     },
     destroy: mocks.destroy,
+    stop: mocks.stop,
   })),
   loadOfflineCopy: vi.fn(),
   userColor: vi.fn(() => "#2563eb"),

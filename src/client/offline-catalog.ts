@@ -37,14 +37,27 @@ export type OfflinePage = {
 const PENDING_MARKER = "noteflare-pending";
 const DOCUMENT_REGISTRY_PREFIX = "noteflare-document-keys:";
 
+function documentRegistryEntryPrefix(accountKey: string) {
+  return `${DOCUMENT_REGISTRY_PREFIX}${accountKey}\u0000`;
+}
+
 function registeredDocumentKeys(accountKey: string): string[] | null {
   const raw = localStorage.getItem(`${DOCUMENT_REGISTRY_PREFIX}${accountKey}`);
-  if (raw === null) return null;
-  const parsed: unknown = JSON.parse(raw);
   const prefix = accountDocumentPrefix(accountKey);
-  if (!prefix || !Array.isArray(parsed) || !parsed.every((key) => typeof key === "string" && key.startsWith(prefix)))
+  if (!prefix) throw new Error("Offline account key is invalid.");
+  const legacy: unknown = raw === null ? [] : JSON.parse(raw);
+  if (!Array.isArray(legacy) || !legacy.every((key) => typeof key === "string" && parseOfflineDocumentKey(key, prefix)))
     throw new Error("Offline document registry is invalid.");
-  return parsed;
+  const entries = [...legacy] as string[];
+  const entryPrefix = documentRegistryEntryPrefix(accountKey);
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const name = localStorage.key(index);
+    if (!name?.startsWith(entryPrefix)) continue;
+    const key = name.slice(entryPrefix.length);
+    if (!parseOfflineDocumentKey(key, prefix)) throw new Error("Offline document registry is invalid.");
+    entries.push(key);
+  }
+  return raw === null && !entries.length ? null : [...new Set(entries)];
 }
 
 function openExistingDocument(key: string): Promise<IDBDatabase | null> {
@@ -177,17 +190,19 @@ export function offlineAccountKey(member: Pick<ClientMemberContext, "user" | "wo
 }
 
 export function offlineDocumentKey(userId: string, workspaceId: string, pageId: string, epoch: number) {
-  const key = `account:${userId}:${workspaceId}:${pageId}:${epoch}:2`;
-  if (typeof localStorage === "undefined") return key;
+  return `account:${userId}:${workspaceId}:${pageId}:${epoch}:2`;
+}
+
+export function registerOfflineDocumentKey(userId: string, workspaceId: string, key: string) {
+  if (typeof localStorage === "undefined") return;
+  const accountKey = `${userId}\u0000${workspaceId}`;
+  if (localStorage.getItem("notes:local-signout") === accountKey)
+    throw new Error("Local sign-out is removing offline documents.");
   try {
-    const accountKey = `${userId}\u0000${workspaceId}`;
-    const entries = registeredDocumentKeys(accountKey) ?? [];
-    if (!entries.includes(key))
-      localStorage.setItem(`${DOCUMENT_REGISTRY_PREFIX}${accountKey}`, JSON.stringify([...entries, key]));
+    localStorage.setItem(`${documentRegistryEntryPrefix(accountKey)}${key}`, "1");
   } catch (error) {
     console.error("Offline document key could not be registered", error);
   }
-  return key;
 }
 
 function accountDocumentPrefix(accountKey: string) {
@@ -203,13 +218,15 @@ function parseOfflineDocumentKey(key: string, prefix: string) {
 
 async function accountDocumentNames(accountKey: string, strict: boolean): Promise<string[]> {
   let registered: string[] | null = null;
+  let registryError: unknown;
   try {
     registered = registeredDocumentKeys(accountKey);
   } catch (error) {
-    if (strict) throw error;
+    registryError = error;
     console.error("Offline document registry could not be read", error);
   }
   if (!indexedDB.databases) {
+    if (strict && registryError) throw registryError;
     if (strict && !registered) throw new Error("This browser cannot verify every saved document before sign-out.");
     return registered ?? [];
   }
@@ -222,6 +239,7 @@ async function accountDocumentNames(accountKey: string, strict: boolean): Promis
       ]),
     ];
   } catch (error) {
+    if (strict && registryError) throw registryError;
     if (strict && !registered) throw error;
     console.error("Offline document enumeration failed", error);
     return registered ?? [];
@@ -338,8 +356,8 @@ export async function listOfflinePages(accountKey: string): Promise<OfflinePage[
     .sort((left, right) => right.lastSyncedAt - left.lastSyncedAt);
 }
 
-export async function listPendingOfflinePages(accountKey: string): Promise<OfflinePage[]> {
-  const pages = await readAccountPages(accountKey, true, true);
+export async function listPendingOfflinePages(accountKey: string, strict = false): Promise<OfflinePage[]> {
+  const pages = await readAccountPages(accountKey, true, strict);
   const available = await Promise.all(
     pages.map(async (page) => {
       const keys = pendingKeysOf(page);
@@ -546,6 +564,13 @@ export async function clearRevokedOfflinePages(accountKey: string) {
       const transaction = db.transaction("pages", "readwrite");
       transaction.objectStore("pages").delete(current.key);
       await transactionDone(transaction);
+      for (const key of current.storageKeys) {
+        try {
+          localStorage.removeItem(`${documentRegistryEntryPrefix(accountKey)}${key}`);
+        } catch (error) {
+          console.error("Revoked offline document registry entry could not be cleared", error);
+        }
+      }
     });
   }
 }
@@ -592,12 +617,14 @@ export async function forgetOfflineAccount(accountKey: string) {
     try {
       remaining = await indexedDB.databases();
     } catch (error) {
-      if (!registeredDocumentKeys(accountKey)) throw error;
+      if (!(await accountDocumentNames(accountKey, true)).length) throw error;
     }
     if (remaining.some((database) => database.name?.startsWith(prefix)))
       throw new Error("New local document storage appeared during sign-out. Retry removal.");
   }
-  const newlyRegistered = registeredDocumentKeys(accountKey)?.filter((key) => !keys.has(key)) ?? [];
+  const newlyRegistered = (await accountDocumentNames(accountKey, true)).filter(
+    (key) => prefix && key.startsWith(prefix) && !keys.has(key),
+  );
   if (newlyRegistered.length) throw new Error("New local document storage appeared during sign-out. Retry removal.");
   const transaction = db.transaction(["accounts", "pages"], "readwrite");
   transaction.objectStore("accounts").delete(accountKey);
@@ -606,6 +633,8 @@ export async function forgetOfflineAccount(accountKey: string) {
   await transactionDone(transaction);
   try {
     localStorage.removeItem(`${DOCUMENT_REGISTRY_PREFIX}${accountKey}`);
+    const entryPrefix = documentRegistryEntryPrefix(accountKey);
+    for (const key of keys) localStorage.removeItem(`${entryPrefix}${key}`);
   } catch (error) {
     console.error("Offline document registry could not be cleared", error);
   }

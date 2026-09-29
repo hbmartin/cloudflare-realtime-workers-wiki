@@ -6,7 +6,7 @@ import { parseWorkspaceEvent } from "../shared/validation";
 import { CollaborationDurability } from "./collaboration-durability";
 import { connectionRetryDelay } from "./retry";
 import { reportClientError } from "./telemetry";
-import { offlineDocumentKey } from "./offline-catalog";
+import { offlineDocumentKey, registerOfflineDocumentKey } from "./offline-catalog";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -84,6 +84,7 @@ export function createCollaboration(
 ): CollaborationBundle {
   const doc = new Y.Doc();
   const key = offlineDocumentKey(userId, workspaceId, pageId, epoch);
+  registerOfflineDocumentKey(userId, workspaceId, key);
   const indexeddb = new IndexeddbPersistence(key, doc);
   const provider = new YProvider(window.location.host, `${pageId}~${epoch}`, doc, {
     party: "document",

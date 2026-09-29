@@ -864,7 +864,7 @@ export function App() {
         return;
       }
       try {
-        const pending = await listPendingOfflinePages(accountKey);
+        const pending = await listPendingOfflinePages(accountKey, true);
         if (pending.length > 0) {
           showState({ screen: "signout-review", accountKey, pages: pending });
           return;
