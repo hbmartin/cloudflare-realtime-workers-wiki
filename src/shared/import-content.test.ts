@@ -393,10 +393,30 @@ describe("import content", () => {
     expect(parsed.references).toContain("data:image/png;base64,AAAA");
   });
 
+  it("keeps a link wrapped around a medium data image", () => {
+    const data = `data:image/png;base64,${"A".repeat(2_000)}`;
+    const parsed = markdownToDocument(`${"x".repeat(9_000)} [![icon](${data})](https://example.com) tail`);
+    expect(parsed.references.includes(data)).toBe(true);
+    expect(parsed.references.includes("https://example.com")).toBe(true);
+  });
+
+  it("keeps an outer link around a long image destination at a cut", () => {
+    const image = `https://example.com/${"a".repeat(2_000)}`;
+    const parsed = markdownToDocument(`${"x ".repeat(3_250)}[![alt](${image})](https://x.test) tail`);
+    expect(parsed.references.includes(image)).toBe(true);
+    expect(parsed.references.includes("https://x.test")).toBe(true);
+  });
+
   it("keeps a code span ending in a backslash and a later link in long content", () => {
     const parsed = markdownToDocument(`Use \`\\\` to escape. ${"word ".repeat(1700)}then \`x\` [later](later.md)`);
     expect(parsed.references).toContain("later.md");
     expect(JSON.stringify(parsed.document)).toContain('"text":"\\\\"');
+  });
+
+  it("does not pair an escaped backtick with the next real opener", () => {
+    const parsed = markdownToDocument(`\\\`\`code\` ${"word ".repeat(1700)}[later](later.md)`);
+    expect(parsed.references.includes("later.md")).toBe(true);
+    expect(JSON.stringify(parsed.document).includes('"text":"code","marks":[{"type":"code"}]')).toBe(true);
   });
 
   it("finds an enclosing link after a distant unmatched bracket", () => {

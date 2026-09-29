@@ -821,15 +821,24 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
       return unlinked;
     } catch (retryError) {
       logger.error(
-        "workflow.capture_lookup.failed",
+        "workflow.capture_import.unresolved",
         "workflow",
         "Capture import failed while receipt lookup was unavailable.",
-        {
-          jobId: job.id,
-          attempt: job.attempt,
-          importError: safeTelemetryErrorMessage(error, "Capture import failed."),
-          firstLookupError: safeTelemetryErrorMessage(lookupError, "Capture receipt lookup failed."),
-        },
+        { jobId: job.id, attempt: job.attempt },
+        error,
+      );
+      logger.error(
+        "workflow.capture_lookup.first_failed",
+        "workflow",
+        "First capture receipt lookup failed.",
+        { jobId: job.id, attempt: job.attempt },
+        lookupError,
+      );
+      logger.error(
+        "workflow.capture_lookup.failed",
+        "workflow",
+        "Capture lookup failed during job recovery.",
+        { jobId: job.id, attempt: job.attempt },
         retryError,
       );
       // The scheduled pass will retry when D1 can answer authoritatively.
@@ -1058,7 +1067,7 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown, deferCl
       .bind(errorCode, message, Date.now(), job.id, job.attempt, job.workflow_instance_id ?? job.id)
       .run();
     if (failed.meta.changes) await notifyJobs(env, job.workspace_id);
-    return Boolean(failed.meta.changes);
+    return false;
   }
   const captureId = job.type === "import" ? jsonRecord(job.options_json).captureId : null;
   const timestamp = Date.now();
@@ -1439,19 +1448,6 @@ export async function recoverQueuedJobs(env: Env) {
       }
     }
   }
-  for (const job of terminalCleanups) {
-    try {
-      await finishPendingJobCleanup(env, job, { terminateWorkflow: false });
-    } catch (error) {
-      logger.error(
-        "workflow.pending_cleanup.failed",
-        "workflow",
-        "Pending job cleanup failed.",
-        { jobId: job.id },
-        error,
-      );
-    }
-  }
   const queued = await env.DB.prepare(
     `SELECT id, workflow_instance_id, attempt, correlation_id FROM jobs
       WHERE status = 'queued' AND updated_at <= ?
@@ -1479,6 +1475,19 @@ export async function recoverQueuedJobs(env: Env) {
           error,
         );
       }
+    }
+  }
+  for (const job of terminalCleanups) {
+    try {
+      await finishPendingJobCleanup(env, job, { terminateWorkflow: false });
+    } catch (error) {
+      logger.error(
+        "workflow.pending_cleanup.failed",
+        "workflow",
+        "Pending job cleanup failed.",
+        { jobId: job.id },
+        error,
+      );
     }
   }
   const cleanups = await env.DB.prepare(

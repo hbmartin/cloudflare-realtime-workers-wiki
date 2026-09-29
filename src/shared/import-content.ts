@@ -147,17 +147,30 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
 
 type CodeRange = { start: number; openEnd: number; closeStart: number; end: number };
 
-function codeRanges(value: string): CodeRange[] | null {
+function closingParenWithin(value: string) {
+  let nextClosing = -1;
+  return (index: number) => {
+    if (nextClosing < index) {
+      const found = value.indexOf(")", index);
+      nextClosing = found < 0 ? value.length : found;
+    }
+    return nextClosing < value.length && nextClosing < index + 8192;
+  };
+}
+
+function codeRanges(value: string, excluded: Array<{ start: number; end: number }> = []): CodeRange[] | null {
   const runs: Array<{ start: number; end: number; length: number; escaped: boolean }> = [];
-  const nextClosing = new Int32Array(value.length + 1);
-  let closing = value.length;
-  for (let index = value.length - 1; index >= 0; index -= 1) {
-    if (value[index] === ")") closing = index;
-    nextClosing[index] = closing;
-  }
+  const possibleOpeners = new Set<number>();
+  const boundedClose = closingParenWithin(value);
+  let excludedIndex = 0;
   let destinationDepth = 0;
   let destinationLimit = 0;
   for (let index = 0; index < value.length; index += 1) {
+    while (excluded[excludedIndex] && excluded[excludedIndex]!.end <= index) excludedIndex += 1;
+    if (excluded[excludedIndex] && excluded[excludedIndex]!.start === index) {
+      index = excluded[excludedIndex]!.end - 1;
+      continue;
+    }
     if (destinationDepth && index >= destinationLimit) destinationDepth = 0;
     if (destinationDepth && value[index] === "\\") {
       index += 1;
@@ -165,20 +178,19 @@ function codeRanges(value: string): CodeRange[] | null {
     }
     if (
       value[index] === "(" &&
-      (destinationDepth ||
-        (value[index - 1] === "]" &&
-          !trailingEscape(value, index - 1) &&
-          nextClosing[index]! < value.length &&
-          nextClosing[index]! < index + 8192))
+      (destinationDepth || (value[index - 1] === "]" && !trailingEscape(value, index - 1) && boundedClose(index)))
     ) {
       destinationDepth += 1;
       if (destinationDepth === 1) destinationLimit = index + 8192;
     } else if (value[index] === ")" && destinationDepth) destinationDepth -= 1;
     if (destinationDepth) continue;
     if (value[index] !== "`") continue;
+    const escaped = trailingEscape(value, index);
     let end = index + 1;
-    while (end < value.length && value[end] === "`") end += 1;
-    runs.push({ start: index, end, length: end - index, escaped: trailingEscape(value, index) });
+    if (!escaped) while (end < value.length && value[end] === "`") end += 1;
+    const length = end - index;
+    if (!escaped) possibleOpeners.add(length);
+    if (!escaped || possibleOpeners.has(length)) runs.push({ start: index, end, length, escaped });
     // Keep hostile paragraphs with millions of delimiters inside Worker memory.
     if (runs.length > 100_000) return null;
     index = end - 1;
@@ -214,15 +226,16 @@ function firstCodeEndingAfter(codes: CodeRange[], position: number) {
   return left;
 }
 
-function enclosingBracket(brackets: number[], value: string, start: number, boundary: number) {
+function enclosingBracket(brackets: number[], value: string, start: number, anchor: number) {
   for (const opening of brackets) {
-    if (opening <= start || boundary - opening > 1024) continue;
+    if (opening <= start || anchor - opening > 1024) continue;
     return value[opening - 1] === "!" ? opening - 1 : opening;
   }
   return Infinity;
 }
 
 function safeInlineCut(value: string, start: number, maximum: number, codes: CodeRange[]) {
+  const boundedClose = closingParenWithin(value);
   const brackets: number[] = [];
   let parenDepth = 0;
   let linkStart = -1;
@@ -236,7 +249,7 @@ function safeInlineCut(value: string, start: number, maximum: number, codes: Cod
       if (code.end > maximum) {
         const earliest = Math.min(
           code.start,
-          enclosingBracket(brackets, value, start, maximum),
+          enclosingBracket(brackets, value, start, code.start),
           parenDepth && linkStart >= 0 ? linkStart : Infinity,
         );
         return earliest > start ? earliest : code.start > start ? code.start : maximum;
@@ -253,7 +266,11 @@ function safeInlineCut(value: string, start: number, maximum: number, codes: Cod
     else if (character === "]" && brackets.length) {
       const opening = brackets.pop()!;
       if (value[index + 1] === "(") linkStart = value[opening - 1] === "!" ? opening - 1 : opening;
-    } else if (character === "(" && (parenDepth || value[index - 1] === "]")) parenDepth += 1;
+    } else if (
+      character === "(" &&
+      (parenDepth || (value[index - 1] === "]" && !trailingEscape(value, index - 1) && boundedClose(index)))
+    )
+      parenDepth += 1;
     else if (character === ")" && parenDepth) {
       parenDepth -= 1;
       if (!parenDepth) linkStart = -1;
@@ -264,7 +281,7 @@ function safeInlineCut(value: string, start: number, maximum: number, codes: Cod
     }
   }
   if (parenDepth && linkStart >= 0) {
-    const earliest = Math.min(linkStart, enclosingBracket(brackets, value, start, maximum));
+    const earliest = Math.min(linkStart, enclosingBracket(brackets, value, start, linkStart));
     if (earliest > start) return earliest;
     if (linkStart > start) return linkStart;
   }
@@ -278,6 +295,7 @@ function trailingEscape(value: string, boundary: number, start = 0) {
 }
 
 function safeDenseBoundary(value: string, boundary: number) {
+  const boundedClose = closingParenWithin(value);
   const brackets: number[] = [];
   const codes = codeRanges(value) ?? [];
   let codeIndex = 0;
@@ -287,7 +305,7 @@ function safeDenseBoundary(value: string, boundary: number) {
     const character = value[index];
     const code = codes[codeIndex];
     if (code && index === code.start) {
-      if (code.end > boundary) return code.start;
+      if (code.end > boundary) return Math.min(code.start, enclosingBracket(brackets, value, -1, code.start));
       index = code.end - 1;
       codeIndex += 1;
       continue;
@@ -300,13 +318,17 @@ function safeDenseBoundary(value: string, boundary: number) {
     else if (character === "]" && brackets.length) {
       const opening = brackets.pop()!;
       if (value[index + 1] === "(") linkStart = value[opening - 1] === "!" ? opening - 1 : opening;
-    } else if (character === "(" && (parenDepth || value[index - 1] === "]")) parenDepth += 1;
+    } else if (
+      character === "(" &&
+      (parenDepth || (value[index - 1] === "]" && !trailingEscape(value, index - 1) && boundedClose(index)))
+    )
+      parenDepth += 1;
     else if (character === ")" && parenDepth) {
       parenDepth -= 1;
       if (!parenDepth) linkStart = -1;
     }
   }
-  const outer = enclosingBracket(brackets, value, -1, boundary);
+  const outer = enclosingBracket(brackets, value, -1, linkStart >= 0 ? linkStart : boundary);
   return parenDepth && linkStart >= 0 ? Math.min(linkStart, outer) : Math.min(outer, boundary);
 }
 
@@ -404,8 +426,8 @@ function markdownLexer() {
 function boundedMarkdownInline(value: string, issues: ImportIssue[], references: string[]) {
   issues.push({ code: "inline_markup_simplified", detail: "Long inline content was parsed in bounded sections." });
   const output: ProseMirrorJson[] = [];
-  const codes = codeRanges(value);
-  if (!codes) {
+  const initialCodes = codeRanges(value);
+  if (!initialCodes) {
     let start = 0;
     for (let position = value.indexOf("!["); position >= 0; position = value.indexOf("![", position + 2)) {
       const image = longDataImage(value, position);
@@ -420,17 +442,26 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
     return output;
   }
   const images: Array<{ kind: "image"; start: number; end: number; label: string; href: string }> = [];
+  let initialCodeIndex = 0;
   for (let position = value.indexOf("!["); position >= 0; position = value.indexOf("![", position + 2)) {
     const image = longDataImage(value, position);
-    if (!image || image.end - position <= 1024) continue;
+    if (!image || image.end - position <= 8192) continue;
+    while (initialCodes[initialCodeIndex] && initialCodes[initialCodeIndex]!.end <= position) initialCodeIndex += 1;
+    if (
+      initialCodes[initialCodeIndex] &&
+      initialCodes[initialCodeIndex]!.start < position &&
+      !images.some(
+        (prior) =>
+          initialCodes[initialCodeIndex]!.start >= prior.start && initialCodes[initialCodeIndex]!.start < prior.end,
+      )
+    )
+      continue;
     images.push({ kind: "image", start: position, ...image });
     position = image.end - 2;
   }
-  let imageIndex = 0;
-  const effectiveCodes = codes.filter((range) => {
-    while (images[imageIndex] && images[imageIndex]!.end <= range.start) imageIndex += 1;
-    return !images[imageIndex] || range.start < images[imageIndex]!.start;
-  });
+  // Backticks in an image label are text; recompute pairing with the entire
+  // large image hidden so they cannot pair with code later in the paragraph.
+  const effectiveCodes = images.length ? codeRanges(value, images)! : initialCodes;
   const specials: Array<
     | { kind: "image"; start: number; end: number; label: string; href: string }
     | { kind: "code"; start: number; end: number; openEnd: number; closeStart: number }
@@ -456,6 +487,7 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
     let sectionCodeIndex = 0;
     let cursor = 0;
     let candidates = 0;
+    let nextDataImage = section.indexOf("data:image/");
     for (let index = 0; index < section.length; index += 1) {
       while (sectionCodes[sectionCodeIndex] && sectionCodes[sectionCodeIndex]!.end <= index) sectionCodeIndex += 1;
       const character = section[index];
@@ -476,7 +508,22 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
       }
       if (character !== "[" && !(character === "!" && section[index + 1] === "[")) continue;
       const start = index;
-      if (++candidates > 128) break;
+      if (++candidates > 128) {
+        while (nextDataImage >= 0 && nextDataImage < start)
+          nextDataImage = section.indexOf("data:image/", nextDataImage + 1);
+        if (character === "!" && nextDataImage >= 0 && nextDataImage - start <= 514) {
+          const image = longDataImage(section, start);
+          if (image) {
+            append(inline(unescapeMarkdown(section.slice(cursor, start))));
+            append(inline(image.label));
+            references.push(image.href);
+            issues.push({ code: "image_not_imported", detail: image.href.slice(0, 120) });
+            cursor = image.end;
+            index = cursor - 1;
+          }
+        }
+        continue;
+      }
       const labelEnd = linkLabelEnd(section, start, 8192);
       if (labelEnd === null) continue;
       const label = section.slice(start, labelEnd);
