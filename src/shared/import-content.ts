@@ -106,7 +106,8 @@ function markdownInline(
   if (!prepared) {
     const plain = unescapeMarkdown(value, true);
     if (plain !== null) return inline(plain);
-    if (value.length > 8192) return boundedMarkdownInline(value, issues, references);
+    if (value.length > 8192 || (value.match(/[<\\]/g)?.length ?? 0) > 128 || (value.match(/[*_`]/g)?.length ?? 0) > 512)
+      return boundedMarkdownInline(value, issues, references);
     if (value.includes("data:image/"))
       return markdownInline(value, issues, references, Lexer.lexInline(value, { gfm: false }), undefined, true);
   }
@@ -166,26 +167,33 @@ function markdownInline(
       else if (token.type === "link" || token.type === "image") {
         const rawUrl = token.href;
         const url = safeLink(rawUrl);
-        const escapedBracket = !token.raw.startsWith("<") && (token.raw.includes("\\[") || token.raw.includes("\\]"));
-        const labelEnd = token.type === "image" || escapedBracket ? linkLabelEnd(token.raw, 0, 8192) : null;
+        const wantsRawLabel = token.type === "image" || token.raw.includes("\\[") || token.raw.includes("\\]");
+        const candidateEnd = wantsRawLabel && !token.raw.startsWith("<") ? linkLabelEnd(token.raw, 0, 8192) : null;
+        const labelEnd =
+          candidateEnd !== null && simpleLongLink(token.raw, 0, candidateEnd)?.end === token.raw.length
+            ? candidateEnd
+            : null;
         const rawLabel = labelEnd === null ? token.text : token.raw.slice(token.type === "image" ? 2 : 1, labelEnd);
+        const escapedBracket = rawLabel.includes("\\[") || rawLabel.includes("\\]");
         const emitLabel = (labelMarks: NonNullable<ProseMirrorJson["marks"]>) => {
           if (escapedBracket && labelEnd !== null) {
+            const { tokenizer, lexer } = markdownLexer();
+            if ((rawLabel.match(/[*_]/g)?.length ?? 0) > 512) tokenizer.emStrong = () => undefined;
             const first = output.length;
-            walk(Lexer.lexInline(rawLabel, { gfm: false }), labelMarks);
-            for (let index = first + 1; index < output.length; index += 1) {
-              const previous = output[index - 1]!;
-              const current = output[index]!;
+            walk(lexer.inlineTokens(rawLabel), labelMarks);
+            const compacted: ProseMirrorJson[] = [];
+            for (const node of output.splice(first)) {
+              const previous = compacted.at(-1);
               if (
-                previous.type === "text" &&
-                current.type === "text" &&
-                JSON.stringify(previous.marks ?? []) === JSON.stringify(current.marks ?? [])
-              ) {
-                previous.text = (previous.text ?? "") + (current.text ?? "");
-                output.splice(index--, 1);
-              }
+                previous?.type === "text" &&
+                node.type === "text" &&
+                JSON.stringify(previous.marks ?? []) === JSON.stringify(node.marks ?? [])
+              )
+                previous.text = (previous.text ?? "") + (node.text ?? "");
+              else compacted.push(node);
             }
-          } else if (escapedBracket) appendPlain(token.text, labelMarks);
+            output.push(...compacted);
+          } else if (escapedBracket) appendPlain(unescapeMarkdown(token.text), labelMarks);
           else if (token.type === "image" && !rawLabel.includes("["))
             output.push(...imageLabelContent({ label: token.text, rawLabel }, labelMarks));
           else walk(children, labelMarks);
@@ -246,11 +254,26 @@ function availableImageMarkers() {
   return markerPool;
 }
 
-function startsAngledDestination(value: string, opener: number, index: number) {
-  return opener >= 0 && index > opener && index - opener <= 8192 && /^\s*$/.test(value.slice(opener + 1, index));
+function angledDestinationCheck(value: string) {
+  let lastOpener = -1;
+  let scannedTo = -1;
+  let onlyWhitespace = true;
+  return (opener: number, index: number) => {
+    if (opener < 0 || index <= opener || index - opener > 8192) return false;
+    if (opener !== lastOpener || index < scannedTo) {
+      lastOpener = opener;
+      scannedTo = opener + 1;
+      onlyWhitespace = true;
+    }
+    while (scannedTo < index) {
+      if (!/\s/.test(value[scannedTo++]!)) onlyWhitespace = false;
+    }
+    return onlyWhitespace;
+  };
 }
 
 function closingParenWithin(value: string) {
+  const startsAngledDestination = angledDestinationCheck(value);
   const candidates = new Map<number, number>();
   const pending: Array<{ index: number; depth: number }> = [];
   const closes = new Map<number, number>();
@@ -275,6 +298,13 @@ function closingParenWithin(value: string) {
       index += 1;
       continue;
     }
+    if (!depth && value[index] === "<") {
+      const end = autolinkEnd(value, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
     if (quote) {
       if (value[index] === quote) quote = null;
       continue;
@@ -292,7 +322,7 @@ function closingParenWithin(value: string) {
       quote = value[index]!;
       continue;
     }
-    if (value[index] === "<" && startsAngledDestination(value, candidates.get(depth) ?? -1, index)) {
+    if (value[index] === "<" && startsAngledDestination(candidates.get(depth) ?? -1, index)) {
       angled = true;
       continue;
     }
@@ -336,6 +366,7 @@ function inlineSpans(
   recognizeImages: boolean,
   boundedClose = lazyClosingParenWithin(value),
 ): { codes: CodeRange[]; images: DataImage[] } | null {
+  const startsAngledDestination = angledDestinationCheck(value);
   const runs: Array<{ start: number; end: number; length: number; escaped: boolean }> = [];
   const destinations: Array<{ start: number; end: number }> = [];
   const possibleOpeners = new Set<number>();
@@ -354,6 +385,13 @@ function inlineSpans(
       index += 1;
       continue;
     }
+    if (!destinationDepth && value[index] === "<") {
+      const end = autolinkEnd(value, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
     if (destinationQuote) {
       if (value[index] === destinationQuote) destinationQuote = null;
       continue;
@@ -366,7 +404,7 @@ function inlineSpans(
       destinationQuote = value[index]!;
       continue;
     }
-    if (destinationDepth === 1 && value[index] === "<" && startsAngledDestination(value, destinationStart, index)) {
+    if (destinationDepth === 1 && value[index] === "<" && startsAngledDestination(destinationStart, index)) {
       destinationAngled = true;
       continue;
     }
@@ -383,6 +421,7 @@ function inlineSpans(
       destinationDepth -= 1;
       if (!destinationDepth) {
         destinations.push({ start: destinationStart, end: index + 1 });
+        if (destinations.length > 100_000) return null;
       }
     }
     if (destinationDepth) continue;
@@ -495,6 +534,7 @@ function safeInlineCut(
   codes: CodeRange[],
   boundedClose: (index: number) => boolean,
 ) {
+  const startsAngledDestination = angledDestinationCheck(value);
   const brackets: number[] = [];
   let parenDepth = 0;
   let destinationStart = -1;
@@ -547,7 +587,7 @@ function safeInlineCut(
       quote = character;
       continue;
     }
-    if (parenDepth === 1 && character === "<" && startsAngledDestination(value, destinationStart, index)) {
+    if (parenDepth === 1 && character === "<" && startsAngledDestination(destinationStart, index)) {
       angled = true;
       continue;
     }
@@ -586,6 +626,7 @@ function trailingEscape(value: string, boundary: number, start = 0) {
 }
 
 function safeDenseBoundary(value: string, boundary: number) {
+  const startsAngledDestination = angledDestinationCheck(value);
   const boundedClose = closingParenWithin(value);
   const brackets: number[] = [];
   const codes = codeRanges(value) ?? [];
@@ -628,7 +669,7 @@ function safeDenseBoundary(value: string, boundary: number) {
       quote = character;
       continue;
     }
-    if (parenDepth === 1 && character === "<" && startsAngledDestination(value, destinationStart, index)) {
+    if (parenDepth === 1 && character === "<" && startsAngledDestination(destinationStart, index)) {
       angled = true;
       continue;
     }
@@ -1003,7 +1044,11 @@ function markdownImage(value: string) {
   const trimmed = value.trim();
   // Bound the label before Marked tokenizes it: Marked lexes image labels
   // recursively, and a hostile long label can otherwise dominate the import.
-  if (!trimmed.startsWith("![") || trimmed.length > 64_000) return null;
+  if (!trimmed.startsWith("![")) return null;
+  if (trimmed.length > 64_000) {
+    const recovered = longDataImage(trimmed, 0);
+    return recovered?.end === trimmed.length ? { label: recovered.label, href: recovered.href } : null;
+  }
   const labelEnd = linkLabelEnd(trimmed, 0, 8192);
   if (labelEnd === null) return null;
   const { tokenizer } = markdownLexer();

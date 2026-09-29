@@ -409,7 +409,7 @@ async function publicTransclusions(
         return null;
       const response = await env.DOCUMENT.getByName(`${sourcePage.page_id}~${sourcePage.content_epoch}`).fetch(
         new Request("https://document.internal/content", {
-          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "x-notes-allow-stale": "1", ...correlationHeaders() },
         }),
       );
       if (!response.ok) return null;
@@ -526,10 +526,11 @@ export async function renderPublicShare(env: Env, share: SharedPageRow, key: str
   if (share.page_kind === "document") {
     const response = await env.DOCUMENT.getByName(`${share.page_id}~${share.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "x-notes-allow-stale": "1", ...correlationHeaders() },
       }),
     );
-    if (!response.ok) return null;
+    if (!response.ok)
+      throw new HttpError(503, "share_content_unavailable", "Shared content is temporarily unavailable.");
     const envelope = await response.json<DocumentContentEnvelope>();
     const transclusions = await publicTransclusions(env, share, key, envelope.document);
     const rendered = publicDocumentHtml(
@@ -599,7 +600,7 @@ export async function publicDiagramThumbnail(env: Env, diagram: SharedPageRow, s
   try {
     const response = await env.DOCUMENT.getByName(`${source.page_id}~${source.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
-        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "x-notes-allow-stale": "1", ...correlationHeaders() },
         signal: AbortSignal.timeout(PUBLIC_DOCUMENT_FETCH_TIMEOUT_MS),
       }),
     );

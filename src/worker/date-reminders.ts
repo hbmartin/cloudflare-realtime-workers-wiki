@@ -111,12 +111,15 @@ export async function putDateReminder(
   tokenId: string,
   input: ReminderInput,
 ) {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
     let current: Awaited<ReturnType<typeof pageDateToken>>;
     try {
       current = await pageDateToken(env, page, tokenId);
     } catch (error) {
-      if (attempt === 0 && error instanceof HttpError && error.code === "content_changing") continue;
+      if (attempt < 2 && error instanceof HttpError && error.code === "content_changing") {
+        await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+        continue;
+      }
       throw error;
     }
     const { token, sequence } = current;
@@ -183,7 +186,7 @@ export async function putDateReminder(
     if (!savedRow) throw new HttpError(503, "reminder_unavailable", "Reminder could not be saved.");
     return reminderJson(savedRow);
   }
-  throw new HttpError(409, "date_token_changed", "This date changed. Reopen the reminder and try again.");
+  throw new HttpError(503, "content_changing", "Page content is still changing. Try again shortly.");
 }
 
 export async function deleteDateReminder(env: Env, member: MemberContext, page: PageRow, tokenId: string) {
@@ -454,7 +457,6 @@ async function deliverDueDateReminders(env: Env) {
     .bind(timestamp, timestamp - 2 * 60_000)
     .all<{ id: string }>();
   const retried = new Set<string>();
-  const envelopes = new Map<string, Promise<DocumentContentEnvelope>>();
   const pendingIds = due.results.map((row) => row.id);
   for (let index = 0; index < pendingIds.length; index += 1) {
     const id = pendingIds[index]!;
@@ -489,13 +491,7 @@ async function deliverDueDateReminders(env: Env) {
           .run();
         continue;
       }
-      const pageKey = `${row.page_id}:${row.content_epoch}`;
-      let pendingEnvelope = envelopes.get(pageKey);
-      if (!pendingEnvelope) {
-        pendingEnvelope = roomEnvelope(env, row.page_id, row.content_epoch);
-        envelopes.set(pageKey, pendingEnvelope);
-      }
-      const envelope = await pendingEnvelope;
+      const envelope = await roomEnvelope(env, row.page_id, row.content_epoch);
       const document = envelope.document;
       const token = dateTokens(document).get(row.token_id);
       const choice = reminderChoice(JSON.parse(row.choice_json));
