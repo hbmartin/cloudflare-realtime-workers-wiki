@@ -188,7 +188,18 @@ function listTagFor(node: ProseMirrorJson): "ul" | "ol" | null {
 export type DocumentSerializationOptions = {
   pageHref?: (pageId: string, nodeType: "linkToPage" | "linkedDiagram") => string | null;
   linkedDiagramThumbnailHref?: (pageId: string) => string | null;
+  mediaHref?: (url: string) => string | null;
 };
+
+function markdownFence(content: string, marker: "`" | "$") {
+  let longest = 0;
+  let run = 0;
+  for (const character of content) {
+    run = character === marker ? run + 1 : 0;
+    if (run > longest) longest = run;
+  }
+  return marker.repeat(Math.max(marker === "`" ? 3 : 2, longest + 1));
+}
 
 function serializeSequence(
   children: ProseMirrorJson[],
@@ -304,15 +315,18 @@ function serializeNode(
     return `${"  ".repeat(depth)}${marker} ${label.trim()}\n${nestedOutput}`;
   }
   if (type === "codeBlock" || type === "code") {
-    const language = stringAttr(node, "language") ?? "";
+    const suppliedLanguage = stringAttr(node, "language") ?? "";
+    const language = /^[\w.+-]{0,64}$/.test(suppliedLanguage) ? suppliedLanguage : "";
     const code = nodeText(node);
+    const fence = markdownFence(code, "`");
     return format === "html"
-      ? `<pre><code data-language="${escapeHtml(language)}">${escapeHtml(code)}</code></pre>`
-      : `\`\`\`${language}\n${code}\n\`\`\`\n\n`;
+      ? `<pre><code data-language="${escapeHtml(suppliedLanguage)}">${escapeHtml(code)}</code></pre>`
+      : `${fence}${language}\n${code}\n${fence}\n\n`;
   }
   if (type === "divider" || type === "horizontalRule") return format === "html" ? "<hr>" : "---\n\n";
   if (["image", "audio", "video", "file", "pdf"].includes(type)) {
-    const url = safeUrl(node.attrs?.url) ?? "";
+    const source = safeUrl(node.attrs?.url) ?? "";
+    const url = safeUrl(options.mediaHref?.(source) ?? source) ?? "";
     const caption = stringAttr(node, "caption") ?? type;
     if (format === "markdown") {
       const label = escapeMarkdownInline(caption);
@@ -332,15 +346,17 @@ function serializeNode(
   }
   if (type === "math") {
     const formula = stringAttr(node, "formula") ?? nodeText(node);
+    const fence = markdownFence(formula, "$");
     return format === "html"
       ? `<div class="math" data-formula="${escapeHtml(formula)}"><pre>${escapeHtml(formula)}</pre></div>`
-      : `$$\n${formula}\n$$\n\n`;
+      : `${fence}\n${formula}\n${fence}\n\n`;
   }
   if (type === "mermaid") {
     const source = stringAttr(node, "source") ?? nodeText(node);
+    const fence = markdownFence(source, "`");
     return format === "html"
       ? `<pre class="mermaid">${escapeHtml(source)}</pre>`
-      : `\`\`\`mermaid\n${source}\n\`\`\`\n\n`;
+      : `${fence}mermaid\n${source}\n${fence}\n\n`;
   }
   if (type === "columns" || type === "columnList" || type === "column") {
     const className = type === "columnList" ? "columns" : type;
@@ -491,6 +507,11 @@ export function serializeDocument(
     markdown: serializeNode(root, "markdown", 0, options).trimEnd() + "\n",
     html: `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>:root{color-scheme:light dark}body{font:16px/1.55 system-ui,sans-serif;max-width:860px;margin:40px auto;padding:0 24px;background:Canvas;color:CanvasText}a{color:LinkText}img{max-width:100%}pre{white-space:pre-wrap;background:color-mix(in srgb,CanvasText 8%,Canvas);padding:12px;border-radius:8px}.callout{display:flex;gap:10px;padding:12px;border-left:4px solid #777;background:color-mix(in srgb,CanvasText 6%,Canvas)}.columns{display:flex;gap:16px}.column{flex:1}@media(max-width:700px){.columns{display:block}}table{border-collapse:collapse}td,th{border:1px solid color-mix(in srgb,CanvasText 25%,Canvas);padding:6px}.synced-reference{border-left:3px solid #777;padding:8px}</style></head><body>${serializeNode(root, "html", 0, options)}</body></html>`,
   };
+}
+
+/** Serialize one node without the full-text and HTML export passes. */
+export function serializeMarkdownNode(node: ProseMirrorJson, options: DocumentSerializationOptions = {}) {
+  return serializeNode(node, "markdown", 0, options);
 }
 
 type TransclusionSourceProjection = { blockId: string; content: ProseMirrorJson[] };

@@ -121,8 +121,46 @@ describe("Notion-compatible API", () => {
       truncated: false,
       unknown_block_ids: [],
     });
+    await client.pages.create({
+      parent: { type: "page_id", page_id: installed.pageId },
+      properties: { title: { type: "title", title: [{ text: { content: "Child specification" } }] } },
+    });
+    const withChild = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(withChild.markdown).toContain("Child specification");
+    expect(withChild.markdown).toContain("?page=");
+    expect(withChild.unknown_block_ids).toEqual([]);
     const missing = await SELF.fetch(notionRequest("invalid", `/pages/${installed.pageId}/markdown`));
     expect(missing.status).toBe(401);
+    const deniedCapability = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ readContent: false }),
+      }),
+    );
+    expect(deniedCapability.status).toBe(200);
+    expect(
+      (await SELF.fetch(notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`))).status,
+    ).toBe(403);
+    const restoredCapability = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ readContent: true }),
+      }),
+    );
+    expect(restoredCapability.status).toBe(200);
+    const removedGrant = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}/grants`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ rootPageIds: [] }),
+      }),
+    );
+    expect(removedGrant.status).toBe(200);
+    expect(
+      (await SELF.fetch(notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`))).status,
+    ).toBe(404);
   });
   it("round-trips expanded embed URLs through /v1 while framing is disabled", async () => {
     const installed = await bootstrap();

@@ -149,6 +149,22 @@ describe("structured document projection", () => {
     expect(serialized.html).toContain("&lt;still readable&gt;");
   });
 
+  it("keeps embedded fences and untrusted language text inside code blocks", () => {
+    const serialized = serializeDocument(
+      document(
+        {
+          type: "codeBlock",
+          attrs: { language: "js\n# forged" },
+          content: [{ type: "text", text: "x\n```\n# inside" }],
+        },
+        { type: "mermaid", attrs: { source: "graph TD\n```\n# inside" } },
+      ),
+    );
+    expect(serialized.markdown).toContain("````\nx\n```\n# inside\n````");
+    expect(serialized.markdown).toContain("````mermaid\ngraph TD\n```\n# inside\n````");
+    expect(serialized.markdown).not.toContain("# forged");
+  });
+
   it("keeps linked diagrams inert unless a caller supplies safe URL resolvers", () => {
     const root = document({
       type: "linkedDiagram",

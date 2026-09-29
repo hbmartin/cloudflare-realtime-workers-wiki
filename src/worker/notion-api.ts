@@ -651,13 +651,51 @@ notionApi.get("/pages/:pageId/markdown", async (c) => {
   const principal = c.get("principal");
   capability(principal, "readContent");
   const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
-  const [snapshot, metadata, id] = await Promise.all([
-    liveDocument(c.env, page),
+  const snapshot = await liveDocument(c.env, page);
+  const [metadata, id, attachments, childPages] = await Promise.all([
     metadataForPage(c.env, page.id),
     publicPageId(c.env, page.id),
+    c.env.DB.prepare(`SELECT id FROM attachments WHERE page_id = ?`).bind(page.id).all<{ id: string }>(),
+    c.env.DB.prepare(
+      `SELECT id, title FROM pages WHERE parent_id = ? AND workspace_id = ? AND archived_at IS NULL
+       AND kind = 'document' ORDER BY position, id LIMIT 1101`,
+    )
+      .bind(page.id, principal.workspaceId)
+      .all<{ id: string; title: string }>(),
   ]);
+  const signedMedia = new Map(
+    await Promise.all(
+      attachments.results.map(
+        async ({ id: attachmentId }) =>
+          [attachmentId, await notionFileUrl(c.env, attachmentId, Date.now() + 60 * 60_000)] as const,
+      ),
+    ),
+  );
   const ids = new Map([...metadata].map(([internalId, value]) => [internalId, value.id]));
-  const projection = projectNotionMarkdown(snapshot.document, ids);
+  const childIds = await publicPageIds(
+    c.env,
+    childPages.results.map((child) => child.id),
+  );
+  for (const [internalId, publicId] of childIds) ids.set(internalId, publicId);
+  const childBlocks = childPages.results.map((child) => ({
+    id: child.id,
+    internalId: child.id,
+    type: "linkToPage",
+    node: { type: "linkToPage", attrs: { pageId: child.id, title: child.title } },
+    children: [],
+  }));
+  const projection = projectNotionMarkdown(
+    snapshot.document,
+    ids,
+    {
+      pageHref: (pageId) => new URL(`/?page=${encodeURIComponent(pageId)}`, c.req.url).toString(),
+      mediaHref: (url) => {
+        const match = /^\/api\/attachments\/([A-Za-z0-9_-]+)(?:[?#]|$)/.exec(url);
+        return match ? (signedMedia.get(match[1]!) ?? null) : url;
+      },
+    },
+    childBlocks,
+  );
   return c.json({
     object: "page_markdown",
     id,
