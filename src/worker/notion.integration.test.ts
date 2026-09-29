@@ -328,6 +328,31 @@ describe("Notion-compatible API", () => {
     await recoverNotionMarkdownTasks(env);
     const recovered = await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`));
     expect((await recovered.json<{ status: string }>()).status).toBe("succeeded");
+    await env.DB.prepare(
+      `UPDATE notion_markdown_tasks SET status='running',attempts=5,operation_id='markdown:missing-receipt',
+         lease_token='stale',lease_expires_at=?,next_attempt_at=?,result_json=NULL WHERE id=?`,
+    )
+      .bind(Date.now() - 1, Date.now() - 1, accepted.id)
+      .run();
+    await recoverNotionMarkdownTasks(env);
+    expect(
+      (
+        await (
+          await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))
+        ).json<{ status: string }>()
+      ).status,
+    ).toBe("retrying");
+    await env.DB.prepare(`UPDATE notion_markdown_tasks SET attempts=9,next_attempt_at=? WHERE id=?`)
+      .bind(Date.now() - 1, accepted.id)
+      .run();
+    await recoverNotionMarkdownTasks(env);
+    expect(
+      (
+        await (
+          await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))
+        ).json<{ status: string }>()
+      ).status,
+    ).toBe("failed");
     const revokeRead = await SELF.fetch(
       authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
         method: "PATCH",
@@ -393,6 +418,17 @@ describe("Notion-compatible API", () => {
     expect(deniedCapability.status).toBe(200);
     expect(
       (await SELF.fetch(notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`))).status,
+    ).toBe(403);
+    expect(
+      (
+        await SELF.fetch(
+          notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ type: "insert_content", insert_content: { content: "" } }),
+          }),
+        )
+      ).status,
     ).toBe(403);
     const restoredCapability = await SELF.fetch(
       authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {

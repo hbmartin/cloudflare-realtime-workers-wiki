@@ -3,6 +3,7 @@ import { notionInputToBlockContainer } from "./notion-blocks";
 import { parseMarkdownCommand } from "./notion-markdown-commands";
 import { projectNotionMarkdown } from "./notion-markdown";
 import { markdownEditTargets, markdownMutations } from "./notion-markdown-mutations";
+import { parseWritableMarkdown } from "./notion-markdown-write";
 
 function fixture() {
   const first = notionInputToBlockContainer({ paragraph: { rich_text: [{ text: { content: "First paragraph" } }] } });
@@ -98,6 +99,64 @@ describe("Notion Markdown block mutations", () => {
     expect(projection.markdown).toContain("First paragraph");
   });
 
+  it("keeps list items when only their Markdown numbering changes", () => {
+    const blocks = parseWritableMarkdown("1. a\n1. b\n1. c\n\nAfter\n");
+    const document = { type: "doc", content: [{ type: "blockGroup", content: blocks }] };
+    const projection = projectNotionMarkdown(document);
+    const protectedId = String(blocks[2]!.attrs?.id);
+    const changed = projection.markdown.replace("1. b", "2. b").replace("1. c", "3. c").replace("After", "Updated");
+    const command = parseMarkdownCommand(
+      { type: "replace_content", replace_content: { new_str: changed } },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false, new Set([protectedId]));
+    expect(operations).toHaveLength(1);
+    expect(operations[0]).toMatchObject({ type: "replace_block", internalId: blocks[3]!.attrs?.id });
+  });
+
+  it("preserves nested and parent color while editing a list label", () => {
+    const [parent] = parseWritableMarkdown("- Parent\n  - **_Styled_**\n");
+    parent!.content![0]!.attrs = { ...parent!.content![0]!.attrs, textColor: "blue" };
+    const child = parent!.content![1]!.content![0]!;
+    child.content![0]!.attrs = { ...child.content![0]!.attrs, textColor: "red" };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [parent!] }] };
+    const projection = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      { type: "update_content", update_content: { content_updates: [{ old_str: "Parent", new_str: "Updated" }] } },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false);
+    expect(operations[0]).toMatchObject({
+      type: "replace_block",
+      container: {
+        content: [{ attrs: { textColor: "blue" } }, { content: [{ content: [{ attrs: { textColor: "red" } }] }] }],
+      },
+    });
+  });
+
+  it("keeps multiline math untouched when surrounding paragraphs change", () => {
+    const { first, second } = fixture();
+    const math = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "math", attrs: { formula: "a\n\nb" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, math, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      {
+        type: "replace_content",
+        replace_content: {
+          new_str: projection.markdown.replace("First", "Updated first").replace("Second", "Updated second"),
+        },
+      },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false);
+    expect(operations.filter((operation) => operation.type === "replace_block")).toHaveLength(2);
+    expect(JSON.stringify(operations)).not.toContain(math.attrs.id);
+  });
+
   it("keeps zero-length spacer blocks while replacing surrounding text", () => {
     const { first, second } = fixture();
     const spacer = {
@@ -119,6 +178,22 @@ describe("Notion Markdown block mutations", () => {
     const operations = markdownMutations(document, projection, command.edits, false);
     expect(operations.filter((operation) => operation.type === "replace_block")).toHaveLength(2);
     expect(JSON.stringify(operations)).not.toContain(spacer.attrs.id);
+  });
+
+  it("rejects a full replacement that would silently leave an invisible spacer", () => {
+    const { first, second } = fixture();
+    const spacer = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "paragraph" }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, spacer, second] }] };
+    const projection = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      { type: "replace_content", replace_content: { new_str: "Only one block", allow_deleting_content: true } },
+      projection.markdown,
+    );
+    expect(() => markdownMutations(document, projection, command.edits, true)).toThrow("invisible block");
   });
 
   it("keeps untouched styled and table-of-contents blocks within a replaced range", () => {

@@ -50,11 +50,25 @@ describe("writable Notion Markdown", () => {
     expect(content.map((node) => node.text ?? "").join("")).toContain("Cost $12 and $5. Escaped $x$");
   });
 
+  it("keeps adjacent dollar delimiters out of inline math", () => {
+    const content = parseWritableMarkdown("Energy: $$E=mc^2$$\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([]);
+    expect(content.map((node) => node.text ?? "").join("")).toBe("Energy: $$E=mc^2$$");
+  });
+
   it("preserves escaped formula characters across inline lexer tokens", () => {
     const content = parseWritableMarkdown("Set $A = \\{1,2\\}$ and $B = \\\\alpha$.\n")[0]!.content![0]!.content!;
     expect(content.filter((node) => node.type === "inlineMath")).toEqual([
       { type: "inlineMath", attrs: { formula: "A = \\{1,2\\}" } },
       { type: "inlineMath", attrs: { formula: "B = \\\\alpha" } },
+    ]);
+  });
+
+  it("keeps formulas intact across emphasis and HTML lexer tokens", () => {
+    const content = parseWritableMarkdown("Set $a*b*c$ and $x<y>z$.\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "a*b*c" } },
+      { type: "inlineMath", attrs: { formula: "x<y>z" } },
     ]);
   });
 
@@ -69,6 +83,13 @@ describe("writable Notion Markdown", () => {
   it("counts delimiters after a backtick line that is not a code fence", () => {
     expect(() => parseWritableMarkdown("```x```\n" + "![x]".repeat(3_000))).toThrow("too many markup delimiters");
   });
+
+  it.each(["```\n```~\n", "- ```\n  x\n  ```\n", "```\n```\r"])(
+    "counts markup after a fence that Marked closes: %s",
+    (prefix) => {
+      expect(() => parseWritableMarkdown(prefix + "![x]".repeat(3_000))).toThrow("too many markup delimiters");
+    },
+  );
 
   it.each([
     '<unknown url="notion://blocks/id"/>',

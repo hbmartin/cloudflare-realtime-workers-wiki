@@ -30,13 +30,21 @@ function textWithMath(value: string, marks: NonNullable<ProseMirrorJson["marks"]
     return slashes % 2 === 1;
   };
   for (let index = 0; index < value.length; index += 1) {
-    if (value[index] !== "$" || escaped(index) || !value[index + 1] || /\s/.test(value[index + 1]!)) continue;
+    if (
+      value[index] !== "$" ||
+      escaped(index) ||
+      !value[index + 1] ||
+      value[index + 1] === "$" ||
+      /\s/.test(value[index + 1]!)
+    )
+      continue;
     let close = index + 1;
     while (close < value.length && value[close] !== "\n") {
       if (value[close] === "$" && !escaped(close)) break;
       close += 1;
     }
-    if (value[close] !== "$" || /\s/.test(value[close - 1]!)) continue;
+    if (close <= index + 1 || value[close] !== "$" || value[close + 1] === "$" || /\s/.test(value[close - 1]!))
+      continue;
     if (index > cursor)
       output.push({
         type: "text",
@@ -56,7 +64,61 @@ function unescapeMarkdown(value: string) {
   return value.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~])/g, "$1");
 }
 
+function splitCrossTokenMath(tokens: Token[]) {
+  const source = tokens.map((token) => token.raw).join("");
+  if (!source.includes("$")) return null;
+  const ranges: Array<{ from: number; to: number; type: string }> = [];
+  let offset = 0;
+  for (const token of tokens) {
+    ranges.push({ from: offset, to: offset + token.raw.length, type: token.type });
+    offset += token.raw.length;
+  }
+  const escaped = (position: number) => {
+    let slashes = 0;
+    for (let index = position - 1; index >= 0 && source[index] === "\\"; index -= 1) slashes += 1;
+    return slashes % 2 === 1;
+  };
+  const spans: Array<{ from: number; to: number; formula: string }> = [];
+  for (let index = 0; index < source.length; index += 1) {
+    if (
+      source[index] !== "$" ||
+      escaped(index) ||
+      source[index + 1] === "$" ||
+      !source[index + 1] ||
+      /\s/.test(source[index + 1]!)
+    )
+      continue;
+    let close = index + 1;
+    while (close < source.length && source[close] !== "\n") {
+      if (source[close] === "$" && !escaped(close)) break;
+      close += 1;
+    }
+    if (source[close] !== "$" || close <= index + 1 || source[close + 1] === "$" || /\s/.test(source[close - 1]!))
+      continue;
+    const overlapping = ranges.filter((range) => range.from < close + 1 && range.to > index);
+    if (overlapping.some((range) => ["codespan", "link", "image"].includes(range.type))) continue;
+    if (overlapping.some((range) => range.type !== "text" && range.type !== "escape"))
+      spans.push({ from: index, to: close + 1, formula: source.slice(index + 1, close).replaceAll("\\$", "$") });
+    index = close;
+  }
+  return spans.length ? { source, spans } : null;
+}
+
 function inline(tokens: Token[], marks: NonNullable<ProseMirrorJson["marks"]> = []): ProseMirrorJson[] {
+  const crossTokenMath = splitCrossTokenMath(tokens);
+  if (crossTokenMath) {
+    const output: ProseMirrorJson[] = [];
+    let cursor = 0;
+    for (const span of crossTokenMath.spans) {
+      if (span.from > cursor)
+        output.push(...inline(Lexer.lexInline(crossTokenMath.source.slice(cursor, span.from), { gfm: true }), marks));
+      output.push({ type: "inlineMath", attrs: { formula: span.formula } });
+      cursor = span.to;
+    }
+    if (cursor < crossTokenMath.source.length)
+      output.push(...inline(Lexer.lexInline(crossTokenMath.source.slice(cursor), { gfm: true }), marks));
+    return output;
+  }
   const output: ProseMirrorJson[] = [];
   let text = "";
   const flushText = () => {
@@ -124,36 +186,30 @@ export function parseWritableMarkdownWithSource(source: string): { blocks: Prose
   if (new TextEncoder().encode(source).length > MAX_INPUT_BYTES)
     throw new MarkdownWriteError("Markdown content exceeds 128 KiB.");
   if (source.includes("\0")) throw new MarkdownWriteError("Markdown content contains an invalid character.");
+  const normalized = source.replaceAll(/\r\n?/g, "\n");
+  const blocks = new Lexer({ gfm: true }).blockTokens(normalized);
   let delimiterCount = 0;
-  let fence: { character: string; length: number } | null = null;
-  for (const line of source.split("\n")) {
-    const opening = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
-    if (
-      opening &&
-      fence &&
-      opening[0] === fence.character &&
-      opening.length >= fence.length &&
-      /^\s*$/.test(line.slice(line.indexOf(opening) + opening.length))
-    ) {
-      fence = null;
-      continue;
+  const countInline = (tokens: Token[]) => {
+    for (const token of tokens) {
+      if (token.type === "code" || token.type === "space") continue;
+      if (token.type === "list") {
+        for (const item of token.items) countInline(item.tokens);
+        continue;
+      }
+      if (token.type === "blockquote") {
+        countInline(token.tokens ?? []);
+        continue;
+      }
+      const inlineSource = "text" in token && typeof token.text === "string" ? token.text : token.raw;
+      for (const character of inlineSource)
+        if ("<\\[]`*_!".includes(character) && ++delimiterCount > 4096)
+          throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
     }
-    if (
-      opening &&
-      !fence &&
-      (opening[0] === "~" || !line.slice(line.indexOf(opening) + opening.length).includes("`"))
-    ) {
-      fence = { character: opening[0]!, length: opening.length };
-      continue;
-    }
-    if (fence) continue;
-    for (const character of line)
-      if ("<\\[]`*_!".includes(character) && ++delimiterCount > 4096)
-        throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
-  }
+  };
+  countInline(blocks);
   const output: ProseMirrorJson[] = [];
   const rawBlocks: string[] = [];
-  for (const token of Lexer.lex(source.replaceAll("\r\n", "\n"), { gfm: true })) {
+  for (const token of Lexer.lex(normalized, { gfm: true })) {
     if (token.type === "space") continue;
     if (token.type === "list") {
       output.push(...list(token));

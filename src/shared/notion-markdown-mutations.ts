@@ -108,25 +108,65 @@ function replacementText(markdown: string, from: number, to: number, edits: Mark
   return text;
 }
 
-function unchangedPairs(original: string[], replacement: string[]): Array<[number, number]> {
+function unchangedPairs(
+  original: string[],
+  replacement: string[],
+  oldMeaning: string[] = [],
+  newMeaning: string[] = [],
+): Array<[number, number]> {
+  const equal = (old: number, next: number) =>
+    original[old] === replacement[next] || (oldMeaning[old] !== undefined && oldMeaning[old] === newMeaning[next]);
   const width = replacement.length + 1;
   const lengths = new Uint16Array((original.length + 1) * width);
   for (let old = original.length - 1; old >= 0; old -= 1)
     for (let next = replacement.length - 1; next >= 0; next -= 1)
-      lengths[old * width + next] =
-        original[old] === replacement[next]
-          ? 1 + lengths[(old + 1) * width + next + 1]!
-          : Math.max(lengths[(old + 1) * width + next]!, lengths[old * width + next + 1]!);
+      lengths[old * width + next] = equal(old, next)
+        ? 1 + lengths[(old + 1) * width + next + 1]!
+        : Math.max(lengths[(old + 1) * width + next]!, lengths[old * width + next + 1]!);
   const pairs: Array<[number, number]> = [];
   let old = 0;
   let next = 0;
   while (old < original.length && next < replacement.length) {
-    if (original[old] === replacement[next]) {
+    if (equal(old, next)) {
       pairs.push([old++, next++]);
     } else if (lengths[(old + 1) * width + next]! >= lengths[old * width + next + 1]!) old += 1;
     else next += 1;
   }
   return pairs;
+}
+
+function markdownMeaning(node: ProseMirrorJson): string {
+  const attrs = node.attrs ?? {};
+  const meaningAttrs: Record<string, unknown> = {};
+  const keys: Record<string, string[]> = {
+    heading: ["level", "isToggleable"],
+    checkListItem: ["checked"],
+    codeBlock: ["language"],
+    math: ["formula"],
+    inlineMath: ["formula"],
+    mermaid: ["source"],
+    image: ["url", "caption"],
+    link: ["href"],
+  };
+  for (const key of keys[node.type ?? ""] ?? []) if (attrs[key] !== undefined) meaningAttrs[key] = attrs[key];
+  const children = (node.content ?? []).map(markdownMeaning);
+  return JSON.stringify({
+    type: node.type,
+    ...(node.text !== undefined ? { text: node.text } : {}),
+    ...(Object.keys(meaningAttrs).length ? { attrs: meaningAttrs } : {}),
+    ...(node.marks?.length ? { marks: node.marks.map((mark) => JSON.stringify(mark)).toSorted() } : {}),
+    ...(children.length ? { children } : {}),
+  });
+}
+
+function preserveBlockStyle(previous: ProseMirrorJson, next: ProseMirrorJson): ProseMirrorJson {
+  const previousNode = previous.content?.[0];
+  const nextNode = next.content?.[0];
+  if (!previousNode || !nextNode || previousNode.type !== nextNode.type) return next;
+  const attrs = { ...nextNode.attrs };
+  for (const key of ["backgroundColor", "textColor", "textAlignment"])
+    if (previousNode.attrs?.[key] !== undefined) attrs[key] = previousNode.attrs[key];
+  return { ...next, content: [{ ...nextNode, attrs }, ...next.content!.slice(1)] };
 }
 
 function blockContainer(block: NotionBlock): ProseMirrorJson {
@@ -146,7 +186,15 @@ function preserveNestedIds(block: NotionBlock, container: ProseMirrorJson) {
   if (!children?.length || !block.children.length) return container;
   const oldSignatures = block.children.map((child) => serializeMarkdownNode(blockContainer(child)).trimEnd());
   const newSignatures = children.map((child) => serializeMarkdownNode(child).trimEnd());
-  const pairs = [...unchangedPairs(oldSignatures, newSignatures), [block.children.length, children.length] as const];
+  const pairs = [
+    ...unchangedPairs(
+      oldSignatures,
+      newSignatures,
+      block.children.map((child) => markdownMeaning(blockContainer(child))),
+      children.map(markdownMeaning),
+    ),
+    [block.children.length, children.length] as const,
+  ];
   const aligned = [...children];
   let oldStart = 0;
   let newStart = 0;
@@ -155,10 +203,13 @@ function preserveNestedIds(block: NotionBlock, container: ProseMirrorJson) {
     for (let index = 0; index < retained; index += 1) {
       const prior = block.children[oldStart + index]!;
       const next = aligned[newStart + index]!;
-      aligned[newStart + index] = preserveNestedIds(prior, {
-        ...next,
-        attrs: { ...next.attrs, id: prior.internalId },
-      });
+      aligned[newStart + index] = preserveNestedIds(
+        prior,
+        preserveBlockStyle(blockContainer(prior), {
+          ...next,
+          attrs: { ...next.attrs, id: prior.internalId },
+        }),
+      );
     }
     if (oldEnd < block.children.length) aligned[newEnd] = blockContainer(block.children[oldEnd]!);
     oldStart = oldEnd + 1;
@@ -178,6 +229,45 @@ function canonicalizeMedia(node: ProseMirrorJson, mediaUrls: ReadonlyMap<string,
     ...(attrs ? { attrs } : {}),
     ...(node.content ? { content: node.content.map((child) => canonicalizeMedia(child, mediaUrls)) } : {}),
   };
+}
+
+function parseGroupPreservingMath(
+  source: string,
+  originals: Array<{ block: NotionBlock; span: NotionMarkdownProjection["spans"][number] }>,
+  markdown: string,
+) {
+  const protectedMath = originals.filter(
+    ({ block }) => block.type === "math" && String(block.node.attrs?.formula ?? "").includes("\n\n"),
+  );
+  if (!protectedMath.length) return parseWritableMarkdownWithSource(source);
+  if (new TextEncoder().encode(source).length > 128 * 1024)
+    throw new MarkdownWriteError("Markdown content exceeds 128 KiB.");
+  const blocks: ProseMirrorJson[] = [];
+  const rawBlocks: string[] = [];
+  let cursor = 0;
+  const append = (segment: string) => {
+    const parsed = parseWritableMarkdownWithSource(segment);
+    blocks.push(...parsed.blocks);
+    rawBlocks.push(...parsed.rawBlocks);
+  };
+  for (const { block, span } of protectedMath) {
+    const raw = markdown.slice(span.from, span.to);
+    let found = source.indexOf(raw, cursor);
+    while (
+      found >= 0 &&
+      ((found > 0 && source[found - 1] !== "\n") ||
+        (found + raw.length < source.length && !raw.endsWith("\n") && source[found + raw.length] !== "\n"))
+    )
+      found = source.indexOf(raw, found + 1);
+    if (found < 0) throw new MarkdownWriteError("Math blocks with blank lines must be edited through the block API.");
+    append(source.slice(cursor, found));
+    blocks.push(blockContainer(block));
+    rawBlocks.push(raw.trimEnd());
+    cursor = found + raw.length;
+  }
+  append(source.slice(cursor));
+  if (blocks.length > 1000) throw new MarkdownWriteError("Markdown content exceeds 1000 blocks.");
+  return { blocks, rawBlocks };
 }
 
 /** Build one document-room transaction without rewriting any unselected block. */
@@ -224,6 +314,7 @@ export function markdownMutations(
   const groups = groupsFor(projection, edits);
   const operations: MarkdownMutation[] = [];
   for (const group of groups.toReversed()) {
+    const operationStart = operations.length;
     if (
       group.first === projection.spans.length &&
       group.first === group.after &&
@@ -246,19 +337,22 @@ export function markdownMutations(
       if (!allowDeletingContent || !group.edits.some((edit) => edit.from <= span.from && edit.to >= span.to))
         throw new MarkdownWriteError("A range cannot partially overwrite unknown content.");
     }
-    const parsed = parseWritableMarkdownWithSource(replacementText(projection.markdown, from, to, group.edits));
+    const groupSource = replacementText(projection.markdown, from, to, group.edits);
+    const originalSpans = original.map((block, index) => ({ block, span: projection.spans[group.first + index]! }));
+    const parsed = parseGroupPreservingMath(groupSource, originalSpans, projection.markdown);
     const replacement = parsed.blocks;
-    const retainedOriginal = original.filter((_, index) => {
-      const span = projection.spans[group.first + index]!;
-      return span.from !== span.to;
+    const retainedOriginal = originalSpans.flatMap(({ block, span }) => {
+      return span.from !== span.to ? [{ block, span }] : [];
     });
-    const oldSignatures = retainedOriginal.map((block) => {
-      const span = projection.spans.find((candidate) => candidate.internalId === block.internalId)!;
-      return projection.markdown.slice(span.from, span.to).trimEnd();
-    });
+    const oldSignatures = retainedOriginal.map(({ span }) => projection.markdown.slice(span.from, span.to).trimEnd());
     const newSignatures = parsed.rawBlocks;
     const pairs = [
-      ...unchangedPairs(oldSignatures, newSignatures),
+      ...unchangedPairs(
+        oldSignatures,
+        newSignatures,
+        retainedOriginal.map(({ block }) => markdownMeaning(blockContainer(block))),
+        replacement.map(markdownMeaning),
+      ),
       [retainedOriginal.length, replacement.length] as const,
     ];
     let oldStart = 0;
@@ -267,14 +361,17 @@ export function markdownMutations(
     for (const [oldEnd, newEnd] of pairs) {
       const retained = Math.min(oldEnd - oldStart, newEnd - newStart);
       for (let index = 0; index < retained; index += 1) {
-        const block = retainedOriginal[oldStart + index]!;
+        const block = retainedOriginal[oldStart + index]!.block;
         if (blockHasProtectedContent(block, protectedBlockIds))
           throw new MarkdownWriteError(
             "A selected block has comments or comment anchors. Use the block API to edit it safely.",
           );
         if (NONEDITABLE_BLOCK_TYPES.has(block.type))
           throw new MarkdownWriteError("This block cannot be changed as Markdown. Use the block API.");
-        let container = canonicalizeMedia(preserveNestedIds(block, replacement[newStart + index]!), canonicalMediaUrls);
+        let container = canonicalizeMedia(
+          preserveNestedIds(block, preserveBlockStyle(blockContainer(block), replacement[newStart + index]!)),
+          canonicalMediaUrls,
+        );
         if (block.type === "image" && container.content?.[0]?.type === "image") {
           const image = container.content[0];
           if (image.attrs?.url === block.node.attrs?.url)
@@ -293,7 +390,7 @@ export function markdownMutations(
         });
         precedingId = block.internalId;
       }
-      for (const block of retainedOriginal.slice(oldStart + retained, oldEnd)) {
+      for (const { block } of retainedOriginal.slice(oldStart + retained, oldEnd)) {
         if (blockHasProtectedContent(block, protectedBlockIds))
           throw new MarkdownWriteError(
             "A selected block has comments or comment anchors. Use the block API to edit it safely.",
@@ -313,10 +410,17 @@ export function markdownMutations(
         });
         precedingId = String(added.at(-1)!.attrs?.id);
       }
-      if (oldEnd < retainedOriginal.length) precedingId = retainedOriginal[oldEnd]!.internalId;
+      if (oldEnd < retainedOriginal.length) precedingId = retainedOriginal[oldEnd]!.block.internalId;
       oldStart = oldEnd + 1;
       newStart = newEnd + 1;
     }
+    if (
+      originalSpans.some(({ span }) => span.from === span.to) &&
+      operations.slice(operationStart).some((operation) => operation.type !== "replace_block")
+    )
+      throw new MarkdownWriteError(
+        "This selection contains an invisible block. Use the block API to reorder or remove it.",
+      );
   }
   if (operations.length > 100) throw new MarkdownWriteError("The Markdown edit has too many block operations.");
   return operations;
