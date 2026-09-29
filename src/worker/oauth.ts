@@ -622,8 +622,6 @@ type RefreshRow = {
 async function refreshGrant(params: URLSearchParams, env: Env) {
   const clientId = singleton(params, "client_id");
   const tokenHash = await sha256(singleton(params, "refresh_token"));
-  const credentialRate = await consumeFixedWindow(env, `oauth-refresh:${tokenHash}`, { window: 60, max: 60 });
-  if (!credentialRate.allowed) return oauthError("slow_down", "Refresh requests are rate limited.", 429);
   const resource = singleton(params, "resource");
   if (resource !== mcpResource(env)) return oauthError("invalid_target", "The MCP resource must match this host.");
   const row = await env.DB.prepare(
@@ -719,7 +717,7 @@ export async function oauthToken(request: Request, env: Env) {
   const grantType = singleton(params, "grant_type");
   const sourceRate = await consumeFixedWindow(env, `oauth-token-source:${await sourceRateLimitKey(request)}`, {
     window: 60,
-    max: 1200,
+    max: 600,
   });
   if (!sourceRate.allowed) return oauthError("slow_down", "Token requests are temporarily rate limited.", 429);
   if (grantType === "authorization_code") return exchangeCode(params, env);
@@ -731,13 +729,11 @@ export async function oauthRevoke(request: Request, env: Env) {
   const params = await formParams(request);
   const sourceRate = await consumeFixedWindow(env, `oauth-revoke-source:${await sourceRateLimitKey(request)}`, {
     window: 60,
-    max: 1200,
+    max: 600,
   });
   if (!sourceRate.allowed) return oauthError("slow_down", "Revocation requests are temporarily rate limited.", 429);
   const clientId = singleton(params, "client_id");
   const hash = await sha256(singleton(params, "token"));
-  const credentialRate = await consumeFixedWindow(env, `oauth-revoke:${hash}`, { window: 60, max: 60 });
-  if (!credentialRate.allowed) return oauthError("slow_down", "Revocation requests are rate limited.", 429);
   await env.DB.prepare(
     `UPDATE oauth_grants SET revoked_at=? WHERE id IN (
       SELECT grant.id FROM oauth_grants grant JOIN oauth_access_tokens access ON access.grant_id=grant.id

@@ -44,18 +44,19 @@ function result(value: unknown) {
 export async function pruneStagedMcpPages(env: Env) {
   const rows = await env.DB.prepare(
     `SELECT id,content_epoch,import_job_id,updated_at FROM pages
-      WHERE (import_job_id GLOB 'mcp:create:*'
+      WHERE ((import_job_id GLOB 'mcp:create:*' AND updated_at<?)
         OR (import_job_id GLOB 'mcp:cleanup:*' AND updated_at<?))
         AND created_at<? ORDER BY updated_at LIMIT 10`,
   )
-    .bind(Date.now() - STAGED_CLEANUP_RETRY_MS, Date.now() - STAGED_PAGE_TTL_MS)
+    .bind(Date.now() - STAGED_CLEANUP_RETRY_MS, Date.now() - STAGED_CLEANUP_RETRY_MS, Date.now() - STAGED_PAGE_TTL_MS)
     .all<{ id: string; content_epoch: number; import_job_id: string; updated_at: number }>();
   for (const row of rows.results) {
     const cleanupId = `mcp:cleanup:${row.id}`;
+    const claimedAt = Date.now();
     const claimed = await env.DB.prepare(
       "UPDATE pages SET import_job_id=?,updated_at=? WHERE id=? AND import_job_id=? AND updated_at=?",
     )
-      .bind(cleanupId, Date.now(), row.id, row.import_job_id, row.updated_at)
+      .bind(cleanupId, claimedAt, row.id, row.import_job_id, row.updated_at)
       .run();
     if (claimed.meta.changes !== 1) continue;
     try {
@@ -72,9 +73,14 @@ export async function pruneStagedMcpPages(env: Env) {
         env.DB.prepare(
           `DELETE FROM oauth_operation_receipts
             WHERE tool_name='create_page' AND json_extract(result_json,'$.status')='staged'
-              AND json_extract(result_json,'$.pageId')=?`,
-        ).bind(row.id),
-        env.DB.prepare("DELETE FROM pages WHERE id=? AND import_job_id=?").bind(row.id, cleanupId),
+              AND json_extract(result_json,'$.pageId')=?
+              AND EXISTS (SELECT 1 FROM pages WHERE id=? AND import_job_id=? AND updated_at=?)`,
+        ).bind(row.id, row.id, cleanupId, claimedAt),
+        env.DB.prepare("DELETE FROM pages WHERE id=? AND import_job_id=? AND updated_at=?").bind(
+          row.id,
+          cleanupId,
+          claimedAt,
+        ),
       ]);
     } catch (error) {
       logger.error(
@@ -85,8 +91,8 @@ export async function pruneStagedMcpPages(env: Env) {
         error,
       );
       try {
-        await env.DB.prepare("UPDATE pages SET updated_at=? WHERE id=? AND import_job_id=?")
-          .bind(Date.now(), row.id, cleanupId)
+        await env.DB.prepare("UPDATE pages SET updated_at=? WHERE id=? AND import_job_id=? AND updated_at=?")
+          .bind(Date.now(), row.id, cleanupId, claimedAt)
           .run();
       } catch {
         // Preserve the original purge failure and continue with other staged pages.
@@ -181,6 +187,13 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
     .first<{ content_epoch: number; import_job_id: string | null }>();
   if (!stage || stage.import_job_id !== stageId)
     throw new HttpError(409, "page_create_unknown", "The page creation outcome could not be verified.");
+  const reserved = await env.DB.prepare(
+    "UPDATE pages SET updated_at=? WHERE id=? AND workspace_id=? AND import_job_id=?",
+  )
+    .bind(Date.now(), staged.pageId, access.member.workspace.id, stageId)
+    .run();
+  if (reserved.meta.changes !== 1)
+    throw new HttpError(409, "page_create_unknown", "The staged page was changed before content could be saved.");
   access = await currentAccess(request, env, ["pages:write"]);
   await writableDestination(env, access, input.space_id, parentId);
   let sequence = 0;
@@ -723,12 +736,6 @@ export async function mcpRequest(request: Request, env: Env, context: Background
   const required = typeof name === "string" && Object.hasOwn(TOOL_SCOPES, name) ? TOOL_SCOPES[name]! : [];
   const access = await mcpAccess(request, env);
   if (!access) {
-    const unauthorizedRate = await consumeFixedWindow(env, `mcp-unauthorized:${source}`, { window: 60, max: 120 });
-    if (!unauthorizedRate.allowed)
-      return new Response("Too many unauthorized MCP requests.", {
-        status: 429,
-        headers: { "retry-after": String(unauthorizedRate.retryAfter ?? 60) },
-      });
     return new Response("Unauthorized", {
       status: 401,
       headers: { "www-authenticate": mcpBearerChallenge(env, required.join(" ")), "cache-control": "no-store" },
