@@ -9,9 +9,13 @@ installClientTelemetry();
 
 if (import.meta.env.PROD && "serviceWorker" in navigator) {
   window.addEventListener("load", () => {
-    void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).catch((error: unknown) => {
+    try {
+      void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" }).catch((error: unknown) => {
+        console.error("Could not prepare offline app shell", error);
+      });
+    } catch (error) {
       console.error("Could not prepare offline app shell", error);
-    });
+    }
   });
 }
 

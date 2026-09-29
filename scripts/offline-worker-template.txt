@@ -3,8 +3,48 @@ const CACHE_NAME = "noteflare-shell-__CACHE_VERSION__";
 const SHELL_ASSETS = __SHELL_ASSETS__;
 const SHELL_ASSET_SET = new Set(SHELL_ASSETS);
 
+function validStaticResponse(path, response) {
+  if (!response.ok || response.redirected) return false;
+  const type = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  if (path === "/") return type === "text/html";
+  if (path.endsWith(".js")) return type.includes("javascript");
+  if (path.endsWith(".css")) return type === "text/css";
+  if (path.endsWith(".woff2")) return type.includes("woff") || type === "application/octet-stream";
+  if (path.endsWith(".webmanifest")) return type.includes("json") || type === "application/manifest+json";
+  if (/\.(?:png|jpg|ico)$/.test(path)) return type.startsWith("image/");
+  return false;
+}
+
+async function retireIfWorkerWasRemoved() {
+  try {
+    const response = await fetch("/sw.js", { cache: "no-store", redirect: "manual" });
+    const type = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+    if (response.ok && type?.includes("javascript")) return;
+    const removed = response.status === 404 ||
+      (response.ok && type === "text/html" && (await response.text()).includes("<title>NoteFlare</title>"));
+    if (removed) {
+      await self.registration.unregister();
+      await caches.delete(CACHE_NAME);
+    }
+  } catch {
+    // An outage is not a rollback; keep the offline shell.
+  }
+}
+
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL_ASSETS)));
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    try {
+      for (const path of SHELL_ASSETS) {
+        const response = await fetch(path, { cache: "no-store" });
+        if (!validStaticResponse(path, response)) throw new Error(`Invalid offline shell asset: ${path}`);
+        await cache.put(path, response);
+      }
+    } catch (error) {
+      await caches.delete(CACHE_NAME);
+      throw error;
+    }
+  })());
 });
 
 self.addEventListener("activate", (event) => {
@@ -29,11 +69,19 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
 
   if (request.mode === "navigate" && (url.pathname === "/" || url.pathname === "/index.html")) {
-    event.respondWith(caches.match("/").then((response) => response ?? fetch(request)));
+    event.waitUntil(retireIfWorkerWasRemoved());
+    event.respondWith(fetch(request).catch(async () => (await caches.match("/")) ?? Response.error()));
     return;
   }
 
-  if (SHELL_ASSET_SET.has(url.pathname)) {
-    event.respondWith(caches.match(url.pathname).then((response) => response ?? fetch(request)));
+  if (SHELL_ASSET_SET.has(url.pathname) || url.pathname.startsWith("/assets/")) {
+    event.respondWith((async () => {
+      const cache = await caches.open(CACHE_NAME);
+      const saved = await cache.match(url.pathname);
+      if (saved) return saved;
+      const response = await fetch(request);
+      if (validStaticResponse(url.pathname, response)) await cache.put(url.pathname, response.clone());
+      return response;
+    })());
   }
 });

@@ -1,7 +1,7 @@
 {
   "name": "NoteFlare",
   "short_name": "NoteFlare",
-  "description": "Your team wiki, including previously visited documents when offline.",
+  "description": "A self-hosted realtime team wiki on Cloudflare.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

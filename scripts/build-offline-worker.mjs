@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { readFile, readdir, writeFile } from "node:fs/promises";
-import { join, relative, resolve, sep } from "node:path";
+import { execFileSync } from "node:child_process";
+import { readFile, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -16,35 +17,45 @@ const staticFiles = [
   "logo.jpg",
 ];
 
-async function visit(directory) {
-  const result = [];
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    const path = join(directory, entry.name);
-    if (entry.isDirectory()) result.push(...(await visit(path)));
-    else if (entry.isFile()) result.push(path);
-  }
-  return result;
+const manifest = JSON.parse(await readFile(join(clientRoot, ".vite/manifest.json"), "utf8"));
+const assetFiles = new Set();
+const visited = new Set();
+function includeChunk(key) {
+  if (visited.has(key)) return;
+  visited.add(key);
+  const chunk = manifest[key];
+  if (!chunk?.file) throw new Error(`Missing client bundle entry: ${key}`);
+  assetFiles.add(chunk.file);
+  for (const path of chunk.css ?? []) assetFiles.add(path);
+  for (const path of chunk.assets ?? []) if (path.endsWith(".woff2")) assetFiles.add(path);
+  for (const dependency of chunk.imports ?? []) includeChunk(dependency);
 }
+includeChunk("index.html");
+includeChunk("src/client/SupportedApp.tsx");
 
 const paths = [
   ...staticFiles.map((name) => ({ path: join(clientRoot, name), url: name === "index.html" ? "/" : `/${name}` })),
-  ...(await visit(join(clientRoot, "assets"))).map((path) => ({
-    path,
-    url: `/${relative(clientRoot, path).split(sep).join("/")}`,
+  ...[...assetFiles].map((name) => ({
+    path: join(clientRoot, name),
+    url: `/${name.split("/").map(encodeURIComponent).join("/")}`,
   })),
 ];
 paths.sort((left, right) => (left.url < right.url ? -1 : left.url > right.url ? 1 : 0));
 const hash = createHash("sha256");
 const urls = [];
+const template = await readFile(join(projectRoot, "scripts/offline-worker-template.txt"), "utf8");
+hash.update(template);
+hash.update(await readFile(join(projectRoot, "public/_headers")));
 for (const { path, url } of paths) {
   hash.update(url);
   hash.update(await readFile(path));
   urls.push(url);
 }
-const template = await readFile(join(projectRoot, "scripts/offline-worker-template.txt"), "utf8");
+const workerPath = join(clientRoot, "sw.js");
 await writeFile(
-  join(clientRoot, "sw.js"),
+  workerPath,
   template
-    .replace("__CACHE_VERSION__", hash.digest("hex").slice(0, 16))
-    .replace("__SHELL_ASSETS__", JSON.stringify(urls)),
+    .replace("__CACHE_VERSION__", () => hash.digest("hex").slice(0, 16))
+    .replace("__SHELL_ASSETS__", () => JSON.stringify(urls)),
 );
+execFileSync(process.execPath, ["--check", workerPath]);
