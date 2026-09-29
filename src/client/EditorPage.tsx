@@ -698,7 +698,6 @@ export function EditorPage({
     const closeReconciler = createDocumentCloseReconciler({
       page: { id: page.id, contentEpoch: page.contentEpoch },
       provider: next.provider,
-      canQuarantine: member.role !== "viewer",
       hasUnsyncedChanges: () => next.hasUnsyncedChanges,
       quarantine,
       onPageChanged,
