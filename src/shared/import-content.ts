@@ -81,38 +81,68 @@ function blockDocument(blocks: ProseMirrorJson[]) {
 }
 
 const ESCAPABLE_MARKDOWN = /[!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~]/;
+const INLINE_MARKUP_CHAR = /[!*_[\]`<&]/;
 
-function unescapeMarkdown(value: string) {
+function unescapeMarkdown(value: string): string;
+function unescapeMarkdown(value: string, abortOnMarkup: true): string | null;
+function unescapeMarkdown(value: string, abortOnMarkup = false): string | null {
   let output = "";
   for (let index = 0; index < value.length; index += 1) {
     if (value[index] === "\\" && ESCAPABLE_MARKDOWN.test(value[index + 1] ?? "")) index += 1;
+    else if (abortOnMarkup && INLINE_MARKUP_CHAR.test(value[index]!)) return null;
     output += value[index];
   }
   return output;
 }
 
-function plainEscapedMarkdown(value: string) {
-  let output = "";
+function tooManyEscapes(value: string) {
+  let count = 0;
+  for (const character of value) if (character === "\\" && ++count > 128) return true;
+  return false;
+}
+
+function simplifiedMarkdownInline(value: string, issues: ImportIssue[], references: string[]) {
+  issues.push({ code: "inline_markup_simplified", detail: "Long or heavily escaped inline content was simplified." });
+  const output: ProseMirrorJson[] = [];
+  let cursor = 0;
+  let open = -1;
   for (let index = 0; index < value.length; index += 1) {
-    const character = value[index]!;
-    if (character === "\\" && ESCAPABLE_MARKDOWN.test(value[index + 1] ?? "")) {
-      output += value[++index];
-    } else if (/[!*_[\]`<&]/.test(character)) {
-      return null;
-    } else {
-      output += character;
+    if (value[index] === "[") open = index;
+    if (value[index] === "\n") open = -1;
+    if (value[index] !== "]" || value[index + 1] !== "(" || open < cursor || index - open > 513) continue;
+    let end = index + 2;
+    while (end < value.length && end - index <= 2050 && value[end] !== ")" && value[end] !== "\n") end += 1;
+    if (value[end] !== ")" || end === index + 2) {
+      index = end;
+      open = -1;
+      continue;
     }
+    const image = open > cursor && value[open - 1] === "!";
+    const start = image ? open - 1 : open;
+    output.push(...inline(unescapeMarkdown(value.slice(cursor, start))));
+    const label = value.slice(open + 1, index);
+    const rawHref = value.slice(index + 2, end);
+    const href = safeLink(unescapeMarkdown(rawHref));
+    if (href) {
+      references.push(href);
+      if (image) issues.push({ code: "image_not_imported", detail: href.slice(0, 120) });
+      output.push(...inline(unescapeMarkdown(label), [{ type: "link", attrs: { href } }]));
+    } else {
+      issues.push({ code: "unsafe_url", detail: rawHref.slice(0, 120) });
+      output.push(...inline(unescapeMarkdown(value.slice(start, end + 1))));
+    }
+    cursor = end + 1;
+    index = end;
+    open = -1;
   }
+  output.push(...inline(unescapeMarkdown(value.slice(cursor))));
   return output;
 }
 
 function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
-  const plain = plainEscapedMarkdown(value);
+  const plain = unescapeMarkdown(value, true);
   if (plain !== null) return inline(plain);
-  if (value.length > 64_000) {
-    issues.push({ code: "inline_markup_simplified", detail: "A long paragraph was imported as plain text." });
-    return inline(unescapeMarkdown(value));
-  }
+  if (value.length > 64_000 || tooManyEscapes(value)) return simplifiedMarkdownInline(value, issues, references);
   const output: ProseMirrorJson[] = [];
   const append = (text: string, marks: ProseMirrorJson["marks"] = []) => {
     if (!text) return;
@@ -128,14 +158,15 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
   const walk = (tokens: Token[], marks: ProseMirrorJson["marks"] = []) => {
     for (const token of tokens) {
       const children: Token[] = "tokens" in token && Array.isArray(token.tokens) ? token.tokens : [];
-      if (token.type === "text") append(unescapeMarkdown(token.text), marks);
+      if (token.type === "text") append(token.text, marks);
       else if (token.type === "escape") append(token.text, marks);
       else if (token.type === "em")
         walk(children, marks.some((mark) => mark.type === "italic") ? marks : [{ type: "italic" }, ...marks]);
-      else if (token.type === "strong") walk(children, [...marks, { type: "bold" }]);
+      else if (token.type === "strong")
+        walk(children, marks.some((mark) => mark.type === "bold") ? marks : [...marks, { type: "bold" }]);
       else if (token.type === "codespan") append(token.text, [...marks, { type: "code" }]);
       else if (token.type === "link" || token.type === "image") {
-        const rawUrl = unescapeMarkdown(token.href);
+        const rawUrl = token.href;
         const url = safeLink(rawUrl);
         if (!url) {
           issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
@@ -149,7 +180,7 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
           walk(children, [...marks, { type: "link", attrs: { href: url } }]);
         }
       } else if (children.length) walk(children, marks);
-      else append(unescapeMarkdown(token.raw), marks);
+      else append(token.raw, marks);
     }
   };
   walk(Lexer.lexInline(value, { gfm: false }));
@@ -157,9 +188,11 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
 }
 
 function markdownImage(value: string) {
-  const tokens = Lexer.lexInline(value.trim(), { gfm: false });
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("![") || trimmed.length > 64_000 || tooManyEscapes(trimmed)) return null;
+  const tokens = Lexer.lexInline(trimmed, { gfm: false });
   const image = tokens.length === 1 && tokens[0]?.type === "image" ? tokens[0] : null;
-  return image ? { label: unescapeMarkdown(image.text), href: unescapeMarkdown(image.href) } : null;
+  return image ? { label: image.text, href: image.href } : null;
 }
 
 export function markdownToDocument(source: string) {

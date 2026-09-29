@@ -158,18 +158,18 @@ describe("import content", () => {
     expect(content).toEqual([{ type: "text", text: source.trim() }]);
   });
 
-  it("unescapes punctuation inside HTML-like text and autolinks", () => {
+  it("preserves literal backslashes inside HTML and autolinks", () => {
     const html = markdownToDocument('<div class="foo\\-bar">');
     expect(html.document.content![0]!.content![0]!.content![0]!.content).toEqual([
-      { type: "text", text: '<div class="foo-bar">' },
+      { type: "text", text: '<div class="foo\\-bar">' },
     ]);
     const link = markdownToDocument("<https://example.com/a\\.b>");
-    expect(link.references).toEqual(["https://example.com/a.b"]);
+    expect(link.references).toEqual(["https://example.com/a\\.b"]);
     expect(link.document.content![0]!.content![0]!.content![0]!.content).toEqual([
       {
         type: "text",
-        text: "https://example.com/a.b",
-        marks: [{ type: "link", attrs: { href: "https://example.com/a.b" } }],
+        text: "https://example.com/a\\.b",
+        marks: [{ type: "link", attrs: { href: "https://example.com/a\\.b" } }],
       },
     ]);
   });
@@ -180,13 +180,37 @@ describe("import content", () => {
     const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
     expect(content).toEqual([{ type: "text", text: `**${".".repeat(40_000)}` }]);
     expect(parsed.issues).toEqual([
-      { code: "inline_markup_simplified", detail: "A long paragraph was imported as plain text." },
+      { code: "inline_markup_simplified", detail: "Long or heavily escaped inline content was simplified." },
     ]);
     const plain = markdownToDocument("\\.".repeat(40_000));
     expect(plain.issues).toEqual([]);
     expect(plain.document.content![0]!.content![0]!.content![0]!.content).toEqual([
       { type: "text", text: ".".repeat(40_000) },
     ]);
+  });
+
+  it("keeps references and bounded work in heavily escaped content", () => {
+    const source = `[child](Folder/child.md) ${"\\.".repeat(20_000)} <`;
+    const parsed = markdownToDocument(source);
+    expect(parsed.references).toEqual(["Folder/child.md"]);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content[0]).toEqual({
+      type: "text",
+      text: "child",
+      marks: [{ type: "link", attrs: { href: "Folder/child.md" } }],
+    });
+    expect(content.map((node) => node.text).join("")).toContain(".".repeat(20_000));
+    expect(parsed.issues).toContainEqual({
+      code: "inline_markup_simplified",
+      detail: "Long or heavily escaped inline content was simplified.",
+    });
+  });
+
+  it("keeps escaped backslashes in link and block image destinations", () => {
+    const link = markdownToDocument(String.raw`[doc](folder\\_name/file.md)`);
+    expect(link.references).toEqual([String.raw`folder\_name/file.md`]);
+    const image = markdownToDocument(String.raw`![diagram](folder\\_name/file.png)`);
+    expect(image.references).toEqual([String.raw`folder\_name/file.png`]);
   });
 
   it.each([

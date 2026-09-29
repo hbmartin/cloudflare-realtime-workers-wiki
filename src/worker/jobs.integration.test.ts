@@ -684,6 +684,38 @@ describe("job execution", () => {
     expect(JSON.stringify(log.mock.calls)).not.toContain("dXNlcjpwYXNz");
   });
 
+  it("replaces a terminal Workflow instance still attached to a queued job", async () => {
+    const installed = await bootstrap();
+    const jobId = crypto.randomUUID();
+    const timestamp = Date.now() - 60_000;
+    await env.DB.prepare(
+      `INSERT INTO jobs
+        (id,workspace_id,type,status,requested_by,workflow_instance_id,progress_label,created_at,updated_at)
+       VALUES (?,?,'search_reindex','queued',?,?,'Queued',?,?)`,
+    )
+      .bind(jobId, installed.workspaceId, installed.userId, jobId, timestamp, timestamp)
+      .run();
+    const create = vi.fn(async ({ id }: { id: string }) => {
+      if (id === jobId) throw new Error("instance already exists");
+      return { id };
+    });
+    await recoverQueuedJobs(
+      bindingsWith({
+        NOTES_WORKFLOW: {
+          create,
+          get: vi.fn(async () => ({ status: vi.fn(async () => ({ status: "complete" })) })),
+        },
+      }),
+    );
+    const current = await env.DB.prepare("SELECT status,workflow_instance_id FROM jobs WHERE id=?")
+      .bind(jobId)
+      .first<{ status: string; workflow_instance_id: string }>();
+    expect(current?.status).toBe("queued");
+    expect(current?.workflow_instance_id).not.toBe(jobId);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create).toHaveBeenLastCalledWith(expect.objectContaining({ id: current?.workflow_instance_id }));
+  });
+
   it("does not overwrite a specific inline failure while recovering queued jobs", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
