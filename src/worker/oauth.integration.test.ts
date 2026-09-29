@@ -258,12 +258,21 @@ describe("OAuth MCP foundation", () => {
       { headers: { cookie }, redirect: "manual" },
     );
     expect(badRedirect.status).toBe(400);
-    const badAudience = await SELF.fetch(
-      `${ORIGIN}/oauth/authorize?${form({ ...params, resource: `${ORIGIN}/other` })}`,
-      { headers: { cookie }, redirect: "manual" },
-    );
-    expect(badAudience.status).toBe(400);
-    expect(badAudience.headers.get("location")).toBeNull();
+    for (const [changes, expectedError] of [
+      [{ resource: `${ORIGIN}/other` }, "invalid_target"],
+      [{ scope: "" }, "invalid_scope"],
+      [{ code_challenge: "short" }, "invalid_request"],
+    ] as const) {
+      const rejected = await SELF.fetch(`${ORIGIN}/oauth/authorize?${form({ ...params, ...changes })}`, {
+        headers: { cookie },
+        redirect: "manual",
+      });
+      expect(rejected.status).toBe(302);
+      const location = new URL(rejected.headers.get("location")!);
+      expect(location.origin).toBe("http://127.0.0.1:3800");
+      expect(location.searchParams.get("error")).toBe(expectedError);
+      expect(location.searchParams.get("state")).toBe(params.state);
+    }
     const deny = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
       method: "POST",
       headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
@@ -275,6 +284,14 @@ describe("OAuth MCP foundation", () => {
     expect(denial.searchParams.get("error")).toBe("access_denied");
     expect(denial.searchParams.get("state")).toBe(params.state);
     expect(denial.searchParams.get("iss")).toBe(ORIGIN);
+    const invalidDecision = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
+      method: "POST",
+      headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
+      body: form({ ...params, decision: "other" }),
+      redirect: "manual",
+    });
+    expect(invalidDecision.status).toBe(302);
+    expect(new URL(invalidDecision.headers.get("location")!).searchParams.get("error")).toBe("invalid_request");
     const approve = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
       method: "POST",
       headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
@@ -491,5 +508,20 @@ describe("OAuth MCP foundation", () => {
       body: form({ grant_type: "refresh_token", token: "x".repeat(9_000) }),
     });
     expect(token.status).toBe(413);
+  });
+
+  it("rejects redirect hosts that could alter the consent page CSP", async () => {
+    for (const redirect of [
+      "https://*.client.example/callback",
+      "https://semi;colon.example/callback",
+      "https://comma,host.example/callback",
+    ]) {
+      const response = await SELF.fetch(`${ORIGIN}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ client_name: "Unsafe redirect", redirect_uris: [redirect] }),
+      });
+      expect(response.status).toBe(400);
+    }
   });
 });

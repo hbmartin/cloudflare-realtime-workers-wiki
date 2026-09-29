@@ -184,8 +184,14 @@ function redirectUris(value: unknown) {
     } catch {
       throw new HttpError(400, "invalid_client_metadata", "A redirect URI is invalid.");
     }
-    const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(url.hostname.toLowerCase());
+    const host = url.hostname.toLowerCase();
+    const loopback = ["127.0.0.1", "[::1]", "localhost"].includes(host);
+    const safeHost =
+      loopback ||
+      (/^[a-z0-9.-]+$/.test(host) &&
+        host.split(".").every((part) => part && !part.startsWith("-") && !part.endsWith("-")));
     if (
+      !safeHost ||
       url.username ||
       url.password ||
       url.hash ||
@@ -387,25 +393,33 @@ type AuthorizationRequest = {
   resource: string;
 };
 
-async function authorizationRequest(params: URLSearchParams, env: Env): Promise<AuthorizationRequest> {
+async function authorizationRequest(params: URLSearchParams, env: Env): Promise<AuthorizationRequest | Response> {
   const clientId = singleton(params, "client_id");
   if (clientId.length > 2048) throw new HttpError(400, "invalid_client", "Client ID is too long.");
   const client = await resolveClient(env, clientId);
   const redirectUri = singleton(params, "redirect_uri");
   if (!(JSON.parse(client.redirect_uris_json) as string[]).includes(redirectUri))
     throw new HttpError(400, "invalid_request", "The redirect URI is not registered for this client.");
-  if (singleton(params, "response_type") !== "code")
-    throw new HttpError(400, "unsupported_response_type", "Only authorization code is supported.");
-  const state = singleton(params, "state");
-  if (!state || state.length > 512) throw new HttpError(400, "invalid_request", "State is invalid.");
-  const challenge = singleton(params, "code_challenge");
-  if (singleton(params, "code_challenge_method") !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(challenge))
-    throw new HttpError(400, "invalid_request", "A valid S256 PKCE challenge is required.");
-  const resource = singleton(params, "resource");
-  if (resource !== mcpResource(env))
-    throw new HttpError(400, "invalid_target", "The MCP resource must match this host.");
-  const scopes = scopeList(singleton(params, "scope"));
-  return { client, redirectUri, state, scopes, challenge, resource };
+  const providedState = params.getAll("state");
+  try {
+    if (singleton(params, "response_type") !== "code")
+      throw new HttpError(400, "unsupported_response_type", "Only authorization code is supported.");
+    const state = singleton(params, "state");
+    if (!state || state.length > 512) throw new HttpError(400, "invalid_request", "State is invalid.");
+    const challenge = singleton(params, "code_challenge");
+    if (singleton(params, "code_challenge_method") !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(challenge))
+      throw new HttpError(400, "invalid_request", "A valid S256 PKCE challenge is required.");
+    const resource = singleton(params, "resource");
+    if (resource !== mcpResource(env))
+      throw new HttpError(400, "invalid_target", "The MCP resource must match this host.");
+    const scopes = scopeList(singleton(params, "scope"));
+    return { client, redirectUri, state, scopes, challenge, resource };
+  } catch (error) {
+    if (!(error instanceof HttpError) || error.status !== 400) throw error;
+    const stateValue = providedState[0];
+    const state = providedState.length === 1 && stateValue !== undefined && stateValue.length <= 512 ? stateValue : "";
+    return authorizationRedirect({ redirectUri, state }, { error: error.code, error_description: error.message }, env);
+  }
 }
 
 async function consentMember(request: Request, env: Env) {
@@ -430,18 +444,21 @@ function authorizationRedirect(
 }
 
 export async function authorizeOAuthGet(request: Request, env: Env) {
+  const source = new URL(request.url).searchParams;
+  const input = await authorizationRequest(source, env);
+  if (input instanceof Response) return input;
   let member: MemberContext;
   try {
     member = await consentMember(request, env);
   } catch (error) {
-    if (!(error instanceof HttpError) || error.status !== 401) throw error;
+    if (!(error instanceof HttpError)) throw error;
+    if (error.status === 403) return authorizationRedirect(input, { error: "access_denied" }, env);
+    if (error.status !== 401) throw error;
     const authorize = new URL(request.url);
     const signin = new URL("/", env.BETTER_AUTH_URL);
     signin.searchParams.set("oauthAuthorize", `${authorize.pathname}${authorize.search}`);
     return Response.redirect(signin, 302);
   }
-  const source = new URL(request.url).searchParams;
-  const input = await authorizationRequest(source, env);
   const controls = [...source.entries()]
     .filter(([key]) => key !== "decision")
     .map(([key, value]) => `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`)
@@ -483,11 +500,26 @@ function randomCredential() {
 
 export async function authorizeOAuthPost(request: Request, env: Env) {
   checkBrowserOrigin(request, env);
-  const member = await consentMember(request, env);
   const params = await formParams(request);
   const input = await authorizationRequest(params, env);
-  if (singleton(params, "decision") === "deny") return authorizationRedirect(input, { error: "access_denied" }, env);
-  if (singleton(params, "decision") !== "approve") throw new HttpError(400, "invalid_request", "Choose Allow or Deny.");
+  if (input instanceof Response) return input;
+  let member: MemberContext;
+  try {
+    member = await consentMember(request, env);
+  } catch (error) {
+    if (!(error instanceof HttpError) || ![401, 403].includes(error.status)) throw error;
+    return authorizationRedirect(input, { error: "access_denied" }, env);
+  }
+  let decision: string;
+  try {
+    decision = singleton(params, "decision");
+  } catch (error) {
+    if (!(error instanceof HttpError)) throw error;
+    return authorizationRedirect(input, { error: "invalid_request" }, env);
+  }
+  if (decision === "deny") return authorizationRedirect(input, { error: "access_denied" }, env);
+  if (decision !== "approve")
+    return authorizationRedirect(input, { error: "invalid_request", error_description: "Choose Allow or Deny." }, env);
   const code = randomCredential();
   const issued = await env.DB.prepare(
     `INSERT INTO oauth_authorization_codes
@@ -509,7 +541,11 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
     )
     .run();
   if (!issued.meta.changes)
-    throw new HttpError(403, "account_security_required", "Complete account protection before connecting this client.");
+    return authorizationRedirect(
+      input,
+      { error: "access_denied", error_description: "Account protection is required." },
+      env,
+    );
   return authorizationRedirect(input, { code }, env);
 }
 
