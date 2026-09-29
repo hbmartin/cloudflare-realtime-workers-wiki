@@ -19,6 +19,7 @@ describe("import option diagnostics", () => {
     [{ parentId: "" }, "Import parent is invalid."],
     [{ parentId: 42 }, "Import parent is invalid."],
     [{ parentId: "p".repeat(101) }, "Import parent is invalid."],
+    [{ parentId: "bad/path" }, "Import parent is invalid."],
     [{ parentId: "parent", format: "notion_zip" }, "Import parent is invalid."],
   ])("retains a specific diagnostic for %j", (invalid, message) => {
     const options = { filename: "notes.md", format: "markdown", confirmed: false, ...invalid };
@@ -37,6 +38,7 @@ describe("single-page import parent", () => {
     });
     expect(options.parentId).toBe("parent");
     expect(requireImportOptions({ ...options, confirmed: true, previewId: "preview" }).parentId).toBe("parent");
+    expect(requireImportOptions({ ...options, parentId: null }).parentId).toBeUndefined();
   });
 });
 

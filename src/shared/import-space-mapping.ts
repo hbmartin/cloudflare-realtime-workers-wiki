@@ -1,4 +1,5 @@
 import type { ImportPreview } from "./types";
+import { ID_PATTERN } from "./validation";
 
 // Bump when ownership, grouping, or structural preview semantics change. Older previews must be inspected again.
 export const NOTION_GROUPING_VERSION = 2;
@@ -26,10 +27,8 @@ export function requireImportOptions(options: Record<string, unknown>): ImportOp
   const keys = options.previewGroupKeys;
   if (
     options.parentId !== undefined &&
-    (typeof options.parentId !== "string" ||
-      options.parentId.length === 0 ||
-      options.parentId.length > 100 ||
-      options.format === "notion_zip")
+    options.parentId !== null &&
+    (typeof options.parentId !== "string" || !ID_PATTERN.test(options.parentId) || options.format === "notion_zip")
   ) {
     throw new Error("Import parent is invalid.");
   }
@@ -51,7 +50,12 @@ export function requireImportOptions(options: Record<string, unknown>): ImportOp
   ) {
     throw new Error("Import space mappings are invalid.");
   }
-  return { ...options, groupSpaceIds, previewGroupKeys: keys } as ImportOptions;
+  return {
+    ...options,
+    parentId: options.parentId ?? undefined,
+    groupSpaceIds,
+    previewGroupKeys: keys,
+  } as ImportOptions;
 }
 
 export function parseImportOptions(options: Record<string, unknown>): ImportOptions | null {

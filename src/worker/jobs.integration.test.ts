@@ -102,6 +102,33 @@ async function bootstrap(): Promise<InstalledWorkspace> {
   return { cookie, pageId: tree.pages[0]!.id, userId: me.user.id, workspaceId: me.workspace.id };
 }
 
+async function confirmedParentImport(installed: InstalledWorkspace) {
+  const upload = new FormData();
+  upload.set("spaceId", `${installed.workspaceId}-general`);
+  upload.set("parentId", installed.pageId);
+  upload.set("file", new File(["# Child\n\nVerified content."], "child.md", { type: "text/markdown" }));
+  const uploadContext = createExecutionContext();
+  const uploaded = await worker.fetch(
+    request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+    inlineBindings(),
+    uploadContext,
+  );
+  expect(uploaded.status).toBe(202);
+  const queued = (await uploaded.json<{ job: Job }>()).job;
+  await waitOnExecutionContext(uploadContext);
+  const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
+  const confirmContext = createExecutionContext();
+  const confirmed = await worker.fetch(
+    await importRequest(installed.cookie, `/api/imports/${queued.id}/confirm`, { method: "POST" }),
+    bindingsWith({ NOTES_WORKFLOW: { create } }),
+    confirmContext,
+  );
+  expect(confirmed.status).toBe(202);
+  await waitOnExecutionContext(confirmContext);
+  await env.DB.prepare(`UPDATE jobs SET status = 'running' WHERE id = ?`).bind(queued.id).run();
+  return (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(queued.id).first<JobRow>())!;
+}
+
 // `in` rather than a nullish fallback: some tests override a binding to undefined.
 function bindingsWith(overrides: Record<string, unknown>) {
   return new Proxy(env as Env, {
@@ -2422,6 +2449,124 @@ describe("job execution", () => {
     expect(content.status).toBe(200);
     expect(JSON.stringify((await content.json<{ document: unknown }>()).document)).toContain("Imported heading");
   });
+
+  it("keeps a parented import detached until verification and attaches it at publication", async () => {
+    const installed = await bootstrap();
+    const job = await confirmedParentImport(installed);
+    let stagedId: string | undefined;
+    const step = {
+      async do<T>(name: string, callback: () => Promise<T>) {
+        if (name === "publish import") {
+          const staged = await env.DB.prepare(`SELECT id, parent_id, import_job_id FROM pages WHERE import_job_id = ?`)
+            .bind(job.id)
+            .first<{ id: string; parent_id: string | null; import_job_id: string }>();
+          expect(staged).toMatchObject({ parent_id: null, import_job_id: job.id });
+          stagedId = staged!.id;
+          const tree = await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext());
+          expect((await tree.json<{ pages: Array<{ id: string }> }>()).pages.map((page) => page.id)).not.toContain(
+            stagedId,
+          );
+        }
+        return callback();
+      },
+    };
+    await runImport(env, job, step as Parameters<typeof runImport>[2]);
+    expect(
+      await env.DB.prepare(`SELECT parent_id, import_job_id FROM pages WHERE id = ?`).bind(stagedId).first(),
+    ).toMatchObject({ parent_id: installed.pageId, import_job_id: null });
+    expect((await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(job.id).first())?.status).toBe(
+      "succeeded",
+    );
+  });
+
+  it("rejects a parent outside the selected or remapped import space", async () => {
+    const installed = await bootstrap();
+    const otherSpaceId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO spaces (id, workspace_id, name, slug, position, created_by, created_at, updated_at)
+        VALUES (?, ?, 'Other', 'other', 'a1', ?, ?, ?)`,
+    )
+      .bind(otherSpaceId, installed.workspaceId, installed.userId, timestamp, timestamp)
+      .run();
+    const wrongUpload = new FormData();
+    wrongUpload.set("spaceId", otherSpaceId);
+    wrongUpload.set("parentId", installed.pageId);
+    wrongUpload.set("file", new File(["# Child"], "child.md", { type: "text/markdown" }));
+    expect(
+      (
+        await worker.fetch(
+          request(installed.cookie, "/api/import-uploads", { method: "POST", body: wrongUpload }),
+          env,
+          createExecutionContext(),
+        )
+      ).status,
+    ).toBe(422);
+
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("parentId", installed.pageId);
+    upload.set("file", new File(["# Child"], "child.md", { type: "text/markdown" }));
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      context,
+    );
+    expect(response.status).toBe(202);
+    const job = (await response.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(context);
+    const confirmed = await worker.fetch(
+      await importRequest(installed.cookie, `/api/imports/${job.id}/confirm`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ groupSpaceIds: { Imported: otherSpaceId } }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    expect(confirmed.status).toBe(422);
+    expect((await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(job.id).first())?.status).toBe(
+      "awaiting_confirmation",
+    );
+  });
+
+  it.each(["archived parent", "stale stage"] as const)(
+    "does not publish a parented import with %s before the final batch",
+    async (failure) => {
+      const installed = await bootstrap();
+      const job = await confirmedParentImport(installed);
+      const step = {
+        async do<T>(name: string, callback: () => Promise<T>) {
+          if (name === "publish import") {
+            if (failure === "archived parent") {
+              await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`)
+                .bind(Date.now(), installed.pageId)
+                .run();
+            } else {
+              await env.DB.prepare(`UPDATE pages SET content_epoch = content_epoch + 1 WHERE import_job_id = ?`)
+                .bind(job.id)
+                .run();
+            }
+          }
+          return callback();
+        },
+      };
+      await expect(runImport(env, job, step as Parameters<typeof runImport>[2])).rejects.toThrow(
+        "The import destination changed before publication",
+      );
+      expect((await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(job.id).first())?.status).toBe(
+        "running",
+      );
+      expect(
+        (
+          await env.DB.prepare(
+            `SELECT COUNT(*) count FROM pages WHERE import_job_id IS NULL AND title = 'child'`,
+          ).first<{ count: number }>()
+        )?.count,
+      ).toBe(0);
+    },
+  );
 
   it("imports a Notion ZIP hierarchy, database CSV, and bundled image", async () => {
     const installed = await bootstrap();

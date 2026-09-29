@@ -55,6 +55,12 @@ type ImportPage = {
   assets: ImportAsset[];
 };
 type ImportBundle = { pages: ImportPage[]; issues: ImportIssue[]; preview: ImportPreview };
+
+// External parents stay detached until the verified import is published. Internal
+// Notion parents are staged together and remain invisible behind import_job_id.
+function stagedParentId(page: ImportPage, pageIds: ReadonlySet<string>) {
+  return page.parentId && pageIds.has(page.parentId) ? page.parentId : null;
+}
 type NotionPageEntry = ZipEntry & {
   text: string;
   directory: string;
@@ -844,6 +850,7 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
   const previous = new Map<string, string | null>();
   const timestamp = Date.now();
   const byId = new Map(bundle.pages.map((page) => [page.id, page]));
+  const pageIds = new Set(byId.keys());
   const pageDepth = (page: ImportPage) => {
     let value = 0;
     let current = page;
@@ -887,13 +894,14 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
       }
       continue;
     }
-    const parentKey = `${page.spaceId}:${page.parentId ?? "root"}`;
+    const parentId = stagedParentId(page, pageIds);
+    const parentKey = `${page.spaceId}:${parentId ?? "root"}`;
     if (!previous.has(parentKey)) {
       const last = await env.DB.prepare(
         `SELECT position FROM pages WHERE space_id = ? AND parent_id IS ? AND archived_at IS NULL
           AND import_job_id IS NULL AND is_template = 0 ORDER BY position DESC, id DESC LIMIT 1`,
       )
-        .bind(page.spaceId, page.parentId)
+        .bind(page.spaceId, parentId)
         .first<{ position: string }>();
       previous.set(parentKey, last?.position ?? null);
     }
@@ -909,7 +917,7 @@ async function stagePageRows(env: Env, job: JobRow, bundle: ImportBundle) {
         page.id,
         job.workspace_id,
         page.spaceId,
-        page.parentId,
+        parentId,
         page.kind,
         position,
         page.title,
@@ -1132,7 +1140,7 @@ async function initializeTable(env: Env, job: JobRow, page: ImportPage) {
   }
 }
 
-async function verifyPage(env: Env, job: JobRow, page: ImportPage) {
+async function verifyPage(env: Env, job: JobRow, page: ImportPage, pageIds: ReadonlySet<string>) {
   const metadata = await env.DB.prepare(
     `SELECT workspace_id, space_id, parent_id, kind, title FROM pages
       WHERE id = ? AND import_job_id = ? AND content_epoch = ?`,
@@ -1143,7 +1151,7 @@ async function verifyPage(env: Env, job: JobRow, page: ImportPage) {
     !metadata ||
     metadata.workspace_id !== job.workspace_id ||
     metadata.space_id !== page.spaceId ||
-    metadata.parent_id !== page.parentId ||
+    metadata.parent_id !== stagedParentId(page, pageIds) ||
     metadata.kind !== page.kind ||
     metadata.title !== page.title
   ) {
@@ -1223,17 +1231,29 @@ async function verifyPage(env: Env, job: JobRow, page: ImportPage) {
   if (expectedHash !== storedHash) throw new Error(`Imported table ${page.title} failed verification.`);
 }
 
-async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
+async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, options: ImportOptions) {
   await assertImportActive(env, job);
   const timestamp = Date.now();
   const roots = bundle.pages.filter((page) => page.parentId === null);
   const pageIdValues = bundle.pages.map((page) => page.id);
   const pageIds = JSON.stringify(pageIdValues);
+  const externalPage = options.parentId ? bundle.pages[0] : undefined;
+  const externalParentId = options.parentId ?? null;
+  let externalPosition: string | null = null;
+  if (externalPage && externalParentId) {
+    const last = await env.DB.prepare(
+      `SELECT position FROM pages WHERE space_id = ? AND parent_id = ? AND archived_at IS NULL
+        AND import_job_id IS NULL AND is_template = 0 ORDER BY position DESC, id DESC LIMIT 1`,
+    )
+      .bind(externalPage.spaceId, externalParentId)
+      .first<{ position: string }>();
+    externalPosition = generateJitteredKeyBetween(last?.position ?? null, null);
+  }
   const result = JSON.stringify({
     warnings: issueMessages(bundle.issues),
     pageId: roots[0]?.id ?? bundle.pages[0]?.id,
   });
-  await env.DB.batch([
+  const committed = await env.DB.batch([
     env.DB.prepare(
       `INSERT OR REPLACE INTO page_import_sources
         (page_id, job_id, source_path, notion_id, source_group, parent_source_path, source_role, created_at)
@@ -1261,9 +1281,43 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
         WHERE import_job_id = ? AND content_epoch = ?`,
     ).bind(job.id, job.requested_by, job.requested_by, timestamp, job.id, job.attempt),
     env.DB.prepare(
-      `UPDATE pages SET import_job_id = NULL, updated_at = ? WHERE import_job_id = ? AND content_epoch = ?
-        AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')`,
-    ).bind(timestamp, job.id, job.attempt, job.id, job.attempt),
+      `UPDATE pages SET parent_id = CASE WHEN id = ? THEN ? ELSE parent_id END,
+        position = CASE WHEN id = ? THEN ? ELSE position END, import_job_id = NULL, updated_at = ?
+       WHERE import_job_id = ? AND content_epoch = ? AND id IN (SELECT value FROM json_each(?))
+         AND (SELECT COUNT(*) FROM pages WHERE import_job_id = ? AND content_epoch = ?) = ?
+         AND EXISTS (SELECT 1 FROM jobs WHERE id = ? AND attempt = ? AND status = 'running')
+         AND (? IS NULL OR EXISTS (
+           SELECT 1 FROM pages parent
+             JOIN spaces space ON space.id = parent.space_id AND space.workspace_id = parent.workspace_id
+             JOIN workspace_members member ON member.workspace_id = parent.workspace_id AND member.user_id = ?
+             LEFT JOIN space_members grant_role ON grant_role.space_id = space.id AND grant_role.user_id = member.user_id
+            WHERE parent.id = ? AND parent.workspace_id = ? AND parent.space_id = ?
+              AND parent.archived_at IS NULL AND parent.import_job_id IS NULL AND parent.is_template = 0
+              AND member.role IN ('owner', 'editor')
+              AND (member.role = 'owner' OR
+                ((space.visibility = 'workspace' OR grant_role.user_id IS NOT NULL)
+                 AND COALESCE(grant_role.role, 'editor') <> 'viewer'))
+         ))`,
+    ).bind(
+      externalPage?.id ?? "",
+      externalParentId,
+      externalPage?.id ?? "",
+      externalPosition,
+      timestamp,
+      job.id,
+      job.attempt,
+      pageIds,
+      job.id,
+      job.attempt,
+      bundle.pages.length,
+      job.id,
+      job.attempt,
+      externalParentId,
+      job.requested_by,
+      externalParentId,
+      job.workspace_id,
+      externalPage?.spaceId ?? "",
+    ),
     env.DB.prepare(
       `INSERT INTO page_search (page_id, workspace_id, title, body)
        SELECT id, workspace_id, title, plain_text FROM pages
@@ -1273,9 +1327,13 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle) {
     env.DB.prepare(
       `UPDATE jobs SET status = 'succeeded', progress_current = 7, progress_total = 7,
         progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
-        updated_at = ? WHERE id = ? AND attempt = ? AND status = 'running'`,
-    ).bind(result, timestamp + IMPORT_ARTIFACT_TTL_MS, timestamp, job.id, job.attempt),
+        updated_at = ? WHERE id = ? AND attempt = ? AND status = 'running'
+        AND (SELECT COUNT(*) FROM pages WHERE id IN (SELECT value FROM json_each(?))
+          AND import_job_id IS NULL) = ?`,
+    ).bind(result, timestamp + IMPORT_ARTIFACT_TTL_MS, timestamp, job.id, job.attempt, pageIds, bundle.pages.length),
   ]);
+  if (committed[2]?.meta.changes !== bundle.pages.length || committed.at(-1)?.meta.changes !== 1)
+    throw new Error("The import destination changed before publication. Choose a writable parent and retry.");
   const published = await env.DB.prepare(
     `SELECT * FROM pages WHERE id IN (SELECT value FROM json_each(?)) AND import_job_id IS NULL ORDER BY position, id`,
   )
@@ -1481,11 +1539,12 @@ async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
   await step.do("verify imported content", async () => {
     const loaded = await bundle();
     await setProgress(env, job, 5, 7, "Verifying import");
-    for (const page of loaded.pages) await verifyPage(env, job, page);
+    const pageIds = new Set(loaded.pages.map((page) => page.id));
+    for (const page of loaded.pages) await verifyPage(env, job, page, pageIds);
   });
   await step.do("publish import", async () => {
     const loaded = await bundle();
     await setProgress(env, job, 6, 7, "Publishing pages");
-    await publishImport(env, job, loaded);
+    await publishImport(env, job, loaded, options);
   });
 }
