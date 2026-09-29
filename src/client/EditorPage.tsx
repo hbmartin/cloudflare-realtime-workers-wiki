@@ -34,6 +34,8 @@ import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 import { useEffectiveColorScheme } from "./ThemeControl";
 import {
+  compactDocumentUpdates,
+  documentPendingMarker,
   getOfflinePage,
   markOfflinePagePending,
   offlineAccountKey,
@@ -41,7 +43,6 @@ import {
   pendingKeysOf,
   persistPendingDocumentUpdate,
   rememberOfflinePage,
-  setDocumentPendingMarker,
   storageEpoch,
 } from "./offline-catalog";
 
@@ -182,7 +183,7 @@ export function EditorPage({
         epoch: storageEpoch(key) || page.contentEpoch,
         reason,
       };
-      if (dismissedRecovery.current[key] !== undefined && reason === "epoch") return;
+      if (dismissedRecovery.current[key] === page.contentEpoch && reason === "epoch") return;
       const current = recoveryRef.current;
       if (current.some((entry) => entry.key === key && entry.epoch === value.epoch && entry.reason === reason)) return;
       replaceRecovery([...current.filter((entry) => entry.key !== key), value].sort((a, b) => a.epoch - b.epoch));
@@ -210,11 +211,15 @@ export function EditorPage({
         throw error;
       }
       const pendingKeys = catalogPage ? pendingKeysOf(catalogPage) : [];
-      if (readingRevision === pendingRevision) pendingActive = pendingKeys.includes(currentStorageKey);
+      const marker = await documentPendingMarker(currentStorageKey).catch((error) => {
+        console.error("Unable to read offline document marker", error);
+        return true;
+      });
+      if (readingRevision === pendingRevision) pendingActive = pendingKeys.includes(currentStorageKey) || marker;
       const olderDrafts = pendingKeys.filter((key) => key !== currentStorageKey);
       for (const key of olderDrafts) quarantine(key);
       const hasLocalDraft =
-        pendingKeys.includes(currentStorageKey) || pendingActive || (!catalogPage && next.hasUnsyncedChanges);
+        pendingKeys.includes(currentStorageKey) || marker || pendingActive || (!catalogPage && next.hasUnsyncedChanges);
       const controller = new AbortController();
       const deadline = window.setTimeout(() => controller.abort(), 10_000);
       try {
@@ -270,6 +275,7 @@ export function EditorPage({
       member.user.id,
       beforeConnect,
     );
+    next.doc.off("update", next.indexeddb["_storeUpdate"]);
     const clearCurrentRecovery = () => {
       if (!active) return;
       const current = recoveryRef.current;
@@ -286,12 +292,13 @@ export function EditorPage({
       }
       pendingActive = pending;
       pendingRevision += 1;
+      const revision = pendingRevision;
       pendingWrite = pendingWrite
         .then(async () => {
+          if (revision !== pendingRevision) return;
           if (!pending && storageFailed) return;
           const currentMember = offlineMember.current;
           if (pending) {
-            await setDocumentPendingMarker(currentStorageKey);
             await rememberOfflinePage(
               currentMember,
               offlineMetadata.current.page,
@@ -320,7 +327,20 @@ export function EditorPage({
           }
         });
     };
+    let persistedUpdates = 0;
+    const failStorage = (error: unknown) => {
+      storageFailed = true;
+      console.error("Unable to persist local document update", error);
+      if (active) {
+        quarantine(currentStorageKey, "storage");
+        setStorageError("Offline storage could not record these local changes. Export this copy before leaving.");
+      }
+    };
     const documentUpdate = (_update: Uint8Array, origin: unknown) => {
+      if (origin === next.provider) {
+        next.indexeddb["_storeUpdate"](_update, origin);
+        return;
+      }
       if (origin !== next.provider && origin !== next.indexeddb) {
         if (dismissedRecovery.current[currentStorageKey] !== undefined) {
           delete dismissedRecovery.current[currentStorageKey];
@@ -333,25 +353,22 @@ export function EditorPage({
         try {
           const db = next.indexeddb.db;
           if (!db) throw new Error("Offline document storage is unavailable.");
-          const stored = persistPendingDocumentUpdate(db, _update);
+          const stored = persistPendingDocumentUpdate(db, _update).catch(failStorage);
           pendingWrite = pendingWrite
             .then(() => stored)
-            .catch((error) => {
-              storageFailed = true;
-              console.error("Unable to persist local document update", error);
-              if (active) {
-                quarantine(currentStorageKey, "storage");
-                setStorageError(
-                  "Offline storage could not record these local changes. Export this copy before leaving.",
+            .then(async () => {
+              if (storageFailed) return;
+              if (++persistedUpdates >= 500) {
+                persistedUpdates = 0;
+                await compactDocumentUpdates(next.indexeddb).catch((error) =>
+                  console.error("Unable to compact offline document storage", error),
                 );
               }
-            });
+            })
+            .catch(failStorage);
           writePending(true);
         } catch (error) {
-          storageFailed = true;
-          console.error("Unable to persist local document update", error);
-          quarantine(currentStorageKey, "storage");
-          setStorageError("Offline storage could not record these local changes. Export this copy before leaving.");
+          failStorage(error);
         }
       }
     };
@@ -589,7 +606,11 @@ export function EditorPage({
                 className="quiet-button"
                 onClick={() => {
                   dismissedRecovery.current[entry.key] = page.contentEpoch;
-                  localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
+                  try {
+                    localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
+                  } catch (error) {
+                    console.error("Unable to update dismissed recovery details", error);
+                  }
                   replaceRecovery(recoveryRef.current.filter((item) => item.key !== entry.key));
                   setRecoveryPreview(null);
                 }}

@@ -13,12 +13,12 @@ import { notesSchema } from "./mentions";
 import { downloadOfflineMarkdown, exportPendingOfflinePages, offlineCopyMarkdown } from "./offline-export";
 import { useEffectiveColorScheme } from "./ThemeControl";
 import {
+  compactDocumentUpdates,
   clearRevokedOfflinePages,
   getOfflinePage,
   listPendingOfflinePages,
   markOfflinePagePending,
   markOfflinePageRevoked,
-  PENDING_MARKER,
   pendingKeysOf,
   persistPendingDocumentUpdate,
   type OfflineAccount,
@@ -122,11 +122,18 @@ export function OfflineWorkspace({
           await discardRevokedCopy(selected.pageId);
           return;
         }
-        if (!space || (hasDraft && (page.contentEpoch !== selected.epoch || space.effectiveRole === "viewer"))) {
+        if (!space || (hasDraft && space.effectiveRole === "viewer")) {
           setQuarantined((current) => ({
             ...current,
-            [selected.pageId]:
-              "Your access or this document's version changed. The local copy is preserved for export.",
+            [selected.pageId]: "Your access changed. The local copy is preserved for export.",
+          }));
+          setRecovery("offline");
+          return;
+        }
+        if (hasDraft && page.contentEpoch !== selected.epoch) {
+          setQuarantined((current) => ({
+            ...current,
+            [selected.pageId]: "This document's version changed. The local copy is preserved for export.",
           }));
           setRecovery("offline");
           return;
@@ -195,8 +202,16 @@ export function OfflineWorkspace({
         <button type="button" onClick={() => void reconnect()} disabled={recovery !== "offline"}>
           {recovery !== "offline" ? "Checking access…" : "Reconnect"}
         </button>
-        {selectedReason && (
-          <button type="button" onClick={onRetry}>
+        {selected && selectedReason?.startsWith("This document's version changed") && (
+          <button
+            type="button"
+            onClick={() => {
+              const next = new URL(window.location.href);
+              next.searchParams.set("page", selected.pageId);
+              window.history.replaceState(null, "", next);
+              onRetry();
+            }}
+          >
             Open online workspace
           </button>
         )}
@@ -406,6 +421,7 @@ function OfflineBlockEditor({
     let writing: Promise<void> | null = null;
     let pendingCommitted = false;
     let pendingMark: Promise<void> | null = null;
+    let persistedBatches = 0;
     const markPending = () => {
       if (pendingCommitted) return Promise.resolve();
       pendingMark ??= markOfflinePagePending(accountKey, page.pageId, storageKey, true)
@@ -431,6 +447,12 @@ function OfflineBlockEditor({
           await persistPendingDocumentUpdate(db, batch.length === 1 ? batch[0]! : Y.mergeUpdates(batch));
           updates.splice(0, batch.length);
           await markPending();
+          if (++persistedBatches >= 500) {
+            persistedBatches = 0;
+            await compactDocumentUpdates(copy.persistence).catch((error) =>
+              console.error("Unable to compact offline document storage", error),
+            );
+          }
           if (active && target === generation) setSaveState("saved");
         }
       })()
@@ -450,13 +472,9 @@ function OfflineBlockEditor({
     });
     const flushOnHide = () => {
       if (!updates.length || !copy.persistence.db) return;
-      try {
-        const transaction = copy.persistence.db.transaction(["updates", "custom"], "readwrite");
-        transaction.objectStore("updates").add(Y.mergeUpdates(updates));
-        transaction.objectStore("custom").put(true, PENDING_MARKER);
-      } catch (error) {
-        console.error("Offline edits could not be queued during page unload", error);
-      }
+      void persistPendingDocumentUpdate(copy.persistence.db, Y.mergeUpdates(updates)).catch((error) =>
+        console.error("Offline edits could not be queued during page unload", error),
+      );
     };
     const updated = (update: Uint8Array, origin: unknown) => {
       if (origin === copy.persistence || origin === copy.provider) return;

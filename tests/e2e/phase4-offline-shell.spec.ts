@@ -170,13 +170,13 @@ test("opens two visited documents offline and keeps local edits through refresh"
   await context.setOffline(false);
   await page.getByRole("button", { name: "Reconnect" }).click();
   await expect(
-    page.getByText("Your access or this document's version changed. The local copy is preserved for export."),
+    page.getByText("This document's version changed. The local copy is preserved for export."),
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Export Markdown" })).toBeVisible();
   await page.unroute(`**/api/pages/${selectedPageId}`);
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
   await expect(
-    page.getByText("Your access or this document's version changed. The local copy is preserved for export."),
+    page.getByText("This document's version changed. The local copy is preserved for export."),
   ).toBeVisible();
   await expect(page.locator(".offline-document [contenteditable='true']")).toHaveCount(0);
   await expect(page.getByLabel("Page title")).toHaveValue("Offline beta", { timeout: 30_000 });
@@ -361,6 +361,7 @@ test("recovers a saved draft when the catalog pending write fails", async ({ pag
 
 test("keeps an online editor draft when its catalog write fails", async ({ page, context }) => {
   await signInOwner(page);
+  await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
   const previousPage = new URL(page.url()).searchParams.get("page");
   await page.getByRole("button", { name: /Find a page or command/ }).click();
   await page
@@ -425,6 +426,7 @@ test("keeps an online editor draft when its catalog write fails", async ({ page,
 
 test("opens the online workspace from a quarantined offline draft", async ({ page, context }) => {
   await signInOwner(page);
+  await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
   const previousPage = new URL(page.url()).searchParams.get("page");
   await page.getByRole("button", { name: /Find a page or command/ }).click();
   await page
@@ -469,7 +471,7 @@ test("opens the online workspace from a quarantined offline draft", async ({ pag
   await context.setOffline(false);
   await page.getByRole("button", { name: "Reconnect" }).click();
   await expect(
-    page.getByText("Your access or this document's version changed. The local copy is preserved for export."),
+    page.getByText("This document's version changed. The local copy is preserved for export."),
   ).toBeVisible();
   await page.getByRole("button", { name: "Open online workspace" }).click();
   await expect(page.getByRole("navigation", { name: "Cached documents" })).toHaveCount(0);

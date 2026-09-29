@@ -1,4 +1,6 @@
 import type { ClientMemberContext, Page, PageKind } from "../shared/types";
+import { fetchUpdates, type IndexeddbPersistence } from "y-indexeddb";
+import * as Y from "yjs";
 
 const DATABASE_NAME = "noteflare-offline-catalog";
 const DATABASE_VERSION = 1;
@@ -50,7 +52,7 @@ function openExistingDocument(key: string): Promise<IDBDatabase | null> {
   });
 }
 
-async function documentPendingMarker(key: string): Promise<boolean> {
+export async function documentPendingMarker(key: string): Promise<boolean> {
   const db = await openExistingDocument(key);
   if (!db) return false;
   try {
@@ -103,19 +105,18 @@ export function persistPendingDocumentUpdate(db: IDBDatabase, update: Uint8Array
   return transactionDone(transaction);
 }
 
-export async function setDocumentPendingMarker(key: string) {
-  const db = await openExistingDocument(key);
-  if (!db || !db.objectStoreNames.contains("custom")) {
-    db?.close();
-    throw new Error("Offline document storage is unavailable.");
-  }
-  try {
-    const transaction = db.transaction("custom", "readwrite");
-    transaction.objectStore("custom").put(true, PENDING_MARKER);
-    await transactionDone(transaction);
-  } finally {
-    db.close();
-  }
+/** Compact only updates already loaded into the Y.Doc; concurrent later rows survive. */
+export async function compactDocumentUpdates(persistence: IndexeddbPersistence): Promise<void> {
+  await fetchUpdates(persistence);
+  const db = persistence.db;
+  if (!db) throw new Error("Offline document storage is unavailable.");
+  const lastLoaded = persistence["_dbref"];
+  const transaction = db.transaction("updates", "readwrite");
+  const store = transaction.objectStore("updates");
+  store.add(Y.encodeStateAsUpdate(persistence.doc));
+  store.delete(IDBKeyRange.upperBound(lastLoaded, true));
+  await transactionDone(transaction);
+  persistence["_dbsize"] = 1;
 }
 
 export function pendingKeysOf(page: OfflinePage): string[] {
@@ -447,7 +448,7 @@ export async function purgingOfflineAccounts() {
 export async function forgetOfflineAccount(accountKey: string) {
   const db = await openCatalog();
   await markOfflineAccountPurging(accountKey);
-  const pages = await readAccountPages(accountKey);
+  const pages = await readAccountPages(accountKey, false);
   const keys = new Set(pages.flatMap((page) => page.storageKeys ?? []));
   // Catalog writes and Yjs store creation are separate transactions. Include
   // stores left behind by an interrupted catalog write or a previous purge.
