@@ -44,6 +44,17 @@ import { reportClientError } from "./telemetry";
 import { editorBlockFactories, EmbedFeatureContext, safeBookmarkUrl } from "./editor-blocks";
 import { resolveEmbed } from "../shared/embed-providers";
 import { notesCommentSchema, notesSchema } from "./mentions";
+import { DateMentionContext } from "./DateMentionChip";
+import { DateMentionPicker } from "./DateMentionPicker";
+import { dateMentionPasteExtension } from "./date-mention-paste";
+import {
+  dateMentionWireProps,
+  parseDatePhrase,
+  validCalendarDate,
+  validTimezone,
+  type DateMention,
+} from "../shared/date-mentions";
+import type { NotificationPreference } from "../shared/types";
 import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 import { useEffectiveColorScheme } from "./ThemeControl";
@@ -1052,6 +1063,7 @@ export function EditorPage({
               panelTarget={panelTarget}
               commentsOpen={commentsVisible}
               pageId={page.id}
+              isTemplate={page.isTemplate}
               commentsRevision={commentsRevision}
               onPageCreated={onPageChanged}
               onError={setEditorError}
@@ -1193,6 +1205,7 @@ function editorOptions(
       showCursorLabels: "activity" as const,
     },
     extensions: [
+      dateMentionPasteExtension(member.user.id),
       SyntaxHighlightingExtension({
         createHighlighter: async () => {
           const [{ createHighlighterCore }, { createJavaScriptRegexEngine }, light, dark, ...langs] = await Promise.all(
@@ -1236,6 +1249,7 @@ function CollaborativeEditor({
   commentsOpen,
   panelTarget,
   pageId,
+  isTemplate,
   commentsRevision,
   onPageCreated,
   onError,
@@ -1246,6 +1260,7 @@ function CollaborativeEditor({
   commentsOpen: boolean;
   panelTarget: HTMLDivElement | null;
   pageId: string;
+  isTemplate: boolean;
   commentsRevision: number;
   onPageCreated: (page: Page) => void;
   onError: (message: string) => void;
@@ -1253,8 +1268,14 @@ function CollaborativeEditor({
   const [commentError, setCommentError] = useState("");
   const [pasteChoice, setPasteChoice] = useState<{ url: string; blockId: string } | null>(null);
   const [pasteNotice, setPasteNotice] = useState("");
+  const [dateInsert, setDateInsert] = useState<DateMention | null>(null);
   const editorShellRef = useRef<HTMLDivElement>(null);
   const pasteChoiceRef = useRef<HTMLFieldSetElement>(null);
+  const dateTimezoneRef = useRef<{ promise: Promise<string>; expiresAt: number } | null>(null);
+  const dateMentionContext = useMemo(
+    () => ({ pageId, userId: member.user.id, editable, remindersAllowed: !isTemplate }),
+    [pageId, member.user.id, editable, isTemplate],
+  );
   const commentsPanel = useRef<HTMLDivElement>(null);
   const threadStore = useMemo(
     () => new ServerThreadStore(pageId, member.user.id, setCommentError),
@@ -1473,10 +1494,82 @@ function CollaborativeEditor({
       query,
     );
   const getMentionItems = async (query: string) => {
-    const data = await api<{ suggestions: MentionSuggestion[] }>(
-      `/api/mentions/suggestions?q=${encodeURIComponent(query)}`,
-    );
-    return data.suggestions.map((suggestion) => ({
+    const detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+    const browserTimezone = validTimezone(detectedTimezone) ? detectedTimezone : "UTC";
+    if (!dateTimezoneRef.current || dateTimezoneRef.current.expiresAt < Date.now()) {
+      let promise!: Promise<string>;
+      promise = api<{ preferences: NotificationPreference[]; configured: boolean }>("/api/notification-preferences")
+        .then((data) => {
+          const preferred = data.configured ? data.preferences[0]?.timezone : undefined;
+          return preferred && validTimezone(preferred) ? preferred : browserTimezone;
+        })
+        .catch(() => {
+          if (dateTimezoneRef.current?.promise === promise) dateTimezoneRef.current = null;
+          return browserTimezone;
+        });
+      dateTimezoneRef.current = { promise, expiresAt: Date.now() + 30_000 };
+    }
+    const [data, timezone] = await Promise.all([
+      api<{ suggestions: MentionSuggestion[] }>(`/api/mentions/suggestions?q=${encodeURIComponent(query)}`),
+      dateTimezoneRef.current.promise,
+    ]);
+    const makeDate = (date: string): DateMention => ({
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: member.user.id,
+      kind: "all-day",
+      value: date,
+      timezone,
+    });
+    const insertDate = (date: string) => {
+      editor.insertInlineContent(
+        [
+          {
+            type: "dateMention",
+            props: dateMentionWireProps(makeDate(date)),
+          },
+          " ",
+        ],
+        { updateSelection: true },
+      );
+    };
+    const normalizedQuery = query.trim().toLowerCase();
+    const parsed =
+      parseDatePhrase(query, new Date(), timezone) || (validCalendarDate(normalizedQuery) ? normalizedQuery : null);
+    const today = parseDatePhrase("today", new Date(), timezone);
+    const dateQuery =
+      !normalizedQuery ||
+      Boolean(parsed) ||
+      "date".startsWith(normalizedQuery) ||
+      (normalizedQuery.length >= 2 && "calendar".startsWith(normalizedQuery)) ||
+      /^(?:\d{4}-|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|next(?:\s|$)|in(?:\s|$)|tod|tom)/.test(
+        normalizedQuery,
+      );
+    const dateItems = [
+      ...(parsed
+        ? [
+            {
+              title: `Date: ${parsed}`,
+              subtext: query,
+              group: "Dates",
+              icon: <span>▦</span>,
+              onItemClick: () => insertDate(parsed),
+            },
+          ]
+        : []),
+      ...(dateQuery && today
+        ? [
+            {
+              title: "Choose date…",
+              subtext: `Calendar · ${timezone}`,
+              group: "Dates",
+              icon: <span>▦</span>,
+              onItemClick: () => setDateInsert(makeDate(parsed ?? today)),
+            },
+          ]
+        : []),
+    ];
+    const mentions = data.suggestions.map((suggestion) => ({
       title: suggestion.label,
       subtext: suggestion.detail,
       group: suggestion.entityType === "page" ? "Pages" : "People",
@@ -1497,92 +1590,113 @@ function CollaborativeEditor({
           { updateSelection: true },
         ),
     }));
+    return parsed ? [...dateItems, ...mentions] : [...mentions, ...dateItems];
   };
   return (
-    <EmbedFeatureContext.Provider value={member.features?.expandedEmbeds ?? false}>
-      <div
-        ref={editorShellRef}
-        onPasteCapture={(event) => {
-          if (!editable || event.clipboardData.files.length || event.isDefaultPrevented()) return;
-          if (
-            !(event.target instanceof Element) ||
-            !editorShellRef.current?.contains(event.target) ||
-            !event.target.closest('.bn-editor[contenteditable="true"]')
-          )
-            return;
-          const value = event.clipboardData.getData("text/plain").trim();
-          if (!safeBookmarkUrl(value) || /\s/.test(value)) return;
-          if (
-            !(
-              (member.features?.expandedEmbeds && value.startsWith("https://")) ||
-              resolveEmbed(value, member.features?.expandedEmbeds)
+    <DateMentionContext.Provider value={dateMentionContext}>
+      <EmbedFeatureContext.Provider value={member.features?.expandedEmbeds ?? false}>
+        <div
+          ref={editorShellRef}
+          onPasteCapture={(event) => {
+            if (!editable || event.clipboardData.files.length || event.isDefaultPrevented()) return;
+            if (
+              !(event.target instanceof Element) ||
+              !editorShellRef.current?.contains(event.target) ||
+              !event.target.closest('.bn-editor[contenteditable="true"]')
             )
-          )
-            return;
-          const block = editor.getTextCursorPosition().block;
-          if (block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) return;
-          event.preventDefault();
-          event.stopPropagation();
-          setPasteNotice("");
-          setPasteChoice({ url: value, blockId: block.id });
-        }}
-      >
-        <BlockNoteView
-          editor={editor}
-          editable={editable}
-          className="notes-editor"
-          theme={colorScheme}
-          slashMenu={false}
+              return;
+            const value = event.clipboardData.getData("text/plain").trim();
+            if (!safeBookmarkUrl(value) || /\s/.test(value)) return;
+            if (
+              !(
+                (member.features?.expandedEmbeds && value.startsWith("https://")) ||
+                resolveEmbed(value, member.features?.expandedEmbeds)
+              )
+            )
+              return;
+            const block = editor.getTextCursorPosition().block;
+            if (block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) return;
+            event.preventDefault();
+            event.stopPropagation();
+            setPasteNotice("");
+            setPasteChoice({ url: value, blockId: block.id });
+          }}
         >
-          {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
-          {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
-          {commentsOpen &&
-            panelTarget &&
-            createPortal(
-              <div ref={commentsPanel} className="comments-panel">
-                <h2>Comments</h2>
-                <p className="muted">
-                  {editable
-                    ? "Select text and use the formatting toolbar to start a thread."
-                    : "You can comment and reply even while the document is read-only."}
-                </p>
-                {commentError && <p className="form-error">{commentError}</p>}
-                <ThreadsSidebar filter="all" sort="position" />
-              </div>,
-              panelTarget,
-            )}
-        </BlockNoteView>
-        {pasteChoice && (
-          <fieldset ref={pasteChoiceRef} className="paste-url-choice">
-            <legend>Paste as</legend>
-            <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("link")}>
-              Link
-            </button>
-            {member.features?.expandedEmbeds && pasteChoice.url.startsWith("https://") && (
-              <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("preview")}>
-                Preview card
+          <BlockNoteView
+            editor={editor}
+            editable={editable}
+            className="notes-editor"
+            theme={colorScheme}
+            slashMenu={false}
+          >
+            {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
+            {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
+            {commentsOpen &&
+              panelTarget &&
+              createPortal(
+                <div ref={commentsPanel} className="comments-panel">
+                  <h2>Comments</h2>
+                  <p className="muted">
+                    {editable
+                      ? "Select text and use the formatting toolbar to start a thread."
+                      : "You can comment and reply even while the document is read-only."}
+                  </p>
+                  {commentError && <p className="form-error">{commentError}</p>}
+                  <ThreadsSidebar filter="all" sort="position" />
+                </div>,
+                panelTarget,
+              )}
+          </BlockNoteView>
+          {pasteChoice && (
+            <fieldset ref={pasteChoiceRef} className="paste-url-choice">
+              <legend>Paste as</legend>
+              <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("link")}>
+                Link
               </button>
-            )}
-            {resolveEmbed(pasteChoice.url, member.features?.expandedEmbeds) && (
-              <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("embed")}>
-                Embed
+              {member.features?.expandedEmbeds && pasteChoice.url.startsWith("https://") && (
+                <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("preview")}>
+                  Preview card
+                </button>
+              )}
+              {resolveEmbed(pasteChoice.url, member.features?.expandedEmbeds) && (
+                <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("embed")}>
+                  Embed
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setPasteChoice(null);
+                  setPasteNotice("");
+                  editor.focus();
+                }}
+              >
+                Cancel
               </button>
-            )}
-            <button
-              type="button"
-              onClick={() => {
-                setPasteChoice(null);
-                setPasteNotice("");
+            </fieldset>
+          )}
+          {pasteNotice && <output className="muted">{pasteNotice}</output>}
+          {dateInsert && (
+            <DateMentionPicker
+              key={dateInsert.tokenId}
+              initial={dateInsert}
+              label="Insert date mention"
+              onSave={(next) => {
+                if (!editable || !editor.isEditable) return "This document is read only.";
+                editor.insertInlineContent([{ type: "dateMention", props: dateMentionWireProps(next) }, " "], {
+                  updateSelection: true,
+                });
+                return null;
+              }}
+              onClose={() => {
+                setDateInsert(null);
                 editor.focus();
               }}
-            >
-              Cancel
-            </button>
-          </fieldset>
-        )}
-        {pasteNotice && <output className="muted">{pasteNotice}</output>}
-      </div>
-    </EmbedFeatureContext.Provider>
+            />
+          )}
+        </div>
+      </EmbedFeatureContext.Provider>
+    </DateMentionContext.Provider>
   );
 }
 

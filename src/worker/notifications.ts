@@ -18,6 +18,7 @@ export const NOTIFICATION_EVENT_TYPES = [
   "thread_resolved",
   "thread_reopened",
   "page_edit",
+  "reminder",
   "task_assigned",
 ] as const satisfies readonly NotificationEventType[];
 
@@ -35,6 +36,7 @@ export type NotificationFanout = {
   recipientIds: string[];
   emitSlackChannel: boolean;
   data?: Record<string, unknown>;
+  reminderGuard?: { id: string; generation: number; receiptId: string };
   createdAt: number;
 };
 
@@ -109,6 +111,9 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
             AND (? IS NULL OR EXISTS(SELECT 1 FROM task_mutation_receipts tr WHERE tr.workspace_id=p.workspace_id AND tr.actor_id=? AND tr.operation_id=? AND tr.detail_page_id=p.id))
             AND (? IS NULL OR EXISTS(SELECT 1 FROM table_row_pages link WHERE link.row_id=? AND link.page_id=p.id))
             AND (wm.role = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+            AND (? IS NULL OR EXISTS (SELECT 1 FROM date_reminders reminder
+              WHERE reminder.id=? AND reminder.generation=? AND reminder.state='delivered'
+                AND reminder.delivery_receipt_id=?))
             AND NOT EXISTS (
               SELECT 1 FROM notifications recent
                WHERE ? IS NOT NULL AND recent.user_id = recipient.value AND recent.page_id = ?
@@ -138,6 +143,10 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         fanout.taskOperationId ?? null,
         fanout.taskRowId ?? null,
         fanout.taskRowId ?? null,
+        fanout.reminderGuard?.id ?? null,
+        fanout.reminderGuard?.id ?? null,
+        fanout.reminderGuard?.generation ?? null,
+        fanout.reminderGuard?.receiptId ?? null,
         coalesceAfter,
         fanout.pageId,
         fanout.eventType,
@@ -622,6 +631,7 @@ function escapeHtml(value: string) {
 
 function notificationCopy(row: DeliveryRow) {
   const actor = row.actor_name ?? "A collaborator";
+  if (row.event_type === "reminder") return `Reminder: ${row.page_title}`;
   if (row.event_type === "task_assigned") return `${actor} assigned you a task: ${row.page_title}`;
   if (row.event_type === "mention") return `${actor} mentioned you on ${row.page_title}`;
   if (row.event_type === "reply") return `${actor} replied on ${row.page_title}`;

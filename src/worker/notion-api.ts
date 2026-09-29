@@ -33,6 +33,9 @@ import { sourceRateLimitKey } from "./source-rate-limit";
 import { sweepOutbox } from "./jobs";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
+import { dateTokens } from "../shared/document-projection";
+import { dateMentionFromProps } from "../shared/date-mentions";
+import { withinMissingGrace } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -541,7 +544,14 @@ async function locatedBlock(env: Env, principal: IntegrationPrincipal, id: strin
   if (!block && !includeTrash) {
     throw new NotionError(404, "object_not_found", "Could not find page or block with the requested ID.");
   }
-  return { page, block, internalId: row.internal_id, metadata: await metadataForPage(env, page.id) };
+  return {
+    page,
+    block,
+    document: envelope.document,
+    sequence: envelope.sequence,
+    internalId: row.internal_id,
+    metadata: await metadataForPage(env, page.id),
+  };
 }
 
 async function mutateDocument(
@@ -550,6 +560,7 @@ async function mutateDocument(
   principal: IntegrationPrincipal,
   operations: unknown[],
   suppressExternalEffects = false,
+  options: { expectedSequence?: number } = {},
 ) {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/api-mutate", {
@@ -559,14 +570,25 @@ async function mutateDocument(
         "x-notes-internal": env.BETTER_AUTH_SECRET,
         ...correlationHeaders(),
       },
-      body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects }),
+      body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects, ...options }),
     }),
   );
   if (response.status === 404) throw new NotionError(404, "object_not_found", "Block not found.");
-  if (response.status === 409) throw new NotionError(409, "conflict_error", "The document could not be changed.");
+  if (response.status === 409) {
+    const result = await response.json<{ error?: string }>().catch((): { error?: string } => ({}));
+    throw new NotionError(
+      409,
+      "conflict_error",
+      result.error === "duplicate_date_token"
+        ? "Move the original date token before reusing its ID."
+        : result.error === "revision_changed"
+          ? "This date token changed while moving it. Retry."
+          : "The document could not be changed.",
+    );
+  }
   if (response.status === 413) throw new NotionError(413, "validation_error", "The mutation exceeds document limits.");
   if (!response.ok) throw new NotionError(400, "validation_error", "The block mutation is invalid.");
-  return response.json<{ document: DocumentContentEnvelope["document"] }>();
+  return response.json<{ document: DocumentContentEnvelope["document"]; sequence: number }>();
 }
 
 async function cleanupStagedPage(env: Env, pageId: string, contentEpoch: number, stageId: string) {
@@ -1197,17 +1219,74 @@ notionApi.patch("/blocks/:blockId", async (c) => {
     await mutateDocument(c.env, located.page, principal, [{ type: "delete_block", internalId: located.internalId }]);
     return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
   }
+  const blockDates = dateTokens(located.block!.node);
+  let guardMove = false;
+  const suppliedDates = new Map<string, NonNullable<ReturnType<typeof dateMentionFromProps>>>();
+  for (const payload of Object.values(input)) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    const content = payload as { rich_text?: unknown; cells?: unknown };
+    const groups = [content.rich_text, ...(Array.isArray(content.cells) ? content.cells : [])];
+    for (const group of groups) {
+      if (!Array.isArray(group)) continue;
+      for (const item of group) {
+        const supplied = dateMentionFromProps(item?.mention?.noteFlare ?? {});
+        if (supplied && !blockDates.has(supplied.tokenId)) suppliedDates.set(supplied.tokenId, supplied);
+      }
+    }
+  }
+  if (suppliedDates.size) {
+    const liveDates = dateTokens(located.document);
+    const possibleMoves = [...suppliedDates.keys()].filter((id) => !liveDates.has(id));
+    const rows = possibleMoves.length
+      ? await c.env.DB.prepare(
+          `SELECT id,generation,token_id,user_id,token_revision,timezone,missing_since FROM date_reminders
+       WHERE page_id=? AND content_epoch=? AND token_id IN (SELECT value FROM json_each(?))
+         AND state IN ('active','claimed','delivered')`,
+        )
+          .bind(located.page.id, located.page.content_epoch, JSON.stringify(possibleMoves))
+          .all<{
+            id: string;
+            generation: number;
+            token_id: string;
+            user_id: string;
+            token_revision: string;
+            timezone: string;
+            missing_since: number | null;
+          }>()
+      : { results: [] };
+    for (const reminder of rows.results) {
+      const supplied = suppliedDates.get(reminder.token_id);
+      if (!supplied) continue;
+      if (
+        reminder.user_id !== supplied.createdBy ||
+        reminder.token_revision !== supplied.revision ||
+        reminder.timezone !== supplied.timezone
+      )
+        continue;
+      if (withinMissingGrace(reminder.missing_since, Date.now())) {
+        guardMove = true;
+        blockDates.set(supplied.tokenId, { ...supplied, revision: crypto.randomUUID() });
+      }
+    }
+  }
   let container;
   try {
-    container = notionInputToBlockContainer({ ...input, id: located.internalId });
+    container = notionInputToBlockContainer({ ...input, id: located.internalId }, 0, blockDates);
   } catch (error) {
     throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid block.");
   }
   const node = container.content?.find((child) => child.type !== "blockGroup");
   if (!node) throw new NotionError(400, "validation_error", "Block content is required.");
-  const mutated = await mutateDocument(c.env, located.page, principal, [
-    { type: "update_block", internalId: located.internalId, node },
-  ]);
+  if ([...dateTokens(container).values()].some((token) => token === null))
+    throw new NotionError(400, "validation_error", "Date tokens must be unique within a block.");
+  const mutated = await mutateDocument(
+    c.env,
+    located.page,
+    principal,
+    [{ type: "update_block", internalId: located.internalId, node }],
+    false,
+    guardMove ? { expectedSequence: located.sequence } : {},
+  );
   const updated = findDocumentBlock(mutated.document, located.internalId)!;
   return c.json(await blockObject(c.env, located.page, updated, await metadataForPage(c.env, located.page.id)));
 });

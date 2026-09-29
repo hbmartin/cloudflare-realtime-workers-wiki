@@ -51,6 +51,38 @@ describe("Notion block adapter", () => {
     ]);
   });
 
+  it("keeps date tokens readable in Notion rich text reads", () => {
+    const payload = JSON.stringify({
+      tokenId: "date-1",
+      revision: "rev-1",
+      createdBy: "user-1",
+      kind: "timed",
+      value: "2026-10-01T14:00:00.000Z",
+      timezone: "America/Chicago",
+    });
+    const rich = proseMirrorInlineToNotion([{ type: "dateMention", attrs: { payload } }]);
+    expect(rich).toMatchObject([
+      {
+        type: "mention",
+        mention: { type: "date", date: { start: "2026-10-01T14:00:00.000Z" }, noteFlare: { payload } },
+        plain_text: "2026-10-01 09:00 America/Chicago",
+      },
+    ]);
+    expect(notionRichTextToProseMirror(rich)).toEqual([{ type: "text", text: "2026-10-01 09:00 America/Chicago" }]);
+    expect(notionRichTextToProseMirror(rich, new Map([["date-1", JSON.parse(payload)]]))).toMatchObject([
+      { type: "dateMention", attrs: { payload } },
+    ]);
+    const changed = structuredClone(rich);
+    (changed[0]!.mention as { date: { start: string } }).date.start = "2026-10-05T14:00:00.000Z";
+    const edited = notionRichTextToProseMirror(changed, new Map([["date-1", JSON.parse(payload)]]));
+    expect(JSON.parse(String(edited[0]?.attrs?.payload))).toMatchObject({
+      tokenId: "date-1",
+      createdBy: "user-1",
+      value: "2026-10-05T14:00:00.000Z",
+    });
+    expect(JSON.parse(String(edited[0]?.attrs?.payload)).revision).not.toBe("rev-1");
+  });
+
   it("returns unsupported for heading levels outside the API contract", () => {
     const block = documentBlocks(
       document({

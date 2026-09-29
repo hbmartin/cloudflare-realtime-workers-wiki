@@ -8,9 +8,12 @@ import {
 import { createReactInlineContentSpec } from "@blocknote/react";
 import { useState } from "react";
 import { mentionInlineConfig } from "../shared/mention-spec";
+import { dateMentionInlineConfig } from "../shared/date-mention-spec";
+import { dateMentionFromProps, dateMentionWireProps, formatDateMention } from "../shared/date-mentions";
 import type { PagePreview } from "../shared/types";
 import { api } from "./api";
 import { coreBlockSpecs, inlineMathSpec } from "./editor-blocks";
+import { DateMentionChip } from "./DateMentionChip";
 
 export const PAGE_NAVIGATE_EVENT = "notes:navigate-page";
 
@@ -105,6 +108,25 @@ const mentionInlineSpec = createReactInlineContentSpec(mentionInlineConfig, {
   toExternalHTML: ({ inlineContent, contentRef }) => <span ref={contentRef}>@{inlineContent.props.label}</span>,
 });
 
+const dateMentionInlineSpec = createReactInlineContentSpec(dateMentionInlineConfig, {
+  render: ({ inlineContent, contentRef, updateInlineContent }) => {
+    const value = dateMentionFromProps(inlineContent.props);
+    return value ? (
+      <DateMentionChip
+        value={value}
+        contentRef={contentRef}
+        update={(next) => updateInlineContent({ type: "dateMention", props: dateMentionWireProps(next) })}
+      />
+    ) : (
+      <span ref={contentRef}>Date</span>
+    );
+  },
+  toExternalHTML: ({ inlineContent, contentRef }) => {
+    const value = dateMentionFromProps(inlineContent.props);
+    return <span ref={contentRef}>{value ? formatDateMention(value) : "Date"}</span>;
+  },
+});
+
 const codeLanguages = {
   text: { name: "Plain text" },
   javascript: { name: "JavaScript", aliases: ["js"] },
@@ -147,7 +169,12 @@ const codeBlock = {
 
 export const notesSchema = BlockNoteSchema.create({
   blockSpecs: { ...defaultBlockSpecs, codeBlock, ...coreBlockSpecs },
-  inlineContentSpecs: { ...defaultInlineContentSpecs, mention: mentionInlineSpec, inlineMath: inlineMathSpec },
+  inlineContentSpecs: {
+    ...defaultInlineContentSpecs,
+    mention: mentionInlineSpec,
+    dateMention: dateMentionInlineSpec,
+    inlineMath: inlineMathSpec,
+  },
   styleSpecs: defaultStyleSpecs,
 });
 

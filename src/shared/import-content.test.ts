@@ -42,20 +42,810 @@ describe("import content", () => {
     ]);
   });
 
-  it.each(["*foo\\*", "_bar\\_", "**baz\\**", "__qux\\__"])(
-    "does not turn an escaped closing delimiter into formatting: %s",
-    (source) => {
-      const parsed = markdownToDocument(source);
-      const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
-      expect(content).toEqual([{ type: "text", text: source.replaceAll("\\", "") }]);
-    },
-  );
+  it.each(["*foo\\*", "_bar\\_"])("does not turn an escaped closing delimiter into formatting: %s", (source) => {
+    const parsed = markdownToDocument(source);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([{ type: "text", text: source.replaceAll("\\", "") }]);
+  });
+
+  it.each(["**baz\\**", "__qux\\__"])("retains the visible text of ambiguous escaped runs: %s", (source) => {
+    const content = markdownToDocument(source).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content.map((node) => node.text).join("")).toBe(source.replaceAll("\\", "").slice(1, -1));
+  });
+
+  it.each([
+    ["\\**foo*", "*", "foo", ""],
+    ["**a***b*", "a", "b", ""],
+    ["*foo**", "", "foo", "*"],
+    ["\\__foo_", "_", "foo", ""],
+  ])("keeps italic spans adjacent to consumed delimiters: %s", (source, prefix, italic, suffix) => {
+    const content = markdownToDocument(source).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content.some((node) => node.text === italic && node.marks?.[0]?.type === "italic")).toBe(true);
+    expect(content.map((node) => node.text).join("")).toBe(`${prefix}${italic}${suffix}`);
+  });
+
+  it("keeps nested bold inside an outer italic delimiter", () => {
+    const content = markdownToDocument("*read the **important** part*").document.content![0]!.content![0]!.content![0]!
+      .content!;
+    expect(content).toEqual([
+      { type: "text", text: "read the ", marks: [{ type: "italic" }] },
+      { type: "text", text: "important", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: " part", marks: [{ type: "italic" }] },
+    ]);
+  });
+
+  it.each([
+    ["**bold *italic***", "italic"],
+    ["*foo**bar*", "foo**bar"],
+    ["*a***b**", "a"],
+    ["*foo** bar", "foo"],
+    ["*foo**\n", "foo"],
+  ])("keeps italics at delimiter runs: %s", (source, italic) => {
+    const content = markdownToDocument(source).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content.some((node) => node.text === italic && node.marks?.[0]?.type === "italic")).toBe(true);
+  });
+
+  it("keeps ambiguous delimiter runs readable without duplicate marks", () => {
+    const content = markdownToDocument("*a**b**").document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "a*", marks: [{ type: "italic" }] },
+      { type: "text", text: "b", marks: [{ type: "italic" }] },
+    ]);
+  });
+
+  it("keeps a strong span inside a matched italic span", () => {
+    const content = markdownToDocument("*foo**bar**baz*").document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "foo", marks: [{ type: "italic" }] },
+      { type: "text", text: "bar", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: "baz", marks: [{ type: "italic" }] },
+    ]);
+  });
+
+  it("keeps two strong spans and the surrounding italic text", () => {
+    const content = markdownToDocument("*Note: **foo** and **bar** are required*").document.content![0]!.content![0]!
+      .content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "Note: ", marks: [{ type: "italic" }] },
+      { type: "text", text: "foo", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: " and ", marks: [{ type: "italic" }] },
+      { type: "text", text: "bar", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: " are required", marks: [{ type: "italic" }] },
+    ]);
+  });
+
+  it("keeps links and code inside nested emphasis", () => {
+    const linked = markdownToDocument("*see [docs](https://example.com) and **this** too*");
+    const content = linked.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toContainEqual({
+      type: "text",
+      text: "docs",
+      marks: [{ type: "italic" }, { type: "link", attrs: { href: "https://example.com" } }],
+    });
+    expect(linked.references).toEqual(["https://example.com"]);
+    const code = markdownToDocument("*run `npm i` then **now** ok*").document.content![0]!.content![0]!.content![0]!
+      .content!;
+    expect(code).toContainEqual({ type: "text", text: "npm i", marks: [{ type: "italic" }, { type: "code" }] });
+    expect(code).toContainEqual({ type: "text", text: "now", marks: [{ type: "italic" }, { type: "bold" }] });
+  });
+
+  it("rejects unsafe links inside emphasis and leaves spaced asterisks literal", () => {
+    const unsafe = markdownToDocument("*see [bad](javascript:alert(1)) and **this** too*");
+    expect(unsafe.issues).toEqual([{ code: "unsafe_url", detail: "javascript:alert(1)" }]);
+    expect(unsafe.references).toEqual([]);
+    const spaced = markdownToDocument("a * b **c** d * e").document.content![0]!.content![0]!.content![0]!.content!;
+    expect(spaced).toEqual([
+      { type: "text", text: "a * b " },
+      { type: "text", text: "c", marks: [{ type: "bold" }] },
+      { type: "text", text: " d * e" },
+    ]);
+  });
+
+  it("recognizes a real opener after an escaped backslash", () => {
+    const content = markdownToDocument("\\\\*a**b**c*").document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "\\" },
+      { type: "text", text: "a", marks: [{ type: "italic" }] },
+      { type: "text", text: "b", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: "c", marks: [{ type: "italic" }] },
+    ]);
+  });
 
   it("scans long unclosed emphasis with backslashes without backtracking", () => {
     const source = `**Path ${"\\alpha ".repeat(90)}`;
     const parsed = markdownToDocument(source);
     const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
     expect(content).toEqual([{ type: "text", text: source.trim() }]);
+  });
+
+  it("preserves literal backslashes inside HTML and autolinks", () => {
+    const html = markdownToDocument('<div class="foo\\-bar">');
+    expect(html.document.content![0]!.content![0]!.content![0]!.content).toEqual([
+      { type: "text", text: '<div class="foo\\-bar">' },
+    ]);
+    const link = markdownToDocument("<https://example.com/a\\.b>");
+    expect(link.references).toEqual(["https://example.com/a%5C.b"]);
+    expect(link.document.content![0]!.content![0]!.content![0]!.content).toEqual([
+      {
+        type: "text",
+        text: "https://example.com/a\\.b",
+        marks: [{ type: "link", attrs: { href: "https://example.com/a%5C.b" } }],
+      },
+    ]);
+  });
+
+  it("bounds formatting work for an exceptionally long paragraph without dropping text", () => {
+    const source = `**${"\\.".repeat(40_000)}`;
+    const parsed = markdownToDocument(source);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([{ type: "text", text: `**${".".repeat(40_000)}` }]);
+    expect(parsed.issues).toEqual([
+      { code: "inline_markup_simplified", detail: "Long inline content was parsed in bounded sections." },
+    ]);
+    const plain = markdownToDocument("\\.".repeat(40_000));
+    expect(plain.issues).toEqual([]);
+    expect(plain.document.content![0]!.content![0]!.content![0]!.content).toEqual([
+      { type: "text", text: ".".repeat(40_000) },
+    ]);
+  });
+
+  it("keeps references and bounded work in heavily escaped content", () => {
+    const source = `[child](Folder/child.md) ${"\\.".repeat(20_000)} <`;
+    const parsed = markdownToDocument(source);
+    expect(parsed.references).toEqual(["Folder/child.md"]);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content[0]).toEqual({
+      type: "text",
+      text: "child",
+      marks: [{ type: "link", attrs: { href: "Folder/child.md" } }],
+    });
+    expect(content.map((node) => node.text).join("")).toContain(".".repeat(20_000));
+    expect(parsed.issues).toContainEqual({
+      code: "inline_markup_simplified",
+      detail: "Long inline content was parsed in bounded sections.",
+    });
+  });
+
+  it("keeps escaped backslashes in link and block image destinations", () => {
+    const link = markdownToDocument(String.raw`[doc](folder\\_name/file.md)`);
+    expect(link.references).toEqual(["folder%5C_name/file.md"]);
+    const image = markdownToDocument(String.raw`![diagram](folder\\_name/file.png)`);
+    expect(image.references).toEqual(["folder%5C_name/file.png"]);
+  });
+
+  it("preserves Slack and nested-path links when a long paragraph is simplified", () => {
+    const suffix = "\\.".repeat(5_000);
+    const parsed = markdownToDocument(
+      `wow\\![Slack](<https://x.slack.com/a.b>) [child](Folder_(one)/Child.md) ${suffix}`,
+    );
+    expect(parsed.references).toEqual(["https://x.slack.com/a.b", "Folder_(one)/Child.md"]);
+    expect(parsed.issues.some((issue) => issue.code === "image_not_imported")).toBe(false);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content!.map((node) => node.text).join("")).toContain(
+      "wow!Slack child",
+    );
+  });
+
+  it("does not make escaped brackets or code-span examples into links in long content", () => {
+    const parsed = markdownToDocument(
+      "\\[example\\](wrong.md) `[code](also-wrong.md)` [real](right.md) " + "\\.".repeat(5_000),
+    );
+    expect(parsed.references).toEqual(["right.md"]);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toContainEqual({ type: "text", text: "[code](also-wrong.md)", marks: [{ type: "code" }] });
+  });
+
+  it("unescapes a block image label once", () => {
+    const parsed = markdownToDocument(String.raw`![my\_diagram \*v2\*](x.png)`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.attrs).toMatchObject({
+      caption: "my_diagram *v2*",
+      name: "my_diagram *v2*",
+    });
+  });
+
+  it("keeps ordinary rich text above four kilobytes and long link destinations", () => {
+    const ordinary = markdownToDocument(`${"word ".repeat(900)}**Important** <https://example.com>`);
+    expect(ordinary.references).toEqual(["https://example.com"]);
+    expect(ordinary.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: "Important",
+      marks: [{ type: "bold" }],
+    });
+    const url = `https://example.com/${"a".repeat(4090)}`;
+    expect(markdownToDocument(`[long](<${url}>) ${"word ".repeat(1800)}`).references).toContain(url);
+  });
+
+  it("keeps a large embedded block image as an image", () => {
+    const data = `data:image/png;base64,${"A".repeat(8192)}`;
+    const parsed = markdownToDocument(`![logo](${data})`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("image");
+    expect(parsed.references).toEqual([data]);
+  });
+
+  it("keeps a long inline data image from spilling its payload into text", () => {
+    const data = `data:image/png;base64,${"A".repeat(50_000)}`;
+    const parsed = markdownToDocument(`See ![chart](${data}) below`);
+    expect(parsed.references).toContain(data);
+    expect(parsed.issues).toContainEqual({ code: "image_not_imported", detail: data.slice(0, 120) });
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("preserves formatted image labels in short paragraphs", () => {
+    const parsed = markdownToDocument("See ![**Fig 1**](data:image/png;base64,AAAA) here");
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toContainEqual({ type: "text", text: "Fig 1", marks: [{ type: "bold" }] });
+    expect(parsed.references).toEqual(["data:image/png;base64,AAAA"]);
+  });
+
+  it("does not close an unfinished link with an image marker", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`[a](http://x/![i](${image}) text ${"x".repeat(9_000)}`);
+    expect(parsed.references).toContain(image);
+    expect(JSON.stringify(parsed.document)).not.toContain("¡");
+    expect(parsed.references.every((reference) => !reference.includes("¡"))).toBe(true);
+  });
+
+  it("keeps titled links intact when a long paragraph is scanned a second time", () => {
+    const parsed = markdownToDocument(
+      `${"x".repeat(8_150)} [a](https://example.com/p "my long title words") ${"y ".repeat(5_000)}[b](b.md)`,
+    );
+    expect(parsed.references).toContain("https://example.com/p");
+    expect(parsed.references).toContain("b.md");
+  });
+
+  it("does not treat a nested or escaped closing parenthesis as a completed link", () => {
+    const data = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`[a](b(c) and \`![x](${data})\` ${"x".repeat(9_000)}`);
+    expect(parsed.references).not.toContain(data);
+    expect(parsed.issues.some((issue) => issue.code === "image_not_imported")).toBe(false);
+  });
+
+  it("keeps autolink URLs literal when they contain image-shaped text", () => {
+    const url = "https://x.test/![i](data:image/png;base64,AAAA)";
+    const parsed = markdownToDocument(`<${url}> ${"x".repeat(9_000)}`);
+    expect(parsed.references).toContain(url);
+    expect(parsed.references.every((reference) => !reference.includes("¡"))).toBe(true);
+  });
+
+  it("keeps short and non-HTTP autolinks literal when they contain image-shaped text", () => {
+    const http = "https://x.test/![i](data:image/png;base64,AAAA)";
+    const short = markdownToDocument(`<${http}>`);
+    const mailto = "mailto:a@b.c?x=![i](data:image/png;base64,AAAA)";
+    const long = markdownToDocument(`<${mailto}> ${"x".repeat(9_000)}`);
+    expect(short.references).toEqual([http]);
+    expect(long.references).toEqual([mailto]);
+    expect(long.references.some((reference) => reference.includes("¡"))).toBe(false);
+  });
+
+  it("keeps autolinks intact in dense inline content", () => {
+    const url = "https://x.test/![i](data:image/png;base64,AAAA)";
+    const parsed = markdownToDocument(`${"< ".repeat(140)}<${url}> ${"x".repeat(9_000)}`);
+    expect(parsed.references).toEqual([url]);
+  });
+
+  it("keeps escaped image labels literal in both inline paths", () => {
+    const data = "data:image/png;base64,AAAA";
+    for (const suffix of ["", ` ${"x".repeat(9_000)}`]) {
+      const parsed = markdownToDocument(`See ${String.raw`![\*star\* and \[x\](Other/page.md)](${data})`}` + suffix);
+      const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+      expect(content.map((node) => node.text ?? "").join("")).toContain("*star* and [x](Other/page.md)");
+      expect(content.every((node) => !node.marks?.some((mark) => mark.type === "link" || mark.type === "italic"))).toBe(
+        true,
+      );
+      expect(parsed.references).toEqual([data]);
+    }
+  });
+
+  it("keeps escaped brackets inside link labels literal", () => {
+    for (const suffix of ["", ` ${"x".repeat(9_000)}`]) {
+      const parsed = markdownToDocument(String.raw`[a \[nested\](wrong.md)](right.md)` + suffix);
+      expect(parsed.references).toEqual(["right.md"]);
+      const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+      expect(content[0]).toMatchObject({
+        text: "a [nested](wrong.md)",
+        marks: [{ type: "link", attrs: { href: "right.md" } }],
+      });
+    }
+    const unsafe = markdownToDocument(String.raw`![a \[nested\](wrong.md)](javascript:bad)`);
+    expect(unsafe.references).toEqual([]);
+    expect(unsafe.issues.some((issue) => issue.code === "unsafe_url")).toBe(true);
+    const rich = markdownToDocument(String.raw`[**bold** \[literal\] ![icon](data:image/png;base64,AAAA)](right.md)`);
+    expect(rich.references).toEqual(["data:image/png;base64,AAAA", "right.md"]);
+    const richText = rich.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(richText).toContainEqual({
+      type: "text",
+      text: "bold",
+      marks: [{ type: "link", attrs: { href: "right.md" } }, { type: "bold" }],
+    });
+  });
+
+  it("keeps an autolink when a dense split starts at its opening bracket", () => {
+    const parsed = markdownToDocument(`${"< ".repeat(127)}<https://example.com/path> < ${"x".repeat(9_000)}`);
+    expect(parsed.references).toContain("https://example.com/path");
+  });
+
+  it("recovers a long data image nested in an ordinary link", () => {
+    const image = `data:image/png;base64,${"A".repeat(9_000)}`;
+    const parsed = markdownToDocument(`[before ![chart](${image}) after](page.md)`);
+    expect(parsed.references).toEqual([image, "page.md"]);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(8_000));
+  });
+
+  it("does not let prose punctuation hide a later bounded link", () => {
+    const parsed = markdownToDocument(`note (quote "unfinished) ${"a ".repeat(4_500)}[later](later.md)`);
+    expect(parsed.references).toContain("later.md");
+  });
+
+  it("does not recover an image inside an unfinished code span", () => {
+    const source = "See ![a `b](data:image/png;base64,AAAA) then `";
+    for (const suffix of ["", ` ${"x".repeat(9_000)}`]) {
+      const parsed = markdownToDocument(source + suffix);
+      expect(parsed.references).toEqual([]);
+      expect(parsed.issues.some((issue) => issue.code === "image_not_imported")).toBe(false);
+    }
+  });
+
+  it("records inline image and link references in source order", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`![i](${image}) [page](page.md) ${"x".repeat(9_000)}`);
+    expect(parsed.references).toEqual([image, "page.md"]);
+  });
+
+  it("records an image inside a link before its containing link", () => {
+    const image = "data:image/png;base64,AAAA";
+    for (const prefix of ["", "< ".repeat(140)]) {
+      const parsed = markdownToDocument(`${prefix}[![i](${image})](page.md) ${"x".repeat(9_000)}`);
+      expect(parsed.references).toEqual([image, "page.md"]);
+    }
+  });
+
+  it("keeps a replaced image atomic across a CJK section cut", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`${"字".repeat(8_190)}![i](${image})${"字".repeat(100)}`);
+    const text = parsed.document
+      .content![0]!.content![0]!.content![0]!.content!.map((node) => node.text ?? "")
+      .join("");
+    expect(text).toBe(`${"字".repeat(8_190)}i${"字".repeat(100)}`);
+    expect(parsed.references).toEqual([image]);
+  });
+
+  it("skips image destinations inside a label code span", () => {
+    const image = "data:image/png;base64,CCCC";
+    const parsed = markdownToDocument(
+      `![a \`x](data:image/png;base64,AAAA) y](data:image/png;base64,BBBB) z\` w](${image}) ${"x".repeat(9_000)}`,
+    );
+    expect(parsed.references).toEqual([image]);
+  });
+
+  it("resolves many distinct image markers without leaking marker characters", () => {
+    const images = Array.from(
+      { length: 1_000 },
+      (_, index) => `data:image/png;base64,${String(index).padStart(4, "A")}`,
+    );
+    const parsed = markdownToDocument(images.map((image, index) => `![item${index}](${image})`).join(" "));
+    expect(parsed.references).toEqual(images);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content.map((node) => node.text ?? "").join("")).toBe(images.map((_, index) => `item${index}`).join(" "));
+  });
+
+  it("keeps data images atomic after more images than available marker characters", () => {
+    const image = `data:image/png;base64,${"Z".repeat(5_000)}`;
+    const many = Array.from({ length: 5_000 }, (_, index) => `![i${index}](data:image/png;base64,AAAA)`).join(" ");
+    const parsed = markdownToDocument(`${many} ![a \` tick](${image})`);
+    expect(parsed.references.at(-1)).toBe(image);
+    expect(parsed.references).toHaveLength(5_001);
+    expect(JSON.stringify(parsed.document)).not.toContain("Z".repeat(1_000));
+  });
+
+  it("keeps a link around a small image when marker characters run out", () => {
+    const many = Array.from({ length: 5_000 }, (_, index) => `![i${index}](data:image/png;base64,AAAA)`).join(" ");
+    const parsed = markdownToDocument(`${many} [![last](data:image/png;base64,AAAA)](https://x.test)`);
+    expect(parsed.references.at(-1)).toBe("https://x.test");
+    expect(parsed.references.at(-2)).toBe("data:image/png;base64,AAAA");
+    expect(parsed.references).toHaveLength(5_002);
+  });
+
+  it("keeps adjacent titled data images out of paragraph text", () => {
+    const data = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`See ![a](${data} "first")![b](${data}) below`);
+    expect(parsed.references).toEqual([data, data]);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("recognizes a data image with unmatched code punctuation in its label", () => {
+    const data = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`See ![a \` tick](${data}) below`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("keeps later and larger data images out of paragraph text", () => {
+    const data = `data:image/png;base64,${"A".repeat(100_000)}`;
+    const parsed = markdownToDocument(`See ![small](small.png) then ![large](${data}) below`);
+    expect(parsed.references).toEqual(["small.png", data]);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("recognizes an image after unmatched code punctuation and an escaped backslash", () => {
+    const data = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const unmatched = markdownToDocument(`Press the \` key. See ![chart](${data}) below`);
+    const escapedBackslash = markdownToDocument(String.raw`See \\![chart](${data}) below`);
+    expect(unmatched.references).toContain(data);
+    expect(escapedBackslash.references).toContain(data);
+    expect(JSON.stringify(unmatched.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("keeps a long data-image example inside code as code", () => {
+    const data = `data:image/png;base64,${"A".repeat(10_000)}`;
+    const parsed = markdownToDocument(`\`example ![chart](${data})\``);
+    expect(parsed.references).toEqual([]);
+    expect(parsed.issues.some((issue) => issue.code === "image_not_imported")).toBe(false);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: `example ![chart](${data})`,
+      marks: [{ type: "code" }],
+    });
+  });
+
+  it("bounds a hostile image label before asking Marked to tokenize it", () => {
+    const parsed = markdownToDocument(`![\\](${"<? ".repeat(20_000)}](img.png)`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+  });
+
+  it("keeps links that follow earlier link destinations near a long-content boundary", () => {
+    const parsed = markdownToDocument(
+      `[first](first.md) ${"word ".repeat(1634)}[second](https://example.com/second) ${"word ".repeat(1000)}`,
+    );
+    expect(parsed.references).toEqual(["first.md", "https://example.com/second"]);
+    expect(JSON.stringify(parsed.document)).toContain("https://example.com/second");
+  });
+
+  it("keeps formatting after ordinary punctuation in a long paragraph", () => {
+    const parsed = markdownToDocument(
+      `2 * 3 = 6 and x < y in file_name ${"word ".repeat(1630)}**important** [source](source.md)`,
+    );
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toContainEqual({ type: "text", text: "important", marks: [{ type: "bold" }] });
+    expect(parsed.references).toEqual(["source.md"]);
+  });
+
+  it.each(["2*3", "a<b", "arr](x", "2 ** 3", "<https://example.com/_next>"])(
+    "keeps references after unmatched long-line punctuation: %s",
+    (prefix) => {
+      const parsed = markdownToDocument(`${prefix} ${"word ".repeat(1700)}[Spec](spec.md)`);
+      expect(parsed.references).toContain("spec.md");
+    },
+  );
+
+  it("keeps references in dense long paragraphs", () => {
+    const links = Array.from({ length: 1_000 }, (_, index) => `[L${index}](file${index}.md)`).join(" ");
+    const parsed = markdownToDocument(links);
+    expect(parsed.references).toHaveLength(1_000);
+    expect(parsed.references.at(-1)).toBe("file999.md");
+  });
+
+  it("bounds long paragraphs at whitespace without retrying the same section", () => {
+    const parsed = markdownToDocument(`*${"a ".repeat(5_000)}[end](end.md)`);
+    expect(parsed.references).toContain("end.md");
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content!.map((node) => node.text).join("")).toContain(
+      "end",
+    );
+  });
+
+  it("keeps rich links and code when a long paragraph crosses a section boundary", () => {
+    const parsed = markdownToDocument(`${"word ".repeat(1_700)}**[Title](page.md)** and \`code\``);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(parsed.references).toContain("page.md");
+    expect(content).toContainEqual({
+      type: "text",
+      text: "Title",
+      marks: [{ type: "bold" }, { type: "link", attrs: { href: "page.md" } }],
+    });
+    expect(content).toContainEqual({ type: "text", text: "code", marks: [{ type: "code" }] });
+  });
+
+  it("keeps a link whose label crosses the long-content cut", () => {
+    const parsed = markdownToDocument(`${"a".repeat(8170)} [see the full design doc](design.md) ${"b ".repeat(100)}*`);
+    expect(parsed.references).toContain("design.md");
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: "see the full design doc",
+      marks: [{ type: "link", attrs: { href: "design.md" } }],
+    });
+  });
+
+  it("keeps an image and a code-bearing link across long-content cuts", () => {
+    const parsed = markdownToDocument(
+      `${"x".repeat(8150)} ![a](https://example.com/${"z".repeat(100)}) [see \`useState\` docs](https://react.dev/x) tail`,
+    );
+    expect(parsed.references).toEqual([`https://example.com/${"z".repeat(100)}`, "https://react.dev/x"]);
+  });
+
+  it("keeps a link wrapped around a small image near a cut", () => {
+    const parsed = markdownToDocument(
+      `${"x".repeat(8180)} [![icon](data:image/png;base64,AAAA)](https://example.com) tail`,
+    );
+    expect(parsed.references).toContain("https://example.com");
+    expect(parsed.references).toContain("data:image/png;base64,AAAA");
+  });
+
+  it("keeps a link wrapped around a medium data image", () => {
+    const data = `data:image/png;base64,${"A".repeat(2_000)}`;
+    const parsed = markdownToDocument(`${"x".repeat(9_000)} [![icon](${data})](https://example.com) tail`);
+    expect(parsed.references.includes(data)).toBe(true);
+    expect(parsed.references.includes("https://example.com")).toBe(true);
+  });
+
+  it("keeps an outer link around a long image destination at a cut", () => {
+    const image = `https://example.com/${"a".repeat(2_000)}`;
+    const parsed = markdownToDocument(`${"x ".repeat(3_250)}[![alt](${image})](https://x.test) tail`);
+    expect(parsed.references.includes(image)).toBe(true);
+    expect(parsed.references.includes("https://x.test")).toBe(true);
+  });
+
+  it("keeps a code span ending in a backslash and a later link in long content", () => {
+    const parsed = markdownToDocument(`Use \`\\\` to escape. ${"word ".repeat(1700)}then \`x\` [later](later.md)`);
+    expect(parsed.references).toContain("later.md");
+    expect(JSON.stringify(parsed.document)).toContain('"text":"\\\\"');
+  });
+
+  it("does not pair an escaped backtick with the next real opener", () => {
+    const parsed = markdownToDocument(`\\\`\`code\` ${"word ".repeat(1700)}[later](later.md)`);
+    expect(parsed.references.includes("later.md")).toBe(true);
+    expect(JSON.stringify(parsed.document).includes('"text":"code","marks":[{"type":"code"}]')).toBe(true);
+  });
+
+  it("finds an enclosing link after a distant unmatched bracket", () => {
+    const parsed = markdownToDocument(`[0, 1) ${"x".repeat(8175)} [see \`useState\` docs](https://react.dev/x) tail`);
+    expect(parsed.references).toContain("https://react.dev/x");
+  });
+
+  it("keeps a second large data image after a stray backtick in the first label", () => {
+    const first = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const second = `data:image/png;base64,${"B".repeat(12_000)}`;
+    const parsed = markdownToDocument(`See ![a \` tick](${first}) ![b](${second}) then \`one\``);
+    expect(parsed.references).toEqual([first, second]);
+    expect(JSON.stringify(parsed.document)).not.toContain("B".repeat(10_000));
+  });
+
+  it("keeps medium data images atomic when a label has an unmatched backtick", () => {
+    const first = `data:image/png;base64,${"A".repeat(5_000)}`;
+    const second = `data:image/png;base64,${"B".repeat(5_000)}`;
+    const parsed = markdownToDocument(`See ![a \` tick](${first}) ![b](${second}) then \`one\``);
+    expect(parsed.references).toEqual([first, second]);
+    expect(JSON.stringify(parsed.document)).not.toContain("B".repeat(1_000));
+  });
+
+  it("keeps small data images atomic when a label has an unmatched backtick", () => {
+    const first = "data:image/png;base64,AAAA";
+    const second = "data:image/png;base64,BBBB";
+    const parsed = markdownToDocument(`See ![a \` tick](${first}) ![b](${second}) then \`one\` ${"x".repeat(9_000)}`);
+    expect(parsed.references).toEqual([first, second]);
+  });
+
+  it("keeps a link wrapped around an image with balanced label code", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`[![a \`b\` c](${image})](https://example.com/x) ${"x".repeat(9_000)}`);
+    expect(parsed.references).toContain(image);
+    expect(parsed.references).toContain("https://example.com/x");
+  });
+
+  it("keeps brackets inside image-label code from ending the image early", () => {
+    const image = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`![a \`]\` b](${image}) [end](end.md)`);
+    expect(parsed.references).toContain(image);
+    expect(parsed.references).toContain("end.md");
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1000));
+  });
+
+  it("keeps outer link and emphasis around a small image with unmatched label code", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(
+      `[![a \` b](${image})](https://example.com/x) *see ![a \` b](${image}) now* ${"x".repeat(9_000)}`,
+    );
+    expect(parsed.references).toContain(image);
+    expect(parsed.references).toContain("https://example.com/x");
+    expect(JSON.stringify(parsed.document)).not.toContain(`](${image})`);
+    expect(JSON.stringify(parsed.document)).toContain("italic");
+  });
+
+  it("keeps adjacent underscore emphasis while removing a data image", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`_note_![icon](${image}) ${"x".repeat(9_000)}`);
+    expect(parsed.references).toEqual([image]);
+    expect(JSON.stringify(parsed.document)).toContain('"type":"italic"');
+    expect(JSON.stringify(parsed.document)).not.toContain(`](${image})`);
+  });
+
+  it("keeps a later link after an earlier destination with code-like punctuation", () => {
+    const image = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`[a](a.md) [b](https://x.test/a\`b) ![i](${image}) and \`code\``);
+    expect(parsed.references).toEqual(["a.md", "https://x.test/a`b", image]);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
+  });
+
+  it("recognizes a long image after an unclosed destination inside a code span", () => {
+    const image = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`\`f[i](x\` then g(y) ![shot](${image})`);
+    expect(parsed.references).toContain(image);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1000));
+  });
+
+  it("does not recognize image syntax inside a link title", () => {
+    const parsed = markdownToDocument(
+      `[doc](https://x.test/p "see ![i \`x](data:image/png;base64,AAAA)") ${"x".repeat(9_000)}`,
+    );
+    expect(parsed.references).toEqual(["https://x.test/p"]);
+  });
+
+  it("re-pairs code around an image with unmatched label punctuation", () => {
+    const first = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const second = `data:image/png;base64,${"B".repeat(12_000)}`;
+    const parsed = markdownToDocument(`![a \` tick](${first}) \`start \`end  ![b](${second}) \`tail`);
+    expect(parsed.references).toEqual([first, second]);
+    expect(JSON.stringify(parsed.document)).not.toContain("B".repeat(1_000));
+  });
+
+  it("closes a multi-backtick code span after a literal backslash without swallowing a later link", () => {
+    const parsed = markdownToDocument("Path ``C:\\`` " + "word ".repeat(1_700) + "[later](later.md) more `x` tail");
+    expect(parsed.references).toContain("later.md");
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: "C:\\",
+      marks: [{ type: "code" }],
+    });
+  });
+
+  it("keeps references after many escaped backticks with no code opener", () => {
+    const parsed = markdownToDocument(`${"\\` ".repeat(100_001)}[later](later.md)`);
+    expect(parsed.references).toContain("later.md");
+  });
+
+  it("strips a small data image after the dense link candidate limit", () => {
+    const data = `data:image/png;base64,${"A".repeat(7_000)}`;
+    const parsed = markdownToDocument(`${"\\.[".repeat(140)} ![i](${data}) ${"x".repeat(8192)}`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
+  });
+
+  it("strips a case-insensitive data image at the maximum label length after dense candidates", () => {
+    const data = `DATA:image/png;base64,${"A".repeat(7_000)}`;
+    const parsed = markdownToDocument(`${"\\.[".repeat(140)} ![${"x".repeat(511)}](${data}) ${"x".repeat(8_192)}`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
+  });
+
+  it("uses original string offsets for case-insensitive images after Unicode case expansion", () => {
+    const data = `data:image/png;base64,${"A".repeat(6_000)}`;
+    const parsed = markdownToDocument(`${"\\.[".repeat(140)} ${"İ".repeat(600)} ![i](${data}) ${"x".repeat(8_192)}`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
+  });
+
+  it("keeps a nearby link when a later unclosed destination crosses a section cut", () => {
+    const parsed = markdownToDocument(
+      `${"x".repeat(8_100)} [a](a.md "t t") [c](${"x".repeat(8_300)} [later](later.md)`,
+    );
+    expect(parsed.references).toContain("a.md");
+    expect(parsed.references).toContain("later.md");
+  });
+
+  it("bounds repeated unclosed destinations across many sections", () => {
+    const parsed = markdownToDocument(("[a](b " + "x".repeat(8_200)).repeat(50) + " [end](end.md)");
+    expect(parsed.references).toContain("end.md");
+  });
+
+  it("rescans the newly visible window after an earlier destination has no close", () => {
+    const parsed = markdownToDocument(`[a](b ${"x".repeat(8_150)} [c](c.md "${"t ".repeat(60)}") ${"z".repeat(9_000)}`);
+    expect(parsed.references).toContain("c.md");
+  });
+
+  it("keeps a link after an unmatched bracket and a long title-bearing link", () => {
+    const ordinary = markdownToDocument(
+      `[0, 1) ${"word ".repeat(1630)}[link text here](https://example.com/x) ${"tail ".repeat(400)}*`,
+    );
+    expect(ordinary.references).toContain("https://example.com/x");
+    const dense = markdownToDocument(`[${"<? ".repeat(1_000)}](doc.md "Design") ${"\\.".repeat(5_000)}`);
+    expect(dense.references).toContain("doc.md");
+  });
+
+  it("keeps an escaped destination after dense markup", () => {
+    const parsed = markdownToDocument(`[${"<? ".repeat(1_000)}](a\\)b) ${"\\.".repeat(5_000)}`);
+    expect(parsed.references).toContain("a)b");
+  });
+
+  it("keeps a link when a dense-section boundary falls inside its destination", () => {
+    const parsed = markdownToDocument(
+      `${"\\.".repeat(100)} [doc](https://x.com/${"\\-".repeat(40)}) tail ${"x ".repeat(4200)}`,
+    );
+    expect(parsed.references).toContain(`https://x.com/${"-".repeat(40)}`);
+  });
+
+  it("keeps a link after dense escaped content without lexing the whole paragraph", () => {
+    const parsed = markdownToDocument(`${"\\.".repeat(10_000)} [late](late.md)`);
+    expect(parsed.references).toContain("late.md");
+  });
+
+  it("keeps links after unmatched backticks and backslashes in dense content", () => {
+    const unmatched = markdownToDocument(`${"\\.".repeat(200)} it's [late](late.md) ${"x ".repeat(4200)}`);
+    expect(unmatched.references).toContain("late.md");
+    const code = markdownToDocument(`${"\\.".repeat(200)} \`C:\\ a\` [after](after.md) ${"x ".repeat(4200)}`);
+    expect(code.references).toContain("after.md");
+  });
+
+  it("keeps a dense long link label without invoking recursive Marked label parsing", () => {
+    const parsed = markdownToDocument(`[${"<? ".repeat(2_000)}](dense.md) ${"\\.".repeat(5_000)}`);
+    expect(parsed.references).toContain("dense.md");
+  });
+
+  it("finishes malformed tags and escapes in a long paragraph", () => {
+    const parsed = markdownToDocument(`${"<? ".repeat(30_000)} ${"\\.".repeat(30_000)}`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+  });
+
+  it("bounds memory for a paragraph of backtick delimiters", () => {
+    const parsed = markdownToDocument("` ".repeat(100_001));
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+    expect(parsed.issues.some((issue) => issue.code === "inline_markup_simplified")).toBe(true);
+  });
+
+  it("removes large data-image payloads even when delimiter scanning is simplified", () => {
+    const data = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`${"` ".repeat(100_001)} ![a](${data})`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("finishes a long paragraph without spaces", () => {
+    const parsed = markdownToDocument(`*${"a".repeat(1_000_000)}`);
+    expect(
+      parsed.document.content![0]!.content![0]!.content![0]!.content!.map((node) => node.text).join(""),
+    ).toHaveLength(1_000_001);
+  });
+
+  it("keeps code-span brackets in a block image caption", () => {
+    const parsed = markdownToDocument("![a `]` b](image.png)");
+    expect(parsed.document.content![0]!.content![0]!.content![0]).toMatchObject({
+      type: "image",
+      attrs: { caption: "a `]` b", name: "a `]` b" },
+    });
+  });
+
+  it("unescapes a literal backslash in a block image caption only once", () => {
+    const parsed = markdownToDocument(String.raw`![a\\[b]](image.png)`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]).toMatchObject({
+      type: "image",
+      attrs: { caption: String.raw`a\[b]` },
+    });
+  });
+
+  it("does not scan a trailing long paragraph as one block image", () => {
+    const parsed = markdownToDocument(`![a](image.png) ${"*x ".repeat(3_000)})`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+    expect(parsed.references).toContain("image.png");
+  });
+
+  it("rejects a malformed image destination with dense emphasis", () => {
+    const parsed = markdownToDocument(`![a](x ${"*x ".repeat(20_000)})`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+  });
+
+  it.each([`![a](image.png "Smile :)")`, `![a](<image).png>)`, "![`C:\\`](image.png)"])(
+    "keeps a block image with a valid quoted or escaped label: %s",
+    (source) => {
+      const parsed = markdownToDocument(source);
+      expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("image");
+    },
+  );
+
+  it("uses Marked link and code rules in long content", () => {
+    const suffix = " word".repeat(1800);
+    const parsed = markdownToDocument(`[Bob's notes](Bob's%20notes%20abc123.md) \`a\`\`b\` [Spec](spec.md)${suffix}`);
+    expect(parsed.references).toEqual(["Bob's%20notes%20abc123.md", "spec.md"]);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: "a``b",
+      marks: [{ type: "code" }],
+    });
   });
 
   it.each([

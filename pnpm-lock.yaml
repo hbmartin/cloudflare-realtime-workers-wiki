@@ -56,12 +56,21 @@ importers:
       katex:
         specifier: 0.18.5
         version: 0.18.5
+      marked:
+        specifier: 16.4.2
+        version: 16.4.2
       mermaid:
         specifier: 11.17.2
         version: 11.17.2
       partyserver:
         specifier: 0.5.10
         version: 0.5.10(@cloudflare/workers-types@5.20260902.1)
+      prosemirror-model:
+        specifier: 1.25.11
+        version: 1.25.11
+      prosemirror-state:
+        specifier: 1.4.4
+        version: 1.4.4
       react:
         specifier: 19.2.8
         version: 19.2.8

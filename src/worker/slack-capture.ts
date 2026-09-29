@@ -7,7 +7,14 @@ import { captureMarkdown, MAX_CAPTURE_MARKDOWN_BYTES, MAX_CAPTURE_MESSAGES } fro
 import { slackApi, SlackApiError, type SlackHistoryMessage, type SlackInstallation } from "./slack";
 import { requireChannelMember, validateChannel, verifiedMember } from "./slack-threads";
 import { taskAssignees } from "./tasks";
+import { logger } from "./observability";
 import type { TaskStatus } from "../shared/tasks";
+
+export const SLACK_CAPTURE_PAGE_GONE_MESSAGE = "Saved to NoteFlare, but the page is no longer available.";
+
+export function isSlackCaptureId(value: string) {
+  return /^[0-9a-f]{32}$/.test(value);
+}
 
 export type SlackCaptureSource = {
   channelId: string;
@@ -57,6 +64,8 @@ type CaptureRow = {
   job_id: string | null;
   page_id: string | null;
   state: "pending" | "running" | "succeeded" | "failed";
+  error_category: string | null;
+  last_failed_job_attempt: number;
 };
 
 export function captureFeedbackStatement(
@@ -75,6 +84,51 @@ export function captureFeedbackStatement(
       )`,
     )
     .bind(state, JSON.stringify({ captureId, state }), timestamp, timestamp, captureId, state, state);
+}
+
+export function failCaptureForJobStatement(
+  db: Env["DB"],
+  captureId: string,
+  jobId: string,
+  jobAttempt: number,
+  timestamp: number,
+  generation: number | null = null,
+  status: "failed" | "final" | "any" = "any",
+) {
+  const retryFailedCapture = status === "final" ? "" : "OR (state='failed' AND last_failed_job_attempt<?)";
+  const jobStatusGuard = {
+    any: "",
+    failed: "AND status='failed'",
+    final: "AND status IN ('failed','canceled') AND cleanup_target IS NULL AND cleanup_token IS NULL AND updated_at=?",
+  }[status];
+  return db
+    .prepare(
+      `UPDATE slack_captures SET job_id=?,state='failed',
+       error_category=(SELECT CASE WHEN status IN ('canceling','canceled') THEN 'canceled'
+         ELSE COALESCE(NULLIF(error_code,''),'job_failed') END FROM jobs WHERE id=?),
+       attempt=CASE WHEN state='failed' THEN attempt+1 ELSE attempt END,
+       last_failed_job_attempt=?,updated_at=?
+     WHERE id=? AND (? IS NULL OR installation_generation=?)
+       AND ((job_id IS NULL AND state='pending') OR
+         (job_id=? AND (state='running' ${retryFailedCapture})))
+       AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND attempt=?
+         AND workspace_id=slack_captures.workspace_id AND requested_by=slack_captures.requested_by
+         ${jobStatusGuard})`,
+    )
+    .bind(
+      jobId,
+      jobId,
+      jobAttempt,
+      timestamp,
+      captureId,
+      generation,
+      generation,
+      jobId,
+      ...(status === "final" ? [] : [jobAttempt]),
+      jobId,
+      jobAttempt,
+      ...(status === "final" ? [timestamp] : []),
+    );
 }
 
 export async function claimSlackCapture(
@@ -143,6 +197,7 @@ export async function claimSlackCapture(
     .first<CaptureRow>();
   if (!capture || capture.request_hash !== requestHash || capture.requested_by !== input.member.user.id)
     throw new HttpError(409, "slack_capture_conflict", "This Slack source is already being saved elsewhere.");
+  await assertCaptureConflictCleared(env, capture);
   if (capture.installation_generation !== input.installation.generation && capture.state !== "succeeded") {
     const rebound = await env.DB.prepare(
       `UPDATE slack_captures SET installation_generation=?,updated_at=?
@@ -215,10 +270,11 @@ async function exactThreadMessage(
     const message = result.messages.find((item) => item.ts === messageTs);
     if (message) return message;
     cursor = result.response_metadata?.next_cursor || undefined;
-    if (result.has_more && !cursor) throw new Error("Slack did not return the next reply cursor.");
+    if (result.has_more && !cursor)
+      throw new HttpError(422, "slack_source", "Slack could not verify the selected reply. Retry the capture.");
     if (!cursor) throw new HttpError(404, "slack_source", "The Slack source is no longer available.");
   }
-  throw new Error("Slack reply pagination exceeded the verification limit.");
+  throw new HttpError(422, "slack_source", "Slack could not verify the selected reply. Retry the capture.");
 }
 
 async function sourceMessages(
@@ -269,7 +325,8 @@ async function sourceMessages(
     if (messages.length > MAX_CAPTURE_MESSAGES)
       throw new HttpError(422, "thread_too_large", "This thread exceeds the capture limit of 2,000 messages.");
     cursor = result.response_metadata?.next_cursor || undefined;
-    if (result.has_more && !cursor) throw new Error("Slack did not return the next thread cursor.");
+    if (result.has_more && !cursor)
+      throw new HttpError(422, "slack_source", "Slack could not verify the full thread. Retry the capture.");
   } while (cursor);
   if (!messages.some((message) => message.ts === capture.source_ts))
     throw new HttpError(404, "slack_source", "The Slack source is no longer available.");
@@ -386,6 +443,20 @@ async function deleteSupersededCaptureInputs(env: Env, capture: CaptureRow) {
   } while (cursor);
 }
 
+async function cleanupSupersededCaptureInputs(env: Env, capture: CaptureRow) {
+  try {
+    await deleteSupersededCaptureInputs(env, capture);
+  } catch (error) {
+    logger.error(
+      "slack.capture_input_cleanup.failed",
+      "slack",
+      "Old Slack capture inputs could not be removed.",
+      { captureId: capture.id },
+      error,
+    );
+  }
+}
+
 async function stageCaptureInput(
   env: Env,
   capture: CaptureRow,
@@ -424,6 +495,8 @@ async function stageCaptureInput(
 
 export async function resumeSlackCaptureJob(env: Env, captureId: string, jobId: string, attempt: number) {
   const capture = await env.DB.prepare(`SELECT * FROM slack_captures WHERE id=?`).bind(captureId).first<CaptureRow>();
+  if (capture?.state === "pending" && capture.job_id === null)
+    throw new HttpError(503, "slack_capture_link_pending", "The Slack capture receipt has not been linked yet.");
   if (!capture || capture.job_id !== jobId)
     throw new HttpError(409, "slack_capture_unavailable", "This Slack capture cannot be resumed.");
   if (capture.state !== "running" && (capture.state !== "failed" || attempt < 2))
@@ -433,7 +506,10 @@ export async function resumeSlackCaptureJob(env: Env, captureId: string, jobId: 
       .bind(jobId)
       .first<{ input_key: string | null }>();
     const inputKey = captureInputKey(capture);
-    if (current?.input_key === inputKey && (await env.BUCKET.head(inputKey))) return inputKey;
+    if (current?.input_key === inputKey && (await env.BUCKET.head(inputKey))) {
+      await cleanupSupersededCaptureInputs(env, capture);
+      return inputKey;
+    }
   }
   const { session, installation } = await authorizedCaptureContext(env, capture);
   const inputKey = await stageCaptureInput(env, capture, session, installation);
@@ -443,7 +519,7 @@ export async function resumeSlackCaptureJob(env: Env, captureId: string, jobId: 
     .bind(inputKey, Date.now(), jobId, attempt)
     .first<{ input_key: string }>();
   if (!input) throw new HttpError(409, "slack_capture_unavailable", "This Slack capture cannot be resumed.");
-  await deleteSupersededCaptureInputs(env, capture);
+  await cleanupSupersededCaptureInputs(env, capture);
   if (capture.state === "running") return input.input_key;
   const resumed = await env.DB.prepare(
     `UPDATE slack_captures SET state='running',error_category=NULL,attempt=attempt+1,updated_at=?
@@ -462,6 +538,7 @@ export async function retryFailedSlackCapture(env: Env, captureId: string) {
   if (!capture) throw new HttpError(404, "slack_capture_unavailable", "Reopen the capture form.");
   if (capture.state !== "failed" || capture.job_id) return capture;
   await authorizedCaptureContext(env, capture);
+  await assertCaptureConflictCleared(env, capture);
   const now = Date.now();
   await env.DB.batch([
     env.DB.prepare(
@@ -515,9 +592,13 @@ export async function deliverSlackCaptureFeedback(
       ? "Your Slack capture is queued. The page will appear after verification."
       : state === "succeeded" && capture.page_id
         ? `Saved to NoteFlare: ${origin}/?page=${encodeURIComponent(capture.page_id)}`
-        : capture.job_id
-          ? `Your Slack capture could not be saved. Open ${origin}/?activity=1 to review and retry it.`
-          : "Your Slack capture could not be saved. Use Retry capture in the Slack form.";
+        : state === "succeeded"
+          ? SLACK_CAPTURE_PAGE_GONE_MESSAGE
+          : capture.error_category === "slack_capture_job_conflict"
+            ? `Your Slack capture could not be saved because its job receipt conflicts with another request. Contact a workspace administrator, then use Retry capture.`
+            : capture.job_id
+              ? `Your Slack capture could not be saved. Open ${origin}/?activity=1 to review and retry it.`
+              : "Your Slack capture could not be saved. Use Retry capture in the Slack form.";
   await slackApi(env, installation, "chat.postEphemeral", {
     channel: capture.channel_id,
     user: session.slack_user_id,
@@ -525,41 +606,70 @@ export async function deliverSlackCaptureFeedback(
   });
 }
 
+async function failCaptureWithJob(env: Env, capture: CaptureRow, job: JobRow) {
+  const timestamp = Date.now();
+  await env.DB.batch([
+    failCaptureForJobStatement(env.DB, capture.id, job.id, job.attempt, timestamp, capture.installation_generation),
+    captureFeedbackStatement(env.DB, capture.id, "failed", timestamp),
+  ]);
+}
+
+async function failUnlinkedCapture(env: Env, capture: CaptureRow, category: string) {
+  const timestamp = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
+       WHERE id=? AND installation_generation=? AND state='pending' AND job_id IS NULL`,
+    ).bind(category, timestamp, capture.id, capture.installation_generation),
+    captureFeedbackStatement(env.DB, capture.id, "failed", timestamp),
+  ]);
+}
+
+async function assertCaptureJobOwner(
+  env: Env,
+  capture: CaptureRow,
+  job: Pick<JobRow, "workspace_id" | "requested_by"> | null,
+  stagedInputKey?: string,
+) {
+  if (!job || (job.workspace_id === capture.workspace_id && job.requested_by === capture.requested_by)) return;
+  await failUnlinkedCapture(env, capture, "slack_capture_job_conflict");
+  if (stagedInputKey) await env.BUCKET.delete(stagedInputKey);
+  throw new HttpError(409, "slack_capture_job_conflict", "The Slack capture job receipt could not be verified.");
+}
+
+async function assertCaptureConflictCleared(env: Env, capture: CaptureRow) {
+  if (capture.error_category !== "slack_capture_job_conflict") return;
+  const job = await env.DB.prepare(`SELECT workspace_id,requested_by FROM jobs WHERE id=?`)
+    .bind(capture.id)
+    .first<Pick<JobRow, "workspace_id" | "requested_by">>();
+  if (job && (job.workspace_id !== capture.workspace_id || job.requested_by !== capture.requested_by))
+    throw new HttpError(409, "slack_capture_job_conflict", "The Slack capture job receipt could not be verified.");
+}
+
 export async function prepareSlackCapture(env: Env, captureId: string): Promise<JobRow | null> {
   const capture = await env.DB.prepare(`SELECT * FROM slack_captures WHERE id = ?`).bind(captureId).first<CaptureRow>();
   if (!capture || capture.state === "succeeded" || capture.state === "failed") return null;
-  const { session, installation } = await authorizedCaptureContext(env, capture);
   const existingJob = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(capture.id).first<JobRow>();
   if (existingJob) {
-    if (existingJob.workspace_id !== capture.workspace_id || existingJob.requested_by !== capture.requested_by)
-      throw new Error("The Slack capture job receipt could not be verified.");
-    if (existingJob.status !== "queued" && existingJob.status !== "running") {
-      const failed = await env.DB.prepare(
-        `UPDATE slack_captures SET job_id=?,state='failed',error_category='job_failed',updated_at=?
-         WHERE id=? AND installation_generation=?
-           AND ((state='pending' AND job_id IS NULL) OR (state='running' AND job_id=?))`,
-      )
-        .bind(existingJob.id, Date.now(), capture.id, capture.installation_generation, existingJob.id)
-        .run();
-      if (failed.meta.changes) await captureFeedbackStatement(env.DB, capture.id, "failed", Date.now()).run();
-      return null;
-    }
+    await assertCaptureJobOwner(env, capture, existingJob);
     if (capture.state === "running" && capture.job_id === existingJob.id) {
-      await deleteSupersededCaptureInputs(env, capture);
-      return existingJob;
+      if (existingJob.status === "queued" || existingJob.status === "running")
+        await cleanupSupersededCaptureInputs(env, capture);
+      if (existingJob.status === "queued") return existingJob;
+      if (existingJob.status === "running") return null;
+      if (existingJob.status === "canceling" || existingJob.cleanup_target) return null;
+    }
+    if (existingJob.status !== "queued" && existingJob.status !== "running") {
+      await failCaptureWithJob(env, capture, existingJob);
+      return null;
     }
     if (capture.state !== "pending" || capture.job_id) throw new Error("The Slack capture receipt changed.");
     const inputKey = captureInputKey(capture);
     if (existingJob.status === "running" && existingJob.input_key !== inputKey) {
-      const failed = await env.DB.prepare(
-        `UPDATE slack_captures SET job_id=?,state='failed',error_category='job_failed',updated_at=?
-         WHERE id=? AND installation_generation=? AND state='pending' AND job_id IS NULL`,
-      )
-        .bind(existingJob.id, Date.now(), capture.id, capture.installation_generation)
-        .run();
-      if (failed.meta.changes) await captureFeedbackStatement(env.DB, capture.id, "failed", Date.now()).run();
+      await failCaptureWithJob(env, capture, existingJob);
       return null;
     }
+    const { session, installation } = await authorizedCaptureContext(env, capture);
     if (existingJob.status === "queued") await stageCaptureInput(env, capture, session, installation);
     const timestamp = Date.now();
     const linked = await env.DB.batch([
@@ -573,10 +683,17 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
            AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND input_key=? AND status IN ('queued','running'))`,
       ).bind(existingJob.id, timestamp, capture.id, capture.installation_generation, existingJob.id, inputKey),
     ]);
-    if (!linked[1]?.meta.changes) throw new Error("The Slack capture changed during job staging.");
-    await deleteSupersededCaptureInputs(env, capture);
+    if (!linked[1]?.meta.changes) {
+      const currentJob = await env.DB.prepare(`SELECT workspace_id,requested_by FROM jobs WHERE id=?`)
+        .bind(capture.id)
+        .first<Pick<JobRow, "workspace_id" | "requested_by">>();
+      await assertCaptureJobOwner(env, capture, currentJob, inputKey);
+      throw new Error("The Slack capture changed during job staging.");
+    }
+    await cleanupSupersededCaptureInputs(env, capture);
     return (await env.DB.prepare(`SELECT * FROM jobs WHERE id=?`).bind(existingJob.id).first<JobRow>())!;
   }
+  const { session, installation } = await authorizedCaptureContext(env, capture);
   const inputKey = await stageCaptureInput(env, capture, session, installation);
   const timestamp = Date.now();
   const options = {
@@ -610,14 +727,25 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
     env.DB.prepare(
       `UPDATE slack_captures SET job_id=?,state='running',attempt=attempt+1,updated_at=?
        WHERE id=? AND installation_generation=? AND state='pending' AND job_id IS NULL
-         AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND input_key=? AND status='queued')`,
-    ).bind(capture.id, timestamp, capture.id, capture.installation_generation, capture.id, inputKey),
+         AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND input_key=? AND status='queued'
+           AND workspace_id=? AND requested_by=?)`,
+    ).bind(
+      capture.id,
+      timestamp,
+      capture.id,
+      capture.installation_generation,
+      capture.id,
+      inputKey,
+      capture.workspace_id,
+      capture.requested_by,
+    ),
   ]);
   const job = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(capture.id).first<JobRow>();
   if (!linked[1]?.meta.changes) {
     const current = await env.DB.prepare(`SELECT installation_generation,job_id,state FROM slack_captures WHERE id=?`)
       .bind(capture.id)
       .first<Pick<CaptureRow, "installation_generation" | "job_id" | "state">>();
+    await assertCaptureJobOwner(env, capture, job, inputKey);
     if (current?.installation_generation !== capture.installation_generation) await env.BUCKET.delete(inputKey);
     if (current?.job_id !== job?.id || current?.state !== "running")
       throw new Error("The Slack capture changed during job staging.");
@@ -629,6 +757,6 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
     job.input_key !== inputKey
   )
     throw new Error("The Slack capture job receipt could not be verified.");
-  await deleteSupersededCaptureInputs(env, capture);
+  await cleanupSupersededCaptureInputs(env, capture);
   return job;
 }
