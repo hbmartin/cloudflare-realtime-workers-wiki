@@ -306,10 +306,56 @@ describe("import content", () => {
     expect(parsed.references.every((reference) => !reference.includes("¡"))).toBe(true);
   });
 
+  it("keeps short and non-HTTP autolinks literal when they contain image-shaped text", () => {
+    const http = "https://x.test/![i](data:image/png;base64,AAAA)";
+    const short = markdownToDocument(`<${http}>`);
+    const mailto = "mailto:a@b.c?x=![i](data:image/png;base64,AAAA)";
+    const long = markdownToDocument(`<${mailto}> ${"x".repeat(9_000)}`);
+    expect(short.references).toEqual([http]);
+    expect(long.references).toEqual([mailto]);
+    expect(long.references.some((reference) => reference.includes("¡"))).toBe(false);
+  });
+
+  it("keeps autolinks intact in dense inline content", () => {
+    const url = "https://x.test/![i](data:image/png;base64,AAAA)";
+    const parsed = markdownToDocument(`${"< ".repeat(140)}<${url}> ${"x".repeat(9_000)}`);
+    expect(parsed.references).toEqual([url]);
+  });
+
+  it("keeps escaped image labels literal in both inline paths", () => {
+    const data = "data:image/png;base64,AAAA";
+    for (const suffix of ["", ` ${"x".repeat(9_000)}`]) {
+      const parsed = markdownToDocument(`See ${String.raw`![\*star\* and \[x\](Other/page.md)](${data})`}` + suffix);
+      const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+      expect(content.map((node) => node.text ?? "").join("")).toContain("*star* and [x](Other/page.md)");
+      expect(content.every((node) => !node.marks?.some((mark) => mark.type === "link" || mark.type === "italic"))).toBe(
+        true,
+      );
+      expect(parsed.references).toEqual([data]);
+    }
+  });
+
+  it("does not recover an image inside an unfinished code span", () => {
+    const source = "See ![a `b](data:image/png;base64,AAAA) then `";
+    for (const suffix of ["", ` ${"x".repeat(9_000)}`]) {
+      const parsed = markdownToDocument(source + suffix);
+      expect(parsed.references).toEqual([]);
+      expect(parsed.issues.some((issue) => issue.code === "image_not_imported")).toBe(false);
+    }
+  });
+
   it("records inline image and link references in source order", () => {
     const image = "data:image/png;base64,AAAA";
     const parsed = markdownToDocument(`![i](${image}) [page](page.md) ${"x".repeat(9_000)}`);
     expect(parsed.references).toEqual([image, "page.md"]);
+  });
+
+  it("records an image inside a link before its containing link", () => {
+    const image = "data:image/png;base64,AAAA";
+    for (const prefix of ["", "< ".repeat(140)]) {
+      const parsed = markdownToDocument(`${prefix}[![i](${image})](page.md) ${"x".repeat(9_000)}`);
+      expect(parsed.references).toEqual([image, "page.md"]);
+    }
   });
 
   it("keeps a replaced image atomic across a CJK section cut", () => {
@@ -338,16 +384,24 @@ describe("import content", () => {
     const parsed = markdownToDocument(images.map((image, index) => `![item${index}](${image})`).join(" "));
     expect(parsed.references).toEqual(images);
     const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
-    expect(content.map((node) => node.text ?? "").join("")).toContain("item999");
+    expect(content.map((node) => node.text ?? "").join("")).toBe(images.map((_, index) => `item${index}`).join(" "));
   });
 
   it("keeps data images atomic after more images than available marker characters", () => {
     const image = `data:image/png;base64,${"Z".repeat(5_000)}`;
     const many = Array.from({ length: 5_000 }, (_, index) => `![i${index}](data:image/png;base64,AAAA)`).join(" ");
     const parsed = markdownToDocument(`${many} ![a \` tick](${image})`);
-    expect(parsed.references).toHaveLength(5_001);
     expect(parsed.references.at(-1)).toBe(image);
+    expect(parsed.references).toHaveLength(5_001);
     expect(JSON.stringify(parsed.document)).not.toContain("Z".repeat(1_000));
+  });
+
+  it("keeps a link around a small image when marker characters run out", () => {
+    const many = Array.from({ length: 5_000 }, (_, index) => `![i${index}](data:image/png;base64,AAAA)`).join(" ");
+    const parsed = markdownToDocument(`${many} [![last](data:image/png;base64,AAAA)](https://x.test)`);
+    expect(parsed.references.at(-1)).toBe("https://x.test");
+    expect(parsed.references.at(-2)).toBe("data:image/png;base64,AAAA");
+    expect(parsed.references).toHaveLength(5_002);
   });
 
   it("keeps adjacent titled data images out of paragraph text", () => {
