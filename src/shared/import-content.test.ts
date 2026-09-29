@@ -51,6 +51,17 @@ describe("import content", () => {
     },
   );
 
+  it.each([
+    ["\\**foo*", "*", "foo", ""],
+    ["**a***b*", "a", "b", ""],
+    ["*foo**", "", "foo", "*"],
+    ["\\__foo_", "_", "foo", ""],
+  ])("keeps italic spans adjacent to consumed delimiters: %s", (source, prefix, italic, suffix) => {
+    const content = markdownToDocument(source).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content.some((node) => node.text === italic && node.marks?.[0]?.type === "italic")).toBe(true);
+    expect(content.map((node) => node.text).join("")).toBe(`${prefix}${italic}${suffix}`);
+  });
+
   it("scans long unclosed emphasis with backslashes without backtracking", () => {
     const source = `**Path ${"\\alpha ".repeat(90)}`;
     const parsed = markdownToDocument(source);

@@ -1906,19 +1906,22 @@ export async function consumeDeliveryMessage(
       if (job) await startJobExecution(env, job);
     } catch (error) {
       if (error instanceof HttpError && error.status >= 400 && error.status < 500 && error.status !== 429) {
-        const failed = await env.DB.prepare(
-          `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
-           WHERE id=? AND job_id IS NULL AND state IN ('pending','running')
-             AND installation_generation=? AND attempt=?`,
-        )
-          .bind(
+        const timestamp = Date.now();
+        const failedBatch = await env.DB.batch([
+          env.DB.prepare(
+            `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
+             WHERE id=? AND job_id IS NULL AND state IN ('pending','running')
+               AND installation_generation=? AND attempt=?`,
+          ).bind(
             error.code,
-            Date.now(),
+            timestamp,
             payload.captureId,
             expected?.installation_generation ?? -1,
             expected?.attempt ?? -1,
-          )
-          .run();
+          ),
+          captureFeedbackStatement(env.DB, payload.captureId, "failed", timestamp),
+        ]);
+        const failed = failedBatch[0]!;
         if (!failed.meta.changes) {
           const current = await env.DB.prepare(`SELECT job_id,state FROM slack_captures WHERE id=?`)
             .bind(payload.captureId)
@@ -1928,7 +1931,6 @@ export async function consumeDeliveryMessage(
           message.retry({ delaySeconds: 2 });
           return "retried";
         }
-        await captureFeedbackStatement(env.DB, payload.captureId, "failed", Date.now()).run();
         return await rejectPayload(error.code);
       }
       throw error;

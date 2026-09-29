@@ -3,6 +3,7 @@ import {
   authorizeSlackCaptureJobRetry,
   deliverSlackCaptureFeedback,
   prepareSlackCapture,
+  resumeSlackCaptureJob,
   retryFailedSlackCapture,
 } from "./slack-capture";
 import { listTasks, mutateTask, taskListStatements } from "./tasks";
@@ -5166,7 +5167,7 @@ describe("Slack documents and tasks", () => {
     expect(await staged!.text()).toContain("Selected reply");
     expect(await (await env.BUCKET.get(job!.input_key!))!.text()).not.toContain("Other reply");
   });
-  it("retries a reply lookup when Slack reports more pages without a cursor", async () => {
+  it("fails a reply lookup with feedback when Slack reports more pages without a cursor", async () => {
     replyFirstParent = true;
     replyMissingCursor = true;
     threadHistoryPages = [[{ ts: "1700000101.000001", thread_ts: "1700000100.000001", user: "UOWNER", text: "Reply" }]];
@@ -5176,7 +5177,26 @@ describe("Slack documents and tasks", () => {
     )
       .bind(captureId)
       .run();
-    await expect(prepareSlackCapture(runtime(), captureId)).rejects.toThrow("next reply cursor");
+    const ack = vi.fn();
+    expect(
+      await consumeDeliveryMessage(runtime(), {
+        id: "missing-reply-cursor",
+        timestamp: new Date(),
+        body: { outboxId: `slack-capture:${captureId}` },
+        attempts: 1,
+        ack,
+        retry: vi.fn(),
+      } as unknown as Message<DeliveryQueueMessage>),
+    ).toBe("discarded");
+    expect(ack).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare("SELECT state,error_category FROM slack_captures WHERE id=?").bind(captureId).first(),
+    ).toEqual({ state: "failed", error_category: "slack_source" });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
+      ).first(),
+    ).toEqual({ count: 1 });
     expect(await env.DB.prepare("SELECT count(*) count FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
       count: 0,
     });
@@ -5437,29 +5457,23 @@ describe("Slack documents and tasks", () => {
   it("reuses a linked running job on duplicate capture delivery", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Duplicate delivery");
     const job = await prepareSlackCapture(runtime(), captureId);
+    const priorSlackCalls = calls.length;
     expect(await prepareSlackCapture(runtime(), captureId)).toMatchObject({ id: job!.id, input_key: job!.input_key });
+    expect(calls).toHaveLength(priorSlackCalls);
+    await env.DB.prepare("UPDATE jobs SET status='running' WHERE id=?").bind(captureId).run();
+    expect(await prepareSlackCapture(runtime(), captureId)).toBeNull();
+    expect(calls).toHaveLength(priorSlackCalls);
     expect(await env.DB.prepare("SELECT attempt FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
       attempt: 1,
     });
   });
-  it("acknowledges a stale duplicate when its linked capture loses authorization", async () => {
+  it("returns a linked duplicate without reauthorizing its Slack source", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Stale duplicate");
-    await prepareSlackCapture(runtime(), captureId);
+    const job = await prepareSlackCapture(runtime(), captureId);
     await env.DB.prepare("UPDATE slack_user_links SET migration_state='legacy' WHERE user_id='owner'").run();
-    const ack = vi.fn();
-    const retry = vi.fn();
-    expect(
-      await consumeDeliveryMessage(runtime(), {
-        id: "stale-duplicate-capture",
-        timestamp: new Date(),
-        body: { outboxId: `slack-capture:${captureId}` },
-        attempts: 1,
-        ack,
-        retry,
-      } as unknown as Message<DeliveryQueueMessage>),
-    ).toBe("discarded");
-    expect(ack).toHaveBeenCalledOnce();
-    expect(retry).not.toHaveBeenCalled();
+    const priorSlackCalls = calls.length;
+    expect(await prepareSlackCapture(runtime(), captureId)).toMatchObject({ id: job!.id });
+    expect(calls).toHaveLength(priorSlackCalls);
     expect(await env.DB.prepare("SELECT state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
       state: "running",
     });
@@ -5651,6 +5665,32 @@ describe("Slack documents and tasks", () => {
     expect(await env.DB.prepare("SELECT job_id,state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
       job_id: captureId,
       state: "running",
+    });
+  });
+  it("retries a queued orphan job while its capture receipt is still unlinked", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Queued orphan");
+    await expect(resumeSlackCaptureJob(runtime(), captureId, captureId, 1)).rejects.toMatchObject({
+      status: 503,
+      code: "slack_capture_link_pending",
+    });
+  });
+  it("does not link a colliding job inserted while the transcript is staged", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Colliding job");
+    const inputKey = `jobs/${captureId}/input/slack-0.md`;
+    beforeResponse = async (method) => {
+      if (method !== "chat.getPermalink") return;
+      beforeResponse = undefined;
+      await env.DB.prepare(
+        `INSERT INTO jobs(id,workspace_id,space_id,type,status,requested_by,input_key,created_at,updated_at)
+         VALUES(?,'workspace','workspace-general','import','queued','viewer',?,?,?)`,
+      )
+        .bind(captureId, inputKey, Date.now(), Date.now())
+        .run();
+    };
+    await expect(prepareSlackCapture(runtime(), captureId)).rejects.toThrow("changed during job staging");
+    expect(await env.DB.prepare("SELECT job_id,state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      job_id: null,
+      state: "pending",
     });
   });
   it("links an orphan failed job to a failed receipt for Activities retry", async () => {

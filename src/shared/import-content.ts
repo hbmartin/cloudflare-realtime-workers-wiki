@@ -142,10 +142,18 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
   // Escapes are a scanner alternative, so delimiters inside code spans stay
   // literal while escaped punctuation outside them cannot open formatting.
   const pattern =
-    /\\([\\`*_{}[\]()#+\-.!|>~])|(!?)\[((?:\\.|[^\]\\])*)\]\(|\*\*((?:\\.|[^\\*])+)\*\*|__((?:\\.|[^\\_])+)__|`([^`]+)`|(?<!\*)\*(?!\*)((?:\\.|[^\\*])+)\*(?!\*)|(?<!_)_(?!_)((?:\\.|[^\\_])+)_(?!\w|_)/g;
+    /\\([\\`*_{}[\]()#+\-.!|>~])|(!?)\[((?:\\.|[^\]\\])*)\]\(|\*\*((?:\\.|[^\\*])+)\*\*|__((?:\\.|[^\\_])+)__|`([^`]+)`|\*(?!\*)((?:\\.|[^\\*])+)\*|_(?!_)((?:\\.|[^\\_])+)_(?!\w)/g;
   let offset = 0;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(value))) {
+    // A delimiter consumed by an escape or bold span can precede a new
+    // italic span. Only reject a second delimiter still in the plain text.
+    const isItalic = match[7] !== undefined || match[8] !== undefined;
+    const delimiter = match[7] !== undefined ? "*" : "_";
+    if (isItalic && match.index > offset && value[match.index - 1] === delimiter) {
+      pattern.lastIndex = match.index + 1;
+      continue;
+    }
     append(value.slice(offset, match.index));
     const [whole, escaped, image, label, boldA, boldB, code, italicA, italicB] = match;
     if (escaped !== undefined) {

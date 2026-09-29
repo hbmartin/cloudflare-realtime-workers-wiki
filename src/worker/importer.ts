@@ -1593,8 +1593,13 @@ async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
         throw error;
       }
     });
-    if (!resumed.ok) throw new HttpError(resumed.status, resumed.code, resumed.message);
-    job.input_key = resumed.inputKey;
+    // Workflows may replay a result cached by the preceding deployment, when
+    // this step returned only the input key string.
+    if (typeof resumed === "string") job.input_key = resumed;
+    else {
+      if (!resumed.ok) throw new HttpError(resumed.status, resumed.code, resumed.message);
+      job.input_key = resumed.inputKey;
+    }
   }
   // A deployment can supersede confirmation while a workflow is queued or suspended.
   const refreshing = options.confirmed && !hasCurrentImportConfirmation(options);
