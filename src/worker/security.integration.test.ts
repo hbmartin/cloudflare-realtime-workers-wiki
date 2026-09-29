@@ -1598,13 +1598,20 @@ describe("security lifecycle regressions", () => {
 
   it("restores the strict three-per-ten-second password limit for one source", async () => {
     await enrollAccount(await bootstrap());
-    for (let i = 0; i < 3; i++)
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      for (let i = 0; i < 3; i++)
+        expect(
+          (await request("", "/api/auth/sign-in/email", { email: "owner@example.test", password: "password123" }))
+            .status,
+        ).toBe(200);
       expect(
         (await request("", "/api/auth/sign-in/email", { email: "owner@example.test", password: "password123" })).status,
-      ).toBe(200);
-    expect(
-      (await request("", "/api/auth/sign-in/email", { email: "owner@example.test", password: "password123" })).status,
-    ).toBe(429);
+      ).toBe(429);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("restores the strict three-per-ten-second two-factor limit for one source", async () => {
