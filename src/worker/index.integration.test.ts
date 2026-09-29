@@ -772,7 +772,9 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     const disabledEnv = new Proxy(env, {
       get(target, property, receiver) {
-        return property === "EXPANDED_EMBEDS_ENABLED" ? "false" : Reflect.get(target, property, receiver);
+        return property === "EXPANDED_EMBEDS_ENABLED" || property === "OFFLINE_EDITING_ENABLED"
+          ? "false"
+          : Reflect.get(target, property, receiver);
       },
     });
     const me = await worker.fetch(
@@ -780,7 +782,7 @@ describe("Worker integration", () => {
       disabledEnv,
       createExecutionContext(),
     );
-    expect((await me.json<{ features: { expandedEmbeds: boolean } }>()).features.expandedEmbeds).toBe(false);
+    expect(await me.json()).toMatchObject({ features: { expandedEmbeds: false, offlineEditing: false } });
     const preview = await worker.fetch(
       authenticatedRequest(installed.cookie, "/api/link-previews", {
         method: "POST",

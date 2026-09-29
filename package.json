@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "vite",
     "dev:e2e": "node scripts/e2e-server.mjs",
-    "build": "pnpm typecheck && vite build",
+    "build": "pnpm typecheck && vite build && node scripts/build-offline-worker.mjs",
     "build:worker": "wrangler deploy --env production --dry-run --outdir .wrangler/dry-run",
     "preview": "vite preview",
     "test": "pnpm test:unit && pnpm test:worker",
@@ -71,6 +71,8 @@
     "marked": "16.4.2",
     "mermaid": "11.17.2",
     "partyserver": "0.5.10",
+    "prosemirror-model": "1.25.11",
+    "prosemirror-state": "1.4.4",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-qr-code": "2.2.0",

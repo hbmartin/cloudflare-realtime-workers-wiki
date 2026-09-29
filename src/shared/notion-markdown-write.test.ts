@@ -50,6 +50,74 @@ describe("writable Notion Markdown", () => {
     expect(content.map((node) => node.text ?? "").join("")).toContain("Cost $12 and $5. Escaped $x$");
   });
 
+  it("keeps adjacent dollar delimiters out of inline math", () => {
+    const content = parseWritableMarkdown("Energy: $$E=mc^2$$\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([]);
+    expect(content.map((node) => node.text ?? "").join("")).toBe("Energy: $$E=mc^2$$");
+  });
+
+  it("round trips adjacent inline math without treating it as display math", () => {
+    const content = parseWritableMarkdown("Values $a$$b$ end.\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "a" } },
+      { type: "inlineMath", attrs: { formula: "b" } },
+    ]);
+  });
+
+  it("parses inline math immediately after an escaped literal dollar", () => {
+    const content = parseWritableMarkdown("Price \\$$x$ today.\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "x" } },
+    ]);
+    expect(content.map((node) => node.text ?? "").join("")).toContain("Price $");
+  });
+
+  it("keeps math inside a single emphasis token inside that formatting", () => {
+    const content = parseWritableMarkdown("**Before $x+1$ after**\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "x+1" } },
+    ]);
+    expect(content.filter((node) => node.type === "text").map((node) => node.marks)).toEqual([
+      [{ type: "bold" }],
+      [{ type: "bold" }],
+    ]);
+  });
+
+  it("preserves escaped formula characters across inline lexer tokens", () => {
+    const content = parseWritableMarkdown("Set $A = \\{1,2\\}$ and $B = \\\\alpha$.\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "A = \\{1,2\\}" } },
+      { type: "inlineMath", attrs: { formula: "B = \\\\alpha" } },
+    ]);
+  });
+
+  it("keeps formulas intact across emphasis and HTML lexer tokens", () => {
+    const content = parseWritableMarkdown("Set $a*b*c$ and $x<y>z$.\n")[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "a*b*c" } },
+      { type: "inlineMath", attrs: { formula: "x<y>z" } },
+    ]);
+  });
+
+  it("keeps escaped block-start text together and decodes image captions", () => {
+    const paragraph = parseWritableMarkdown("1\\. Not a list\n")[0]!.content![0]!;
+    expect(paragraph.type).toBe("paragraph");
+    expect(paragraph.content).toEqual([{ type: "text", text: "1. Not a list" }]);
+    const image = parseWritableMarkdown("![Revenue \\$5M](https://example.com/chart.png)\n")[0]!.content![0]!;
+    expect(image.attrs?.caption).toBe("Revenue $5M");
+  });
+
+  it("counts delimiters after a backtick line that is not a code fence", () => {
+    expect(() => parseWritableMarkdown("```x```\n" + "![x]".repeat(3_000))).toThrow("too many markup delimiters");
+  });
+
+  it.each(["```\n```~\n", "- ```\n  x\n  ```\n", "```\n```\r"])(
+    "counts markup after a fence that Marked closes: %s",
+    (prefix) => {
+      expect(() => parseWritableMarkdown(prefix + "![x]".repeat(3_000))).toThrow("too many markup delimiters");
+    },
+  );
+
   it.each([
     '<unknown url="notion://blocks/id"/>',
     "<script>alert(1)</script>",

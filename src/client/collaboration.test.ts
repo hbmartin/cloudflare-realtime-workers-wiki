@@ -1,14 +1,29 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createCollaboration, createNetworkCollaboration, createWorkspaceEvents } from "./collaboration";
+import {
+  createCollaboration,
+  createNetworkCollaboration,
+  createWorkspaceEvents,
+  loadOfflineCopy,
+  waitForOfflinePersistence,
+} from "./collaboration";
+import { LOCAL_SIGNOUT_KEY } from "./offline-catalog";
 
 const mocks = vi.hoisted(() => ({
   whenSynced: new Promise<void>(() => undefined),
+  dbOpen: Promise.resolve({} as IDBDatabase),
+  persistenceNames: [] as string[],
   providers: [] as Array<{
     synced: boolean;
+    wsconnected: boolean;
+    wsconnecting: boolean;
+    shouldConnect: boolean;
     sendMessage: ReturnType<typeof vi.fn>;
     connect: ReturnType<typeof vi.fn>;
+    connectBc: ReturnType<typeof vi.fn>;
+    reconnect: ReturnType<typeof vi.fn>;
+    _reconnectWS: () => Promise<void>;
     disconnect: ReturnType<typeof vi.fn>;
     destroy: ReturnType<typeof vi.fn>;
     emit(event: string, value: unknown): void;
@@ -25,7 +40,11 @@ function deferred<T>() {
 
 vi.mock("y-indexeddb", () => ({
   IndexeddbPersistence: class {
+    constructor(name: string) {
+      mocks.persistenceNames.push(name);
+    }
     whenSynced = mocks.whenSynced;
+    _db = mocks.dbOpen;
     destroy = vi.fn(async () => undefined);
   },
 }));
@@ -33,9 +52,21 @@ vi.mock("y-indexeddb", () => ({
 vi.mock("y-partyserver/provider", () => ({
   default: class {
     synced = false;
+    wsconnected = false;
+    wsconnecting = false;
+    shouldConnect = false;
     sendMessage = vi.fn();
-    connect = vi.fn(async () => undefined);
-    disconnect = vi.fn();
+    connect = vi.fn(async () => {
+      this.shouldConnect = true;
+    });
+    connectBc = vi.fn();
+    reconnect = vi.fn(async () => undefined);
+    _reconnectWS = async () => {
+      await this.reconnect();
+    };
+    disconnect = vi.fn(() => {
+      this.shouldConnect = false;
+    });
     destroy = vi.fn();
     awareness = { setLocalState: vi.fn() };
     private readonly handlers = new Map<string, Set<(value: unknown) => void>>();
@@ -84,12 +115,36 @@ vi.mock("yjs", () => ({
 }));
 
 describe("collaboration durability barriers", () => {
+  it("bounds a copy load whose IndexedDB open never resolves", async () => {
+    const persistence = {
+      _db: new Promise<IDBDatabase>(() => undefined),
+      whenSynced: new Promise<void>(() => undefined),
+    } as unknown as Parameters<typeof waitForOfflinePersistence>[0];
+    await Promise.all([
+      expect(waitForOfflinePersistence(persistence)).rejects.toThrow(
+        "Offline document storage did not finish loading.",
+      ),
+      vi.advanceTimersByTimeAsync(30_000),
+    ]);
+  });
+
   beforeEach(() => {
+    mocks.dbOpen = Promise.resolve({} as IDBDatabase);
     vi.useFakeTimers();
     vi.setSystemTime(0);
     vi.spyOn(Math, "random").mockReturnValue(1);
     mocks.whenSynced = new Promise<void>(() => undefined);
     mocks.providers.length = 0;
+    mocks.persistenceNames.length = 0;
+    const stored = new Map<string, string>();
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      value: {
+        clear: () => stored.clear(),
+        getItem: (key: string) => stored.get(key) ?? null,
+        setItem: (key: string, value: string) => stored.set(key, value),
+      },
+    });
   });
 
   afterEach(() => {
@@ -99,7 +154,7 @@ describe("collaboration durability barriers", () => {
   });
 
   it("preserves the original deadline when a barrier cannot yet be sent", async () => {
-    const bundle = createCollaboration("workspace", "page", 1, vi.fn());
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user");
     const doc = bundle.doc as typeof bundle.doc & { emitUpdate: (origin: unknown) => void };
     const provider = mocks.providers[0]!;
 
@@ -114,6 +169,52 @@ describe("collaboration durability barriers", () => {
 
     expect(provider.sendMessage).toHaveBeenCalledOnce();
     bundle.destroy();
+  });
+
+  it("separates local Yjs stores by account", () => {
+    const first = createCollaboration("workspace", "page", 1, vi.fn(), "user-a");
+    const second = createCollaboration("workspace", "page", 1, vi.fn(), "user-b");
+    expect(mocks.persistenceNames).toEqual(["account:user-a:workspace:page:1:2", "account:user-b:workspace:page:1:2"]);
+    first.destroy();
+    second.destroy();
+  });
+
+  it("registers each store and blocks new stores and copy readers while the account is signing out", async () => {
+    localStorage.clear();
+    const first = createCollaboration("workspace", "page", 1, vi.fn(), "user");
+    const key = "account:user:workspace:page:1:2";
+    expect(localStorage.getItem(`noteflare-document-keys:user\u0000workspace\u0000${key}`)).toBe("1");
+    localStorage.setItem(LOCAL_SIGNOUT_KEY, "user\u0000workspace");
+    expect(() => createCollaboration("workspace", "other", 1, vi.fn(), "user")).toThrow(
+      "Local sign-out is removing offline documents.",
+    );
+    await expect(loadOfflineCopy(key)).rejects.toThrow("Local sign-out is removing offline documents.");
+    expect(mocks.persistenceNames).toEqual([key]);
+    first.destroy();
+    localStorage.clear();
+  });
+
+  it("keeps online collaboration available when enumeration can replace a full registry", () => {
+    const originalIndexedDb = Object.getOwnPropertyDescriptor(globalThis, "indexedDB");
+    Object.defineProperty(globalThis, "indexedDB", {
+      configurable: true,
+      value: { databases: vi.fn(async () => []) },
+    });
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
+      throw new DOMException("Storage full", "QuotaExceededError");
+    });
+    try {
+      const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user");
+      expect(mocks.persistenceNames).toEqual(["account:user:workspace:page:1:2"]);
+      expect(error).toHaveBeenCalled();
+      bundle.destroy();
+    } finally {
+      setItem.mockRestore();
+      error.mockRestore();
+      if (originalIndexedDb) Object.defineProperty(globalThis, "indexedDB", originalIndexedDb);
+      else Reflect.deleteProperty(globalThis, "indexedDB");
+    }
   });
 
   it("bounds diagram durability latency while retaining the quiet-period debounce", async () => {
@@ -162,12 +263,11 @@ describe("collaboration durability barriers", () => {
     const onStatus = vi.fn();
     const error = new Error("token refresh failed");
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const bundle = createCollaboration("workspace", "page", 1, onStatus);
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
     const provider = mocks.providers[0]!;
     provider.connect.mockRejectedValueOnce(error);
 
-    await Promise.resolve();
-    await Promise.resolve();
+    await bundle.ready;
     await Promise.resolve();
 
     expect(onStatus).toHaveBeenCalledWith("offline");
@@ -178,12 +278,72 @@ describe("collaboration durability barriers", () => {
     bundle.destroy();
   });
 
+  it("checks access again before the provider's automatic reconnect", async () => {
+    mocks.whenSynced = Promise.resolve();
+    const beforeConnect = vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user", beforeConnect);
+    const provider = mocks.providers[0]!;
+    await bundle.ready;
+    expect(provider.connect).toHaveBeenCalledOnce();
+
+    await provider["_reconnectWS"]();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(beforeConnect).toHaveBeenCalledTimes(2);
+    expect(provider.connect).toHaveBeenCalledOnce();
+    expect(provider.disconnect).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
+  it("uses the provider's socket-only reconnect after checking access", async () => {
+    mocks.whenSynced = Promise.resolve();
+    const beforeConnect = vi.fn().mockResolvedValue(true);
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user", beforeConnect);
+    const provider = mocks.providers[0]!;
+    await bundle.ready;
+    await provider["_reconnectWS"]();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(beforeConnect).toHaveBeenCalledTimes(2);
+    expect(provider.connect).toHaveBeenCalledOnce();
+    expect(provider.reconnect).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
+  it("re-enables a connection when a hidden tab returns before its socket closes", async () => {
+    mocks.whenSynced = Promise.resolve();
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user");
+    const provider = mocks.providers[0]!;
+    await bundle.ready;
+    provider.wsconnected = true;
+    (provider.disconnect as () => void)();
+    document.dispatchEvent(new Event("visibilitychange"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(provider.connect).toHaveBeenCalledTimes(2);
+    expect(provider.shouldConnect).toBe(true);
+    bundle.destroy();
+  });
+
+  it("keeps a connected status when the tab becomes visible", async () => {
+    mocks.whenSynced = Promise.resolve();
+    const onStatus = vi.fn();
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
+    const provider = mocks.providers[0]!;
+    await bundle.ready;
+    provider.wsconnected = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(onStatus).toHaveBeenLastCalledWith("connected");
+    expect(provider.connect).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
   it("fails closed when offline storage fails to open", async () => {
     const error = new Error("IndexedDB unavailable");
     mocks.whenSynced = Promise.reject(error);
     const onStatus = vi.fn();
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const bundle = createCollaboration("workspace", "page", 1, onStatus);
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
     const provider = mocks.providers[0]!;
 
     await expect(bundle.ready).rejects.toBe(error);
@@ -194,15 +354,44 @@ describe("collaboration durability barriers", () => {
     bundle.destroy();
   });
 
+  it("reports an IndexedDB open rejection even when synchronization never settles", async () => {
+    const error = new Error("IndexedDB open failed");
+    mocks.dbOpen = Promise.reject(error);
+    const onStatus = vi.fn();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
+
+    await expect(bundle.ready).rejects.toBe(error);
+    expect(logged).toHaveBeenCalledWith("Failed to load offline document state", error);
+    expect(onStatus).toHaveBeenCalledWith("offline");
+    expect(mocks.providers[0]?.connect).not.toHaveBeenCalled();
+    bundle.destroy();
+  });
+
+  it("allows a slow IndexedDB copy to become ready after the loading deadline", async () => {
+    const storage = deferred<void>();
+    mocks.whenSynced = storage.promise;
+    const onStatus = vi.fn();
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
+    await Promise.all([
+      expect(bundle.ready).rejects.toThrow("Offline document storage did not finish loading."),
+      vi.advanceTimersByTimeAsync(30_000),
+    ]);
+    expect(mocks.providers[0]?.connect).not.toHaveBeenCalled();
+    storage.resolve();
+    await bundle.lateReady;
+    expect(mocks.providers[0]?.connect).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
   it("disconnects a collaboration connection that completes after destroy", async () => {
     const connection = deferred<void>();
     mocks.whenSynced = Promise.resolve();
-    const bundle = createCollaboration("workspace", "page", 1, vi.fn());
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user");
     const provider = mocks.providers[0]!;
     provider.connect.mockReturnValue(connection.promise);
 
-    await Promise.resolve();
-    await Promise.resolve();
+    await bundle.ready;
     expect(provider.connect).toHaveBeenCalledOnce();
 
     bundle.destroy();

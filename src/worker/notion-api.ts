@@ -16,6 +16,7 @@ import { MAX_MARKDOWN_BLOCKS, MAX_UNKNOWN_BLOCK_IDS, projectNotionMarkdown } fro
 import { parseMarkdownCommand } from "../shared/notion-markdown-commands";
 import { markdownEditTargets, markdownMutations } from "../shared/notion-markdown-mutations";
 import { MarkdownWriteError } from "../shared/notion-markdown-write";
+import { sha256Hex } from "../shared/import-integrity";
 import type { Comment, CommentThread, DocumentContentEnvelope, WorkspaceEvent } from "../shared/types";
 import { PAGE_TITLE_MAX } from "../shared/validation";
 import { processArchiveDisconnectTargets } from "./archive";
@@ -33,6 +34,7 @@ import {
 } from "./integrations";
 import {
   claimMarkdownTask,
+  claimExhaustedMarkdownTasks,
   completeMarkdownTask,
   createMarkdownTask,
   dueMarkdownTasks,
@@ -41,6 +43,8 @@ import {
   markdownTaskForRequestKey,
   markdownTaskJson,
   pruneMarkdownTasks,
+  renewMarkdownTaskLease,
+  RESULT_RETENTION_MS,
   type MarkdownTaskRow,
 } from "./notion-markdown-tasks";
 import type { Env } from "./env";
@@ -50,6 +54,9 @@ import { sourceRateLimitKey } from "./source-rate-limit";
 import { sweepOutbox } from "./jobs";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
+import { dateTokens } from "../shared/document-projection";
+import { dateMentionFromProps } from "../shared/date-mentions";
+import { withinMissingGrace } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -79,6 +86,12 @@ class NotionError extends Error {
     readonly retryAfter?: number,
   ) {
     super(message);
+  }
+}
+
+class UnknownMutationOutcome extends NotionError {
+  constructor() {
+    super(409, "conflict_error", "The mutation outcome is unknown. Fetch the page before retrying.");
   }
 }
 
@@ -568,7 +581,14 @@ async function locatedBlock(env: Env, principal: IntegrationPrincipal, id: strin
   if (!block && !includeTrash) {
     throw new NotionError(404, "object_not_found", "Could not find page or block with the requested ID.");
   }
-  return { page, block, internalId: row.internal_id, metadata: await metadataForPage(env, page.id) };
+  return {
+    page,
+    block,
+    document: envelope.document,
+    sequence: envelope.sequence,
+    internalId: row.internal_id,
+    metadata: await metadataForPage(env, page.id),
+  };
 }
 
 async function mutateDocument(
@@ -579,20 +599,41 @@ async function mutateDocument(
   suppressExternalEffects = false,
   options: { expectedSequence?: number; operationId?: string } = {},
 ) {
-  const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
-    new Request("https://document.internal/api-mutate", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-notes-internal": env.BETTER_AUTH_SECRET,
-        ...correlationHeaders(),
-      },
-      body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects, ...options }),
-    }),
-  );
+  const unknownOutcome = () =>
+    options.expectedSequence !== undefined && !options.operationId
+      ? new UnknownMutationOutcome()
+      : new NotionError(503, "service_unavailable", "The document is temporarily unavailable.");
+  let response: Response;
+  try {
+    response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
+      new Request("https://document.internal/api-mutate", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-notes-internal": env.BETTER_AUTH_SECRET,
+          ...correlationHeaders(),
+        },
+        body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects, ...options }),
+      }),
+    );
+  } catch {
+    throw unknownOutcome();
+  }
   if (response.status === 404) throw new NotionError(404, "object_not_found", "Block not found.");
-  if (response.status === 409) throw new NotionError(409, "conflict_error", "The document could not be changed.");
+  if (response.status === 409) {
+    const result = await response.json<{ error?: string }>().catch((): { error?: string } => ({}));
+    throw new NotionError(
+      409,
+      "conflict_error",
+      result.error === "duplicate_date_token"
+        ? "Move the original date token before reusing its ID."
+        : result.error === "revision_changed"
+          ? "This date token changed while moving it. Retry."
+          : "The document could not be changed.",
+    );
+  }
   if (response.status === 413) throw new NotionError(413, "validation_error", "The mutation exceeds document limits.");
+  if (response.status >= 500) throw unknownOutcome();
   if (!response.ok) throw new NotionError(400, "validation_error", "The block mutation is invalid.");
   return response.json<{ document: DocumentContentEnvelope["document"]; sequence: number }>();
 }
@@ -802,17 +843,21 @@ function refreshMarkdownFileUrls(input: Record<string, unknown>, signedMedia: Re
   const replace = (value: unknown, depth: number): unknown => {
     if (depth > 4) return value;
     if (typeof value === "string")
-      return value.replace(
-        /https?:\/\/[^\s<>)\]]+\/v1\/files\/([^/?#]+)\?expires=\d+&signature=[A-Za-z0-9_-]+/g,
-        (url, encodedId: string) => {
-          try {
-            const current = signedMedia.get(decodeURIComponent(encodedId));
-            return current && new URL(url).origin === new URL(current).origin ? current : url;
-          } catch {
-            return url;
-          }
-        },
-      );
+      return value.replace(/https?:\/\/[^\s<>)\]]+/g, (candidate) => {
+        const path = candidate.indexOf("/v1/files/");
+        if (path < 0) return candidate;
+        const match = /^\/v1\/files\/([^/?#]+)\?expires=\d+&signature=[A-Za-z0-9_-]+/.exec(candidate.slice(path));
+        if (!match) return candidate;
+        const url = candidate.slice(0, path) + match[0];
+        try {
+          const current = signedMedia.get(decodeURIComponent(match[1]!));
+          return current && new URL(url).origin === new URL(current).origin
+            ? current + candidate.slice(url.length)
+            : candidate;
+        } catch {
+          return candidate;
+        }
+      });
     if (Array.isArray(value)) return value.map((part) => replace(part, depth + 1));
     if (value && typeof value === "object")
       return Object.fromEntries(Object.entries(value).map(([key, part]) => [key, replace(part, depth + 1)]));
@@ -847,7 +892,7 @@ async function markdownRequestKey(
 
 async function taskPage(env: Env, task: MarkdownTaskRow) {
   const principal = await activeIntegrationPrincipal(env, task.integration_id);
-  if (!principal || !principal.updateContent || principal.workspaceId !== task.workspace_id)
+  if (!principal || !principal.updateContent || !principal.readContent || principal.workspaceId !== task.workspace_id)
     throw new NotionError(403, "restricted_resource", "The integration can no longer update this page.");
   const page = await pageForIntegration(env, principal, task.page_id);
   if (!page || page.kind !== "document")
@@ -857,22 +902,49 @@ async function taskPage(env: Env, task: MarkdownTaskRow) {
   return { principal, page };
 }
 
+async function completeMarkdownFromReceipt(
+  env: Env,
+  task: MarkdownTaskRow,
+  principal: IntegrationPrincipal,
+  page: IntegrationPage,
+  receipt: { document: DocumentContentEnvelope["document"]; sequence: number },
+) {
+  const current = await pageMarkdownProjection(env, principal, page, env.BETTER_AUTH_URL, {
+    schemaVersion: 1,
+    pageId: page.id,
+    contentEpoch: page.content_epoch,
+    document: receipt.document,
+    sequence: receipt.sequence,
+  });
+  await completeMarkdownTask(env, task, pageMarkdownJson(current));
+}
+
+function keepMarkdownTaskLease(env: Env, task: MarkdownTaskRow) {
+  const timer = setInterval(() => {
+    void renewMarkdownTaskLease(env, task).catch((error) =>
+      logger.warn(
+        "notion_api.markdown_task.lease_failed",
+        "notion-api",
+        "Markdown task lease could not be renewed.",
+        { taskId: task.id },
+        error,
+      ),
+    );
+  }, 20_000);
+  return () => clearInterval(timer);
+}
+
 /** A D1 lease and a document-room receipt make crashes after commit safe to retry. */
 export async function runNotionMarkdownTask(env: Env, id: string) {
+  if (env.NOTION_MARKDOWN_WRITES_ENABLED !== "true") return;
   const task = await claimMarkdownTask(env, id);
   if (!task) return;
+  const stopLease = keepMarkdownTaskLease(env, task);
   try {
     let { principal, page } = await taskPage(env, task);
     const receipt = await mutationReceipt(env, page, task.operation_id);
     if (receipt) {
-      const current = await pageMarkdownProjection(env, principal, page, env.BETTER_AUTH_URL, {
-        schemaVersion: 1,
-        pageId: page.id,
-        contentEpoch: page.content_epoch,
-        document: receipt.document,
-        sequence: receipt.sequence,
-      });
-      await completeMarkdownTask(env, task, pageMarkdownJson(current));
+      await completeMarkdownFromReceipt(env, task, principal, page, receipt);
       return;
     }
     const input = JSON.parse(task.request_json) as Record<string, unknown>;
@@ -884,8 +956,8 @@ export async function runNotionMarkdownTask(env: Env, id: string) {
           refreshMarkdownFileUrls(input, current.signedMedia),
           current.projection.markdown,
         );
-        const targets = JSON.stringify(
-          markdownEditTargets(current.snapshot.document, current.projection, command.edits),
+        const targets = await sha256Hex(
+          JSON.stringify(markdownEditTargets(current.snapshot.document, current.projection, command.edits)),
         );
         if (targets !== task.target_signature)
           throw new MarkdownWriteError("The selected content changed before this task ran.");
@@ -925,7 +997,8 @@ export async function runNotionMarkdownTask(env: Env, id: string) {
     }
   } catch (error) {
     const terminal = error instanceof NotionError && error.status !== 503;
-    const retry = !terminal && task.attempts < 5;
+    // After the final mutation attempt, recovery still needs one receipt check.
+    const retry = !terminal;
     if (retry)
       logger.warn(
         "notion_api.markdown_task.retry",
@@ -949,11 +1022,59 @@ export async function runNotionMarkdownTask(env: Env, id: string) {
       },
       retry,
     );
+  } finally {
+    stopLease();
   }
 }
 
 export async function recoverNotionMarkdownTasks(env: Env) {
-  for (const id of await dueMarkdownTasks(env)) await runNotionMarkdownTask(env, id);
+  if (env.NOTION_MARKDOWN_WRITES_ENABLED === "true") {
+    for (let recovered = 0; recovered < 5; recovered += 1) {
+      const task = (await claimExhaustedMarkdownTasks(env))[0];
+      if (!task) break;
+      const stopLease = keepMarkdownTaskLease(env, task);
+      try {
+        const { principal, page } = await taskPage(env, task);
+        const receipt = await mutationReceipt(env, page, task.operation_id);
+        if (!receipt) {
+          await failMarkdownTask(
+            env,
+            task,
+            task.error_json
+              ? JSON.parse(task.error_json)
+              : {
+                  object: "error",
+                  status: 503,
+                  code: "service_unavailable",
+                  message: "The Markdown update could not be completed.",
+                },
+            false,
+          );
+          continue;
+        }
+        await completeMarkdownFromReceipt(env, task, principal, page, receipt);
+      } catch (error) {
+        const retry =
+          !(error instanceof SyntaxError || error instanceof RangeError) &&
+          (!(error instanceof NotionError) || error.status === 503) &&
+          Date.now() <= task.expires_at + RESULT_RETENTION_MS;
+        await failMarkdownTask(
+          env,
+          task,
+          {
+            object: "error",
+            status: error instanceof NotionError ? error.status : 503,
+            code: error instanceof NotionError ? error.code : "service_unavailable",
+            message: error instanceof NotionError ? error.message : "The Markdown update could not be completed.",
+          },
+          retry,
+        );
+      } finally {
+        stopLease();
+      }
+    }
+    for (const id of await dueMarkdownTasks(env)) await runNotionMarkdownTask(env, id);
+  }
   await pruneMarkdownTasks(env);
 }
 
@@ -976,6 +1097,7 @@ notionApi.patch("/pages/:pageId/markdown", async (c) => {
     throw new NotionError(404, "object_not_found", "Markdown updates are unavailable.");
   const principal = c.get("principal");
   capability(principal, "updateContent");
+  capability(principal, "readContent");
   const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
   const input = await body(c.req.raw);
   if (input.allow_async !== undefined && typeof input.allow_async !== "boolean")
@@ -1016,7 +1138,9 @@ notionApi.patch("/pages/:pageId/markdown", async (c) => {
         current.protectedBlockIds,
         current.canonicalMediaUrls,
       );
-      targets = JSON.stringify(markdownEditTargets(current.snapshot.document, current.projection, command.edits));
+      targets = await sha256Hex(
+        JSON.stringify(markdownEditTargets(current.snapshot.document, current.projection, command.edits)),
+      );
     } catch (error) {
       if (error instanceof MarkdownWriteError) throw new NotionError(400, "validation_error", error.message);
       throw error;
@@ -1089,7 +1213,13 @@ notionApi.patch("/pages/:pageId/markdown", async (c) => {
       });
       return c.json(pageMarkdownJson(current));
     } catch (error) {
-      if (!(error instanceof NotionError) || error.status !== 409 || attempt === 1) throw error;
+      if (
+        error instanceof UnknownMutationOutcome ||
+        !(error instanceof NotionError) ||
+        error.status !== 409 ||
+        attempt === 1
+      )
+        throw error;
       current = await pageMarkdownProjection(c.env, principal, page, c.req.url);
     }
   }
@@ -1098,6 +1228,7 @@ notionApi.patch("/pages/:pageId/markdown", async (c) => {
 
 notionApi.get("/async_tasks/:taskId", async (c) => {
   const principal = c.get("principal");
+  capability(principal, "readContent");
   const task = await markdownTaskForIntegration(
     c.env,
     c.req.param("taskId"),
@@ -1105,6 +1236,8 @@ notionApi.get("/async_tasks/:taskId", async (c) => {
     principal.integrationId,
   );
   if (!task) throw new NotionError(404, "object_not_found", "Async task not found.");
+  if (!(await pageForIntegration(c.env, principal, task.page_id)))
+    throw new NotionError(404, "object_not_found", "Async task not found.");
   return c.json(markdownTaskJson(task, c.req.url));
 });
 
@@ -1242,6 +1375,8 @@ notionApi.post("/pages", async (c) => {
         .first<{ import_job_id: string | null }>();
       if (state?.import_job_id !== null) {
         await cleanupStagedPage(c.env, pageId, staged.content_epoch, stageId);
+        if (error instanceof NotionError && error.status === 409)
+          throw new NotionError(503, "service_unavailable", "The staged page could not be initialized.");
         throw error;
       }
     }
@@ -1660,17 +1795,74 @@ notionApi.patch("/blocks/:blockId", async (c) => {
     await mutateDocument(c.env, located.page, principal, [{ type: "delete_block", internalId: located.internalId }]);
     return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
   }
+  const blockDates = dateTokens(located.block!.node);
+  let guardMove = false;
+  const suppliedDates = new Map<string, NonNullable<ReturnType<typeof dateMentionFromProps>>>();
+  for (const payload of Object.values(input)) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
+    const content = payload as { rich_text?: unknown; cells?: unknown };
+    const groups = [content.rich_text, ...(Array.isArray(content.cells) ? content.cells : [])];
+    for (const group of groups) {
+      if (!Array.isArray(group)) continue;
+      for (const item of group) {
+        const supplied = dateMentionFromProps(item?.mention?.noteFlare ?? {});
+        if (supplied && !blockDates.has(supplied.tokenId)) suppliedDates.set(supplied.tokenId, supplied);
+      }
+    }
+  }
+  if (suppliedDates.size) {
+    const liveDates = dateTokens(located.document);
+    const possibleMoves = [...suppliedDates.keys()].filter((id) => !liveDates.has(id));
+    const rows = possibleMoves.length
+      ? await c.env.DB.prepare(
+          `SELECT id,generation,token_id,user_id,token_revision,timezone,missing_since FROM date_reminders
+       WHERE page_id=? AND content_epoch=? AND token_id IN (SELECT value FROM json_each(?))
+         AND state IN ('active','claimed','delivered')`,
+        )
+          .bind(located.page.id, located.page.content_epoch, JSON.stringify(possibleMoves))
+          .all<{
+            id: string;
+            generation: number;
+            token_id: string;
+            user_id: string;
+            token_revision: string;
+            timezone: string;
+            missing_since: number | null;
+          }>()
+      : { results: [] };
+    for (const reminder of rows.results) {
+      const supplied = suppliedDates.get(reminder.token_id);
+      if (!supplied) continue;
+      if (
+        reminder.user_id !== supplied.createdBy ||
+        reminder.token_revision !== supplied.revision ||
+        reminder.timezone !== supplied.timezone
+      )
+        continue;
+      if (withinMissingGrace(reminder.missing_since, Date.now())) {
+        guardMove = true;
+        blockDates.set(supplied.tokenId, { ...supplied, revision: crypto.randomUUID() });
+      }
+    }
+  }
   let container;
   try {
-    container = notionInputToBlockContainer({ ...input, id: located.internalId });
+    container = notionInputToBlockContainer({ ...input, id: located.internalId }, 0, blockDates);
   } catch (error) {
     throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid block.");
   }
   const node = container.content?.find((child) => child.type !== "blockGroup");
   if (!node) throw new NotionError(400, "validation_error", "Block content is required.");
-  const mutated = await mutateDocument(c.env, located.page, principal, [
-    { type: "update_block", internalId: located.internalId, node },
-  ]);
+  if ([...dateTokens(container).values()].some((token) => token === null))
+    throw new NotionError(400, "validation_error", "Date tokens must be unique within a block.");
+  const mutated = await mutateDocument(
+    c.env,
+    located.page,
+    principal,
+    [{ type: "update_block", internalId: located.internalId, node }],
+    false,
+    guardMove ? { expectedSequence: located.sequence } : {},
+  );
   const updated = findDocumentBlock(mutated.document, located.internalId)!;
   return c.json(await blockObject(c.env, located.page, updated, await metadataForPage(c.env, located.page.id)));
 });

@@ -4,6 +4,7 @@ import type { ProseMirrorJson } from "./types";
 const BLOCK_ATTRS = { backgroundColor: "default", textColor: "default", textAlignment: "left" };
 const MAX_INPUT_BYTES = 128 * 1024;
 const MAX_INPUT_BLOCKS = 1000;
+export const MAX_MARKDOWN_DELIMITERS = 4096;
 
 export class MarkdownWriteError extends Error {}
 
@@ -23,28 +24,120 @@ function validHref(value: string) {
 
 function textWithMath(value: string, marks: NonNullable<ProseMirrorJson["marks"]>): ProseMirrorJson[] {
   const output: ProseMirrorJson[] = [];
-  const expression = /(?<!\\)\$((?:\\.|[^\\$\n])*?\S)\$/g;
   let cursor = 0;
-  for (const match of value.matchAll(expression)) {
-    const index = match.index;
+  const escaped = (position: number) => {
+    let slashes = 0;
+    for (let index = position - 1; index >= 0 && value[index] === "\\"; index -= 1) slashes += 1;
+    return slashes % 2 === 1;
+  };
+  for (let index = 0; index < value.length; index += 1) {
+    if (
+      value[index] !== "$" ||
+      escaped(index) ||
+      (value[index - 1] === "$" && !escaped(index - 1) && index > cursor) ||
+      !value[index + 1] ||
+      value[index + 1] === "$" ||
+      /\s/.test(value[index + 1]!)
+    )
+      continue;
+    let close = index + 1;
+    while (close < value.length && value[close] !== "\n") {
+      if (value[close] === "$" && !escaped(close)) break;
+      close += 1;
+    }
+    if (close <= index + 1 || value[close] !== "$" || /\s/.test(value[close - 1]!)) continue;
     if (index > cursor)
-      output.push({ type: "text", text: value.slice(cursor, index), ...(marks.length ? { marks } : {}) });
-    output.push({ type: "inlineMath", attrs: { formula: match[1]!.replaceAll("\\$", "$") } });
-    cursor = index + match[0].length;
+      output.push({
+        type: "text",
+        text: unescapeMarkdown(value.slice(cursor, index)),
+        ...(marks.length ? { marks } : {}),
+      });
+    output.push({ type: "inlineMath", attrs: { formula: value.slice(index + 1, close).replaceAll("\\$", "$") } });
+    cursor = close + 1;
+    index = close;
   }
   if (cursor < value.length)
-    output.push({ type: "text", text: value.slice(cursor), ...(marks.length ? { marks } : {}) });
+    output.push({ type: "text", text: unescapeMarkdown(value.slice(cursor)), ...(marks.length ? { marks } : {}) });
   return output;
 }
 
-function inline(tokens: Token[], marks: NonNullable<ProseMirrorJson["marks"]> = []): ProseMirrorJson[] {
-  const output: ProseMirrorJson[] = [];
+function unescapeMarkdown(value: string) {
+  return value.replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~])/g, "$1");
+}
+
+function splitCrossTokenMath(tokens: Token[]) {
+  const source = tokens.map((token) => token.raw).join("");
+  if (!source.includes("$")) return null;
+  const ranges: Array<{ from: number; to: number; type: string }> = [];
+  let offset = 0;
   for (const token of tokens) {
-    if (token.type === "text") {
-      output.push(...textWithMath(token.text, marks));
-    } else if (token.type === "escape") {
-      output.push({ type: "text", text: token.text, ...(marks.length ? { marks } : {}) });
-    } else if (token.type === "strong" || token.type === "em" || token.type === "del") {
+    ranges.push({ from: offset, to: offset + token.raw.length, type: token.type });
+    offset += token.raw.length;
+  }
+  const escaped = (position: number) => {
+    let slashes = 0;
+    for (let index = position - 1; index >= 0 && source[index] === "\\"; index -= 1) slashes += 1;
+    return slashes % 2 === 1;
+  };
+  const spans: Array<{ from: number; to: number; formula: string }> = [];
+  let lastClose = -1;
+  for (let index = 0; index < source.length; index += 1) {
+    if (
+      source[index] !== "$" ||
+      escaped(index) ||
+      (source[index - 1] === "$" && !escaped(index - 1) && lastClose !== index - 1) ||
+      source[index + 1] === "$" ||
+      !source[index + 1] ||
+      /\s/.test(source[index + 1]!)
+    )
+      continue;
+    let close = index + 1;
+    while (close < source.length && source[close] !== "\n") {
+      if (source[close] === "$" && !escaped(close)) break;
+      close += 1;
+    }
+    if (source[close] !== "$" || close <= index + 1 || /\s/.test(source[close - 1]!)) continue;
+    const overlapping = ranges.filter((range) => range.from < close + 1 && range.to > index);
+    if (overlapping.some((range) => ["codespan", "link", "image"].includes(range.type))) continue;
+    const opening = ranges.find((range) => range.from <= index && index < range.to);
+    const closing = ranges.find((range) => range.from <= close && close < range.to);
+    if (opening !== closing && overlapping.some((range) => range.type !== "text" && range.type !== "escape"))
+      spans.push({ from: index, to: close + 1, formula: source.slice(index + 1, close).replaceAll("\\$", "$") });
+    lastClose = close;
+    index = close;
+  }
+  return spans.length ? { source, spans } : null;
+}
+
+function inline(tokens: Token[], marks: NonNullable<ProseMirrorJson["marks"]> = []): ProseMirrorJson[] {
+  const crossTokenMath = splitCrossTokenMath(tokens);
+  if (crossTokenMath) {
+    const output: ProseMirrorJson[] = [];
+    let cursor = 0;
+    for (const span of crossTokenMath.spans) {
+      if (span.from > cursor)
+        output.push(...inline(Lexer.lexInline(crossTokenMath.source.slice(cursor, span.from), { gfm: true }), marks));
+      output.push({ type: "inlineMath", attrs: { formula: span.formula } });
+      cursor = span.to;
+    }
+    if (cursor < crossTokenMath.source.length)
+      output.push(...inline(Lexer.lexInline(crossTokenMath.source.slice(cursor), { gfm: true }), marks));
+    return output;
+  }
+  const output: ProseMirrorJson[] = [];
+  let text = "";
+  const flushText = () => {
+    if (!text) return;
+    output.push(...textWithMath(text, marks));
+    text = "";
+  };
+  for (const token of tokens) {
+    if (token.type === "text" || token.type === "escape") {
+      text += token.raw;
+      continue;
+    }
+    flushText();
+    if (token.type === "strong" || token.type === "em" || token.type === "del") {
       const mark = token.type === "strong" ? "bold" : token.type === "em" ? "italic" : "strike";
       output.push(...inline(token.tokens ?? [], [...marks, { type: mark }]));
     } else if (token.type === "codespan") {
@@ -58,6 +151,7 @@ function inline(tokens: Token[], marks: NonNullable<ProseMirrorJson["marks"]> = 
       throw new MarkdownWriteError(`Markdown inline content of type ${token.type} cannot be edited.`);
     }
   }
+  flushText();
   return output;
 }
 
@@ -93,28 +187,41 @@ function list(token: Token): ProseMirrorJson[] {
 }
 
 /** Parse only Markdown structures that can be represented without changing their meaning. */
-export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
+export function parseWritableMarkdownWithSource(
+  source: string,
+  maxDelimiters = MAX_MARKDOWN_DELIMITERS,
+): { blocks: ProseMirrorJson[]; rawBlocks: string[]; delimiterCount: number } {
   if (new TextEncoder().encode(source).length > MAX_INPUT_BYTES)
     throw new MarkdownWriteError("Markdown content exceeds 128 KiB.");
   if (source.includes("\0")) throw new MarkdownWriteError("Markdown content contains an invalid character.");
+  const normalized = source.replaceAll(/\r\n?/g, "\n");
+  const blocks = new Lexer({ gfm: true }).blockTokens(normalized);
   let delimiterCount = 0;
-  let fence: { character: string; length: number } | null = null;
-  for (const line of source.split("\n")) {
-    const opening = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
-    if (opening && (!fence || (opening[0] === fence.character && opening.length >= fence.length))) {
-      fence = fence ? null : { character: opening[0]!, length: opening.length };
-      continue;
+  const countInline = (tokens: Token[]) => {
+    for (const token of tokens) {
+      if (token.type === "code" || token.type === "space") continue;
+      if (token.type === "list") {
+        for (const item of token.items) countInline(item.tokens);
+        continue;
+      }
+      if (token.type === "blockquote") {
+        countInline(token.tokens ?? []);
+        continue;
+      }
+      const inlineSource = "text" in token && typeof token.text === "string" ? token.text : token.raw;
+      for (const character of inlineSource)
+        if ("<\\[]`*_!".includes(character) && ++delimiterCount > maxDelimiters)
+          throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
     }
-    if (fence) continue;
-    for (const character of line)
-      if ("<\\[]`*_!".includes(character) && ++delimiterCount > 4096)
-        throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
-  }
+  };
+  countInline(blocks);
   const output: ProseMirrorJson[] = [];
-  for (const token of Lexer.lex(source.replaceAll("\r\n", "\n"), { gfm: true })) {
+  const rawBlocks: string[] = [];
+  for (const token of Lexer.lex(normalized, { gfm: true })) {
     if (token.type === "space") continue;
     if (token.type === "list") {
       output.push(...list(token));
+      rawBlocks.push(...token.items.map((item: Tokens.ListItem) => item.raw.trimEnd()));
     } else if (token.type === "heading") {
       output.push(
         container({
@@ -135,8 +242,8 @@ export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
             type: "image",
             attrs: {
               url: validHref(image.href),
-              caption: image.text,
-              name: image.text || "image",
+              caption: unescapeMarkdown(image.text),
+              name: unescapeMarkdown(image.text) || "image",
               showPreview: true,
               previewWidth: 512,
               ...BLOCK_ATTRS,
@@ -169,7 +276,12 @@ export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
     } else {
       throw new MarkdownWriteError(`Markdown blocks of type ${token.type} cannot be edited.`);
     }
+    if (token.type !== "list") rawBlocks.push(token.raw.trimEnd());
     if (output.length > MAX_INPUT_BLOCKS) throw new MarkdownWriteError("Markdown content exceeds 1000 blocks.");
   }
-  return output;
+  return { blocks: output, rawBlocks, delimiterCount };
+}
+
+export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
+  return parseWritableMarkdownWithSource(source).blocks;
 }

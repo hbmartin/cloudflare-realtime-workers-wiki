@@ -655,7 +655,10 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
     if (capture.state === "running" && capture.job_id === existingJob.id) {
       if (existingJob.status === "queued" || existingJob.status === "running")
         await cleanupSupersededCaptureInputs(env, capture);
-      if (existingJob.status === "queued") return existingJob;
+      if (existingJob.status === "queued") {
+        await authorizedCaptureContext(env, capture);
+        return existingJob;
+      }
       if (existingJob.status === "running") return null;
       if (existingJob.status === "canceling" || existingJob.cleanup_target) return null;
     }

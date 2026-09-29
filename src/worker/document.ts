@@ -3,7 +3,8 @@ import { tracing } from "cloudflare:workers";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
-import { collectTransclusions, projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { collectTransclusions, dateTokens, projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { dateMentionFromProps } from "../shared/date-mentions";
 import {
   diagramFromYDoc,
   DIAGRAM_NODES_ROOT,
@@ -20,6 +21,7 @@ import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
 import { sweepOutbox } from "./jobs";
 import { notificationFanoutStatements } from "./notifications";
+import { reconcileDateRemindersForPage } from "./date-reminders";
 import { MentionTargetTracker } from "./mention-targets";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
@@ -252,6 +254,68 @@ function yNode(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {
   return element;
 }
 
+function duplicateDateTokens(document: Y.Doc) {
+  const occurrences = new Map<string, Array<{ node: Y.XmlElement; blockId: string | null }>>();
+  const visit = (parent: Y.XmlFragment | Y.XmlElement, blockId: string | null) => {
+    for (const child of parent.toArray()) {
+      if (!(child instanceof Y.XmlElement)) continue;
+      const currentBlockId = child.nodeName === "blockContainer" ? String(child.getAttribute("id") ?? "") : blockId;
+      if (child.nodeName === "dateMention") {
+        const token = dateMentionFromProps(child.getAttributes());
+        if (token)
+          occurrences.set(token.tokenId, [
+            ...(occurrences.get(token.tokenId) ?? []),
+            { node: child, blockId: currentBlockId },
+          ]);
+      }
+      visit(child, currentBlockId);
+    }
+  };
+  visit(document.getXmlFragment("document-store"), null);
+  return [...occurrences].filter(([, matches]) => matches.length > 1);
+}
+
+async function priorDateTokenBlocks(env: Env, pageId: string, epoch: number) {
+  const row = await env.DB.prepare(`SELECT r2_key FROM document_projections WHERE page_id=? AND content_epoch=?`)
+    .bind(pageId, epoch)
+    .first<{ r2_key: string }>();
+  if (!row) return new Map<string, string>();
+  const stored = await env.BUCKET.get(row.r2_key);
+  if (!stored) return new Map<string, string>();
+  const envelope = await stored.json<DocumentContentEnvelope>();
+  if (envelope.pageId !== pageId || envelope.contentEpoch !== epoch || envelope.document.type !== "doc")
+    return new Map<string, string>();
+  return dateTokenBlocks(envelope.document);
+}
+
+function dateTokenBlocks(document: ProseMirrorJson) {
+  const preferred = new Map<string, string>();
+  for (const block of flattenDocumentBlocks(document))
+    for (const tokenId of dateTokens(block.node).keys()) if (!preferred.has(tokenId)) preferred.set(tokenId, block.id);
+  return preferred;
+}
+
+function repairDuplicateDateTokens(
+  document: Y.Doc,
+  duplicates: ReturnType<typeof duplicateDateTokens>,
+  preferredBlocks: Map<string, string>,
+) {
+  document.transact(() => {
+    for (const [tokenId, matches] of duplicates) {
+      const preserved = matches.find((match) => match.blockId === preferredBlocks.get(tokenId)) ?? matches[0]!;
+      for (const match of matches) {
+        if (match === preserved) continue;
+        const token = dateMentionFromProps(match.node.getAttributes());
+        if (token)
+          match.node.setAttribute(
+            "payload",
+            JSON.stringify({ ...token, tokenId: crypto.randomUUID(), revision: crypto.randomUUID() }),
+          );
+      }
+    }
+  }, "date-token-normalize");
+}
+
 type YBlockParent = Y.XmlFragment | Y.XmlElement;
 
 function blockGroup(parent: YBlockParent, create: boolean) {
@@ -473,6 +537,7 @@ export class Document extends YServer {
   // a resident room still reconciles on its own schedule.
   private reconciledOnStart = false;
   private compaction: Promise<void> | null = null;
+  private priorDateBlocks: Map<string, string> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env as Cloudflare.Env);
@@ -788,15 +853,69 @@ export class Document extends YServer {
     return withDurableObjectContext(this.bindings, request, () => this.onRequestObserved(request));
   }
 
-  private async onRequestObserved(request: Request) {
+  private async onRequestObserved(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.headers.get("x-notes-internal") !== this.bindings.BETTER_AUTH_SECRET) {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
+      // Most callers use this endpoint as a current-content barrier. Public
+      // rendering may explicitly request the last coherent committed copy.
+      const allowStale = request.headers.get("x-notes-allow-stale") === "1";
       this.flushPendingUpdates();
-      if (this.metadata.dirty) await this.compact();
+      if (!allowStale) {
+        try {
+          for (let attempt = 0; attempt < 2 && (this.metadata.dirty || this.compaction); attempt += 1) {
+            if (this.compaction) await this.compaction.catch(() => undefined);
+            this.flushPendingUpdates();
+            if (this.metadata.dirty) await this.compact();
+            this.flushPendingUpdates();
+          }
+        } catch {
+          return Response.json({ error: "Document content is temporarily unavailable." }, { status: 503 });
+        }
+      }
       const { pageId, epoch } = this.ids;
+      if (this.metadata.dirty || this.compaction) {
+        if (!allowStale)
+          return Response.json(
+            { error: "Document content is still changing." },
+            { status: 503, headers: { "x-notes-content-retry": "changing" } },
+          );
+        const table = this.metadata.content_kind === "diagram" ? "diagram_projections" : "document_projections";
+        let row: { sequence: number; r2_key: string; content_hash: string } | null = null;
+        let stored: R2ObjectBody | null = null;
+        for (let attempt = 0; attempt < 2 && !stored; attempt += 1) {
+          row = await this.bindings.DB.prepare(
+            `SELECT sequence,r2_key,content_hash FROM ${table} WHERE page_id=? AND content_epoch=?`,
+          )
+            .bind(pageId, epoch)
+            .first<{ sequence: number; r2_key: string; content_hash: string }>();
+          stored = row ? await this.bindings.BUCKET.get(row.r2_key) : null;
+        }
+        if (!stored) {
+          // A newly restored room may have a snapshot but no committed projection yet.
+          try {
+            await this.compact();
+            this.flushPendingUpdates();
+          } catch {
+            return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
+          }
+          if (!this.metadata.dirty && !this.compaction) return this.onRequestObserved(request);
+          return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
+        }
+        let envelope: { pageId: string; contentEpoch: number; sequence: number };
+        try {
+          envelope = await stored.json();
+        } catch {
+          return Response.json({ error: "Committed document content is invalid." }, { status: 503 });
+        }
+        if (envelope.pageId !== pageId || envelope.contentEpoch !== epoch || envelope.sequence !== row!.sequence)
+          return Response.json({ error: "Committed document content is invalid." }, { status: 503 });
+        return Response.json(envelope, {
+          headers: { etag: `"${row!.content_hash}"`, "x-notes-content-current": "0" },
+        });
+      }
       if (this.metadata.content_kind === "diagram") {
         const envelope = diagramFromYDoc(this.document, {
           pageId,
@@ -804,7 +923,7 @@ export class Document extends YServer {
           sequence: this.metadata.snapshot_seq,
         });
         return Response.json(envelope, {
-          headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
+          headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"`, "x-notes-content-current": "1" },
         });
       }
       const document = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
@@ -816,7 +935,7 @@ export class Document extends YServer {
         document,
       };
       return Response.json(envelope, {
-        headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
+        headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"`, "x-notes-content-current": "1" },
       });
     }
     if (request.method === "GET" && url.pathname.endsWith("/api-mutate-receipt")) {
@@ -861,6 +980,13 @@ export class Document extends YServer {
         return Response.json({ error: "This document version has been retired." }, { status: 410 });
       }
       if (this.metadata.read_only) return Response.json({ error: "This document is read-only." }, { status: 409 });
+      if (body.expectedSequence !== undefined) {
+        if (!Number.isInteger(body.expectedSequence) || Number(body.expectedSequence) < 0)
+          return Response.json({ error: "Invalid expected sequence." }, { status: 400 });
+        this.flushPendingUpdates();
+        if (this.compaction || this.metadata.dirty || this.metadata.snapshot_seq !== body.expectedSequence)
+          return Response.json({ error: "revision_changed" }, { status: 409 });
+      }
       const operationId =
         typeof body.operationId === "string" && /^[A-Za-z0-9:_-]{1,200}$/.test(body.operationId)
           ? body.operationId
@@ -904,6 +1030,19 @@ export class Document extends YServer {
         return Response.json({ error: code }, { status: code === "block_not_found" ? 404 : 422 });
       }
       const document = yXmlFragmentToProsemirrorJSON(clone.getXmlFragment("document-store")) as ProseMirrorJson;
+      const incomingDateIds = new Set<string>();
+      for (const operation of body.operations as ApiBlockMutation[]) {
+        if (operation.type === "update_block") {
+          for (const id of dateTokens(operation.node).keys()) incomingDateIds.add(id);
+        } else if (operation.type === "append_children") {
+          for (const child of operation.children) for (const id of dateTokens(child).keys()) incomingDateIds.add(id);
+        }
+      }
+      const resultingDates = dateTokens(document);
+      if (Array.from(incomingDateIds).some((id) => resultingDates.get(id) === null)) {
+        clone.destroy();
+        return Response.json({ error: "duplicate_date_token" }, { status: 409 });
+      }
       const blockCount = flattenDocumentBlocks(document).length;
       if (blockCount > 10_000) {
         clone.destroy();
@@ -915,6 +1054,17 @@ export class Document extends YServer {
         return Response.json({ error: "Document size limit exceeded." }, { status: 413 });
       }
       clone.destroy();
+      this.flushPendingUpdates();
+      if (
+        this.purged ||
+        this.metadata.retired ||
+        this.metadata.restore_pending ||
+        this.transition ||
+        this.metadata.read_only ||
+        (body.expectedSequence !== undefined &&
+          (this.metadata.dirty || this.compaction || this.metadata.snapshot_seq !== body.expectedSequence))
+      )
+        return Response.json({ error: "revision_changed" }, { status: 409 });
       this.pendingAuthorId = body.actorId;
       this.pendingNotifyEdit = false;
       this.document.transact(() => {
@@ -1263,7 +1413,33 @@ export class Document extends YServer {
   }
 
   private async compactOnce(forceVersion = false, suppressExternalEffects = false) {
-    if (this.metadata.content_kind === "document") migrateLegacyColumns(this.document);
+    if (this.metadata.content_kind === "document") {
+      migrateLegacyColumns(this.document);
+      let duplicates = duplicateDateTokens(this.document);
+      if (duplicates.length) {
+        const { pageId, epoch } = this.ids;
+        let preferredBlocks = this.priorDateBlocks ?? new Map<string, string>();
+        const fetchedPrevious = !this.priorDateBlocks;
+        try {
+          if (fetchedPrevious) {
+            preferredBlocks = await priorDateTokenBlocks(this.bindings, pageId, epoch);
+            this.priorDateBlocks = preferredBlocks;
+          }
+        } catch (error) {
+          logger.warn(
+            "document.date_token_origin.unavailable",
+            "document",
+            "The previous date token location could not be read during duplicate repair.",
+            { pageId, epoch },
+            error,
+          );
+        }
+        if (fetchedPrevious) duplicates = duplicateDateTokens(this.document);
+        // The previous projection fetch can yield to incoming websocket edits.
+        // Repair the live tree after it returns, then capture the compaction.
+        if (duplicates.length) repairDuplicateDateTokens(this.document, duplicates, preferredBlocks);
+      }
+    }
     this.flushPendingUpdates();
     const { pageId, epoch } = this.ids;
     const maximum = this.state.storage.sql
@@ -1371,12 +1547,12 @@ export class Document extends YServer {
       let versionKey: string | null = null;
       let versionStatementIndex = -1;
       let pageProjected = false;
+      const effectsSuppressed =
+        suppressExternalEffects &&
+        (page?.import_job_id?.startsWith("notion-create:") === true ||
+          page?.import_job_id?.startsWith("mcp:create:") === true);
 
       if (page) {
-        const effectsSuppressed =
-          suppressExternalEffects &&
-          (page.import_job_id?.startsWith("notion-create:") === true ||
-            page.import_job_id?.startsWith("mcp:create:") === true);
         const [oldPageTargets, oldUserTargets, watcherRows] = await Promise.all([
           this.bindings.DB.prepare(`SELECT target_page_id id FROM page_references WHERE source_page_id = ?`)
             .bind(pageId)
@@ -1688,6 +1864,8 @@ export class Document extends YServer {
 
         const results = await this.bindings.DB.batch(statements);
         pageProjected = Boolean(results[0]?.meta.changes);
+        if (pageProjected && (this.priorDateBlocks || structuredJson.includes('"dateMention"')))
+          this.priorDateBlocks = dateTokenBlocks(json);
         const superseded = supersededProjection?.r2_key;
         if (pageProjected && superseded && superseded !== structuredKey) {
           this.state.waitUntil(
@@ -1781,6 +1959,17 @@ export class Document extends YServer {
       });
       this.metadata.snapshot_seq = maximum;
       this.metadata.last_version_at = versionAt;
+
+      if (pageProjected && !effectsSuppressed)
+        await reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
+          logger.error(
+            "document.date_reminder_reconcile.failed",
+            "document",
+            "Date reminder reconciliation failed.",
+            { pageId, epoch },
+            error,
+          ),
+        );
 
       if (pageProjected && versionKey) {
         this.state.waitUntil(

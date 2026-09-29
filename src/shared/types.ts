@@ -52,7 +52,7 @@ export type MemberContext = {
 };
 
 export type ClientMemberContext = Omit<MemberContext, "session"> & {
-  features?: { expandedEmbeds: boolean };
+  features?: { expandedEmbeds: boolean; offlineEditing?: boolean };
 };
 
 export type Page = {
@@ -188,6 +188,7 @@ export type NotificationEventType =
   | "thread_resolved"
   | "thread_reopened"
   | "page_edit"
+  | "reminder"
   | "task_assigned";
 export type NotificationChannelMode = "off" | "immediate" | "digest";
 
