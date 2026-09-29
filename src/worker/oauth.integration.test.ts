@@ -244,6 +244,10 @@ describe("OAuth MCP foundation", () => {
     expect(consent.status).toBe(200);
     expect(consent.headers.get("content-security-policy")).toContain("form-action 'self' http://127.0.0.1:3800");
     expect(await consent.text()).toContain("Test MCP client");
+    const injectedDecision = await SELF.fetch(`${ORIGIN}/oauth/authorize?${form({ ...params, decision: "deny" })}`, {
+      headers: { cookie },
+    });
+    expect(await injectedDecision.text()).not.toContain('type="hidden" name="decision"');
     const signedOut = await SELF.fetch(`${ORIGIN}/oauth/authorize?${form(params)}`, { redirect: "manual" });
     expect(signedOut.status).toBe(302);
     expect(new URL(signedOut.headers.get("location")!).searchParams.get("oauthAuthorize")).toContain(
@@ -251,14 +255,27 @@ describe("OAuth MCP foundation", () => {
     );
     const badRedirect = await SELF.fetch(
       `${ORIGIN}/oauth/authorize?${form({ ...params, redirect_uri: "https://evil.example/callback" })}`,
-      { headers: { cookie } },
+      { headers: { cookie }, redirect: "manual" },
     );
     expect(badRedirect.status).toBe(400);
     const badAudience = await SELF.fetch(
       `${ORIGIN}/oauth/authorize?${form({ ...params, resource: `${ORIGIN}/other` })}`,
-      { headers: { cookie } },
+      { headers: { cookie }, redirect: "manual" },
     );
-    expect(badAudience.status).toBe(400);
+    expect(badAudience.status).toBe(302);
+    expect(new URL(badAudience.headers.get("location")!).searchParams.get("error")).toBe("invalid_target");
+    expect(new URL(badAudience.headers.get("location")!).searchParams.get("iss")).toBe(ORIGIN);
+    const deny = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
+      method: "POST",
+      headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
+      body: form({ ...params, decision: "deny" }),
+      redirect: "manual",
+    });
+    expect(deny.status).toBe(302);
+    const denial = new URL(deny.headers.get("location")!);
+    expect(denial.searchParams.get("error")).toBe("access_denied");
+    expect(denial.searchParams.get("state")).toBe(params.state);
+    expect(denial.searchParams.get("iss")).toBe(ORIGIN);
     const approve = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
       method: "POST",
       headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
@@ -447,6 +464,14 @@ describe("OAuth MCP foundation", () => {
         Date.now() + 60_000,
       ),
     ]);
+    await env.DB.prepare("UPDATE pages SET import_job_id=?,updated_at=? WHERE id=?")
+      .bind(`mcp:cleanup:${pageId}`, Date.now(), pageId)
+      .run();
+    await pruneStagedMcpPages(env);
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(pageId).first()).not.toBeNull();
+    await env.DB.prepare("UPDATE pages SET updated_at=? WHERE id=?")
+      .bind(Date.now() - 2 * 60_000, pageId)
+      .run();
     await pruneStagedMcpPages(env);
     expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(pageId).first()).toBeNull();
     expect(

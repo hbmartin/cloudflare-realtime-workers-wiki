@@ -27,6 +27,7 @@ const MAX_MCP_BODY = 64 * 1024;
 const OPERATION_ID = /^[A-Za-z0-9:_-]{1,128}$/;
 const RECEIPT_TTL_MS = 30 * 24 * 60 * 60_000;
 const STAGED_PAGE_TTL_MS = 24 * 60 * 60_000;
+const STAGED_CLEANUP_RETRY_MS = 60_000;
 type BackgroundContext = Pick<ExecutionContext, "waitUntil">;
 const TOOL_SCOPES: Record<string, readonly McpScope[]> = {
   search_pages: ["pages:read"],
@@ -43,16 +44,19 @@ function result(value: unknown) {
 export async function pruneStagedMcpPages(env: Env) {
   const rows = await env.DB.prepare(
     `SELECT id,content_epoch,import_job_id FROM pages
-      WHERE (import_job_id GLOB 'mcp:create:*' OR import_job_id GLOB 'mcp:cleanup:*')
+      WHERE (import_job_id GLOB 'mcp:create:*'
+        OR (import_job_id GLOB 'mcp:cleanup:*' AND updated_at<?))
         AND created_at<? ORDER BY created_at LIMIT 10`,
   )
-    .bind(Date.now() - STAGED_PAGE_TTL_MS)
+    .bind(Date.now() - STAGED_CLEANUP_RETRY_MS, Date.now() - STAGED_PAGE_TTL_MS)
     .all<{ id: string; content_epoch: number; import_job_id: string }>();
   for (const row of rows.results) {
     const cleanupId = `mcp:cleanup:${row.id}`;
     if (row.import_job_id !== cleanupId) {
-      const claimed = await env.DB.prepare("UPDATE pages SET import_job_id=? WHERE id=? AND import_job_id=?")
-        .bind(cleanupId, row.id, row.import_job_id)
+      const claimed = await env.DB.prepare(
+        "UPDATE pages SET import_job_id=?,updated_at=? WHERE id=? AND import_job_id=?",
+      )
+        .bind(cleanupId, Date.now(), row.id, row.import_job_id)
         .run();
       if (claimed.meta.changes !== 1) continue;
     }
@@ -61,6 +65,7 @@ export async function pruneStagedMcpPages(env: Env) {
         new Request("https://document.internal/purge", {
           method: "POST",
           headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
+          signal: AbortSignal.timeout(30_000),
         }),
       );
       if (!purged.ok) throw new Error(`Staged document purge returned ${purged.status}.`);
@@ -74,6 +79,9 @@ export async function pruneStagedMcpPages(env: Env) {
         env.DB.prepare("DELETE FROM pages WHERE id=? AND import_job_id=?").bind(row.id, cleanupId),
       ]);
     } catch (error) {
+      await env.DB.prepare("UPDATE pages SET updated_at=? WHERE id=? AND import_job_id=?")
+        .bind(Date.now(), row.id, cleanupId)
+        .run();
       logger.error(
         "mcp.staged_page.cleanup_failed",
         "mcp",
@@ -264,7 +272,17 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
   }).catch((error: unknown) => {
     logger.warn("mcp.page_event.failed", "mcp", "Page event delivery failed.", { pageId: page.id }, error);
   });
-  context.waitUntil(sweepOutbox(env));
+  context.waitUntil(
+    sweepOutbox(env).catch((error: unknown) => {
+      logger.warn(
+        "mcp.page_webhook.failed",
+        "mcp",
+        "Page webhook delivery will be retried.",
+        { pageId: page.id },
+        error,
+      );
+    }),
+  );
   return value;
 }
 
@@ -337,8 +355,8 @@ async function updatePageTool(
   });
   const command = parseMarkdownCommand(input.command, projection.markdown);
   const protectedRows = await env.DB.prepare(
-    `SELECT DISTINCT block.internal_id FROM comment_threads thread
-       JOIN api_blocks block ON (block.id=thread.block_id OR block.internal_id=thread.block_id)
+    `SELECT DISTINCT COALESCE(block.internal_id,thread.block_id) internal_id FROM comment_threads thread
+       LEFT JOIN api_blocks block ON (block.id=thread.block_id OR block.internal_id=thread.block_id)
          AND block.page_id=thread.page_id
       WHERE thread.page_id=? AND thread.block_id IS NOT NULL`,
   )
@@ -655,6 +673,15 @@ export async function mcpRequest(request: Request, env: Env, context: Background
   if (request.method !== "POST") return new Response("Method not allowed.", { status: 405 });
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json"))
     return new Response("Expected application/json.", { status: 415 });
+  const sourceRate = await consumeFixedWindow(env, `mcp-source:${await sourceRateLimitKey(request)}`, {
+    window: 60,
+    max: 600,
+  });
+  if (!sourceRate.allowed)
+    return new Response("Too many MCP requests.", {
+      status: 429,
+      headers: { "retry-after": "60", "www-authenticate": mcpBearerChallenge(env) },
+    });
   const length = Number(request.headers.get("content-length"));
   if (Number.isFinite(length) && length > MAX_MCP_BODY) return new Response("Request is too large.", { status: 413 });
   const reader = request.clone().body?.getReader();
@@ -692,11 +719,6 @@ export async function mcpRequest(request: Request, env: Env, context: Background
   const required = typeof name === "string" && Object.hasOwn(TOOL_SCOPES, name) ? TOOL_SCOPES[name]! : [];
   const access = await mcpAccess(request, env);
   if (!access) {
-    const rate = await consumeFixedWindow(env, `mcp-unauthorized:${await sourceRateLimitKey(request)}`, {
-      window: 60,
-      max: 120,
-    });
-    if (!rate.allowed) return new Response("Too many MCP requests.", { status: 429, headers: { "retry-after": "60" } });
     return new Response("Unauthorized", {
       status: 401,
       headers: { "www-authenticate": mcpBearerChallenge(env, required.join(" ")), "cache-control": "no-store" },
@@ -708,7 +730,7 @@ export async function mcpRequest(request: Request, env: Env, context: Background
     return new Response("Insufficient scope", {
       status: 403,
       headers: {
-        "www-authenticate": `${mcpBearerChallenge(env, required.join(" "))}, error="insufficient_scope"`,
+        "www-authenticate": `${mcpBearerChallenge(env, [...new Set([...access.scopes, ...required])].join(" "))}, error="insufficient_scope"`,
         "cache-control": "no-store",
       },
     });

@@ -78,6 +78,7 @@ export function oauthAuthorizationMetadata(env: Env) {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
+    authorization_response_iss_parameter_supported: true,
     scopes_supported: MCP_SCOPES,
   });
 }
@@ -188,6 +189,7 @@ function redirectUris(value: unknown) {
       url.username ||
       url.password ||
       url.hash ||
+      ["code", "error", "state", "iss"].some((key) => url.searchParams.has(key)) ||
       !((url.protocol === "https:" && !loopback) || (url.protocol === "http:" && loopback))
     )
       throw new HttpError(400, "invalid_client_metadata", "A redirect URI is invalid.");
@@ -384,25 +386,35 @@ type AuthorizationRequest = {
   resource: string;
 };
 
-async function authorizationRequest(params: URLSearchParams, env: Env): Promise<AuthorizationRequest> {
+async function authorizationRequest(params: URLSearchParams, env: Env): Promise<AuthorizationRequest | Response> {
   const clientId = singleton(params, "client_id");
   if (clientId.length > 2048) throw new HttpError(400, "invalid_client", "Client ID is too long.");
   const client = await resolveClient(env, clientId);
   const redirectUri = singleton(params, "redirect_uri");
   if (!(JSON.parse(client.redirect_uris_json) as string[]).includes(redirectUri))
     throw new HttpError(400, "invalid_request", "The redirect URI is not registered for this client.");
-  if (singleton(params, "response_type") !== "code")
-    throw new HttpError(400, "unsupported_response_type", "Only authorization code is supported.");
-  const state = singleton(params, "state");
-  if (!state || state.length > 512) throw new HttpError(400, "invalid_request", "State is invalid.");
-  const challenge = singleton(params, "code_challenge");
-  if (singleton(params, "code_challenge_method") !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(challenge))
-    throw new HttpError(400, "invalid_request", "A valid S256 PKCE challenge is required.");
-  const resource = singleton(params, "resource");
-  if (resource !== mcpResource(env))
-    throw new HttpError(400, "invalid_target", "The MCP resource must match this host.");
-  const scopes = scopeList(singleton(params, "scope"));
-  return { client, redirectUri, state, scopes, challenge, resource };
+  try {
+    if (singleton(params, "response_type") !== "code")
+      throw new HttpError(400, "unsupported_response_type", "Only authorization code is supported.");
+    const state = singleton(params, "state");
+    if (!state || state.length > 512) throw new HttpError(400, "invalid_request", "State is invalid.");
+    const challenge = singleton(params, "code_challenge");
+    if (singleton(params, "code_challenge_method") !== "S256" || !/^[A-Za-z0-9_-]{43}$/.test(challenge))
+      throw new HttpError(400, "invalid_request", "A valid S256 PKCE challenge is required.");
+    const resource = singleton(params, "resource");
+    if (resource !== mcpResource(env))
+      throw new HttpError(400, "invalid_target", "The MCP resource must match this host.");
+    const scopes = scopeList(singleton(params, "scope"));
+    return { client, redirectUri, state, scopes, challenge, resource };
+  } catch (error) {
+    if (!(error instanceof HttpError)) throw error;
+    const state = params.getAll("state");
+    return authorizationRedirect(
+      { redirectUri, state: state.length === 1 && state[0]!.length <= 512 ? state[0]! : "" },
+      { error: error.code },
+      env,
+    );
+  }
 }
 
 async function consentMember(request: Request, env: Env) {
@@ -414,10 +426,14 @@ async function consentMember(request: Request, env: Env) {
   return member;
 }
 
-function authorizationRedirect(request: AuthorizationRequest, params: Record<string, string>, env: Env) {
+function authorizationRedirect(
+  request: Pick<AuthorizationRequest, "redirectUri" | "state">,
+  params: Record<string, string>,
+  env: Env,
+) {
   const redirect = new URL(request.redirectUri);
   for (const [key, value] of Object.entries(params)) redirect.searchParams.set(key, value);
-  redirect.searchParams.set("state", request.state);
+  if (request.state) redirect.searchParams.set("state", request.state);
   redirect.searchParams.set("iss", origin(env));
   return Response.redirect(redirect, 302);
 }
@@ -435,7 +451,9 @@ export async function authorizeOAuthGet(request: Request, env: Env) {
   }
   const source = new URL(request.url).searchParams;
   const input = await authorizationRequest(source, env);
+  if (input instanceof Response) return input;
   const controls = [...source.entries()]
+    .filter(([key]) => key !== "decision")
     .map(([key, value]) => `<input type="hidden" name="${escapeHtml(key)}" value="${escapeHtml(value)}">`)
     .join("");
   const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect MCP client</title>
@@ -450,7 +468,7 @@ export async function authorizeOAuthGet(request: Request, env: Env) {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-      "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${new URL(input.redirectUri).origin}; frame-ancestors 'none'; base-uri 'none'`,
+      "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${new URL(input.redirectUri).hostname === "[::1]" ? "http:" : new URL(input.redirectUri).origin}; frame-ancestors 'none'; base-uri 'none'`,
       "x-content-type-options": "nosniff",
       "x-frame-options": "DENY",
     },
@@ -478,6 +496,7 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
   const member = await consentMember(request, env);
   const params = await formParams(request);
   const input = await authorizationRequest(params, env);
+  if (input instanceof Response) return input;
   if (singleton(params, "decision") === "deny") return authorizationRedirect(input, { error: "access_denied" }, env);
   if (singleton(params, "decision") !== "approve") throw new HttpError(400, "invalid_request", "Choose Allow or Deny.");
   const code = randomCredential();
@@ -500,7 +519,7 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
       member.user.id,
     )
     .run();
-  if (!issued.meta.changes) throw new HttpError(403, "account_security_required", "Complete account protection again.");
+  if (!issued.meta.changes) return authorizationRedirect(input, { error: "access_denied" }, env);
   return authorizationRedirect(input, { code }, env);
 }
 
@@ -704,19 +723,11 @@ export async function pruneOAuthSecurityRecords(env: Env) {
 export async function oauthToken(request: Request, env: Env) {
   const params = await formParams(request);
   const grantType = singleton(params, "grant_type");
-  const credential = params.get(grantType === "refresh_token" ? "refresh_token" : "code");
   const sourceRate = await consumeFixedWindow(env, `oauth-token-source:${await sourceRateLimitKey(request)}`, {
     window: 60,
-    max: 1200,
+    max: 120,
   });
   if (!sourceRate.allowed) return oauthError("slow_down", "Token requests are temporarily rate limited.", 429);
-  if (credential) {
-    const credentialRate = await consumeFixedWindow(env, `oauth-token-credential:${await sha256(credential)}`, {
-      window: 60,
-      max: 60,
-    });
-    if (!credentialRate.allowed) return oauthError("slow_down", "Token requests are temporarily rate limited.", 429);
-  }
   if (grantType === "authorization_code") return exchangeCode(params, env);
   if (grantType === "refresh_token") return refreshGrant(params, env);
   return oauthError("unsupported_grant_type", "Only authorization code and refresh token are supported.");
@@ -724,20 +735,11 @@ export async function oauthToken(request: Request, env: Env) {
 
 export async function oauthRevoke(request: Request, env: Env) {
   const params = await formParams(request);
-  const credential = params.get("token");
   const sourceRate = await consumeFixedWindow(env, `oauth-revoke-source:${await sourceRateLimitKey(request)}`, {
     window: 60,
-    max: 1200,
+    max: 120,
   });
   if (!sourceRate.allowed) return oauthError("slow_down", "Revocation requests are temporarily rate limited.", 429);
-  if (credential) {
-    const credentialRate = await consumeFixedWindow(env, `oauth-revoke-credential:${await sha256(credential)}`, {
-      window: 60,
-      max: 60,
-    });
-    if (!credentialRate.allowed)
-      return oauthError("slow_down", "Revocation requests are temporarily rate limited.", 429);
-  }
   const clientId = singleton(params, "client_id");
   const hash = await sha256(singleton(params, "token"));
   await env.DB.prepare(
