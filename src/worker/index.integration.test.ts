@@ -678,6 +678,8 @@ async function clearWorkerDatabase() {
   await env.DB.batch([
     env.DB.prepare(`DELETE FROM install_state`),
     env.DB.prepare(`DELETE FROM page_search`),
+    env.DB.prepare(`DELETE FROM link_preview_image_gc`),
+    env.DB.prepare(`DELETE FROM link_preview_cache`),
     env.DB.prepare(`DELETE FROM workspaces`),
     env.DB.prepare(`DELETE FROM verification`),
     env.DB.prepare(`DELETE FROM user`),

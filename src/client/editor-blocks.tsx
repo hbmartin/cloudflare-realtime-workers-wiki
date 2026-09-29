@@ -13,7 +13,7 @@ import {
 } from "react";
 import { notionBlockRegistry } from "../shared/notion-blocks";
 import { resolveEmbed } from "../shared/embed-providers";
-import { api, apiErrorMessage, json } from "./api";
+import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import type { Page, SearchTitleSuggestion } from "../shared/types";
 import "katex/dist/katex.min.css";
 
@@ -334,17 +334,27 @@ export function BookmarkBlock({ url, title, update }: { url: string; title: stri
   useEffect(() => {
     if (!expanded || !url.startsWith("https://")) return undefined;
     const controller = new AbortController();
-    const timer = window.setTimeout(() => {
+    let retries = 0;
+    let retryTimer: number | undefined;
+    const load = () => {
       void api<{ preview: LinkPreview }>("/api/link-previews", {
         method: "POST",
         body: json({ url }),
         signal: controller.signal,
       })
         .then((result) => setLoaded({ url, preview: result.preview }))
-        .catch(() => setLoaded(null));
-    }, 500);
+        .catch((cause: unknown) => {
+          if (controller.signal.aborted) return;
+          setLoaded(null);
+          if (cause instanceof ApiClientError && cause.code === "preview_pending" && retries++ < 2) {
+            retryTimer = window.setTimeout(load, 30_000);
+          }
+        });
+    };
+    const timer = window.setTimeout(load, 500);
     return () => {
       window.clearTimeout(timer);
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       controller.abort();
     };
   }, [expanded, url]);

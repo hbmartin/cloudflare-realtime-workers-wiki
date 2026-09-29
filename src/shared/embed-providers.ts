@@ -107,6 +107,16 @@ export const embedProviders: readonly EmbedProvider[] = [
           if (gid && /^\d+$/.test(gid)) frame.searchParams.set("gid", gid);
           if (single === "true" || single === "false") frame.searchParams.set("single", single);
         }
+        if (published[1] === "presentation") {
+          for (const name of ["start", "loop"] as const) {
+            const value = url.searchParams.get(name);
+            if (value === "true" || value === "false") frame.searchParams.set(name, value);
+          }
+          const delay = url.searchParams.get("delayms");
+          const slide = url.searchParams.get("slide");
+          if (delay && /^\d{1,6}$/.test(delay)) frame.searchParams.set("delayms", delay);
+          if (slide && /^[A-Za-z0-9_.-]{1,100}$/.test(slide)) frame.searchParams.set("slide", slide);
+        }
         return frame.href;
       }
       const match = /^\/(document|spreadsheets|presentation)\/d\/([A-Za-z0-9_-]+)(?:\/|$)/.exec(url.pathname);

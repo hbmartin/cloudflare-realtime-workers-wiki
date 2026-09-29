@@ -673,6 +673,7 @@ function CollaborativeEditor({
     const block = editor.getBlock(blockId);
     if (!block || block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) {
       setPasteChoice(null);
+      editor.focus();
       return;
     }
     if (kind === "link") {
@@ -683,7 +684,7 @@ function CollaborativeEditor({
       editor.replaceBlocks([block], [{ type: "embed", props: { url, title: "Embedded link" } }] as never);
     } else {
       // Store the URL immediately; the bookmark resolves disposable metadata in the background.
-      editor.replaceBlocks([block], [{ type: "bookmark", props: { url, title: url, previewId: "" } }] as never);
+      editor.replaceBlocks([block], [{ type: "bookmark", props: { url, title: url } }] as never);
     }
     setPasteChoice(null);
     editor.focus();

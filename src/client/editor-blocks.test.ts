@@ -4,6 +4,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { createElement } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
+import { ApiClientError } from "./api";
 import {
   allowedEmbedUrl,
   BookmarkBlock,
@@ -21,7 +22,8 @@ const renderMermaid = vi.hoisted(() => vi.fn(async (id: string) => ({ svg: `<svg
 const mocks = vi.hoisted(() => ({ api: vi.fn() }));
 
 vi.mock("mermaid", () => ({ default: { initialize: vi.fn(), render: renderMermaid } }));
-vi.mock("./api", () => ({
+vi.mock("./api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./api")>()),
   api: mocks.api,
   apiErrorMessage: (_cause: unknown, fallback: string) => fallback,
   json: (value: unknown) => JSON.stringify(value),
@@ -94,6 +96,36 @@ describe("core editor blocks", () => {
     view.rerender(block("https://example.com/other"));
     await waitFor(() => expect(mocks.api).toHaveBeenCalledTimes(2), { timeout: 3_000 });
     expect(screen.getByRole("link")).toHaveAttribute("href", "https://example.com/other");
+  });
+
+  it("retries an unfinished preview after the refresh lease", async () => {
+    vi.useFakeTimers();
+    try {
+      const url = "https://example.com/pending";
+      mocks.api
+        .mockRejectedValueOnce(new ApiClientError(503, "preview_pending", "Still fetching"))
+        .mockResolvedValueOnce({
+          preview: {
+            id: "preview-id",
+            url,
+            title: "Finished article",
+            description: "Summary",
+            siteName: "Example",
+            imageUrl: null,
+            expiresAt: Date.now() + 60_000,
+          },
+        });
+      render(
+        createElement(EmbedFeatureContext.Provider, { value: true }, createElement(BookmarkBlock, { url, title: url })),
+      );
+      await act(async () => vi.advanceTimersByTimeAsync(500));
+      expect(mocks.api).toHaveBeenCalledOnce();
+      await act(async () => vi.advanceTimersByTimeAsync(30_000));
+      expect(mocks.api).toHaveBeenCalledTimes(2);
+      expect(screen.getByRole("link")).toHaveTextContent("Finished article");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("uses a fresh Mermaid DOM id for every render invocation", async () => {

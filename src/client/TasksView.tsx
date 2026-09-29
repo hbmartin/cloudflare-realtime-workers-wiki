@@ -413,7 +413,6 @@ export function TasksView({
     const listId = task?.listId ?? page?.id;
     if (!listId) return false;
     const startedViewEpoch = viewEpoch.current;
-    const startedFilterKey = filterKeyRef.current;
     const current = task ? (dataRef.current.tasks.find((item) => item.id === task.id) ?? task) : null;
     const readVersion = task ? (taskReadVersion.current.get(task.id) ?? 0) + 1 : 1;
     if (task) taskReadVersion.current.set(task.id, readVersion);
@@ -440,7 +439,7 @@ export function TasksView({
         return true;
       }
       // A list load that started before this mutation can contain stale rows.
-      const needsReload = activeLoad.current !== null || filterKeyRef.current !== startedFilterKey;
+      const needsReload = activeLoad.current !== null;
       generation.current++;
       setLoading(false);
       setRevision(result.revision);
@@ -457,7 +456,11 @@ export function TasksView({
       setError(null);
       setBusy(false);
       paginationDirty.current = true;
-      if (needsReload) void loadRef.current();
+      if (needsReload) {
+        queuedAutoRefresh.current = false;
+        queuedForceRefresh.current = false;
+        void loadRef.current();
+      }
       if (changes.archived === true && task) {
         const remaining = { ...dataRef.current, tasks: dataRef.current.tasks.filter((item) => item.id !== task.id) };
         dataRef.current = remaining;

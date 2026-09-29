@@ -71,6 +71,12 @@ describe("embed providers", () => {
     expect(resolveEmbed("https://docs.google.com/presentation/d/e/2PACX-abc123/embed", true)?.frameUrl).toBe(
       "https://docs.google.com/presentation/d/e/2PACX-abc123/embed",
     );
+    expect(
+      resolveEmbed(
+        "https://docs.google.com/presentation/d/e/2PACX-abc123/embed?start=true&loop=true&delayms=5000&slide=id.p3",
+        true,
+      )?.frameUrl,
+    ).toBe("https://docs.google.com/presentation/d/e/2PACX-abc123/embed?start=true&loop=true&delayms=5000&slide=id.p3");
     expect(resolveEmbed("https://docs.google.com/document/d/e/2PACX-abc123/edit", true)).toBeNull();
   });
 });

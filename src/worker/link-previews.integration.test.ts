@@ -260,6 +260,26 @@ describe("link previews", () => {
     expect((await pending).title).toBe("Finished");
   });
 
+  it("charges in-progress callers before they poll D1", async () => {
+    let release!: (response: Response) => void;
+    const fetcher = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    const first = linkPreview(env, "workspace", pageUrl);
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    const gate = vi.fn(async () => {
+      throw new Error("rate limited");
+    });
+    await expect(linkPreview(env, "workspace", pageUrl, gate)).rejects.toThrow("rate limited");
+    expect(gate).toHaveBeenCalledOnce();
+    release(new Response("<title>Finished</title>", { headers: { "content-type": "text/html" } }));
+    await first;
+  });
+
   it("caps cache rows before fetching a new URL", async () => {
     const fetcher = vi.fn();
     vi.stubGlobal("fetch", fetcher);
@@ -267,7 +287,7 @@ describe("link previews", () => {
       get(target, property) {
         if (property === "prepare")
           return (sql: string) =>
-            sql.startsWith("SELECT COUNT(*) AS count FROM link_preview_cache")
+            sql.startsWith("SELECT (SELECT COUNT(*) FROM link_preview_cache")
               ? { bind: () => ({ first: async () => ({ count: 1_000 }) }) }
               : target.prepare(sql);
         const value = Reflect.get(target, property);
@@ -279,6 +299,38 @@ describe("link previews", () => {
       code: "preview_cache_full",
     });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("reclaims expired rows at the cap while counting queued R2 images", async () => {
+    await env.DB.prepare(
+      `INSERT INTO link_preview_cache
+       (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at)
+       WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<1000)
+       SELECT printf('expired-%04d',n),'workspace',printf('https://www.public-preview.org/%d',n),
+         'Old','','site',NULL,NULL,1,1 FROM seq`,
+    ).run();
+    const fetcher = vi.fn(async () => new Response("<title>New</title>", { headers: { "content-type": "text/html" } }));
+    vi.stubGlobal("fetch", fetcher);
+    expect((await linkPreview(env, "workspace", pageUrl)).title).toBe("New");
+    expect(
+      (
+        await env.DB.prepare("SELECT COUNT(*) AS count FROM link_preview_cache WHERE workspace_id='workspace'").first<{
+          count: number;
+        }>()
+      )?.count,
+    ).toBe(901);
+    await env.DB.prepare(
+      `INSERT INTO link_preview_image_gc (image_key,queued_at)
+       WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n<1000)
+       SELECT printf('link-previews/workspace/orphan-%04d',n), ? FROM seq`,
+    )
+      .bind(Date.now() + 60_000)
+      .run();
+    await expect(linkPreview(env, "workspace", "https://www.public-preview.org/another")).rejects.toMatchObject({
+      status: 429,
+      code: "preview_cache_full",
+    });
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("rejects internal targets before fetch and never follows a private redirect", async () => {
@@ -340,7 +392,14 @@ describe("link previews", () => {
     );
     vi.stubGlobal("fetch", fetcher);
     const first = await linkPreview(env, "workspace", pageUrl);
-    await env.DB.prepare("UPDATE link_preview_cache SET expires_at = 1 WHERE id = ?").bind(first.id).run();
+    await env.DB.prepare("UPDATE link_preview_cache SET expires_at = 1, refresh_until = ? WHERE id = ?")
+      .bind(Date.now() + 30_000, first.id)
+      .run();
+    await pruneLinkPreviews(env);
+    expect(await env.DB.prepare("SELECT id FROM link_preview_cache WHERE id = ?").bind(first.id).first()).toBeTruthy();
+    expect((await linkPreview(env, "workspace", pageUrl)).title).toBe("Original title");
+    expect(fetcher).toHaveBeenCalledOnce();
+    await env.DB.prepare("UPDATE link_preview_cache SET refresh_until = 1 WHERE id = ?").bind(first.id).run();
     fetcher.mockResolvedValueOnce(new Response("unavailable", { status: 503 }));
     const refreshed = await linkPreview(env, "workspace", pageUrl);
     expect(refreshed.title).toBe("Original title");

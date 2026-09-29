@@ -538,6 +538,7 @@ describe("task views", () => {
     await waitFor(() => expect(loads).toBe(3));
     await act(async () => resolveRefresh!({ tasks: [fixture], hasMore: false, nextCursor: null }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
+    expect(screen.getByLabelText("Status for Ship release")).toHaveValue("done");
   });
   it("keeps viewer properties read-only while allowing access to details", async () => {
     render(<TasksView page={page} member={{ ...member, role: "viewer" }} onSelectPage={vi.fn()} />);

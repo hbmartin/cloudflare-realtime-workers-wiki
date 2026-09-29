@@ -37,6 +37,7 @@ type CacheRow = {
   image_mime: string | null;
   expires_at: number;
   fetched_at: number;
+  refresh_until: number;
 };
 
 function publicUrl(value: string, base?: string): URL {
@@ -183,58 +184,80 @@ function responsePreview(row: CacheRow) {
 async function waitForRefresh(env: Env, workspaceId: string, id: string) {
   const deadline = Date.now() + FETCH_TIMEOUT + 5_000;
   while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 500));
     const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
       .bind(id, workspaceId)
       .first<CacheRow>();
-    if (current && current.fetched_at >= 0 && current.expires_at > Date.now()) return responsePreview(current);
+    if (current && current.refresh_until === 0 && current.expires_at > Date.now()) return responsePreview(current);
   }
   throw new HttpError(503, "preview_pending", "Link preview is still being fetched. Try again shortly.");
+}
+
+async function workspaceCacheSize(env: Env, workspaceId: string) {
+  const prefix = `link-previews/${workspaceId}/`;
+  const count = await env.DB.prepare(
+    `SELECT (SELECT COUNT(*) FROM link_preview_cache WHERE workspace_id = ?)
+      + (SELECT COUNT(*) FROM link_preview_image_gc WHERE image_key >= ? AND image_key < ?) AS count`,
+  )
+    .bind(workspaceId, prefix, `${prefix}\uffff`)
+    .first<{ count: number }>();
+  return count?.count ?? 0;
 }
 
 export async function linkPreview(env: Env, workspaceId: string, value: string, beforeFetch?: () => Promise<void>) {
   const url = publicUrl(value);
   const id = await sha256(`${workspaceId}\0${url.href}`);
-  const existing = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
+  let existing = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
     .bind(id, workspaceId)
     .first<CacheRow>();
   const now = Date.now();
-  if (existing && existing.expires_at > now)
-    return existing.fetched_at < 0 ? waitForRefresh(env, workspaceId, id) : responsePreview(existing);
+  if (existing && existing.refresh_until > now) {
+    if (existing.fetched_at > 0) return responsePreview(existing);
+    await beforeFetch?.();
+    return waitForRefresh(env, workspaceId, id);
+  }
+  if (existing && existing.expires_at > now) return responsePreview(existing);
   await beforeFetch?.();
   if (existing) {
     const claimed = await env.DB.prepare(
-      "UPDATE link_preview_cache SET expires_at = ?, fetched_at = ? WHERE id = ? AND workspace_id = ? AND expires_at <= ?",
+      "UPDATE link_preview_cache SET refresh_until = ? WHERE id = ? AND workspace_id = ? AND expires_at <= ? AND refresh_until <= ?",
     )
-      .bind(now + REFRESH_LEASE, -now, id, workspaceId, now)
+      .bind(now + REFRESH_LEASE, id, workspaceId, now, now)
       .run();
     if (!claimed.meta.changes) {
       const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
         .bind(id, workspaceId)
         .first<CacheRow>();
-      if (current) return current.fetched_at < 0 ? waitForRefresh(env, workspaceId, id) : responsePreview(current);
+      if (current)
+        return current.refresh_until > now && current.fetched_at === 0
+          ? waitForRefresh(env, workspaceId, id)
+          : responsePreview(current);
+      existing = null;
     }
   }
   if (!existing) {
-    const count = await env.DB.prepare(
-      "SELECT COUNT(*) AS count FROM link_preview_cache WHERE workspace_id = ? AND expires_at > ?",
-    )
-      .bind(workspaceId, now)
-      .first<{ count: number }>();
-    if ((count?.count ?? 0) >= MAX_WORKSPACE_PREVIEWS)
+    let size = await workspaceCacheSize(env, workspaceId);
+    if (size >= MAX_WORKSPACE_PREVIEWS) {
+      await pruneLinkPreviews(env);
+      size = await workspaceCacheSize(env, workspaceId);
+    }
+    if (size >= MAX_WORKSPACE_PREVIEWS)
       throw new HttpError(429, "preview_cache_full", "This workspace has too many cached previews.");
     const claimed = await env.DB.prepare(
       `INSERT OR IGNORE INTO link_preview_cache
-        (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at,refresh_until)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
     )
-      .bind(id, workspaceId, url.href, url.hostname, "", url.hostname, null, null, now + REFRESH_LEASE, -now)
+      .bind(id, workspaceId, url.href, url.hostname, "", url.hostname, null, null, now, 0, now + REFRESH_LEASE)
       .run();
     if (!claimed.meta.changes) {
       const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
         .bind(id, workspaceId)
         .first<CacheRow>();
-      if (current) return current.fetched_at < 0 ? waitForRefresh(env, workspaceId, id) : responsePreview(current);
+      if (current)
+        return current.refresh_until > now && current.fetched_at === 0
+          ? waitForRefresh(env, workspaceId, id)
+          : responsePreview(current);
     }
   }
 
@@ -265,7 +288,7 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
             const key = `link-previews/${workspaceId}/${id}/${crypto.randomUUID()}`;
             // Reserve the key for cleanup before writing R2; D1 and R2 cannot commit atomically.
             await env.DB.prepare("INSERT OR IGNORE INTO link_preview_image_gc (image_key,queued_at) VALUES (?,?)")
-              .bind(key, Date.now() + 60_000)
+              .bind(key, Date.now() + 60 * 60_000)
               .run();
             await env.BUCKET.put(key, bytes, { httpMetadata: { contentType: mime } });
             imageKey = key;
@@ -280,20 +303,25 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     // A failed external request is a short-lived plain link card.
   }
   if (!succeeded && existing && existing.fetched_at > 0) {
-    title = existing.title;
-    description = existing.description;
-    siteName = existing.site_name;
-    imageKey = existing.image_key;
-    imageMime = existing.image_mime;
+    const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
+      .bind(id, workspaceId)
+      .first<CacheRow>();
+    if (current && current.refresh_until > Date.now() && current.image_key === existing.image_key) {
+      title = existing.title;
+      description = existing.description;
+      siteName = existing.site_name;
+      imageKey = existing.image_key;
+      imageMime = existing.image_mime;
+    }
   }
   const expiresAt = Date.now() + (succeeded ? SUCCESS_TTL : FAILURE_TTL);
   const save = env.DB.prepare(
     `INSERT INTO link_preview_cache
-      (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?)
+      (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at,refresh_until)
+      VALUES (?,?,?,?,?,?,?,?,?,?,0)
       ON CONFLICT(id) DO UPDATE SET title=excluded.title,description=excluded.description,
         site_name=excluded.site_name,image_key=excluded.image_key,image_mime=excluded.image_mime,
-        expires_at=excluded.expires_at,fetched_at=excluded.fetched_at`,
+        expires_at=excluded.expires_at,fetched_at=excluded.fetched_at,refresh_until=0`,
   ).bind(id, workspaceId, url.href, title, description, siteName, imageKey, imageMime, expiresAt, Date.now());
   const statements: D1PreparedStatement[] = [];
   if (existing?.image_key && existing.image_key !== imageKey)
@@ -304,8 +332,7 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
       ),
     );
   statements.push(save);
-  if (imageKey && imageKey !== existing?.image_key)
-    statements.push(env.DB.prepare("DELETE FROM link_preview_image_gc WHERE image_key = ?").bind(imageKey));
+  if (imageKey) statements.push(env.DB.prepare("DELETE FROM link_preview_image_gc WHERE image_key = ?").bind(imageKey));
   try {
     await env.DB.batch(statements);
   } catch (cause) {
@@ -324,15 +351,17 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     image_mime: imageMime,
     expires_at: expiresAt,
     fetched_at: Date.now(),
+    refresh_until: 0,
   });
 }
 
 export async function linkPreviewImage(env: Env, workspaceId: string, id: string) {
   if (!/^[0-9a-f]{64}$/.test(id)) throw new HttpError(404, "preview_not_found", "Preview image not found.");
   const row = await env.DB.prepare(
-    "SELECT image_key,image_mime FROM link_preview_cache WHERE id = ? AND workspace_id = ? AND expires_at > ?",
+    `SELECT image_key,image_mime FROM link_preview_cache
+     WHERE id = ? AND workspace_id = ? AND (expires_at > ? OR refresh_until > ?)`,
   )
-    .bind(id, workspaceId, Date.now())
+    .bind(id, workspaceId, Date.now(), Date.now())
     .first<{ image_key: string | null; image_mime: string | null }>();
   if (!row?.image_key || !row.image_mime || !IMAGE_MIMES.has(row.image_mime)) {
     throw new HttpError(404, "preview_not_found", "Preview image not found.");
@@ -351,16 +380,24 @@ export async function linkPreviewImage(env: Env, workspaceId: string, id: string
 
 export async function pruneLinkPreviews(env: Env) {
   const now = Date.now();
-  const expired = "SELECT id FROM link_preview_cache WHERE expires_at <= ? ORDER BY expires_at LIMIT 100";
+  const expired =
+    "SELECT id FROM link_preview_cache WHERE expires_at <= ? AND refresh_until <= ? ORDER BY expires_at LIMIT 100";
   await env.DB.batch([
     env.DB.prepare(
       `INSERT OR IGNORE INTO link_preview_image_gc (image_key,queued_at)
        SELECT image_key, ? FROM link_preview_cache WHERE id IN (${expired}) AND image_key IS NOT NULL`,
-    ).bind(now, now),
-    env.DB.prepare(`DELETE FROM link_preview_cache WHERE id IN (${expired})`).bind(now),
+    ).bind(now, now, now),
+    env.DB.prepare(`DELETE FROM link_preview_cache WHERE id IN (${expired})`).bind(now, now),
+    env.DB.prepare(
+      `DELETE FROM link_preview_image_gc
+       WHERE EXISTS (SELECT 1 FROM link_preview_cache WHERE image_key = link_preview_image_gc.image_key)`,
+    ),
   ]);
   const rows = await env.DB.prepare(
-    "SELECT image_key FROM link_preview_image_gc WHERE queued_at <= ? ORDER BY queued_at LIMIT 100",
+    `SELECT image_key FROM link_preview_image_gc
+     WHERE queued_at <= ? AND NOT EXISTS
+       (SELECT 1 FROM link_preview_cache WHERE image_key = link_preview_image_gc.image_key)
+     ORDER BY queued_at LIMIT 100`,
   )
     .bind(Date.now())
     .all<{ image_key: string }>();
