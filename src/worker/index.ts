@@ -6496,7 +6496,7 @@ async function publicPageResponse(c: Context<{ Bindings: Env }>, pageId?: string
   } catch (error) {
     if (error instanceof HttpError && error.code === "share_content_unavailable")
       return c.html(
-        "<!doctype html><html><body><p>Shared content is temporarily unavailable. Please try again shortly.</p></body></html>",
+        '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared content unavailable</title><body><p>Shared content is temporarily unavailable. Please try again shortly.</p></body></html>',
         503,
         {
           "cache-control": "no-store",

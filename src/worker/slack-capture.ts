@@ -501,6 +501,7 @@ export async function resumeSlackCaptureJob(env: Env, captureId: string, jobId: 
     throw new HttpError(409, "slack_capture_unavailable", "This Slack capture cannot be resumed.");
   if (capture.state !== "running" && (capture.state !== "failed" || attempt < 2))
     throw new HttpError(409, "slack_capture_unavailable", "This Slack capture cannot be resumed.");
+  const { session, installation } = await authorizedCaptureContext(env, capture);
   if (capture.state === "running" && attempt === 1) {
     const current = await env.DB.prepare(`SELECT input_key FROM jobs WHERE id=? AND attempt=1 AND status='running'`)
       .bind(jobId)
@@ -511,7 +512,6 @@ export async function resumeSlackCaptureJob(env: Env, captureId: string, jobId: 
       return inputKey;
     }
   }
-  const { session, installation } = await authorizedCaptureContext(env, capture);
   const inputKey = await stageCaptureInput(env, capture, session, installation);
   const input = await env.DB.prepare(
     `UPDATE jobs SET input_key=?,updated_at=? WHERE id=? AND attempt=? AND status='running' RETURNING input_key`,
@@ -655,10 +655,7 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
     if (capture.state === "running" && capture.job_id === existingJob.id) {
       if (existingJob.status === "queued" || existingJob.status === "running")
         await cleanupSupersededCaptureInputs(env, capture);
-      if (existingJob.status === "queued") {
-        await authorizedCaptureContext(env, capture);
-        return existingJob;
-      }
+      if (existingJob.status === "queued") return existingJob;
       if (existingJob.status === "running") return null;
       if (existingJob.status === "canceling" || existingJob.cleanup_target) return null;
     }
