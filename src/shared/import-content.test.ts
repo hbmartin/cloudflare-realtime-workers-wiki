@@ -454,6 +454,32 @@ describe("import content", () => {
     expect(parsed.references).toContain("https://example.com/x");
   });
 
+  it("keeps brackets inside image-label code from ending the image early", () => {
+    const image = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`![a \`]\` b](${image}) [end](end.md)`);
+    expect(parsed.references).toContain(image);
+    expect(parsed.references).toContain("end.md");
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1000));
+  });
+
+  it("keeps outer link and emphasis around a small image with unmatched label code", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(
+      `[![a \` b](${image})](https://example.com/x) *see ![a \` b](${image}) now* ${"x".repeat(9_000)}`,
+    );
+    expect(parsed.references).toContain(image);
+    expect(parsed.references).toContain("https://example.com/x");
+    expect(JSON.stringify(parsed.document)).not.toContain("](${image})");
+    expect(JSON.stringify(parsed.document)).toContain("italic");
+  });
+
+  it("recognizes a long image after an unclosed destination inside a code span", () => {
+    const image = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`\`f[i](x\` then g(y) ![shot](${image})`);
+    expect(parsed.references).toContain(image);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1000));
+  });
+
   it("does not recognize image syntax inside a link title", () => {
     const parsed = markdownToDocument(
       `[doc](https://x.test/p "see ![i \`x](data:image/png;base64,AAAA)") ${"x".repeat(9_000)}`,
@@ -516,6 +542,11 @@ describe("import content", () => {
   it("bounds repeated unclosed destinations across many sections", () => {
     const parsed = markdownToDocument(("[a](b " + "x".repeat(8_200)).repeat(50) + " [end](end.md)");
     expect(parsed.references).toContain("end.md");
+  });
+
+  it("rescans the newly visible window after an earlier destination has no close", () => {
+    const parsed = markdownToDocument(`[a](b ${"x".repeat(8_150)} [c](c.md "${"t ".repeat(60)}") ${"z".repeat(9_000)}`);
+    expect(parsed.references).toContain("c.md");
   });
 
   it("keeps a link after an unmatched bracket and a long title-bearing link", () => {

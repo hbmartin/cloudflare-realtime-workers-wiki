@@ -679,7 +679,7 @@ describe("job execution", () => {
     },
   );
 
-  it("starts queued work before heavy cleanup and cleans newly failed imports ahead of old rows", async () => {
+  it("cleans newly failed imports before queued work and older cleanup rows", async () => {
     const installed = await bootstrap();
     const now = Date.now();
     const jobId = crypto.randomUUID();
@@ -702,12 +702,12 @@ describe("job execution", () => {
       ).bind(queuedId, installed.workspaceId, installed.userId, now - 60_000, now - 60_000),
     ]);
     const get = vi.fn(async (_id: string) => ({ status: vi.fn(async () => ({ status: "errored" })) }));
-    let queuedStartedBeforeCleanup = false;
+    let newlyFailedCleanedBeforeQueuedStart = false;
     const create = vi.fn(async ({ id }: { id: string }) => {
-      queuedStartedBeforeCleanup =
+      newlyFailedCleanedBeforeQueuedStart =
         (await env.DB.prepare(`SELECT cleanup_target FROM jobs WHERE id=?`)
           .bind(jobId)
-          .first<string>("cleanup_target")) === "failed";
+          .first<string>("cleanup_target")) === null;
       return { id };
     });
     await recoverQueuedJobs(bindingsWith({ NOTES_WORKFLOW: { get, create } }));
@@ -717,7 +717,7 @@ describe("job execution", () => {
     });
     expect(get.mock.calls.filter(([id]) => id === jobId)).toHaveLength(1);
     expect(create).toHaveBeenCalled();
-    expect(queuedStartedBeforeCleanup).toBe(true);
+    expect(newlyFailedCleanedBeforeQueuedStart).toBe(true);
   });
 
   it("stores a generic workflow-start recovery failure and logs a redacted diagnostic", async () => {
