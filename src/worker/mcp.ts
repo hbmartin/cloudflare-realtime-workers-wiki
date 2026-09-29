@@ -1,0 +1,622 @@
+import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
+import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
+import { z } from "zod";
+import { createCommentThread, type CommentPage } from "./comments";
+import { projectNotionMarkdown } from "../shared/notion-markdown";
+import { MarkdownWriteError, parseWritableMarkdown } from "../shared/notion-markdown-write";
+import { markdownMutations } from "../shared/notion-markdown-mutations";
+import { parseMarkdownCommand } from "../shared/notion-markdown-commands";
+import type { DocumentContentEnvelope } from "../shared/types";
+import { ID_PATTERN, PAGE_TITLE_MAX } from "../shared/validation";
+import type { Env } from "./env";
+import { HttpError, locationHint, sha256 } from "./http";
+import { mcpAccess, mcpBearerChallenge, type McpAccess, type McpScope } from "./oauth";
+import { correlationHeaders, logger } from "./observability";
+import { editableSpaceForMember, pageForMember, requirePageEditor, type PageRow } from "./page-access";
+import { pageJson } from "./page-row";
+import { parseSearchRequest, searchPages } from "./search";
+import { broadcastWorkspaceEvent } from "./workspace-events";
+
+const MAX_MCP_BODY = 64 * 1024;
+const OPERATION_ID = /^[A-Za-z0-9._~:-]{1,128}$/;
+const RECEIPT_TTL_MS = 30 * 24 * 60 * 60_000;
+const TOOL_SCOPES: Record<string, readonly McpScope[]> = {
+  search_pages: ["pages:read"],
+  fetch_page: ["pages:read"],
+  create_page: ["pages:write"],
+  update_page: ["pages:write"],
+  create_comment: ["pages:read", "comments:write"],
+};
+
+function result(value: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+}
+
+function toolError(error: unknown) {
+  const message =
+    error instanceof HttpError || error instanceof MarkdownWriteError
+      ? error.message
+      : "The tool could not complete this request.";
+  return { isError: true, content: [{ type: "text" as const, text: message }] };
+}
+
+async function writableDestination(env: Env, access: McpAccess, spaceId: string, parentId: string | null) {
+  await editableSpaceForMember(env, access.member, spaceId);
+  if (!parentId) return;
+  const parent = await pageForMember(env, access.member, parentId);
+  requirePageEditor(parent);
+  if (parent.space_id !== spaceId)
+    throw new HttpError(422, "cross_space_parent", "The parent page belongs to another space.");
+}
+
+type CreatePageInput = {
+  space_id: string;
+  parent_id?: string | null | undefined;
+  title: string;
+  markdown: string;
+  operation_id: string;
+};
+
+async function createPageTool(request: Request, env: Env, input: CreatePageInput) {
+  let access = await currentAccess(request, env, ["pages:write"]);
+  const parentId = input.parent_id ?? null;
+  await writableDestination(env, access, input.space_id, parentId);
+  const inputHash = await sha256(JSON.stringify({ ...input, parent_id: parentId }));
+  type Staged = { status: "staged"; pageId: string; children: ReturnType<typeof parseWritableMarkdown> };
+  let receipt = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
+  if (receipt && (receipt as { status?: unknown }).status !== "staged") return receipt;
+  if (!receipt) {
+    const children = parseWritableMarkdown(input.markdown);
+    if (children.length > 100)
+      throw new HttpError(413, "too_many_blocks", "Create up to 100 Markdown blocks at a time.");
+    const pageId = crypto.randomUUID();
+    const stageId = `mcp:create:${pageId}`;
+    const previous = await env.DB.prepare(
+      `SELECT position FROM pages WHERE workspace_id=? AND parent_id IS ? AND archived_at IS NULL
+        ORDER BY position DESC,id DESC LIMIT 1`,
+    )
+      .bind(access.member.workspace.id, parentId)
+      .first<{ position: string }>();
+    const position = generateJitteredKeyBetween(previous?.position ?? null, null);
+    const staged: Staged = { status: "staged", pageId, children };
+    const timestamp = Date.now();
+    access = await currentAccess(request, env, ["pages:write"]);
+    await writableDestination(env, access, input.space_id, parentId);
+    try {
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO pages
+            (id,workspace_id,space_id,parent_id,kind,position,title,import_job_id,
+             created_by,updated_by,created_at,updated_at)
+           VALUES (?,?,?,?,'document',?,?,?,?,?,?,?)`,
+        ).bind(
+          pageId,
+          access.member.workspace.id,
+          input.space_id,
+          parentId,
+          position,
+          input.title,
+          stageId,
+          access.member.user.id,
+          access.member.user.id,
+          timestamp,
+          timestamp,
+        ),
+        receiptStatement(env, access.grantId, input.operation_id, "create_page", inputHash, staged),
+      ]);
+      receipt = staged;
+    } catch (error) {
+      receipt = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
+      if (!receipt) throw error;
+    }
+  }
+  if ((receipt as { status?: unknown }).status !== "staged") return receipt;
+  const staged = receipt as Staged;
+  const stageId = `mcp:create:${staged.pageId}`;
+  const stage = await env.DB.prepare("SELECT content_epoch,import_job_id FROM pages WHERE id=? AND workspace_id=?")
+    .bind(staged.pageId, access.member.workspace.id)
+    .first<{ content_epoch: number; import_job_id: string | null }>();
+  if (!stage || stage.import_job_id !== stageId)
+    throw new HttpError(409, "page_create_unknown", "The page creation outcome could not be verified.");
+  access = await currentAccess(request, env, ["pages:write"]);
+  await writableDestination(env, access, input.space_id, parentId);
+  let sequence = 0;
+  if (staged.children.length) {
+    const operationId = `mcp:${access.grantId}:${input.operation_id}`;
+    const response = await env.DOCUMENT.getByName(`${staged.pageId}~${stage.content_epoch}`).fetch(
+      new Request("https://document.internal/api-mutate", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-notes-internal": env.BETTER_AUTH_SECRET,
+          ...correlationHeaders(),
+        },
+        body: JSON.stringify({
+          actorId: access.member.user.id,
+          operations: [{ type: "append_children", children: staged.children, position: { type: "end" } }],
+          suppressExternalEffects: true,
+          operationId,
+        }),
+      }),
+    );
+    if (!response.ok)
+      throw new HttpError(
+        response.status === 409 ? 409 : 503,
+        "page_content_failed",
+        "The page content could not be saved.",
+      );
+    sequence = (await response.json<{ sequence: number }>()).sequence;
+  }
+  access = await currentAccess(request, env, ["pages:write"]);
+  await writableDestination(env, access, input.space_id, parentId);
+  const value = {
+    id: staged.pageId,
+    title: input.title,
+    url: new URL(`/?page=${staged.pageId}`, env.BETTER_AUTH_URL).href,
+    revision: sequence,
+    operationId: input.operation_id,
+  };
+  const timestamp = Date.now();
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO page_search(page_id,workspace_id,title,body)
+         SELECT id,workspace_id,title,'' FROM pages WHERE id=? AND import_job_id=?`,
+      ).bind(staged.pageId, stageId),
+      env.DB.prepare(
+        `INSERT INTO page_search_v2(page_id,workspace_id,space_id,title,tags,body,comments,attachments)
+         SELECT id,workspace_id,space_id,title,'','','','' FROM pages WHERE id=? AND import_job_id=?`,
+      ).bind(staged.pageId, stageId),
+      env.DB.prepare(
+        `INSERT INTO subscriptions(id,workspace_id,user_id,resource_type,resource_id,created_by,created_at)
+         SELECT ?,workspace_id,?,'page',id,?,? FROM pages WHERE id=? AND import_job_id=?`,
+      ).bind(
+        `page:${staged.pageId}:${access.member.user.id}`,
+        access.member.user.id,
+        access.member.user.id,
+        timestamp,
+        staged.pageId,
+        stageId,
+      ),
+      env.DB.prepare("UPDATE pages SET import_job_id=NULL WHERE id=? AND import_job_id=?").bind(staged.pageId, stageId),
+      env.DB.prepare(
+        "UPDATE oauth_operation_receipts SET result_json=? WHERE grant_id=? AND operation_id=? AND input_hash=?",
+      ).bind(JSON.stringify(value), access.grantId, input.operation_id, inputHash),
+    ]);
+  } catch (error) {
+    const committed = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
+    if (!committed || (committed as { status?: unknown }).status === "staged") throw error;
+    return committed;
+  }
+  const page = await pageForMember(env, access.member, staged.pageId);
+  await broadcastWorkspaceEvent(env, access.member.workspace.id, {
+    type: "pages-upserted",
+    pages: [pageJson(page)],
+  }).catch((error: unknown) => {
+    logger.warn("mcp.page_event.failed", "mcp", "Page event delivery failed.", { pageId: page.id }, error);
+  });
+  return value;
+}
+
+async function roomContent(env: Env, access: McpAccess, page: PageRow) {
+  const hint = locationHint(access.member.workspace.locationHint ?? undefined);
+  const response = await env.DOCUMENT.getByName(
+    `${page.id}~${page.content_epoch}`,
+    hint ? { locationHint: hint } : undefined,
+  ).fetch(
+    new Request("https://document.internal/content", {
+      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
+    }),
+  );
+  if (!response.ok) throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
+  const envelope = await response.json<DocumentContentEnvelope>();
+  if (envelope.pageId !== page.id || envelope.contentEpoch !== page.content_epoch)
+    throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
+  return envelope;
+}
+
+async function roomMutationReceipt(env: Env, page: PageRow, operationId: string) {
+  const url = new URL("https://document.internal/api-mutate-receipt");
+  url.searchParams.set("operationId", operationId);
+  const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
+    new Request(url, { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() } }),
+  );
+  if (response.status === 404) return null;
+  if (!response.ok) throw new HttpError(503, "receipt_unavailable", "The document receipt is unavailable.");
+  return response.json<{ found: true; sequence: number }>();
+}
+
+async function updatePageTool(
+  request: Request,
+  env: Env,
+  input: { page_id: string; command: Record<string, unknown>; operation_id: string },
+) {
+  let access = await currentAccess(request, env, ["pages:write"]);
+  let page = await pageForMember(env, access.member, input.page_id);
+  requirePageEditor(page);
+  if (page.kind !== "document") throw new HttpError(422, "document_required", "This page is not a document.");
+  const inputHash = await sha256(JSON.stringify(input));
+  const cached = await receiptFor(env, access.grantId, input.operation_id, "update_page", inputHash);
+  if (cached) return cached;
+  const operationId = `mcp:${access.grantId}:${input.operation_id}`;
+  const complete = async (sequence: number) => {
+    access = await currentAccess(request, env, ["pages:write"]);
+    page = await pageForMember(env, access.member, input.page_id);
+    requirePageEditor(page);
+    const value = {
+      id: page.id,
+      title: page.title,
+      url: new URL(`/?page=${page.id}`, env.BETTER_AUTH_URL).href,
+      revision: sequence,
+      operationId: input.operation_id,
+    };
+    try {
+      await receiptStatement(env, access.grantId, input.operation_id, "update_page", inputHash, value).run();
+    } catch (error) {
+      const committed = await receiptFor(env, access.grantId, input.operation_id, "update_page", inputHash);
+      if (!committed) throw error;
+      return committed;
+    }
+    return value;
+  };
+  const prior = await roomMutationReceipt(env, page, operationId);
+  if (prior) return complete(prior.sequence);
+  const envelope = await roomContent(env, access, page);
+  const projection = projectNotionMarkdown(envelope.document, new Map(), {
+    pageHref: (id) => new URL(`/?page=${encodeURIComponent(id)}`, env.BETTER_AUTH_URL).href,
+  });
+  const command = parseMarkdownCommand(input.command, projection.markdown);
+  const protectedRows = await env.DB.prepare(
+    "SELECT DISTINCT block_id FROM comment_threads WHERE page_id=? AND block_id IS NOT NULL",
+  )
+    .bind(page.id)
+    .all<{ block_id: string }>();
+  const operations = markdownMutations(
+    envelope.document,
+    projection,
+    command.edits,
+    command.allowDeletingContent,
+    new Set(protectedRows.results.map((row) => row.block_id)),
+  );
+  if (!operations.length) return complete(envelope.sequence);
+  access = await currentAccess(request, env, ["pages:write"]);
+  page = await pageForMember(env, access.member, input.page_id);
+  requirePageEditor(page);
+  if (page.content_epoch !== envelope.contentEpoch)
+    throw new HttpError(409, "page_changed", "The page content version changed.");
+  const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
+    new Request("https://document.internal/api-mutate", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-notes-internal": env.BETTER_AUTH_SECRET,
+        ...correlationHeaders(),
+      },
+      body: JSON.stringify({
+        actorId: access.member.user.id,
+        operations,
+        expectedSequence: envelope.sequence,
+        operationId,
+      }),
+    }),
+  );
+  if (!response.ok) {
+    const committed = await roomMutationReceipt(env, page, operationId);
+    if (committed) return complete(committed.sequence);
+    throw new HttpError(
+      response.status === 409 ? 409 : 503,
+      "page_update_failed",
+      "The document edit was not applied.",
+    );
+  }
+  return complete((await response.json<{ sequence: number }>()).sequence);
+}
+
+async function currentAccess(request: Request, env: Env, scopes: readonly McpScope[]) {
+  const access = await mcpAccess(request, env, scopes);
+  if (!access) throw new HttpError(403, "mcp_access_denied", "This connection no longer has access.");
+  return access;
+}
+
+async function receiptFor(env: Env, grantId: string, operationId: string, toolName: string, inputHash: string) {
+  const row = await env.DB.prepare(
+    "SELECT tool_name,input_hash,result_json FROM oauth_operation_receipts WHERE grant_id=? AND operation_id=?",
+  )
+    .bind(grantId, operationId)
+    .first<{ tool_name: string; input_hash: string; result_json: string }>();
+  if (!row) return null;
+  if (row.tool_name !== toolName || row.input_hash !== inputHash)
+    throw new HttpError(409, "operation_id_reused", "This operation ID was used with different input.");
+  return JSON.parse(row.result_json) as unknown;
+}
+
+function receiptStatement(
+  env: Env,
+  grantId: string,
+  operationId: string,
+  toolName: string,
+  inputHash: string,
+  value: unknown,
+) {
+  const timestamp = Date.now();
+  return env.DB.prepare(
+    `INSERT INTO oauth_operation_receipts
+      (grant_id,operation_id,tool_name,input_hash,result_json,created_at,expires_at)
+     VALUES (?,?,?,?,?,?,?)`,
+  ).bind(grantId, operationId, toolName, inputHash, JSON.stringify(value), timestamp, timestamp + RECEIPT_TTL_MS);
+}
+
+async function commentTool(
+  request: Request,
+  env: Env,
+  input: { page_id: string; body: string; block_id?: string | undefined; operation_id: string },
+) {
+  const scopes = TOOL_SCOPES.create_comment!;
+  let access = await currentAccess(request, env, scopes);
+  await pageForMember(env, access.member, input.page_id);
+  const inputHash = await sha256(JSON.stringify(input));
+  const cached = await receiptFor(env, access.grantId, input.operation_id, "create_comment", inputHash);
+  if (cached) return cached;
+  access = await currentAccess(request, env, scopes);
+  const page = await pageForMember(env, access.member, input.page_id);
+  const scoped: CommentPage = {
+    id: page.id,
+    workspace_id: page.workspace_id,
+    space_id: page.space_id ?? `${page.workspace_id}-general`,
+    content_epoch: page.content_epoch,
+    created_by: page.created_by,
+    effective_role: page.effective_role,
+  };
+  const threadId = crypto.randomUUID();
+  const commentId = crypto.randomUUID();
+  const value = { threadId, commentId, pageId: page.id, url: new URL(`/?page=${page.id}`, env.BETTER_AUTH_URL).href };
+  try {
+    await createCommentThread(
+      env,
+      access.member,
+      scoped,
+      { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: input.body }] }] },
+      null,
+      input.block_id ?? null,
+      {
+        threadId,
+        commentId,
+        receipt: receiptStatement(env, access.grantId, input.operation_id, "create_comment", inputHash, value),
+      },
+    );
+  } catch (error) {
+    const committed = await receiptFor(env, access.grantId, input.operation_id, "create_comment", inputHash);
+    if (!committed) throw error;
+    return committed;
+  }
+  await broadcastWorkspaceEvent(env, access.member.workspace.id, {
+    type: "comments-invalidated",
+    pageId: page.id,
+  }).catch((error: unknown) => {
+    logger.warn("mcp.comment_event.failed", "mcp", "Comment event delivery failed.", { pageId: page.id }, error);
+  });
+  return value;
+}
+
+function cursorOffset(cursor: string | undefined, query: string) {
+  if (!cursor) return 0;
+  try {
+    const decoded = JSON.parse(atob(cursor.replaceAll("-", "+").replaceAll("_", "/"))) as unknown;
+    if (
+      !decoded ||
+      typeof decoded !== "object" ||
+      (decoded as { query?: unknown }).query !== query ||
+      !Number.isInteger((decoded as { offset?: unknown }).offset) ||
+      Number((decoded as { offset: number }).offset) < 0 ||
+      Number((decoded as { offset: number }).offset) > 1000
+    )
+      throw new Error("Invalid cursor");
+    return Number((decoded as { offset: number }).offset);
+  } catch {
+    throw new HttpError(400, "invalid_cursor", "The search cursor is invalid.");
+  }
+}
+
+function nextCursor(query: string, offset: number) {
+  return btoa(JSON.stringify({ query, offset })).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+async function searchPageTool(request: Request, env: Env, query: string, cursor?: string) {
+  const access = await currentAccess(request, env, ["pages:read"]);
+  const offset = cursorOffset(cursor, query);
+  const url = new URL("/api/search", env.BETTER_AUTH_URL);
+  url.searchParams.set("q", query);
+  url.searchParams.set("limit", "20");
+  url.searchParams.set("offset", String(offset));
+  const searched = await searchPages(env.DB, access.member, parseSearchRequest(url.href));
+  return {
+    pages: searched.results.map(({ page, snippet }) => ({
+      id: page.id,
+      title: page.title,
+      kind: page.kind,
+      url: new URL(`/?page=${encodeURIComponent(page.id)}`, env.BETTER_AUTH_URL).href,
+      snippet: snippet.text,
+    })),
+    nextCursor: searched.hasMore ? nextCursor(query, offset + searched.results.length) : null,
+  };
+}
+
+async function fetchPageTool(request: Request, env: Env, pageId: string) {
+  const access = await currentAccess(request, env, ["pages:read"]);
+  const page = await pageForMember(env, access.member, pageId);
+  if (page.kind !== "document") throw new HttpError(422, "document_required", "This page is not a document.");
+  const envelope = await roomContent(env, access, page);
+  const projected = projectNotionMarkdown(envelope.document, new Map(), {
+    pageHref: (id) => new URL(`/?page=${encodeURIComponent(id)}`, env.BETTER_AUTH_URL).href,
+  });
+  return {
+    id: page.id,
+    title: page.title,
+    url: new URL(`/?page=${encodeURIComponent(page.id)}`, env.BETTER_AUTH_URL).href,
+    revision: envelope.sequence,
+    markdown: projected.markdown,
+    truncated: projected.truncated,
+    unknownBlockIds: projected.unknownBlockIds,
+  };
+}
+
+function serverFor(request: Request, env: Env, access: McpAccess) {
+  const server = new McpServer({ name: "noteflare", version: "1.0.0" });
+  if (access.scopes.has("pages:read"))
+    server.registerTool(
+      "search_pages",
+      {
+        title: "Search pages",
+        description: "Search pages currently accessible to the connected member.",
+        inputSchema: z.object({ query: z.string().trim().min(1).max(200), cursor: z.string().max(512).optional() }),
+      },
+      async ({ query, cursor }) => {
+        try {
+          return result(await searchPageTool(request, env, query, cursor));
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  if (TOOL_SCOPES.create_comment!.every((scope) => access.scopes.has(scope)))
+    server.registerTool(
+      "create_comment",
+      {
+        title: "Create comment",
+        description: "Post a comment as the connected member. Reuse operation_id when retrying.",
+        inputSchema: z.object({
+          page_id: z.string().regex(ID_PATTERN),
+          body: z.string().trim().min(1).max(16_000),
+          block_id: z.string().regex(ID_PATTERN).optional(),
+          operation_id: z.string().regex(OPERATION_ID),
+        }),
+      },
+      async (input) => {
+        try {
+          return result(await commentTool(request, env, input));
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  if (access.scopes.has("pages:write"))
+    server.registerTool(
+      "create_page",
+      {
+        title: "Create page",
+        description: "Create a document in a writable space. Reuse operation_id when retrying.",
+        inputSchema: z.object({
+          space_id: z.string().regex(ID_PATTERN),
+          parent_id: z.string().regex(ID_PATTERN).nullable().optional(),
+          title: z.string().trim().min(1).max(PAGE_TITLE_MAX),
+          markdown: z.string().max(64_000),
+          operation_id: z.string().regex(OPERATION_ID),
+        }),
+      },
+      async (input) => {
+        try {
+          return result(await createPageTool(request, env, input));
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  if (access.scopes.has("pages:write"))
+    server.registerTool(
+      "update_page",
+      {
+        title: "Update page",
+        description: "Apply a Phase 5 Markdown command to a writable document. Reuse operation_id when retrying.",
+        inputSchema: z.object({
+          page_id: z.string().regex(ID_PATTERN),
+          command: z.record(z.string(), z.unknown()),
+          operation_id: z.string().regex(OPERATION_ID),
+        }),
+      },
+      async (input) => {
+        try {
+          return result(await updatePageTool(request, env, input));
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  if (access.scopes.has("pages:read"))
+    server.registerTool(
+      "fetch_page",
+      {
+        title: "Fetch page",
+        description: "Read a document as Markdown using current member permissions.",
+        inputSchema: z.object({ page_id: z.string().regex(ID_PATTERN) }),
+      },
+      async ({ page_id }) => {
+        try {
+          return result(await fetchPageTool(request, env, page_id));
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  return server;
+}
+
+export async function mcpRequest(request: Request, env: Env) {
+  const site = new URL(env.BETTER_AUTH_URL).origin;
+  const requestOrigin = request.headers.get("origin");
+  if (requestOrigin && requestOrigin !== site) return Response.json({ error: "Invalid Origin." }, { status: 403 });
+  if (new URL(request.url).origin !== site) return Response.json({ error: "Invalid host." }, { status: 403 });
+  if (request.method !== "POST") return new Response("Method not allowed.", { status: 405 });
+  if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json"))
+    return new Response("Expected application/json.", { status: 415 });
+  const length = Number(request.headers.get("content-length"));
+  if (Number.isFinite(length) && length > MAX_MCP_BODY) return new Response("Request is too large.", { status: 413 });
+  const reader = request.clone().body?.getReader();
+  if (!reader) return new Response("Expected a JSON request.", { status: 400 });
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  while (true) {
+    const part = await reader.read();
+    if (part.done) break;
+    size += part.value.byteLength;
+    if (size > MAX_MCP_BODY) {
+      await reader.cancel();
+      return new Response("Request is too large.", { status: 413 });
+    }
+    parts.push(part.value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const part of parts) {
+    bytes.set(part, offset);
+    offset += part.byteLength;
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+  } catch {
+    body = null;
+  }
+  const message = body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : null;
+  const params = message?.params;
+  const name =
+    message?.method === "tools/call" && params && typeof params === "object" && !Array.isArray(params)
+      ? (params as { name?: unknown }).name
+      : null;
+  const required = typeof name === "string" ? (TOOL_SCOPES[name] ?? []) : [];
+  const access = await mcpAccess(request, env, required);
+  if (!access)
+    return new Response("Unauthorized", {
+      status: 401,
+      headers: { "www-authenticate": mcpBearerChallenge(env, required[0]), "cache-control": "no-store" },
+    });
+  const handler = createMcpHandler(() => serverFor(request, env, access), {
+    legacy: "reject",
+    responseMode: "json",
+    maxRequestBodySize: MAX_MCP_BODY,
+  });
+  try {
+    return await handler.fetch(request);
+  } finally {
+    await handler.close();
+  }
+}

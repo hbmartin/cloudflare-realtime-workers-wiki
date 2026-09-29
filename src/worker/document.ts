@@ -1373,7 +1373,10 @@ export class Document extends YServer {
       let pageProjected = false;
 
       if (page) {
-        const effectsSuppressed = suppressExternalEffects && page.import_job_id?.startsWith("notion-create:") === true;
+        const effectsSuppressed =
+          suppressExternalEffects &&
+          (page.import_job_id?.startsWith("notion-create:") === true ||
+            page.import_job_id?.startsWith("mcp:create:") === true);
         const [oldPageTargets, oldUserTargets, watcherRows] = await Promise.all([
           this.bindings.DB.prepare(`SELECT target_page_id id FROM page_references WHERE source_page_id = ?`)
             .bind(pageId)

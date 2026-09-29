@@ -12,6 +12,44 @@ export type PageRow = PageJsonRow & {
   effective_role?: Role;
 };
 
+export type SpaceRow = {
+  id: string;
+  workspace_id: string;
+  name: string;
+  slug: string;
+  description: string;
+  icon: string | null;
+  position: string;
+  visibility: "workspace" | "private";
+  space_role: Exclude<Role, "owner"> | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export function requirePageEditor(page: PageRow) {
+  if (page.effective_role === "viewer") throw new HttpError(403, "read_only", "Your role in this space is read-only.");
+}
+
+export async function spaceForMember(env: Env, member: MemberContext, spaceId: string) {
+  const row = await env.DB.prepare(
+    `SELECT s.*, sm.role space_role FROM spaces s
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE s.id = ? AND s.workspace_id = ?
+       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
+  )
+    .bind(member.user.id, spaceId, member.workspace.id, member.role)
+    .first<SpaceRow>();
+  if (!row) throw new HttpError(404, "space_not_found", "Space not found.");
+  return row;
+}
+
+export async function editableSpaceForMember(env: Env, member: MemberContext, spaceId: string) {
+  const space = await spaceForMember(env, member, spaceId);
+  if (effectiveSpaceRole(member.role, space.visibility, space.space_role ?? null) === "viewer")
+    throw new HttpError(403, "space_forbidden", "You cannot write to this space.");
+  return space;
+}
+
 export async function pageForMember(env: Env, member: MemberContext, pageId: string, includeArchived = false) {
   const row = await env.DB.prepare(
     `SELECT p.*, s.visibility, sm.role space_role

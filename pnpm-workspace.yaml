@@ -15,3 +15,5 @@ minimumReleaseAgeExclude:
   - better-auth@1.6.28
   - miniflare@5.20260811.1-alpha
   - wrangler@4.123.0
+  - "@modelcontextprotocol/core@2.2.0"
+  - "@modelcontextprotocol/server@2.2.0"

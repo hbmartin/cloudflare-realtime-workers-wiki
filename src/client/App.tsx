@@ -69,6 +69,7 @@ import { SlackSettings } from "./SlackSettings";
 import { ThemeControl } from "./ThemeControl";
 import { ShareControl } from "./ShareControl";
 import { IntegrationsSettings } from "./IntegrationsSettings";
+import { OAuthConnectionsSettings } from "./OAuthConnectionsSettings";
 
 const DiagramPage = lazy(() => import("./DiagramPage").then((module) => ({ default: module.DiagramPage })));
 
@@ -770,6 +771,12 @@ export function App() {
     if (state.screen === "workspace") return onApiUnauthorized(sessionExpired);
     return undefined;
   }, [sessionExpired, state.screen]);
+
+  useEffect(() => {
+    if (state.screen !== "workspace") return;
+    const authorize = new URLSearchParams(window.location.search).get("oauthAuthorize");
+    if (authorize?.startsWith("/oauth/authorize?")) window.location.assign(authorize);
+  }, [state.screen]);
 
   useEffect(() => {
     void load();
@@ -4363,6 +4370,7 @@ function MembersView({ member, spaces, pages }: { member: ClientMemberContext; s
       </div>
       <SecurityScreen settings />
       <SlackSettings owner={member.role === "owner"} spaces={spaces} pages={pages} />
+      <OAuthConnectionsSettings owner={member.role === "owner"} />
       <IntegrationsSettings owner={member.role === "owner"} pages={pages} />
     </main>
   );

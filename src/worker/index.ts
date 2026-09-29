@@ -3,7 +3,16 @@ import { authorizeSlackCaptureJobRetry } from "./slack-capture";
 import { taskListStatements, listTasks, mutateTask, taskAssignees } from "./tasks";
 import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror, verifySlackMirrorRecovery } from "./slack-threads";
 import { acceptSlackWorkspaceInteraction, openSlackSearch, purgeExpiredSlackSearchSessions } from "./slack-workspace";
-import { pageForMember, effectiveSpaceRole, sidebarHiddenPageIds, type PageRow } from "./page-access";
+import {
+  pageForMember,
+  effectiveSpaceRole,
+  sidebarHiddenPageIds,
+  requirePageEditor,
+  spaceForMember,
+  editableSpaceForMember,
+  type PageRow,
+  type SpaceRow,
+} from "./page-access";
 import { mentionsInbox, markMentionsRead } from "./mentions-inbox";
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
@@ -168,6 +177,21 @@ import {
   spaceWatchState,
 } from "./notifications";
 import { notionApi, notionFileResponse, recoverNotionMarkdownTasks } from "./notion-api";
+import {
+  authorizeOAuthGet,
+  authorizeOAuthPost,
+  listOAuthConnections,
+  oauthAuthorizationMetadata,
+  oauthProtectedResourceMetadata,
+  oauthRevoke,
+  oauthToken,
+  pruneOAuthSecurityRecords,
+  registerOAuthClient,
+  revokeOAuthConnection,
+  setWorkspaceMcpEnabled,
+  workspaceMcpSettings,
+} from "./oauth";
+import { mcpRequest } from "./mcp";
 import { parseSearchRequest, searchPages, searchTitles } from "./search";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import {
@@ -878,26 +902,6 @@ async function pageForComment(env: Env, member: MemberContext, commentId: string
   return { threadId: located.thread_id, page: await pageForMember(env, member, located.page_id) };
 }
 
-function requirePageEditor(page: PageRow) {
-  if (page.effective_role === "viewer") {
-    throw new HttpError(403, "read_only", "Your role in this space is read-only.");
-  }
-}
-
-type SpaceRow = {
-  id: string;
-  workspace_id: string;
-  name: string;
-  slug: string;
-  description: string;
-  icon: string | null;
-  position: string;
-  visibility: "workspace" | "private";
-  space_role: Exclude<Role, "owner"> | null;
-  created_at: number;
-  updated_at: number;
-};
-
 function spaceJson(row: SpaceRow, member: MemberContext): Space {
   return {
     id: row.id,
@@ -912,27 +916,6 @@ function spaceJson(row: SpaceRow, member: MemberContext): Space {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
-}
-
-async function spaceForMember(env: Env, member: MemberContext, spaceId: string) {
-  const row = await env.DB.prepare(
-    `SELECT s.*, sm.role space_role FROM spaces s
-      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
-     WHERE s.id = ? AND s.workspace_id = ?
-       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
-  )
-    .bind(member.user.id, spaceId, member.workspace.id, member.role)
-    .first<SpaceRow>();
-  if (!row) throw new HttpError(404, "space_not_found", "Space not found.");
-  return row;
-}
-
-async function editableSpaceForMember(env: Env, member: MemberContext, spaceId: string) {
-  const space = await spaceForMember(env, member, spaceId);
-  if (effectiveSpaceRole(member.role, space.visibility, space.space_role ?? null) === "viewer") {
-    throw new HttpError(403, "space_forbidden", "You cannot write to this space.");
-  }
-  return space;
 }
 
 type TagRow = {
@@ -1138,6 +1121,20 @@ function tableRowBinds(query: TableRowQuery, limit: number) {
 }
 
 app.onError((error, c) => errorResponse(c, error));
+
+app.get("/.well-known/oauth-protected-resource/mcp", (c) => oauthProtectedResourceMetadata(c.env));
+app.get("/.well-known/oauth-protected-resource", (c) => oauthProtectedResourceMetadata(c.env));
+app.get("/.well-known/oauth-authorization-server", (c) => oauthAuthorizationMetadata(c.env));
+app.get("/oauth/authorize", (c) => authorizeOAuthGet(c.req.raw, c.env));
+app.post("/oauth/authorize", (c) => authorizeOAuthPost(c.req.raw, c.env));
+app.post("/oauth/token", (c) => oauthToken(c.req.raw, c.env));
+app.post("/oauth/revoke", (c) => oauthRevoke(c.req.raw, c.env));
+app.post("/oauth/register", (c) => registerOAuthClient(c.req.raw, c.env));
+app.get("/api/oauth/connections", (c) => listOAuthConnections(c.req.raw, c.env));
+app.delete("/api/oauth/connections/:id", (c) => revokeOAuthConnection(c.req.raw, c.env, c.req.param("id")));
+app.get("/api/oauth/workspace", (c) => workspaceMcpSettings(c.req.raw, c.env));
+app.post("/api/oauth/workspace", (c) => setWorkspaceMcpEnabled(c.req.raw, c.env));
+app.on(["GET", "POST", "DELETE"], "/mcp", (c) => mcpRequest(c.req.raw, c.env));
 
 app.post("/api/telemetry/client-errors", async (c) => {
   const { success: sourceAllowed } = await c.env.CLIENT_TELEMETRY_PREAUTH_LIMIT.limit({
@@ -6951,7 +6948,10 @@ export default {
         slack_digests: () => sendDueSlackChannelDigests(env),
         slack_security_records: () => pruneSlackSecurityRecords(env),
         webhook_history: () => pruneWebhookHistory(env),
-        security_state: () => pruneSecurityState(env),
+        security_state: async () => {
+          await pruneSecurityState(env);
+          await pruneOAuthSecurityRecords(env);
+        },
         table_search_values: () => backfillTableSearchValues(env),
       };
       const tasks: ScheduledTask[] = SCHEDULED_TASK_NAMES.map((name) => ({ name, run: runners[name] }));
