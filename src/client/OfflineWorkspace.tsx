@@ -123,7 +123,7 @@ export function OfflineWorkspace({
         flushSync(() => setRecovery("finalizing"));
         const stored = await getOfflinePage(account.key, selected.pageId);
         if (!isCurrent()) return;
-        const hasDraft = Boolean(pendingKeysOf(stored ?? selected).length);
+        const hasDraft = Boolean(pendingKeysOf(stored ?? selected).length || pendingKeysOf(selected).length);
         const space = spaces.find((item) => item.id === page.spaceId);
         if (!space && !hasDraft) {
           await discardRevokedCopy(selected.pageId);
@@ -492,8 +492,11 @@ function OfflineBlockEditor({
       return writing;
     };
     registerFlush(async () => {
-      while (updates.length) await persistUpdates();
-      if (compacting) await compacting;
+      try {
+        while (updates.length) await persistUpdates();
+      } finally {
+        if (compacting) await compacting;
+      }
     });
     const flushOnHide = () => {
       if (!updates.length || !copy.persistence.db) return;

@@ -589,6 +589,24 @@ test("warns and offers export before offline sign-out removes pending edits", as
   ).toBe(0);
 });
 
+test("can finish offline sign-out when database enumeration is unavailable", async ({ page, context }) => {
+  await signInOwner(page);
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type("Cached before sign-out");
+  await expect(page.locator(".bn-editor")).toContainText("Cached before sign-out");
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
+  await page.evaluate(() => Object.defineProperty(indexedDB, "databases", { value: undefined, configurable: true }));
+  await page.locator(".offline-document .bn-editor").click();
+  await page.keyboard.type(" unsynced");
+  await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
+  await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
+  await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
+  await page.getByRole("button", { name: "Sign out and delete local copies" }).click();
+  await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+});
+
 test("retains drafts from both epochs in the sign-out review", async ({ page, context }) => {
   await signInOwner(page);
   const previousPage = new URL(page.url()).searchParams.get("page");

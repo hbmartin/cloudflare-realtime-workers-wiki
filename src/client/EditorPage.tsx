@@ -42,7 +42,6 @@ import {
   offlineDocumentKey,
   pendingKeysOf,
   persistPendingDocumentUpdate,
-  rememberOfflineAccount,
   rememberOfflinePage,
   storageEpoch,
 } from "./offline-catalog";
@@ -120,8 +119,12 @@ export function EditorPage({
         const converted = Object.fromEntries(
           saved.filter((key): key is string => typeof key === "string").map((key) => [key, page.contentEpoch]),
         );
-        localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(converted));
         dismissedRecovery.current = converted;
+        try {
+          localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(converted));
+        } catch (error) {
+          console.error("Unable to migrate dismissed recovery details", error);
+        }
       } else
         dismissedRecovery.current =
           saved && typeof saved === "object"
@@ -229,7 +232,8 @@ export function EditorPage({
             console.error("Unable to read offline document marker", error);
             return true;
           })));
-      catalogNeedsRepair = Boolean(catalogPage?.catalogNeedsRepair) || (marker && !listed);
+      catalogNeedsRepair =
+        Boolean(catalogPage?.catalogNeedsRepair && pendingKeys.includes(currentStorageKey)) || (marker && !listed);
       if (readingRevision === pendingRevision) pendingActive = marker;
       const olderDrafts = pendingKeys.filter((key) => key !== currentStorageKey);
       for (const key of olderDrafts) quarantine(key);
@@ -238,6 +242,7 @@ export function EditorPage({
       const deadline = window.setTimeout(() => controller.abort(), 10_000);
       try {
         const currentMember = await api<ClientMemberContext>("/api/me", { signal: controller.signal });
+        if (!active) return false;
         if (currentMember.user.id !== member.user.id || currentMember.workspace.id !== member.workspace.id) {
           window.location.reload();
           return false;
@@ -246,6 +251,7 @@ export function EditorPage({
           writePending(true);
           await pendingWrite;
         }
+        if (!active) return false;
         // A clean copy can rely on the document room's page access check.
         if (!hasLocalDraft && !olderDrafts.length) return true;
         const [{ page: currentPage }, { spaces }] = await Promise.all([
@@ -270,6 +276,7 @@ export function EditorPage({
         }
         return true;
       } catch (error) {
+        if (!active) return false;
         if (error instanceof ApiClientError && [401, 403, 404, 410].includes(error.status)) {
           if (error.status === 401) {
             if (hasLocalDraft) quarantine(currentStorageKey, "access");
@@ -300,6 +307,7 @@ export function EditorPage({
       const remaining = current.filter((entry) => entry.key !== currentStorageKey);
       if (remaining.length !== current.length) replaceRecovery(remaining);
       setStorageError("");
+      setCatalogWarning(null);
     };
     const writePending = (pending: boolean) => {
       if (!pending && storageFailed) return;
@@ -317,7 +325,6 @@ export function EditorPage({
           if (!pending && storageFailed) return;
           const currentMember = offlineMember.current;
           if (pending) {
-            if (catalogNeedsRepair) await rememberOfflineAccount(currentMember);
             const remembered = await rememberOfflinePage(
               currentMember,
               offlineMetadata.current.page,
@@ -349,6 +356,7 @@ export function EditorPage({
               true,
             );
             clearCurrentRecovery();
+            if (active) setCatalogWarning(null);
           }
         })
         .catch((error) => {
@@ -419,6 +427,7 @@ export function EditorPage({
     };
     next.doc.on("update", documentUpdate);
     const customMessage = (message: string) => {
+      if (!active) return;
       try {
         const value = JSON.parse(message) as { type: string; bytes: number; readOnly: boolean };
         if (value.type === "document-size") setSizeWarning(value);
@@ -438,8 +447,11 @@ export function EditorPage({
       onPageUnavailable,
       onAccessDenied,
     });
-    const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
+    const connectionClose = (event: CloseEvent) => {
+      if (active) closeReconciler.handleClose(event);
+    };
     const connectionSync = (synced: boolean) => {
+      if (!active) return;
       closeReconciler.handleSync(synced);
       if (synced && active) setHasConfirmedSync(true);
     };
@@ -462,7 +474,12 @@ export function EditorPage({
       next.provider.off("sync", connectionSync);
       next.doc.off("update", documentUpdate);
       next.provider.disconnect();
-      void Promise.allSettled([pendingWrite, compacting ?? Promise.resolve()]).then(() => next.destroy());
+      void pendingWrite
+        .catch(() => {})
+        .then(async () => {
+          if (compacting) await compacting;
+          next.destroy();
+        });
       setBundle(null);
     };
   }, [
