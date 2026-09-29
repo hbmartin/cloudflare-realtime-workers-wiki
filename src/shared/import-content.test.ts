@@ -269,6 +269,20 @@ describe("import content", () => {
     expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
   });
 
+  it("keeps adjacent titled data images out of paragraph text", () => {
+    const data = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`See ![a](${data} "first")![b](${data}) below`);
+    expect(parsed.references).toEqual([data, data]);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
+  it("recognizes a data image with unmatched code punctuation in its label", () => {
+    const data = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`See ![a \` tick](${data}) below`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
+  });
+
   it("keeps later and larger data images out of paragraph text", () => {
     const data = `data:image/png;base64,${"A".repeat(100_000)}`;
     const parsed = markdownToDocument(`See ![small](small.png) then ![large](${data}) below`);
@@ -364,6 +378,21 @@ describe("import content", () => {
     });
   });
 
+  it("keeps an image and a code-bearing link across long-content cuts", () => {
+    const parsed = markdownToDocument(
+      `${"x".repeat(8150)} ![a](https://example.com/${"z".repeat(100)}) [see \`useState\` docs](https://react.dev/x) tail`,
+    );
+    expect(parsed.references).toEqual([`https://example.com/${"z".repeat(100)}`, "https://react.dev/x"]);
+  });
+
+  it("keeps a link wrapped around a small image near a cut", () => {
+    const parsed = markdownToDocument(
+      `${"x".repeat(8100)} [![icon](data:image/png;base64,AAAA)](https://example.com) tail`,
+    );
+    expect(parsed.references).toContain("https://example.com");
+    expect(parsed.references).toContain("data:image/png;base64,AAAA");
+  });
+
   it("keeps a link after an unmatched bracket and a long title-bearing link", () => {
     const ordinary = markdownToDocument(
       `[0, 1) ${"word ".repeat(1630)}[link text here](https://example.com/x) ${"tail ".repeat(400)}*`,
@@ -411,6 +440,13 @@ describe("import content", () => {
     const parsed = markdownToDocument("` ".repeat(100_001));
     expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
     expect(parsed.issues.some((issue) => issue.code === "inline_markup_simplified")).toBe(true);
+  });
+
+  it("removes large data-image payloads even when delimiter scanning is simplified", () => {
+    const data = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`${"` ".repeat(100_001)} ![a](${data})`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
   });
 
   it("finishes a long paragraph without spaces", () => {

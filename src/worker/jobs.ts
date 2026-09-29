@@ -810,14 +810,36 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
     return await hasUnlinkedCapture(env, job.id);
   } catch (lookupError) {
     try {
-      return await hasUnlinkedCapture(env, job.id);
+      const unlinked = await hasUnlinkedCapture(env, job.id);
+      logger.warn(
+        "workflow.capture_lookup.retried",
+        "workflow",
+        "Capture receipt lookup recovered on retry.",
+        { jobId: job.id, attempt: job.attempt },
+        lookupError,
+      );
+      return unlinked;
     } catch (retryError) {
+      logger.error(
+        "workflow.capture_import.unresolved",
+        "workflow",
+        "Capture import failed while receipt lookup was unavailable.",
+        { jobId: job.id, attempt: job.attempt },
+        error,
+      );
+      logger.error(
+        "workflow.capture_lookup.first_failed",
+        "workflow",
+        "First capture receipt lookup failed.",
+        { jobId: job.id, attempt: job.attempt },
+        lookupError,
+      );
       logger.error(
         "workflow.capture_lookup.failed",
         "workflow",
         "Capture lookup failed during job recovery.",
         { jobId: job.id, attempt: job.attempt },
-        new AggregateError([lookupError, retryError], "Capture receipt lookup failed twice.", { cause: retryError }),
+        retryError,
       );
       // The scheduled pass will retry when D1 can answer authoritatively.
     }
@@ -1361,6 +1383,7 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
 
 export async function recoverQueuedJobs(env: Env) {
   const cutoff = Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS;
+  const terminalCleanupIds: string[] = [];
   if (env.WORKFLOW_INLINE !== "true") {
     const rotateRunningJob = (job: JobRow) =>
       env.DB.prepare(`UPDATE jobs SET updated_at=? WHERE id=? AND attempt=? AND status='running'
@@ -1406,6 +1429,7 @@ export async function recoverQueuedJobs(env: Env) {
           }
         }
         await failJobWithCleanup(env, job, failure, true);
+        terminalCleanupIds.push(job.id);
       } catch (error) {
         logger.error(
           "workflow.running_recovery.failed",
@@ -1453,11 +1477,13 @@ export async function recoverQueuedJobs(env: Env) {
       }
     }
   }
+  const immediate = terminalCleanupIds.length ? ` OR id IN (${terminalCleanupIds.map(() => "?").join(",")})` : "";
   const cleanups = await env.DB.prepare(
     `SELECT id, attempt FROM jobs WHERE cleanup_target IS NOT NULL
-      AND status IN (${CLEANUP_JOB_STATUS_SQL}) AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
+      AND status IN (${CLEANUP_JOB_STATUS_SQL}) AND (updated_at <= ?${immediate})
+      ORDER BY updated_at LIMIT 25`,
   )
-    .bind(cutoff)
+    .bind(cutoff, ...terminalCleanupIds)
     .all<Pick<JobRow, "id" | "attempt">>();
   for (const job of cleanups.results) {
     try {

@@ -149,10 +149,18 @@ type CodeRange = { start: number; openEnd: number; closeStart: number; end: numb
 
 function codeRanges(value: string): CodeRange[] | null {
   const runs: Array<{ start: number; end: number; length: number; escaped: boolean }> = [];
+  let destinationDepth = 0;
   for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (value[index] === "(" && (destinationDepth || value[index - 1] === "]")) destinationDepth += 1;
+    else if (value[index] === ")" && destinationDepth) destinationDepth -= 1;
+    if (destinationDepth) continue;
     if (value[index] !== "`") continue;
     let end = index + 1;
-    while (value[end] === "`") end += 1;
+    while (end < value.length && value[end] === "`") end += 1;
     runs.push({ start: index, end, length: end - index, escaped: trailingEscape(value, index) });
     // Keep hostile paragraphs with millions of delimiters inside Worker memory.
     if (runs.length > 100_000) return null;
@@ -200,7 +208,12 @@ function safeInlineCut(value: string, start: number, maximum: number, codes: Cod
     const character = value[index];
     const code = codes[codeIndex];
     if (code && index === code.start) {
-      if (code.end > maximum) return code.start > start ? code.start : maximum;
+      if (code.end > maximum) {
+        const outer = brackets[0];
+        const activeOuter = outer !== undefined && code.start - outer <= 1024 ? outer : Infinity;
+        const earliest = Math.min(code.start, activeOuter, parenDepth ? linkStart : Infinity);
+        return earliest > start ? earliest : maximum;
+      }
       index = code.end - 1;
       codeIndex += 1;
       continue;
@@ -212,15 +225,21 @@ function safeInlineCut(value: string, start: number, maximum: number, codes: Cod
     if (character === "[") brackets.push(index);
     else if (character === "]" && brackets.length) {
       const opening = brackets.pop()!;
-      if (value[index + 1] === "(") linkStart = opening;
+      if (value[index + 1] === "(") linkStart = value[opening - 1] === "!" ? opening - 1 : opening;
     } else if (character === "(" && (parenDepth || value[index - 1] === "]")) parenDepth += 1;
-    else if (character === ")" && parenDepth) parenDepth -= 1;
+    else if (character === ")" && parenDepth) {
+      parenDepth -= 1;
+      if (!parenDepth) linkStart = 0;
+    }
     if (character === " " && index >= start + 1024) {
       fallback = index + 1;
       if (!brackets.length && !parenDepth) whitespace = index + 1;
     }
   }
-  if (parenDepth && linkStart > start) return linkStart;
+  if (parenDepth && linkStart > start) {
+    const outer = brackets[0];
+    return outer !== undefined && linkStart - outer <= 1024 ? Math.min(linkStart, outer) : linkStart;
+  }
   return whitespace || fallback || maximum;
 }
 
@@ -252,16 +271,24 @@ function safeDenseBoundary(value: string, boundary: number) {
     if (character === "[") brackets.push(index);
     else if (character === "]" && brackets.length) {
       const opening = brackets.pop()!;
-      if (value[index + 1] === "(") linkStart = opening;
+      if (value[index + 1] === "(") linkStart = value[opening - 1] === "!" ? opening - 1 : opening;
     } else if (character === "(" && (parenDepth || value[index - 1] === "]")) parenDepth += 1;
-    else if (character === ")" && parenDepth) parenDepth -= 1;
+    else if (character === ")" && parenDepth) {
+      parenDepth -= 1;
+      if (!parenDepth) linkStart = 0;
+    }
   }
-  return parenDepth ? linkStart : (brackets[0] ?? boundary);
+  const outer = brackets[0];
+  return parenDepth
+    ? outer !== undefined && linkStart - outer <= 1024
+      ? Math.min(linkStart || boundary, outer)
+      : linkStart || boundary
+    : (outer ?? boundary);
 }
 
 function longDataImage(value: string, start: number) {
   if (!value.startsWith("![", start) || trailingEscape(value, start)) return null;
-  const labelEnd = linkLabelEnd(value, start, 514);
+  const labelEnd = linkLabelEnd(value, start, 514, false);
   if (labelEnd === null) return null;
   const destinationStart = labelEnd + 2;
   const prefix = /^data:image\/(?:png|gif|jpeg|webp);base64,/i.exec(
@@ -269,22 +296,30 @@ function longDataImage(value: string, start: number) {
   )?.[0];
   if (!prefix) return null;
   let end = destinationStart + prefix.length;
-  while (end < value.length && /[A-Za-z0-9+/=]/.test(value[end]!)) end += 1;
+  while (end < value.length && /[A-Za-z0-9+/_=%-]/.test(value[end]!)) end += 1;
+  const payloadEnd = end;
+  while (value[end] === " ") end += 1;
+  if (value[end] === '"' || value[end] === "'") {
+    const quote = value[end++];
+    while (end < value.length && value[end] !== quote) end += 1;
+    if (value[end++] !== quote) return null;
+    while (value[end] === " ") end += 1;
+  }
   if (value[end] !== ")") return null;
-  const href = safeLink(value.slice(destinationStart, end));
+  const href = safeLink(value.slice(destinationStart, payloadEnd));
   if (!href) return null;
   return { label: unescapeMarkdown(value.slice(start + 2, labelEnd)), href, end: end + 1 };
 }
 
-function linkLabelEnd(value: string, start: number, maximum: number) {
+function linkLabelEnd(value: string, start: number, maximum: number, respectCode = true) {
   let depth = 1;
   let ticks = 0;
   let index = start + (value[start] === "!" ? 2 : 1);
   for (; index < Math.min(value.length, start + maximum) && depth; index += 1) {
     const character = value[index];
-    if (character === "`") {
+    if (respectCode && character === "`") {
       let end = index + 1;
-      while (value[end] === "`") end += 1;
+      while (end < Math.min(value.length, start + maximum) && value[end] === "`") end += 1;
       ticks = ticks ? 0 : end - index;
       index = end - 1;
     } else if (!ticks && character === "\\") index += 1;
@@ -313,8 +348,16 @@ function simpleLongLink(value: string, start: number, labelEnd: number) {
       return null;
     rawDestination = rawDestination.slice(1, closing);
   } else {
-    rawDestination = rawDestination.replace(/\s+(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')$/, "");
-    if (/\s/.test(rawDestination)) return null;
+    const space = rawDestination.search(/\s/);
+    if (space >= 0) {
+      const title = rawDestination.slice(space).trim();
+      if (title.length < 2 || !['"', "'"].includes(title[0]!) || title.at(-1) !== title[0]) return null;
+      for (let index = 1; index < title.length - 1; index += 1) {
+        if (title[index] === "\\") index += 1;
+        else if (title[index] === title[0]) return null;
+      }
+      rawDestination = rawDestination.slice(0, space);
+    }
   }
   return {
     label: unescapeMarkdown(value.slice(start + (value[start] === "!" ? 2 : 1), labelEnd)),
@@ -332,7 +375,20 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
   issues.push({ code: "inline_markup_simplified", detail: "Long inline content was parsed in bounded sections." });
   const output: ProseMirrorJson[] = [];
   const codes = codeRanges(value);
-  if (!codes) return inline(unescapeMarkdown(value));
+  if (!codes) {
+    let start = 0;
+    for (let position = value.indexOf("!["); position >= 0; position = value.indexOf("![", position + 2)) {
+      const image = longDataImage(value, position);
+      if (!image) continue;
+      output.push(...inline(unescapeMarkdown(value.slice(start, position))), ...inline(image.label));
+      references.push(image.href);
+      issues.push({ code: "image_not_imported", detail: image.href.slice(0, 120) });
+      start = image.end;
+      position = image.end - 2;
+    }
+    output.push(...inline(unescapeMarkdown(value.slice(start))));
+    return output;
+  }
   const specials: Array<
     | { kind: "image"; start: number; end: number; label: string; href: string }
     | { kind: "code"; start: number; end: number; openEnd: number; closeStart: number }
@@ -342,11 +398,17 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
     while (codes[codeIndex] && codes[codeIndex]!.end <= position) codeIndex += 1;
     if (codes[codeIndex] && codes[codeIndex]!.start <= position) continue;
     const image = longDataImage(value, position);
-    if (!image) continue;
+    if (!image || image.end - position <= 8192) continue;
     specials.push({ kind: "image", start: position, ...image });
-    position = image.end - 1;
+    position = image.end - 2;
   }
   specials.sort((left, right) => left.start - right.start);
+  for (let index = 1; index < specials.length;) {
+    if (specials[index]!.start < specials[index - 1]!.end) {
+      const remove = specials[index]!.kind === "image" ? index - 1 : index;
+      specials.splice(remove, 1);
+    } else index += 1;
+  }
   const append = (section: ProseMirrorJson[]) => {
     for (const node of section) {
       const previous = output.at(-1);
@@ -420,6 +482,10 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
   for (let start = 0; start < value.length;) {
     while (specials[specialIndex] && specials[specialIndex]!.end <= start) specialIndex += 1;
     const special = specials[specialIndex];
+    if (special && special.start < start) {
+      specialIndex += 1;
+      continue;
+    }
     if (special?.start === start) {
       if (special.kind === "image") {
         references.push(special.href);
