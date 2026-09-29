@@ -62,13 +62,13 @@ describe("import content", () => {
     expect(content.map((node) => node.text).join("")).toBe(`${prefix}${italic}${suffix}`);
   });
 
-  it("keeps bold inside an unmatched outer italic delimiter", () => {
+  it("keeps nested bold inside an outer italic delimiter", () => {
     const content = markdownToDocument("*read the **important** part*").document.content![0]!.content![0]!.content![0]!
       .content!;
     expect(content).toEqual([
-      { type: "text", text: "*read the " },
-      { type: "text", text: "important", marks: [{ type: "bold" }] },
-      { type: "text", text: " part*" },
+      { type: "text", text: "read the ", marks: [{ type: "italic" }] },
+      { type: "text", text: "important", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: " part", marks: [{ type: "italic" }] },
     ]);
   });
 
@@ -83,11 +83,21 @@ describe("import content", () => {
     expect(content.some((node) => node.text === italic && node.marks?.[0]?.type === "italic")).toBe(true);
   });
 
-  it.each(["*a**b**", "*foo**bar**baz*"])("keeps a strong span after an unmatched star: %s", (source) => {
-    const content = markdownToDocument(source).document.content![0]!.content![0]!.content![0]!.content!;
-    expect(content.some((node) => node.text === "b" || node.text === "bar")).toBe(true);
-    expect(content.some((node) => node.marks?.[0]?.type === "bold")).toBe(true);
-    expect(content[0]?.text?.startsWith("*a") || content[0]?.text?.startsWith("*foo")).toBe(true);
+  it("keeps a strong span after an unmatched star", () => {
+    const content = markdownToDocument("*a**b**").document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "*a" },
+      { type: "text", text: "b", marks: [{ type: "bold" }] },
+    ]);
+  });
+
+  it("keeps a strong span inside a matched italic span", () => {
+    const content = markdownToDocument("*foo**bar**baz*").document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "foo", marks: [{ type: "italic" }] },
+      { type: "text", text: "bar", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: "baz", marks: [{ type: "italic" }] },
+    ]);
   });
 
   it("scans long unclosed emphasis with backslashes without backtracking", () => {

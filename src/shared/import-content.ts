@@ -143,9 +143,30 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
   // literal while escaped punctuation outside them cannot open formatting.
   const pattern =
     /\\([\\`*_{}[\]()#+\-.!|>~])|(!?)\[((?:\\.|[^\]\\])*)\]\(|\*\*((?:\\.|[^\\*])+)\*\*|__((?:\\.|[^\\_])+)__|`([^`]+)`|\*(?!\*)((?:\\.|[^\\*])+)(?<=\S)\*|_(?!_)((?:\\.|[^\\_])+)_(?!\w)/g;
+  const nestedPattern = /\*((?:\\.|[^\\*])+?)\*\*((?:\\.|[^\\*])+?)\*\*((?:\\.|[^\\*])+?)\*/g;
   let offset = 0;
+  let nested = nestedPattern.exec(value);
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(value))) {
+    // A single emphasis span can contain a strong span using the same marker.
+    // Consume the full delimiter sequence before the flat alternatives split it.
+    while (nested && nested.index < offset) nested = nestedPattern.exec(value);
+    if (
+      nested &&
+      nested.index <= match.index &&
+      value[nested.index - 1] !== "*" &&
+      value[nested.index - 1] !== "\\" &&
+      (nested.index < match.index || match[7] !== undefined)
+    ) {
+      append(value.slice(offset, nested.index));
+      append(unescapeMarkdownPunctuation(nested[1]!), [{ type: "italic" }]);
+      append(unescapeMarkdownPunctuation(nested[2]!), [{ type: "italic" }, { type: "bold" }]);
+      append(unescapeMarkdownPunctuation(nested[3]!), [{ type: "italic" }]);
+      offset = nested.index + nested[0].length;
+      pattern.lastIndex = offset;
+      nested = nestedPattern.exec(value);
+      continue;
+    }
     // A delimiter consumed by an escape or bold span can precede a new
     // italic span. Only reject a second delimiter still in the plain text.
     const isItalic = match[7] !== undefined || match[8] !== undefined;

@@ -385,6 +385,10 @@ function resultView(env: Env, id: string, pageId: string, pending: boolean) {
 }
 function captureView(env: Env, id: string, capture: { state: string; page_id: string | null; job_id: string | null }) {
   if (capture.state === "succeeded" && capture.page_id) return resultView(env, id, capture.page_id, false);
+  if (capture.state === "succeeded")
+    return modal(id, [
+      { type: "section", text: { type: "mrkdwn", text: "Saved to NoteFlare, but the page is no longer available." } },
+    ]);
   return modal(id, [
     {
       type: "section",

@@ -1592,7 +1592,10 @@ async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
         return { ok: true, inputKey: await resumeSlackCaptureJob(env, captureId, job.id, job.attempt) } as const;
       } catch (error) {
         const permanent = safeHttpError(error);
-        if (permanent && permanent.status < 500 && permanent.status !== 429)
+        if (
+          permanent &&
+          ((permanent.status < 500 && permanent.status !== 429) || permanent.code === "slack_capture_link_pending")
+        )
           return { ok: false, status: permanent.status, code: permanent.code, message: permanent.message } as const;
         throw error;
       }
