@@ -221,9 +221,9 @@ describe("EditorPage close reconciliation", () => {
       await Promise.resolve();
     });
 
-    expect(localStorage.getItem("notes:recovery:user-1:workspace-1:page-1")).toBe(
-      JSON.stringify({ key: "account:user-1:workspace-1:page-1:1:2", epoch: 1 }),
-    );
+    expect(JSON.parse(localStorage.getItem("notes:recovery:user-1:workspace-1:page-1") ?? "null")).toEqual([
+      { key: "account:user-1:workspace-1:page-1:1:2", epoch: 1, reason: "epoch" },
+    ]);
   });
 
   it("keeps the editor closed when offline storage is unavailable", async () => {

@@ -179,7 +179,6 @@ test("opens two visited documents offline and keeps local edits through refresh"
     page.getByText("Your access or this document's version changed. The local copy is preserved for export."),
   ).toBeVisible();
   await expect(page.locator(".offline-document [contenteditable='true']")).toHaveCount(0);
-  await page.getByRole("button", { name: "Open online workspace" }).click();
   await expect(page.getByLabel("Page title")).toHaveValue("Offline beta", { timeout: 30_000 });
   await expect(page.locator(".bn-editor")).toContainText("local edit");
   await expect
@@ -304,6 +303,60 @@ test("retries a failed offline write without claiming a partial save", async ({ 
   await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
   await page.reload();
   await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedXY");
+});
+
+test("recovers a saved draft when the catalog pending write fails", async ({ page, context }) => {
+  await signInOwner(page);
+  await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
+  const previousPage = new URL(page.url()).searchParams.get("page");
+  await page.getByRole("button", { name: /Find a page or command/ }).click();
+  await page
+    .getByRole("dialog", { name: "Find a page or command" })
+    .getByRole("option", { name: /Create document/ })
+    .click();
+  await page.waitForURL((url) =>
+    Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
+  );
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type("Online seed");
+  await expect(page.locator(".bn-editor")).toContainText("Online seed");
+  await expect
+    .poll(() =>
+      page.evaluate(async (id) => {
+        const request = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        const read = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const pages = await new Promise<Array<{ pageId: string }>>((resolve) =>
+          read.addEventListener("success", () => resolve(read.result)),
+        );
+        db.close();
+        return pages.some((entry) => entry.pageId === id);
+      }, new URL(page.url()).searchParams.get("page")),
+    )
+    .toBe(true);
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toBeVisible();
+  await page.evaluate(() => {
+    const put = IDBObjectStore.prototype.put;
+    let failOnce = true;
+    IDBObjectStore.prototype.put = function (value, key) {
+      if (this.name === "pages" && this.transaction.db.name === "noteflare-offline-catalog" && failOnce) {
+        failOnce = false;
+        throw new DOMException("Catalog unavailable", "QuotaExceededError");
+      }
+      return put.call(this, value, key);
+    };
+  });
+  await page.locator(".offline-document .bn-editor").click();
+  await page.keyboard.type("Z");
+  await expect(page.getByText("Local save failed. Export this copy before closing it.")).toBeVisible();
+  await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedZ");
+  await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
+  await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
 });
 
 test("shows an online-required state for table and diagram links", async ({ page, context }) => {

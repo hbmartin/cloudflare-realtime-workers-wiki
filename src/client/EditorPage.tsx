@@ -94,15 +94,25 @@ export function EditorPage({
       return [];
     }
   });
-  const dismissedRecovery = useRef<string[]>([]);
+  const recoveryRef = useRef(recovery);
+  const replaceRecovery = useCallback(
+    (next: RecoveryEntry[]) => {
+      recoveryRef.current = next;
+      localStorage.setItem(recoveryKey, JSON.stringify(next));
+      setRecovery(next);
+    },
+    [recoveryKey],
+  );
+  const dismissedRecovery = useRef<Record<string, number>>({});
   useEffect(() => {
     try {
-      const saved: unknown = JSON.parse(localStorage.getItem(`${recoveryKey}:dismissed`) ?? "[]");
-      dismissedRecovery.current = Array.isArray(saved)
-        ? saved.filter((value): value is string => typeof value === "string")
-        : [];
+      const saved: unknown = JSON.parse(localStorage.getItem(`${recoveryKey}:dismissed`) ?? "{}");
+      dismissedRecovery.current =
+        saved && typeof saved === "object" && !Array.isArray(saved)
+          ? Object.fromEntries(Object.entries(saved).filter(([key, value]) => key && Number.isInteger(value)))
+          : {};
     } catch {
-      dismissedRecovery.current = [];
+      dismissedRecovery.current = {};
     }
   }, [recoveryKey]);
   const [recoveryPreview, setRecoveryPreview] = useState<{ key: string; text: string } | null>(null);
@@ -163,12 +173,10 @@ export function EditorPage({
         epoch: storageEpoch(key) || page.contentEpoch,
         reason,
       };
-      if (dismissedRecovery.current.includes(key) && reason === "epoch") return;
-      setRecovery((current) => {
-        const next = [...current.filter((entry) => entry.key !== key), value].sort((a, b) => a.epoch - b.epoch);
-        localStorage.setItem(recoveryKey, JSON.stringify(next));
-        return next;
-      });
+      if (dismissedRecovery.current[key] === page.contentEpoch && reason === "epoch") return;
+      const current = recoveryRef.current;
+      if (current.some((entry) => entry.key === key && entry.epoch === value.epoch && entry.reason === reason)) return;
+      replaceRecovery([...current.filter((entry) => entry.key !== key), value].sort((a, b) => a.epoch - b.epoch));
     };
     let next: CollaborationBundle;
     let catalogFailures = 0;
@@ -188,9 +196,11 @@ export function EditorPage({
         throw error;
       }
       const pendingKeys = catalogPage ? pendingKeysOf(catalogPage) : [];
+      if (pendingKeys.includes(currentStorageKey)) pendingActive = true;
       const olderDrafts = pendingKeys.filter((key) => key !== currentStorageKey);
       for (const key of olderDrafts) quarantine(key);
-      const hasLocalDraft = pendingKeys.includes(currentStorageKey) || pendingActive || next.hasUnsyncedChanges;
+      const hasLocalDraft =
+        pendingKeys.includes(currentStorageKey) || pendingActive || (!catalogPage && next.hasUnsyncedChanges);
       const controller = new AbortController();
       const deadline = window.setTimeout(() => controller.abort(), 10_000);
       try {
@@ -248,15 +258,14 @@ export function EditorPage({
     );
     let pendingWrite = Promise.resolve();
     const clearCurrentRecovery = () => {
-      setRecovery((current) => {
-        const remaining = current.filter((entry) => entry.key !== currentStorageKey);
-        localStorage.setItem(recoveryKey, JSON.stringify(remaining));
-        return remaining;
-      });
+      const current = recoveryRef.current;
+      const remaining = current.filter((entry) => entry.key !== currentStorageKey);
+      if (remaining.length !== current.length) replaceRecovery(remaining);
       setStorageError("");
     };
     const writePending = (pending: boolean) => {
       if (pending && pendingActive) return;
+      if (!pending && !pendingActive) return;
       pendingActive = pending;
       pendingWrite = pendingWrite
         .then(async () => {
@@ -348,7 +357,7 @@ export function EditorPage({
     onPageUnavailable,
     page.id,
     page.contentEpoch,
-    recoveryKey,
+    replaceRecovery,
   ]);
 
   async function saveTitle() {
@@ -520,17 +529,13 @@ export function EditorPage({
             >
               Copy Markdown
             </button>
-            {entry.reason !== "access" && !accessQuarantine && (
+            {(entry.epoch !== page.contentEpoch || (entry.reason !== "access" && !accessQuarantine)) && (
               <button
                 className="quiet-button"
                 onClick={() => {
-                  dismissedRecovery.current = [...new Set([...dismissedRecovery.current, entry.key])];
+                  dismissedRecovery.current[entry.key] = page.contentEpoch;
                   localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
-                  setRecovery((current) => {
-                    const next = current.filter((item) => item.key !== entry.key);
-                    localStorage.setItem(recoveryKey, JSON.stringify(next));
-                    return next;
-                  });
+                  replaceRecovery(recoveryRef.current.filter((item) => item.key !== entry.key));
                   setRecoveryPreview(null);
                 }}
               >

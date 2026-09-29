@@ -30,6 +30,65 @@ export type OfflinePage = {
   storageKeys: string[];
 };
 
+const PENDING_MARKER = "noteflare-pending";
+export { PENDING_MARKER };
+
+async function documentPendingMarker(key: string): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(key);
+    request.addEventListener("upgradeneeded", () => request.transaction?.abort());
+    request.addEventListener("error", () => {
+      if (request.error?.name === "AbortError") resolve(false);
+      else reject(request.error ?? new Error("Offline document marker could not be read."));
+    });
+    request.addEventListener("success", () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains("custom")) {
+        db.close();
+        resolve(false);
+        return;
+      }
+      const transaction = db.transaction("custom", "readonly");
+      const marker = transaction.objectStore("custom").get(PENDING_MARKER);
+      marker.addEventListener("success", () => {
+        db.close();
+        resolve(Boolean(marker.result));
+      });
+      marker.addEventListener("error", () => {
+        db.close();
+        reject(marker.error);
+      });
+    });
+  });
+}
+
+async function withPendingMarkers(page: OfflinePage): Promise<OfflinePage> {
+  const marked = (
+    await Promise.all(page.storageKeys.map(async (key) => ((await documentPendingMarker(key)) ? key : null)))
+  ).filter((key): key is string => key !== null);
+  if (!marked.length) return page;
+  const keys = [...new Set([...pendingKeysOf(page), ...marked])];
+  return { ...page, pendingCopyKeys: keys, pendingChanges: keys.includes(page.storageKeys.at(-1) ?? "") };
+}
+
+async function clearDocumentPendingMarker(key: string) {
+  const request = indexedDB.open(key);
+  await new Promise<void>((resolve, reject) => {
+    request.addEventListener("upgradeneeded", () => request.transaction?.abort());
+    request.addEventListener("success", () => resolve());
+    request.addEventListener("error", () => reject(request.error));
+  });
+  const db = request.result;
+  try {
+    if (!db.objectStoreNames.contains("custom")) return;
+    const transaction = db.transaction("custom", "readwrite");
+    transaction.objectStore("custom").delete(PENDING_MARKER);
+    await transactionDone(transaction);
+  } finally {
+    db.close();
+  }
+}
+
 export function pendingKeysOf(page: OfflinePage): string[] {
   return page.pendingCopyKeys?.length
     ? page.pendingCopyKeys.filter(Boolean)
@@ -218,7 +277,7 @@ async function readAccountPages(accountKey: string): Promise<OfflinePage[]> {
     transaction.objectStore("pages").index("byAccount").getAll(accountKey) as IDBRequest<OfflinePage[]>,
   );
   await transactionDone(transaction);
-  return pages;
+  return Promise.all(pages.map(withPendingMarkers));
 }
 
 export async function getOfflinePage(accountKey: string, pageId: string): Promise<OfflinePage | null> {
@@ -228,7 +287,7 @@ export async function getOfflinePage(accountKey: string, pageId: string): Promis
     transaction.objectStore("pages").get(`${accountKey}\u0000${pageId}`) as IDBRequest<OfflinePage | undefined>,
   );
   await transactionDone(transaction);
-  return page ?? null;
+  return page ? withPendingMarkers(page) : null;
 }
 
 export async function rememberOfflinePage(
@@ -303,6 +362,7 @@ export async function markOfflinePagePending(
       });
     }
     await transactionDone(transaction);
+    if (!pendingChanges) await clearDocumentPendingMarker(storageKey);
   });
 }
 

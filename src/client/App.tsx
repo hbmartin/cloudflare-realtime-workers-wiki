@@ -705,7 +705,7 @@ async function authenticatedWorkspace(member: ClientMemberContext): Promise<AppS
     await rememberOfflineAccount(member).catch((error) =>
       console.error("Unable to remember this account for offline use", error),
     );
-    void clearRevokedOfflinePages(offlineAccountKey(member)).catch((error) =>
+    await clearRevokedOfflinePages(offlineAccountKey(member)).catch((error) =>
       console.error("Unable to remove revoked offline copies", error),
     );
   }

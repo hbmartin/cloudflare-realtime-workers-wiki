@@ -3,7 +3,7 @@ import { BlockNoteView } from "@blocknote/mantine";
 import { useCreateBlockNote } from "@blocknote/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { IndexeddbPersistence } from "y-indexeddb";
+import { IndexeddbPersistence, storeState } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
@@ -18,6 +18,7 @@ import {
   listPendingOfflinePages,
   markOfflinePagePending,
   markOfflinePageRevoked,
+  PENDING_MARKER,
   pendingKeysOf,
   type OfflineAccount,
   type OfflinePage,
@@ -90,7 +91,6 @@ export function OfflineWorkspace({
   );
 
   const reconnect = useCallback(async () => {
-    if (selectedReason) return;
     reconnectController.current?.abort();
     const controller = new AbortController();
     reconnectController.current = controller;
@@ -171,7 +171,7 @@ export function OfflineWorkspace({
         if (controller.signal.aborted && selectedId.current === (selected?.pageId ?? null)) setRecovery("offline");
       }
     }
-  }, [account.key, account.userId, account.workspaceId, discardRevokedCopy, onRetry, selected, selectedReason]);
+  }, [account.key, account.userId, account.workspaceId, discardRevokedCopy, onRetry, selected]);
 
   useEffect(() => {
     const handleOnline = () => void reconnect();
@@ -191,12 +191,8 @@ export function OfflineWorkspace({
           <strong>{account.workspaceName}</strong>
           <span>Offline copy for {account.userName}</span>
         </div>
-        <button
-          type="button"
-          onClick={selectedReason ? onRetry : () => void reconnect()}
-          disabled={recovery !== "offline"}
-        >
-          {selectedReason ? "Open online workspace" : recovery !== "offline" ? "Checking access…" : "Reconnect"}
+        <button type="button" onClick={() => void reconnect()} disabled={recovery !== "offline"}>
+          {recovery !== "offline" ? "Checking access…" : "Reconnect"}
         </button>
         <button type="button" onClick={onSignOut}>
           Sign out and remove local copies
@@ -381,6 +377,7 @@ function OfflineBlockEditor({
 }) {
   const storageKey = page.storageKeys.at(-1) ?? "";
   const initialPending = pendingKeysOf(page).includes(storageKey);
+  const edited = useRef(false);
   const [saveState, setSaveState] = useState<"ready" | "saving" | "saved" | "failed">(
     initialPending ? "saved" : "ready",
   );
@@ -388,11 +385,10 @@ function OfflineBlockEditor({
     let live = true;
     void getOfflinePage(accountKey, page.pageId)
       .then((current) => {
-        if (live && current) setSaveState(pendingKeysOf(current).includes(storageKey) ? "saved" : "ready");
+        if (live && current && !edited.current)
+          setSaveState(pendingKeysOf(current).includes(storageKey) ? "saved" : "ready");
       })
-      .catch(() => {
-        if (live) setSaveState("failed");
-      });
+      .catch((error) => console.error("Offline save status could not be read", error));
     return () => {
       live = false;
     };
@@ -404,6 +400,7 @@ function OfflineBlockEditor({
     let writing: Promise<void> | null = null;
     let pendingCommitted = false;
     let pendingMark: Promise<void> | null = null;
+    let writesSinceCompact = 0;
     const markPending = () => {
       if (pendingCommitted) return Promise.resolve();
       pendingMark ??= markOfflinePagePending(accountKey, page.pageId, storageKey, true)
@@ -419,20 +416,32 @@ function OfflineBlockEditor({
       if (writing) return writing;
       let failed = false;
       writing = (async () => {
-        await markPending();
         const db = copy.persistence.db;
         if (!db) throw new Error("Offline document storage is unavailable.");
         while (updates.length) {
           const batch = updates.slice();
           const target = generation;
-          const transaction = db.transaction("updates", "readwrite");
+          // Start the document transaction before the first await. The marker
+          // is atomic with the Yjs update and recovers an interrupted catalog write.
+          const transaction = db.transaction(["updates", "custom"], "readwrite");
           transaction.objectStore("updates").add(batch.length === 1 ? batch[0] : Y.mergeUpdates(batch));
+          transaction.objectStore("custom").put(true, PENDING_MARKER);
           await new Promise<void>((resolve, reject) => {
             transaction.addEventListener("complete", () => resolve());
             transaction.addEventListener("abort", () => reject(transaction.error));
             transaction.addEventListener("error", () => reject(transaction.error));
           });
           updates.splice(0, batch.length);
+          await markPending();
+          writesSinceCompact += batch.length;
+          if (writesSinceCompact >= 500) {
+            writesSinceCompact = 0;
+            try {
+              await storeState(copy.persistence, true);
+            } catch (error) {
+              console.error("Offline document compaction failed", error);
+            }
+          }
           if (active && target === generation) setSaveState("saved");
         }
       })()
@@ -450,21 +459,33 @@ function OfflineBlockEditor({
     registerFlush(async () => {
       while (updates.length) await persistUpdates();
     });
+    const flushOnHide = () => {
+      if (!updates.length || !copy.persistence.db) return;
+      try {
+        const transaction = copy.persistence.db.transaction(["updates", "custom"], "readwrite");
+        transaction.objectStore("updates").add(Y.mergeUpdates(updates));
+        transaction.objectStore("custom").put(true, PENDING_MARKER);
+      } catch (error) {
+        console.error("Offline edits could not be queued during page unload", error);
+      }
+    };
     const updated = (update: Uint8Array, origin: unknown) => {
       if (origin === copy.persistence || origin === copy.provider) return;
+      edited.current = true;
       generation += 1;
       updates.push(update);
       setSaveState("saving");
       void persistUpdates().catch(() => {});
     };
     copy.doc.on("update", updated);
+    window.addEventListener("pagehide", flushOnHide);
     return () => {
       active = false;
       copy.doc.off("update", updated);
+      window.removeEventListener("pagehide", flushOnHide);
       // OfflineEditor waits for this queue before closing IndexedDB.
     };
-    // The writer belongs to the account, page and storage epoch even if React
-    // reuses this component with a different copy object.
+    // The catalog identity and document epoch are part of this writer's lease.
     // eslint-disable-next-line react/exhaustive-effect-dependencies
   }, [accountKey, copy, page.pageId, registerFlush, storageKey]);
   const options = useMemo(
