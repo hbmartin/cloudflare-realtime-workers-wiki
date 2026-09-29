@@ -1146,7 +1146,7 @@ app.get("/api/oauth/connections", (c) => listOAuthConnections(c.req.raw, c.env))
 app.delete("/api/oauth/connections/:id", (c) => revokeOAuthConnection(c.req.raw, c.env, c.req.param("id")));
 app.get("/api/oauth/workspace", (c) => workspaceMcpSettings(c.req.raw, c.env));
 app.post("/api/oauth/workspace", (c) => setWorkspaceMcpEnabled(c.req.raw, c.env));
-app.on(["GET", "POST", "DELETE"], "/mcp", (c) => mcpRequest(c.req.raw, c.env));
+app.on(["GET", "POST", "DELETE"], "/mcp", (c) => mcpRequest(c.req.raw, c.env, c.executionCtx));
 
 app.post("/api/telemetry/client-errors", async (c) => {
   const { success: sourceAllowed } = await c.env.CLIENT_TELEMETRY_PREAUTH_LIMIT.limit({

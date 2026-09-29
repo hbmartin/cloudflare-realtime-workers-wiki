@@ -2,6 +2,7 @@ import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { enrollAccount } from "../../tests/helpers/security";
 import { mcpAccess } from "./oauth";
+import { pruneStagedMcpPages } from "./mcp";
 
 const ORIGIN = "http://example.test";
 const RESOURCE = `${ORIGIN}/mcp`;
@@ -241,6 +242,7 @@ describe("OAuth MCP foundation", () => {
     };
     const consent = await SELF.fetch(`${ORIGIN}/oauth/authorize?${form(params)}`, { headers: { cookie } });
     expect(consent.status).toBe(200);
+    expect(consent.headers.get("content-security-policy")).toContain("form-action 'self' http://127.0.0.1:3800");
     expect(await consent.text()).toContain("Test MCP client");
     const signedOut = await SELF.fetch(`${ORIGIN}/oauth/authorize?${form(params)}`, { redirect: "manual" });
     expect(signedOut.status).toBe(302);
@@ -380,8 +382,75 @@ describe("OAuth MCP foundation", () => {
     ]);
     const request = new Request(RESOURCE, { headers: { authorization: `Bearer ${token}` } });
     expect(await mcpAccess(request, env)).not.toBeNull();
+    const insufficient = await SELF.fetch(RESOURCE, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "create_comment", arguments: {} },
+      }),
+    });
+    expect(insufficient.status).toBe(403);
+    expect(insufficient.headers.get("www-authenticate")).toContain('scope="pages:read comments:write"');
     await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?").bind(me.user.id).run();
     expect(await mcpAccess(request, env)).toBeNull();
+    const revoked = await env.DB.prepare("SELECT revoked_at FROM oauth_grants WHERE id=?")
+      .bind(grantId)
+      .first<{ revoked_at: number | null }>();
+    expect(revoked?.revoked_at).not.toBeNull();
+  });
+
+  it("prunes an abandoned MCP page and its staged receipt", async () => {
+    const cookie = await bootstrap();
+    const clientId = await register();
+    const me = await (
+      await SELF.fetch(`${ORIGIN}/api/me`, { headers: { cookie, origin: ORIGIN } })
+    ).json<{ user: { id: string }; workspace: { id: string } }>();
+    const tree = await (
+      await SELF.fetch(`${ORIGIN}/api/pages/tree`, { headers: { cookie, origin: ORIGIN } })
+    ).json<{ pages: Array<{ spaceId: string }> }>();
+    const pageId = crypto.randomUUID();
+    const grantId = crypto.randomUUID();
+    const createdAt = Date.now() - 2 * 24 * 60 * 60_000;
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at)
+         SELECT ?,?,?,?,?,generation,? FROM account_security WHERE user_id=?`,
+      ).bind(grantId, clientId, me.user.id, me.workspace.id, "pages:write", createdAt, me.user.id),
+      env.DB.prepare(
+        `INSERT INTO pages
+         (id,workspace_id,space_id,parent_id,kind,position,title,import_job_id,created_by,updated_by,created_at,updated_at)
+         VALUES (?,?,?,NULL,'document','z0','Abandoned',?,?,?,?,?)`,
+      ).bind(
+        pageId,
+        me.workspace.id,
+        tree.pages[0]!.spaceId,
+        `mcp:create:${pageId}`,
+        me.user.id,
+        me.user.id,
+        createdAt,
+        createdAt,
+      ),
+      env.DB.prepare(
+        `INSERT INTO oauth_operation_receipts
+         (grant_id,operation_id,tool_name,input_hash,result_json,created_at,expires_at)
+         VALUES (?,?,'create_page',?,?,?,?)`,
+      ).bind(
+        grantId,
+        "abandoned",
+        "hash",
+        JSON.stringify({ status: "staged", pageId, children: [] }),
+        createdAt,
+        Date.now() + 60_000,
+      ),
+    ]);
+    await pruneStagedMcpPages(env);
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(pageId).first()).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT operation_id FROM oauth_operation_receipts WHERE grant_id=?").bind(grantId).first(),
+    ).toBeNull();
   });
 
   it("bounds registration and token request bodies before parsing", async () => {

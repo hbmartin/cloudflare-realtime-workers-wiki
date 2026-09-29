@@ -17,14 +17,17 @@ import { pageJson } from "./page-row";
 import { parseSearchRequest, searchPages } from "./search";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { sweepOutbox } from "./jobs";
-import { cleanupStagedPage } from "./notion-api";
+import { deleteR2Prefix } from "./r2";
 import { consumeFixedWindow } from "./rate-limit";
 import { sourceRateLimitKey } from "./source-rate-limit";
+import { refreshPageSearchV2Statements } from "./search-index";
+import { webhookEventStatements } from "./webhooks";
 
 const MAX_MCP_BODY = 64 * 1024;
 const OPERATION_ID = /^[A-Za-z0-9:_-]{1,128}$/;
 const RECEIPT_TTL_MS = 30 * 24 * 60 * 60_000;
 const STAGED_PAGE_TTL_MS = 24 * 60 * 60_000;
+type BackgroundContext = Pick<ExecutionContext, "waitUntil">;
 const TOOL_SCOPES: Record<string, readonly McpScope[]> = {
   search_pages: ["pages:read"],
   fetch_page: ["pages:read"],
@@ -40,25 +43,45 @@ function result(value: unknown) {
 export async function pruneStagedMcpPages(env: Env) {
   const rows = await env.DB.prepare(
     `SELECT id,content_epoch,import_job_id FROM pages
-      WHERE import_job_id LIKE 'mcp:create:%' AND created_at<? ORDER BY created_at LIMIT 10`,
+      WHERE (import_job_id GLOB 'mcp:create:*' OR import_job_id GLOB 'mcp:cleanup:*')
+        AND created_at<? ORDER BY created_at LIMIT 10`,
   )
     .bind(Date.now() - STAGED_PAGE_TTL_MS)
     .all<{ id: string; content_epoch: number; import_job_id: string }>();
   for (const row of rows.results) {
-    // Claim the staged row before purging its content. A retry may have
-    // published the page since the SELECT above.
-    const removed = await env.DB.prepare("DELETE FROM pages WHERE id=? AND import_job_id=?")
-      .bind(row.id, row.import_job_id)
-      .run();
-    if (removed.meta.changes !== 1) continue;
-    await cleanupStagedPage(env, row.id, row.content_epoch, row.import_job_id);
-    await env.DB.prepare(
-      `DELETE FROM oauth_operation_receipts
-        WHERE tool_name='create_page' AND json_extract(result_json,'$.status')='staged'
-          AND json_extract(result_json,'$.pageId')=?`,
-    )
-      .bind(row.id)
-      .run();
+    const cleanupId = `mcp:cleanup:${row.id}`;
+    if (row.import_job_id !== cleanupId) {
+      const claimed = await env.DB.prepare("UPDATE pages SET import_job_id=? WHERE id=? AND import_job_id=?")
+        .bind(cleanupId, row.id, row.import_job_id)
+        .run();
+      if (claimed.meta.changes !== 1) continue;
+    }
+    try {
+      const purged = await env.DOCUMENT.getByName(`${row.id}~${row.content_epoch}`).fetch(
+        new Request("https://document.internal/purge", {
+          method: "POST",
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
+        }),
+      );
+      if (!purged.ok) throw new Error(`Staged document purge returned ${purged.status}.`);
+      await deleteR2Prefix(env.BUCKET, `documents/${row.id}/`);
+      await env.DB.batch([
+        env.DB.prepare(
+          `DELETE FROM oauth_operation_receipts
+            WHERE tool_name='create_page' AND json_extract(result_json,'$.status')='staged'
+              AND json_extract(result_json,'$.pageId')=?`,
+        ).bind(row.id),
+        env.DB.prepare("DELETE FROM pages WHERE id=? AND import_job_id=?").bind(row.id, cleanupId),
+      ]);
+    } catch (error) {
+      logger.error(
+        "mcp.staged_page.cleanup_failed",
+        "mcp",
+        "Staged page cleanup will be retried.",
+        { pageId: row.id },
+        error,
+      );
+    }
   }
 }
 
@@ -87,7 +110,7 @@ type CreatePageInput = {
   operation_id: string;
 };
 
-async function createPageTool(request: Request, env: Env, input: CreatePageInput) {
+async function createPageTool(request: Request, env: Env, context: BackgroundContext, input: CreatePageInput) {
   let access = await currentAccess(request, env, ["pages:write"]);
   const parentId = input.parent_id ?? null;
   await writableDestination(env, access, input.space_id, parentId);
@@ -190,32 +213,44 @@ async function createPageTool(request: Request, env: Env, input: CreatePageInput
   try {
     const published = await env.DB.batch([
       env.DB.prepare(
-        `INSERT INTO page_search(page_id,workspace_id,title,body)
-         SELECT id,workspace_id,title,plain_text FROM pages WHERE id=? AND import_job_id=?`,
-      ).bind(staged.pageId, stageId),
+        `UPDATE oauth_operation_receipts SET result_json=?
+         WHERE grant_id=? AND operation_id=? AND input_hash=?
+           AND EXISTS (SELECT 1 FROM pages WHERE id=? AND import_job_id=?)`,
+      ).bind(JSON.stringify(value), access.grantId, input.operation_id, inputHash, staged.pageId, stageId),
       env.DB.prepare(
-        `INSERT INTO page_search_v2(page_id,workspace_id,space_id,title,tags,body,comments,attachments)
-         SELECT id,workspace_id,space_id,title,'',plain_text,'','' FROM pages WHERE id=? AND import_job_id=?`,
-      ).bind(staged.pageId, stageId),
+        `UPDATE pages SET import_job_id=NULL WHERE id=? AND import_job_id=?
+          AND EXISTS (SELECT 1 FROM oauth_operation_receipts
+            WHERE grant_id=? AND operation_id=? AND input_hash=? AND result_json=?)`,
+      ).bind(staged.pageId, stageId, access.grantId, input.operation_id, inputHash, JSON.stringify(value)),
+      env.DB.prepare(
+        `INSERT INTO page_search(page_id,workspace_id,title,body)
+         SELECT id,workspace_id,title,plain_text FROM pages WHERE id=? AND import_job_id IS NULL`,
+      ).bind(staged.pageId),
+      ...refreshPageSearchV2Statements(env.DB, staged.pageId),
       env.DB.prepare(
         `INSERT INTO subscriptions(id,workspace_id,user_id,resource_type,resource_id,created_by,created_at)
-         SELECT ?,workspace_id,?,'page',id,?,? FROM pages WHERE id=? AND import_job_id=?`,
+         SELECT ?,workspace_id,?,'page',id,?,? FROM pages WHERE id=? AND import_job_id IS NULL`,
       ).bind(
         `page:${staged.pageId}:${access.member.user.id}`,
         access.member.user.id,
         access.member.user.id,
         timestamp,
         staged.pageId,
-        stageId,
       ),
-      env.DB.prepare(
-        `UPDATE oauth_operation_receipts SET result_json=?
-         WHERE grant_id=? AND operation_id=? AND input_hash=?
-           AND EXISTS (SELECT 1 FROM pages WHERE id=? AND import_job_id=?)`,
-      ).bind(JSON.stringify(value), access.grantId, input.operation_id, inputHash, staged.pageId, stageId),
-      env.DB.prepare("UPDATE pages SET import_job_id=NULL WHERE id=? AND import_job_id=?").bind(staged.pageId, stageId),
+      ...webhookEventStatements(env.DB, {
+        workspaceId: access.member.workspace.id,
+        type: "page.created",
+        entityType: "page",
+        entityId: staged.pageId,
+        pageId: staged.pageId,
+        contentEpoch: stage.content_epoch,
+        publishedOnly: true,
+        actorId: access.member.user.id,
+        sourceKey: `page.created:${staged.pageId}`,
+        createdAt: timestamp,
+      }),
     ]);
-    if (published[3]?.meta.changes !== 1 || published[4]?.meta.changes !== 1)
+    if (published[0]?.meta.changes !== 1 || published[1]?.meta.changes !== 1)
       throw new HttpError(409, "page_create_unknown", "The staged page was changed before publication.");
   } catch (error) {
     const committed = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
@@ -229,6 +264,7 @@ async function createPageTool(request: Request, env: Env, input: CreatePageInput
   }).catch((error: unknown) => {
     logger.warn("mcp.page_event.failed", "mcp", "Page event delivery failed.", { pageId: page.id }, error);
   });
+  context.waitUntil(sweepOutbox(env));
   return value;
 }
 
@@ -302,7 +338,8 @@ async function updatePageTool(
   const command = parseMarkdownCommand(input.command, projection.markdown);
   const protectedRows = await env.DB.prepare(
     `SELECT DISTINCT block.internal_id FROM comment_threads thread
-       JOIN api_blocks block ON block.id=thread.block_id AND block.page_id=thread.page_id
+       JOIN api_blocks block ON (block.id=thread.block_id OR block.internal_id=thread.block_id)
+         AND block.page_id=thread.page_id
       WHERE thread.page_id=? AND thread.block_id IS NOT NULL`,
   )
     .bind(page.id)
@@ -385,6 +422,7 @@ function receiptStatement(
 async function commentTool(
   request: Request,
   env: Env,
+  context: BackgroundContext,
   input: { page_id: string; body: string; block_id?: string | undefined; operation_id: string },
 ) {
   const scopes = TOOL_SCOPES.create_comment!;
@@ -427,26 +465,23 @@ async function commentTool(
     if (!committed) throw error;
     return committed;
   }
-  await broadcastWorkspaceEvent(env, access.member.workspace.id, {
-    type: "comments-invalidated",
-    pageId: page.id,
-  }).catch((error: unknown) => {
-    logger.warn("mcp.comment_event.failed", "mcp", "Comment event delivery failed.", { pageId: page.id }, error);
-  });
-  await broadcastWorkspaceEvent(env, access.member.workspace.id, { type: "notifications-invalidated" }).catch(
-    (error: unknown) => {
-      logger.warn(
-        "mcp.notification_event.failed",
-        "mcp",
-        "Notification event delivery failed.",
-        { pageId: page.id },
-        error,
-      );
-    },
+  context.waitUntil(
+    Promise.allSettled([
+      broadcastWorkspaceEvent(env, access.member.workspace.id, { type: "comments-invalidated", pageId: page.id }),
+      broadcastWorkspaceEvent(env, access.member.workspace.id, { type: "notifications-invalidated" }),
+      sweepOutbox(env),
+    ]).then((results) => {
+      for (const delivery of results)
+        if (delivery.status === "rejected")
+          logger.warn(
+            "mcp.comment_followup.failed",
+            "mcp",
+            "Comment follow-up delivery failed.",
+            { pageId: page.id },
+            delivery.reason,
+          );
+    }),
   );
-  await sweepOutbox(env).catch((error: unknown) => {
-    logger.warn("mcp.comment_outbox.failed", "mcp", "Comment outbox delivery failed.", { pageId: page.id }, error);
-  });
   return value;
 }
 
@@ -512,7 +547,7 @@ async function fetchPageTool(request: Request, env: Env, pageId: string) {
   };
 }
 
-function serverFor(request: Request, env: Env, access: McpAccess) {
+function serverFor(request: Request, env: Env, context: BackgroundContext, access: McpAccess) {
   const server = new McpServer({ name: "noteflare", version: "1.0.0" });
   if (access.scopes.has("pages:read"))
     server.registerTool(
@@ -545,7 +580,7 @@ function serverFor(request: Request, env: Env, access: McpAccess) {
       },
       async (input) => {
         try {
-          return result(await commentTool(request, env, input));
+          return result(await commentTool(request, env, context, input));
         } catch (error) {
           return toolError(error);
         }
@@ -567,7 +602,7 @@ function serverFor(request: Request, env: Env, access: McpAccess) {
       },
       async (input) => {
         try {
-          return result(await createPageTool(request, env, input));
+          return result(await createPageTool(request, env, context, input));
         } catch (error) {
           return toolError(error);
         }
@@ -612,14 +647,12 @@ function serverFor(request: Request, env: Env, access: McpAccess) {
   return server;
 }
 
-export async function mcpRequest(request: Request, env: Env) {
+export async function mcpRequest(request: Request, env: Env, context: BackgroundContext) {
   const site = new URL(env.BETTER_AUTH_URL).origin;
   const requestOrigin = request.headers.get("origin");
   if (requestOrigin && requestOrigin !== site) return Response.json({ error: "Invalid Origin." }, { status: 403 });
   if (new URL(request.url).origin !== site) return Response.json({ error: "Invalid host." }, { status: 403 });
   if (request.method !== "POST") return new Response("Method not allowed.", { status: 405 });
-  const rate = await consumeFixedWindow(env, `mcp:${await sourceRateLimitKey(request)}`, { window: 60, max: 120 });
-  if (!rate.allowed) return new Response("Too many MCP requests.", { status: 429, headers: { "retry-after": "60" } });
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json"))
     return new Response("Expected application/json.", { status: 415 });
   const length = Number(request.headers.get("content-length"));
@@ -658,20 +691,28 @@ export async function mcpRequest(request: Request, env: Env) {
       : null;
   const required = typeof name === "string" && Object.hasOwn(TOOL_SCOPES, name) ? TOOL_SCOPES[name]! : [];
   const access = await mcpAccess(request, env);
-  if (!access)
+  if (!access) {
+    const rate = await consumeFixedWindow(env, `mcp-unauthorized:${await sourceRateLimitKey(request)}`, {
+      window: 60,
+      max: 120,
+    });
+    if (!rate.allowed) return new Response("Too many MCP requests.", { status: 429, headers: { "retry-after": "60" } });
     return new Response("Unauthorized", {
       status: 401,
-      headers: { "www-authenticate": mcpBearerChallenge(env, required[0]), "cache-control": "no-store" },
+      headers: { "www-authenticate": mcpBearerChallenge(env, required.join(" ")), "cache-control": "no-store" },
     });
+  }
+  const rate = await consumeFixedWindow(env, `mcp-grant:${access.grantId}`, { window: 60, max: 120 });
+  if (!rate.allowed) return new Response("Too many MCP requests.", { status: 429, headers: { "retry-after": "60" } });
   if (required.some((scope) => !access.scopes.has(scope)))
     return new Response("Insufficient scope", {
       status: 403,
       headers: {
-        "www-authenticate": `${mcpBearerChallenge(env)}, error="insufficient_scope", scope="${required.join(" ")}"`,
+        "www-authenticate": `${mcpBearerChallenge(env, required.join(" "))}, error="insufficient_scope"`,
         "cache-control": "no-store",
       },
     });
-  const handler = createMcpHandler(() => serverFor(request, env, access), {
+  const handler = createMcpHandler(() => serverFor(request, env, context, access), {
     legacy: "reject",
     responseMode: "json",
     maxRequestBodySize: MAX_MCP_BODY,

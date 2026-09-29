@@ -60,7 +60,10 @@ function json(value: unknown, status = 200) {
 }
 
 function oauthError(code: string, description: string, status = 400) {
-  return json({ error: code, error_description: description }, status);
+  return Response.json(
+    { error: code, error_description: description },
+    { status, headers: { "cache-control": "no-store", ...(status === 429 ? { "retry-after": "60" } : {}) } },
+  );
 }
 
 export function oauthAuthorizationMetadata(env: Env) {
@@ -89,7 +92,7 @@ export function oauthProtectedResourceMetadata(env: Env) {
   });
 }
 
-export function mcpBearerChallenge(env: Env, scope?: McpScope) {
+export function mcpBearerChallenge(env: Env, scope?: string) {
   const metadata = `${origin(env)}/.well-known/oauth-protected-resource/mcp`;
   return `Bearer resource_metadata="${metadata}"${scope ? `, scope="${scope}"` : ""}`;
 }
@@ -446,8 +449,7 @@ export async function authorizeOAuthGet(request: Request, env: Env) {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-      "content-security-policy":
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' http: https:; frame-ancestors 'none'; base-uri 'none'",
+      "content-security-policy": `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${new URL(input.redirectUri).origin}; frame-ancestors 'none'; base-uri 'none'`,
       "x-content-type-options": "nosniff",
       "x-frame-options": "DENY",
     },
@@ -699,25 +701,42 @@ export async function pruneOAuthSecurityRecords(env: Env) {
 }
 
 export async function oauthToken(request: Request, env: Env) {
-  const rate = await consumeFixedWindow(env, `oauth-token:${await sourceRateLimitKey(request)}`, {
-    window: 60,
-    max: 60,
-  });
-  if (!rate.allowed) return oauthError("slow_down", "Token requests are temporarily rate limited.", 429);
   const params = await formParams(request);
   const grantType = singleton(params, "grant_type");
+  const credential = params.get(grantType === "refresh_token" ? "refresh_token" : "code");
+  const sourceRate = await consumeFixedWindow(env, `oauth-token-source:${await sourceRateLimitKey(request)}`, {
+    window: 60,
+    max: 1200,
+  });
+  if (!sourceRate.allowed) return oauthError("slow_down", "Token requests are temporarily rate limited.", 429);
+  if (credential) {
+    const credentialRate = await consumeFixedWindow(env, `oauth-token-credential:${await sha256(credential)}`, {
+      window: 60,
+      max: 60,
+    });
+    if (!credentialRate.allowed) return oauthError("slow_down", "Token requests are temporarily rate limited.", 429);
+  }
   if (grantType === "authorization_code") return exchangeCode(params, env);
   if (grantType === "refresh_token") return refreshGrant(params, env);
   return oauthError("unsupported_grant_type", "Only authorization code and refresh token are supported.");
 }
 
 export async function oauthRevoke(request: Request, env: Env) {
-  const rate = await consumeFixedWindow(env, `oauth-revoke:${await sourceRateLimitKey(request)}`, {
-    window: 60,
-    max: 60,
-  });
-  if (!rate.allowed) return oauthError("slow_down", "Revocation requests are temporarily rate limited.", 429);
   const params = await formParams(request);
+  const credential = params.get("token");
+  const sourceRate = await consumeFixedWindow(env, `oauth-revoke-source:${await sourceRateLimitKey(request)}`, {
+    window: 60,
+    max: 1200,
+  });
+  if (!sourceRate.allowed) return oauthError("slow_down", "Revocation requests are temporarily rate limited.", 429);
+  if (credential) {
+    const credentialRate = await consumeFixedWindow(env, `oauth-revoke-credential:${await sha256(credential)}`, {
+      window: 60,
+      max: 60,
+    });
+    if (!credentialRate.allowed)
+      return oauthError("slow_down", "Revocation requests are temporarily rate limited.", 429);
+  }
   const clientId = singleton(params, "client_id");
   const hash = await sha256(singleton(params, "token"));
   await env.DB.prepare(

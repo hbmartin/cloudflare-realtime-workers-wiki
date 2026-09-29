@@ -1,6 +1,7 @@
 -- OAuth credentials and MCP receipts contain no document content. Revoking a
 -- grant never removes a page, comment, or other workspace record.
 ALTER TABLE workspaces ADD COLUMN mcp_enabled INTEGER NOT NULL DEFAULT 0 CHECK (mcp_enabled IN (0, 1));
+CREATE INDEX idx_pages_import_job ON pages(import_job_id, created_at) WHERE import_job_id IS NOT NULL;
 
 CREATE TABLE oauth_clients (
   client_id TEXT PRIMARY KEY,
@@ -37,6 +38,12 @@ CREATE TABLE oauth_grants (
   revoked_at INTEGER
 );
 CREATE INDEX idx_oauth_grants_member ON oauth_grants(user_id,workspace_id,revoked_at);
+CREATE TRIGGER oauth_revoke_on_security_reset AFTER UPDATE OF generation,recovery_required,codes_saved ON account_security
+WHEN NEW.generation<>OLD.generation OR NEW.recovery_required=1 OR NEW.codes_saved=0
+BEGIN
+  UPDATE oauth_grants SET revoked_at=CAST(strftime('%s','now') AS INTEGER)*1000
+    WHERE user_id=NEW.user_id AND revoked_at IS NULL;
+END;
 
 CREATE TABLE oauth_access_tokens (
   token_hash TEXT PRIMARY KEY,

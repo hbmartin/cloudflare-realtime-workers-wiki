@@ -393,6 +393,7 @@ export function webhookEventStatements(
     entityId: string;
     pageId: string | null;
     contentEpoch?: number;
+    publishedOnly?: boolean;
     actorId: string | null;
     sourceKey: string;
     data?: Record<string, unknown>;
@@ -408,7 +409,8 @@ export function webhookEventStatements(
         (id, workspace_id, event_type, entity_type, entity_id, page_id, actor_id, data_json, source_key, created_at)
        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
        WHERE (? IS NULL OR EXISTS (SELECT 1 FROM pages page
-         WHERE page.id=? AND page.content_epoch=?))`,
+         WHERE page.id=? AND page.content_epoch=?))
+         AND (?=0 OR EXISTS (SELECT 1 FROM pages page WHERE page.id=? AND page.import_job_id IS NULL))`,
       )
       .bind(
         eventId,
@@ -424,6 +426,8 @@ export function webhookEventStatements(
         input.contentEpoch ?? null,
         input.pageId,
         input.contentEpoch ?? null,
+        input.publishedOnly ? 1 : 0,
+        input.pageId,
       ),
     database
       .prepare(
