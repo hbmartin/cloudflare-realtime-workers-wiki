@@ -721,12 +721,14 @@ describe("Worker integration", () => {
       createExecutionContext(),
     );
     expect(preview.status).toBe(404);
+    expect(await preview.json()).toMatchObject({ error: { code: "preview_disabled" } });
     const image = await worker.fetch(
       authenticatedRequest(installed.cookie, `/api/link-previews/${"a".repeat(64)}/image`),
       disabledEnv,
       createExecutionContext(),
     );
     expect(image.status).toBe(404);
+    expect(await image.json()).toMatchObject({ error: { code: "preview_disabled" } });
     expect(
       (await env.DB.prepare("SELECT COUNT(*) AS count FROM link_preview_cache").first<{ count: number }>())?.count,
     ).toBe(0);

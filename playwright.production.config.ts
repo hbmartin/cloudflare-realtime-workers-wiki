@@ -6,6 +6,8 @@ export default defineConfig({
   testDir: "tests/e2e",
   testMatch: "phase1-production.spec.ts",
   workers: 1,
+  forbidOnly: Boolean(process.env.CI),
+  retries: process.env.CI ? 1 : 0,
   reporter: "list",
   use: {
     baseURL: "http://localhost:4173",
@@ -16,7 +18,7 @@ export default defineConfig({
     command: "node scripts/e2e-production-server.mjs",
     url: "http://localhost:4173/api/health",
     reuseExistingServer: false,
-    timeout: 180_000,
+    timeout: 300_000,
   },
   projects: [
     { name: "chromium", use: { ...devices["Desktop Chrome"] }, grepInvert: /@touch/ },

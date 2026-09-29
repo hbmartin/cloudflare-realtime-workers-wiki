@@ -408,8 +408,10 @@ function validatedExternalUrl(value: string, label: string) {
   }
 }
 
-function validatedEmbedUrl(value: string, expandedEmbeds: boolean) {
-  if (!resolveEmbed(value, expandedEmbeds)) throw new Error("Embeds require a supported HTTPS provider URL.");
+function validatedEmbedUrl(value: string) {
+  // An embed URL is durable content. The feature flag controls framing at render time,
+  // so an API client can round-trip an existing URL while expanded embeds are disabled.
+  if (!resolveEmbed(value, true)) throw new Error("Embeds require a supported HTTPS provider URL.");
   return new URL(value).href;
 }
 
@@ -424,7 +426,7 @@ function notionPlainText(value: unknown) {
     .join("");
 }
 
-function blockNode(type: string, payload: Record<string, unknown>, expandedEmbeds: boolean): ProseMirrorJson {
+function blockNode(type: string, payload: Record<string, unknown>): ProseMirrorJson {
   const rich = () => notionRichTextToProseMirror(payload.rich_text ?? []);
   if (/^heading_[1-4]$/.test(type))
     return {
@@ -485,10 +487,7 @@ function blockNode(type: string, payload: Record<string, unknown>, expandedEmbed
       attrs: { url: validatedExternalUrl(string(payload.url), "Bookmark"), title: string(payload.title, "Bookmark") },
     };
   if (type === "embed")
-    return {
-      type: "embed",
-      attrs: { url: validatedEmbedUrl(string(payload.url), expandedEmbeds), title: "Embedded link" },
-    };
+    return { type: "embed", attrs: { url: validatedEmbedUrl(string(payload.url)), title: "Embedded link" } };
   if (["image", "video", "audio", "file", "pdf"].includes(type))
     return { type, attrs: { url: notionMediaUrl(payload), caption: "", name: type, showPreview: true } };
   if (type === "table")
@@ -509,7 +508,7 @@ function blockNode(type: string, payload: Record<string, unknown>, expandedEmbed
   throw new Error(`Unsupported block type: ${type}`);
 }
 
-export function notionInputToBlockContainer(value: unknown, expandedEmbeds = false, depth = 0): ProseMirrorJson {
+export function notionInputToBlockContainer(value: unknown, depth = 0): ProseMirrorJson {
   if (depth > 2) throw new Error("Block nesting exceeds the supported depth.");
   const input = record(value);
   const inferredTypes = Object.keys(input).filter((key) => NOTION_WRITABLE_BLOCK_TYPES.has(key));
@@ -518,7 +517,7 @@ export function notionInputToBlockContainer(value: unknown, expandedEmbeds = fal
   if (!type) throw new Error("Block type is required.");
   const payload = record(input[type]);
   const id = typeof input.id === "string" && input.id ? input.id : crypto.randomUUID();
-  const node = blockNode(type, payload, expandedEmbeds);
+  const node = blockNode(type, payload);
   if (node.type === "syncedBlockSource") node.attrs = { ...node.attrs, blockId: id };
   const childrenInput = Array.isArray(payload.children) ? payload.children : [];
   if (node.type === "syncedBlockReference" && childrenInput.length) {
@@ -528,7 +527,7 @@ export function notionInputToBlockContainer(value: unknown, expandedEmbeds = fal
   if (childrenInput.length) {
     if (childrenInput.length > NOTION_PAGE_SIZE_MAX)
       throw new Error("A block may contain at most 100 children per request.");
-    const children = childrenInput.map((child) => notionInputToBlockContainer(child, expandedEmbeds, depth + 1));
+    const children = childrenInput.map((child) => notionInputToBlockContainer(child, depth + 1));
     if (
       node.type === "columnList" &&
       children.some((child) => child.content?.find((item) => item.type !== "blockGroup")?.type !== "column")

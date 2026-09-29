@@ -169,7 +169,7 @@ test("hides expanded paste actions when bootstrap disables them", async ({ page 
     const response = await route.fetch();
     const member = (await response.json()) as { features?: { expandedEmbeds?: boolean } };
     await route.fulfill({
-      response,
+      status: response.status(),
       json: { ...member, features: { ...member.features, expandedEmbeds: false } },
     });
   });
@@ -188,6 +188,18 @@ test("hides expanded paste actions when bootstrap disables them", async ({ page 
   await expect(choices.getByRole("button", { name: "Link" })).toBeVisible();
   await expect(choices.getByRole("button", { name: "Preview card" })).toHaveCount(0);
   await expect(choices.getByRole("button", { name: "Embed" })).toHaveCount(0);
+  await choices.getByRole("button", { name: "Link" }).click();
+  await createDocument(page);
+  await page.locator('.bn-editor [data-content-type="paragraph"]').last().click();
+  await page.evaluate((url) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", url);
+    document.activeElement?.dispatchEvent(
+      new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }),
+    );
+  }, embedProviders[0]!.fixture);
+  await expect(choices.getByRole("button", { name: "Embed" })).toBeVisible();
+  await expect(choices.getByRole("button", { name: "Preview card" })).toHaveCount(0);
 });
 
 test("@touch opens the palette and runs a command", async ({ page }) => {

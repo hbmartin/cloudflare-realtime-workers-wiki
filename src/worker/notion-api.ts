@@ -610,12 +610,12 @@ async function cleanupStagedPage(env: Env, pageId: string, contentEpoch: number,
   }
 }
 
-function notionChildren(value: unknown, expandedEmbeds: boolean) {
+function notionChildren(value: unknown) {
   if (!Array.isArray(value) || value.length > NOTION_PAGE_SIZE_MAX) {
     throw new NotionError(400, "validation_error", "children must contain at most 100 blocks.");
   }
   try {
-    return value.map((child) => notionInputToBlockContainer(child, expandedEmbeds));
+    return value.map((child) => notionInputToBlockContainer(child));
   } catch (error) {
     throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid block.");
   }
@@ -686,8 +686,7 @@ notionApi.post("/pages", async (c) => {
   const titleProperty = (properties.title ?? {}) as Record<string, unknown>;
   const title = pageTitle(titleProperty.title ?? titleProperty.rich_text ?? [], true) || "Untitled";
   const iconValue = input.icon === undefined || input.icon === null ? null : pageIcon(input.icon);
-  const children =
-    input.children === undefined ? [] : notionChildren(input.children, c.env.EXPANDED_EMBEDS_ENABLED === "true");
+  const children = input.children === undefined ? [] : notionChildren(input.children);
   const pageId = crypto.randomUUID();
   const stageId = children.length ? `notion-create:${pageId}` : null;
   const previous = await c.env.DB.prepare(
@@ -1149,7 +1148,7 @@ notionApi.patch("/blocks/:blockId/children", async (c) => {
   const principal = c.get("principal");
   capability(principal, "insertContent");
   const input = await body(c.req.raw);
-  const children = notionChildren(input.children, c.env.EXPANDED_EMBEDS_ENABLED === "true");
+  const children = notionChildren(input.children);
   const position = requestedPosition(input.position);
   const page = await pageForIntegration(c.env, principal, c.req.param("blockId"));
   let owner: IntegrationPage;
@@ -1200,10 +1199,7 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   }
   let container;
   try {
-    container = notionInputToBlockContainer(
-      { ...input, id: located.internalId },
-      c.env.EXPANDED_EMBEDS_ENABLED === "true",
-    );
+    container = notionInputToBlockContainer({ ...input, id: located.internalId });
   } catch (error) {
     throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid block.");
   }
