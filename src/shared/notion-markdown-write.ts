@@ -23,7 +23,7 @@ function validHref(value: string) {
 
 function textWithMath(value: string, marks: NonNullable<ProseMirrorJson["marks"]>): ProseMirrorJson[] {
   const output: ProseMirrorJson[] = [];
-  const expression = /(?<!\\)\$((?:\\.|[^\\$\n])+)\$/g;
+  const expression = /(?<!\\)\$((?:\\.|[^\\$\n])*?\S)\$/g;
   let cursor = 0;
   for (const match of value.matchAll(expression)) {
     const index = match.index;
@@ -40,8 +40,10 @@ function textWithMath(value: string, marks: NonNullable<ProseMirrorJson["marks"]
 function inline(tokens: Token[], marks: NonNullable<ProseMirrorJson["marks"]> = []): ProseMirrorJson[] {
   const output: ProseMirrorJson[] = [];
   for (const token of tokens) {
-    if (token.type === "text" || token.type === "escape") {
+    if (token.type === "text") {
       output.push(...textWithMath(token.text, marks));
+    } else if (token.type === "escape") {
+      output.push({ type: "text", text: token.text, ...(marks.length ? { marks } : {}) });
     } else if (token.type === "strong" || token.type === "em" || token.type === "del") {
       const mark = token.type === "strong" ? "bold" : token.type === "em" ? "italic" : "strike";
       output.push(...inline(token.tokens ?? [], [...marks, { type: mark }]));
@@ -95,6 +97,19 @@ export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
   if (new TextEncoder().encode(source).length > MAX_INPUT_BYTES)
     throw new MarkdownWriteError("Markdown content exceeds 128 KiB.");
   if (source.includes("\0")) throw new MarkdownWriteError("Markdown content contains an invalid character.");
+  let delimiterCount = 0;
+  let fence: { character: string; length: number } | null = null;
+  for (const line of source.split("\n")) {
+    const opening = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+    if (opening && (!fence || (opening[0] === fence.character && opening.length >= fence.length))) {
+      fence = fence ? null : { character: opening[0]!, length: opening.length };
+      continue;
+    }
+    if (fence) continue;
+    for (const character of line)
+      if ("<\\[]`*_!".includes(character) && ++delimiterCount > 4096)
+        throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
+  }
   const output: ProseMirrorJson[] = [];
   for (const token of Lexer.lex(source.replaceAll("\r\n", "\n"), { gfm: true })) {
     if (token.type === "space") continue;
@@ -112,7 +127,7 @@ export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
       const raw = token.text.trim();
       const displayMath = /^\$\$\n([\s\S]*?)\n\$\$$/.exec(raw);
       if (displayMath) {
-        output.push(container({ type: "math", attrs: { formula: displayMath[1]!.replaceAll("\\$\\$", "$$") } }));
+        output.push(container({ type: "math", attrs: { formula: displayMath[1]!.replaceAll("\\$\\$", () => "$$") } }));
       } else if (token.tokens?.length === 1 && token.tokens[0]?.type === "image") {
         const image = token.tokens[0] as Tokens.Image;
         output.push(

@@ -819,6 +819,20 @@ export class Document extends YServer {
         headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
       });
     }
+    if (request.method === "GET" && url.pathname.endsWith("/api-mutate-receipt")) {
+      const operationId = url.searchParams.get("operationId");
+      if (!operationId || !/^[A-Za-z0-9:_-]{1,200}$/.test(operationId))
+        return Response.json({ error: "Invalid operation ID." }, { status: 400 });
+      if (!this.document.getMap<string>("api-operation-receipts").has(operationId))
+        return Response.json({ found: false }, { status: 404 });
+      this.flushPendingUpdates();
+      if (this.metadata.dirty) await this.compact();
+      return Response.json({
+        found: true,
+        document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")),
+        sequence: this.metadata.snapshot_seq,
+      });
+    }
     if (request.method === "POST" && url.pathname.endsWith("/api-mutate")) {
       if (this.metadata.content_kind !== "document") {
         return Response.json({ error: "Block mutations are only available for document pages." }, { status: 422 });
@@ -854,6 +868,12 @@ export class Document extends YServer {
       const requestHash = operationId
         ? await sha256Hex(canonicalJson({ actorId: body.actorId, operations: body.operations }))
         : null;
+      if (body.expectedSequence !== undefined) {
+        this.flushPendingUpdates();
+        if (this.metadata.dirty || this.compaction) await this.compact();
+        this.flushPendingUpdates();
+        if (this.metadata.dirty) await this.compact();
+      }
       const receipts = operationId ? this.document.getMap<string>("api-operation-receipts") : null;
       if (operationId && receipts?.has(operationId)) {
         if (receipts.get(operationId) !== requestHash)

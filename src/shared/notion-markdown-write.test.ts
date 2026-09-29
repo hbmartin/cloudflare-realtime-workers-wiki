@@ -41,12 +41,22 @@ describe("writable Notion Markdown", () => {
     expect(parseWritableMarkdown(" \n")).toEqual([]);
   });
 
+  it("keeps prices and escaped dollars as text beside actual math", () => {
+    const blocks = parseWritableMarkdown("Cost $12 and $5. Escaped \\$x\\$ and $x + y$.\n");
+    const content = blocks[0]!.content![0]!.content!;
+    expect(content.filter((node) => node.type === "inlineMath")).toEqual([
+      { type: "inlineMath", attrs: { formula: "x + y" } },
+    ]);
+    expect(content.map((node) => node.text ?? "").join("")).toContain("Cost $12 and $5. Escaped $x$");
+  });
+
   it.each([
     '<unknown url="notion://blocks/id"/>',
     "<script>alert(1)</script>",
     "[bad](javascript:alert(1))",
     "![not inline](https://example.com) and words",
     "a".repeat(129 * 1024),
+    "![x]".repeat(3_000),
   ])("rejects content that would change meaning or exceed limits", (source) => {
     expect(() => parseWritableMarkdown(source)).toThrow(/Markdown|link|128 KiB/);
   });

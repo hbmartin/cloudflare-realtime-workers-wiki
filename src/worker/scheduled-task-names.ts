@@ -4,6 +4,7 @@ export const SCHEDULED_TASK_NAMES = [
   "upload_reaps",
   "page_move_receipts",
   "queued_jobs",
+  "notion_markdown_tasks",
   "outbox",
   "slack_redrive",
   "job_artifacts",

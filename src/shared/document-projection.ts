@@ -68,7 +68,7 @@ function normalizeText(text: string) {
 // markup. `_` is deliberately absent: CommonMark does not emphasise intraword `_`,
 // so escaping it would mangle every snake_case identifier.
 function escapeMarkdownInline(value: string) {
-  return value.replaceAll(/[\\`*[\]<>|]/g, (character) => `\\${character}`);
+  return value.replaceAll(/[\\`*$[\]<>|]/g, (character) => `\\${character}`);
 }
 
 // Block-level constructs are only meaningful at the start of a line.
@@ -79,7 +79,8 @@ function escapeMarkdownText(value: string) {
 function escapeMarkdownBlockStart(value: string) {
   return value.replace(
     /(^|\n)([ \t]*)(#{1,6}(?=[ \t]|$)|>|[-+](?=[ \t]|$)|\d{1,9}[.)](?=[ \t]|$)|={1,}[ \t]*$|(?:[-*_][ \t]*){3,}$|~{3,})/gm,
-    (_match, lineStart: string, indent: string, token: string) => `${lineStart}${indent}\\${token}`,
+    (_match, lineStart: string, indent: string, token: string) =>
+      `${lineStart}${indent}${/^\d/.test(token) ? token.replace(/[.)]$/, "\\$&") : `\\${token}`}`,
   );
 }
 

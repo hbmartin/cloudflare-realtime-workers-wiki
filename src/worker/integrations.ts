@@ -316,6 +316,36 @@ export async function authenticateIntegration(request: Request, env: Env): Promi
   };
 }
 
+/** Recheck an integration's current capabilities before a persisted task runs. */
+export async function activeIntegrationPrincipal(
+  env: Env,
+  integrationId: string,
+): Promise<IntegrationPrincipal | null> {
+  const row = await env.DB.prepare(
+    `SELECT integration.*, workspace.name workspace_name, bot.name bot_name
+       FROM integrations integration
+       JOIN workspaces workspace ON workspace.id = integration.workspace_id
+       JOIN user bot ON bot.id = integration.bot_user_id
+      WHERE integration.id=? AND integration.revoked_at IS NULL`,
+  )
+    .bind(integrationId)
+    .first<IntegrationRow & { workspace_name: string; bot_name: string }>();
+  if (!row) return null;
+  return {
+    integrationId: row.id,
+    workspaceId: row.workspace_id,
+    workspaceName: row.workspace_name,
+    botUserId: row.bot_user_id,
+    botName: row.bot_name,
+    readContent: Boolean(row.read_content),
+    insertContent: Boolean(row.insert_content),
+    updateContent: Boolean(row.update_content),
+    readComments: Boolean(row.read_comments),
+    insertComments: Boolean(row.insert_comments),
+    userInformation: row.user_information,
+  };
+}
+
 export async function pageForIntegration(
   env: Env,
   principal: IntegrationPrincipal,

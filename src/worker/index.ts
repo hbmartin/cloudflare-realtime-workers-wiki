@@ -167,7 +167,7 @@ import {
   setSubscription,
   spaceWatchState,
 } from "./notifications";
-import { notionApi, notionFileResponse } from "./notion-api";
+import { notionApi, notionFileResponse, recoverNotionMarkdownTasks } from "./notion-api";
 import { parseSearchRequest, searchPages, searchTitles } from "./search";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import {
@@ -6939,6 +6939,7 @@ export default {
         upload_reaps: () => processDueUploadReaps(env),
         page_move_receipts: () => pruneExpiredPageMoveReceipts(env.DB),
         queued_jobs: () => recoverQueuedJobs(env),
+        notion_markdown_tasks: () => recoverNotionMarkdownTasks(env),
         outbox: async () => {
           await sweepOutbox(env);
           await purgeExpiredSlackSearchSessions(env);

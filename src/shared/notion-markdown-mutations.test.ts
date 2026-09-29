@@ -43,24 +43,112 @@ describe("Notion Markdown block mutations", () => {
     ]);
   });
 
+  it("replaces an empty page body", () => {
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [] }] };
+    const projection = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      { type: "replace_content", replace_content: { new_str: "First paragraph\n" } },
+      projection.markdown,
+    );
+    expect(markdownMutations(document, projection, command.edits, false)).toMatchObject([
+      { type: "append_children", position: { type: "start" } },
+    ]);
+  });
+
+  it("appends body content before a child-page marker", () => {
+    const { document } = fixture();
+    const projection = projectNotionMarkdown(document, new Map(), {}, [
+      {
+        id: "child",
+        internalId: "child",
+        type: "linkToPage",
+        node: { type: "linkToPage", attrs: { pageId: "child", title: "Child" } },
+        children: [],
+      },
+    ]);
+    const command = parseMarkdownCommand(
+      { type: "insert_content", insert_content: { content: "Last paragraph\n", position: { type: "end" } } },
+      projection.markdown,
+    );
+    expect(markdownMutations(document, projection, command.edits, false)).toMatchObject([
+      { type: "append_children", position: { type: "after_block" } },
+    ]);
+  });
+
+  it("keeps existing IDs and formatting when a range inserts between unchanged blocks", () => {
+    const { first, second, document, projection } = fixture();
+    first.content![0]!.attrs = { ...first.content![0]!.attrs, textColor: "red" };
+    const updated = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      {
+        type: "replace_content_range",
+        replace_content_range: {
+          content_range: "First paragraph...Second paragraph",
+          content: "First paragraph\n\nMiddle\n\nSecond paragraph",
+        },
+      },
+      updated.markdown,
+    );
+    const operations = markdownMutations(document, updated, command.edits, false);
+    expect(operations).toMatchObject([{ type: "append_children" }]);
+    expect(operations[0]).toMatchObject({ position: { afterInternalId: first.attrs?.id } });
+    expect(operations.some((operation) => "internalId" in operation && operation.internalId === second.attrs?.id)).toBe(
+      false,
+    );
+    expect(projection.markdown).toContain("First paragraph");
+  });
+
+  it("does not confuse literal unknown text in code with an unknown block", () => {
+    const code = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [
+        { type: "codeBlock", attrs: { language: "txt" }, content: [{ type: "text", text: "<unknown literal" }] },
+      ],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [code] }] };
+    const projection = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      { type: "update_content", update_content: { content_updates: [{ old_str: "literal", new_str: "text" }] } },
+      projection.markdown,
+    );
+    expect(markdownMutations(document, projection, command.edits, false)).toHaveLength(1);
+  });
+
+  it("rejects a changed audio link while preserving the same audio inside a range", () => {
+    const audio = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "audio", attrs: { url: "https://example.com/audio.mp3", caption: "Recording" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [audio] }] };
+    const projection = projectNotionMarkdown(document);
+    const command = parseMarkdownCommand(
+      { type: "update_content", update_content: { content_updates: [{ old_str: "Recording", new_str: "Edited" }] } },
+      projection.markdown,
+    );
+    expect(() => markdownMutations(document, projection, command.edits, true)).toThrow(/block API/);
+  });
+
   it("identifies a selected block across a concurrent projection", () => {
     const { document, projection } = fixture();
     const edit = parseMarkdownCommand(
       { type: "update_content", update_content: { content_updates: [{ old_str: "First", new_str: "Changed" }] } },
       projection.markdown,
     ).edits;
-    const original = markdownEditTargets(projection, edit);
+    const original = markdownEditTargets(document, projection, edit);
     const unrelated = notionInputToBlockContainer({ paragraph: { rich_text: [{ text: { content: "Intro" } }] } });
-    const shifted = projectNotionMarkdown({
+    const shiftedDocument = {
       ...document,
       content: [{ type: "blockGroup", content: [unrelated, ...document.content![0]!.content!] }],
-    });
+    };
+    const shifted = projectNotionMarkdown(shiftedDocument);
     const shiftedEdit = parseMarkdownCommand(
       { type: "update_content", update_content: { content_updates: [{ old_str: "First", new_str: "Changed" }] } },
       shifted.markdown,
     ).edits;
-    expect(markdownEditTargets(shifted, shiftedEdit)).toEqual(original);
-    const changed = projectNotionMarkdown({
+    expect(markdownEditTargets(shiftedDocument, shifted, shiftedEdit)).toEqual(original);
+    const changedDocument = {
       ...document,
       content: [
         {
@@ -74,9 +162,11 @@ describe("Notion Markdown block mutations", () => {
           ],
         },
       ],
-    });
+    };
+    const changed = projectNotionMarkdown(changedDocument);
     expect(
       markdownEditTargets(
+        changedDocument,
         changed,
         parseMarkdownCommand(
           { type: "update_content", update_content: { content_updates: [{ old_str: "First", new_str: "Changed" }] } },
