@@ -135,7 +135,7 @@ afterEach(async () => {
 });
 
 describe("date reminders", () => {
-  it("returns a committed content sequence when edits arrive during compaction", async () => {
+  it("asks content readers to retry while edits arrive during compaction", async () => {
     const installed = await bootstrap();
     const stub = env.DOCUMENT.getByName(`${installed.page.id}~1`);
     const content = () =>
@@ -152,18 +152,24 @@ describe("date reminders", () => {
     const before = await content();
     expect(before.status).toBe(200);
     expect(before.headers.get("x-notes-content-current")).toBe("1");
-    const committed = await before.json<{ sequence: number; document: unknown }>();
+    let originalCompact: (() => Promise<void>) | null = null;
     await runInDurableObject(stub, async (instance) => {
-      const room = instance as unknown as { document: Y.Doc; compaction: Promise<void> | null };
-      room.compaction = Promise.resolve();
+      const room = instance as unknown as { document: Y.Doc; compact: () => Promise<void> };
+      originalCompact = room.compact;
+      room.compact = async () => {};
       room.document.transact(() => {
         room.document.getXmlFragment("document-store").insert(0, [new Y.XmlElement("paragraph")]);
       });
     });
     const during = await content();
-    expect(during.status).toBe(200);
-    expect(during.headers.get("x-notes-content-current")).toBe("0");
-    expect(await during.json()).toEqual(committed);
+    expect(during.status).toBe(503);
+    expect(during.headers.get("x-notes-content-retry")).toBe("changing");
+    await runInDurableObject(stub, async (instance) => {
+      (instance as unknown as { compact: () => Promise<void> }).compact = originalCompact!;
+    });
+    const settled = await content();
+    expect(settled.status).toBe(200);
+    expect(settled.headers.get("x-notes-content-current")).toBe("1");
   });
 
   it("validates expected document sequences before block mutation", async () => {

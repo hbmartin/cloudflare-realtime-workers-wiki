@@ -62,6 +62,8 @@ async function roomEnvelope(env: Env, pageId: string, epoch: number) {
       headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
     }),
   );
+  if (!response.ok && response.headers.get("x-notes-content-retry") === "changing")
+    throw new HttpError(503, "content_changing", "Page content is still changing.");
   if (!response.ok || response.headers.get("x-notes-content-current") !== "1")
     throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
   const envelope = await response.json<DocumentContentEnvelope>();
@@ -329,7 +331,7 @@ async function sweepDateReminders(env: Env) {
   );
   const failures: unknown[] = [];
   for (const row of rows) {
-    let retryDelay: number | null = null;
+    let retryAfterMs: number | null = null;
     try {
       const page = await env.DB.prepare(`SELECT content_epoch FROM pages WHERE id=? AND archived_at IS NULL`)
         .bind(row.page_id)
@@ -352,11 +354,11 @@ async function sweepDateReminders(env: Env) {
         envelope.sequence,
         cutoffs,
       );
-      if (!applied) retryDelay = 0;
+      if (!applied) retryAfterMs = 2 * 60_000;
     } catch (error) {
-      if (error instanceof HttpError && error.code === "content_unavailable") retryDelay = 0;
+      if (error instanceof HttpError && error.code === "content_changing") retryAfterMs = 2 * 60_000;
       else {
-        retryDelay = 2 * 60_000;
+        retryAfterMs = 17 * 60_000;
         failures.push(error);
         logger.error(
           "date_reminder.sweep.failed",
@@ -367,9 +369,8 @@ async function sweepDateReminders(env: Env) {
         );
       }
     }
-    if (retryDelay !== null) {
-      // A stale or changing room retries next tick; other failures skip one tick.
-      await rotateSweepRows(env, row.page_id, row.content_epoch, cutoffs, retryDelay).catch((rotateError) => {
+    if (retryAfterMs !== null) {
+      await rotateSweepRows(env, row.page_id, row.content_epoch, cutoffs, retryAfterMs).catch((rotateError) => {
         failures.push(rotateError);
         logger.error(
           "date_reminder.sweep_rotate.failed",
@@ -395,16 +396,22 @@ async function rotateSweepRows(
   pageId: string,
   epoch: number,
   cutoffs: { active: number; delivered: number },
-  retryDelay: number,
+  retryAfterMs: number,
 ) {
-  const offset = retryDelay === 0 ? 2 * 60_000 : 17 * 60_000;
   await env.DB.prepare(
     `UPDATE date_reminders SET checked_at=CASE
        WHEN state='delivered' THEN ? ELSE ? END
      WHERE page_id=? AND content_epoch=?
        AND ((state IN ('active','claimed') AND checked_at<?) OR (state='delivered' AND checked_at<?))`,
   )
-    .bind(cutoffs.delivered + offset, cutoffs.active + offset, pageId, epoch, cutoffs.active, cutoffs.delivered)
+    .bind(
+      cutoffs.delivered + retryAfterMs,
+      cutoffs.active + retryAfterMs,
+      pageId,
+      epoch,
+      cutoffs.active,
+      cutoffs.delivered,
+    )
     .run();
 }
 
@@ -533,7 +540,7 @@ async function deliverDueDateReminders(env: Env) {
         });
       }
     } catch (error) {
-      if (!(error instanceof HttpError && error.code === "content_unavailable"))
+      if (!(error instanceof HttpError && error.code === "content_changing"))
         logger.error("date_reminder.delivery.failed", "scheduler", "Date reminder delivery failed.", { id }, error);
       await releaseReminderClaim(env, row, claimId);
     }

@@ -851,29 +851,32 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
-      // A single compaction captures one coherent envelope. New websocket edits
-      // can arrive while it persists; readers can still use the committed copy.
-      this.flushPendingUpdates();
-      if (this.compaction) await this.compaction;
-      else if (this.metadata.dirty) await this.compact();
-      this.flushPendingUpdates();
-      const { pageId, epoch } = this.ids;
-      if (this.metadata.dirty || this.compaction) {
-        const table = this.metadata.content_kind === "diagram" ? "diagram_projections" : "document_projections";
-        const row = await this.bindings.DB.prepare(
-          `SELECT sequence,r2_key,content_hash FROM ${table} WHERE page_id=? AND content_epoch=?`,
-        )
-          .bind(pageId, epoch)
-          .first<{ sequence: number; r2_key: string; content_hash: string }>();
-        const stored = row ? await this.bindings.BUCKET.get(row.r2_key) : null;
-        if (!stored) return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
-        const envelope = await stored.json<{ pageId: string; contentEpoch: number; sequence: number }>();
-        if (envelope.pageId !== pageId || envelope.contentEpoch !== epoch || envelope.sequence !== row!.sequence)
-          return Response.json({ error: "Committed document content is invalid." }, { status: 503 });
-        return Response.json(envelope, {
-          headers: { etag: `"${row!.content_hash}"`, "x-notes-content-current": "0" },
-        });
+      // Websocket edits can arrive while a compaction persists. Give the room
+      // one additional chance to settle, then ask readers to retry.
+      try {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          this.flushPendingUpdates();
+          if (this.compaction) await this.compaction;
+          if (this.metadata.dirty) await this.compact();
+          this.flushPendingUpdates();
+          if (!this.metadata.dirty && !this.compaction) break;
+        }
+      } catch (error) {
+        logger.error(
+          "document.content_compaction.failed",
+          "document",
+          "Document content could not be compacted.",
+          {},
+          error,
+        );
+        return Response.json({ error: "Document content is temporarily unavailable." }, { status: 503 });
       }
+      const { pageId, epoch } = this.ids;
+      if (this.metadata.dirty || this.compaction)
+        return Response.json(
+          { error: "Document content is still changing." },
+          { status: 503, headers: { "x-notes-content-retry": "changing" } },
+        );
       if (this.metadata.content_kind === "diagram") {
         const envelope = diagramFromYDoc(this.document, {
           pageId,
