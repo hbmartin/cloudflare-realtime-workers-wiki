@@ -125,8 +125,10 @@ async function rememberOfflinePurgeVerification(accountKey: string, verified: bo
   else transientPurgeWarnings.add(accountKey);
   try {
     const key = `${OFFLINE_PURGE_WARNING_PREFIX}${await sha256Hex(accountKey)}`;
-    if (verified) localStorage.removeItem(key);
-    else localStorage.setItem(key, "1");
+    if (verified) {
+      localStorage.removeItem(key);
+      localStorage.removeItem(`${OFFLINE_PURGE_WARNING_PREFIX}${accountKey}`);
+    } else localStorage.setItem(key, "1");
   } catch {
     // Continue sign-out even when browser storage is disabled.
   }
@@ -959,7 +961,8 @@ export function App() {
       showState({ screen: "loading" });
       try {
         await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
-        await load();
+        if (localStorage.getItem(LOCAL_SIGNOUT_KEY) === accountKey) showState({ screen: "signin" });
+        else await load();
       } catch (error) {
         showState({
           screen: "signout-cleanup",
@@ -1321,7 +1324,14 @@ function signInFailure(cause: unknown, fallback: string) {
 function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Promise<void>; initialError?: string }) {
   const [error, setError] = useState(() => consumeSlackAuthError() || initialError);
   const [busy, setBusy] = useState(false);
-  const purgeNotice = offlinePurgeNotice();
+  const [purgeNotice, setPurgeNotice] = useState(offlinePurgeNotice);
+  useEffect(() => {
+    const onWarningChanged = (event: StorageEvent) => {
+      if (event.key?.startsWith(OFFLINE_PURGE_WARNING_PREFIX)) setPurgeNotice(offlinePurgeNotice());
+    };
+    window.addEventListener("storage", onWarningChanged);
+    return () => window.removeEventListener("storage", onWarningChanged);
+  }, []);
   const slackAvailable = useSlackIdentityAvailable();
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

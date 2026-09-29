@@ -377,6 +377,22 @@ export async function hasOfflineDocument(key: string): Promise<boolean> {
   return Boolean(db);
 }
 
+export async function availablePendingKeys(keys: readonly string[], strict = true): Promise<string[]> {
+  const available = await Promise.all(
+    keys.map(async (key) => {
+      if (!key) return null;
+      try {
+        return (await hasOfflineDocument(key)) ? key : null;
+      } catch (error) {
+        if (strict) throw error;
+        // An unreadable copy still needs to be shown for best-effort export.
+        return key;
+      }
+    }),
+  );
+  return available.filter((key): key is string => key !== null);
+}
+
 export async function listOfflinePages(accountKey: string): Promise<OfflinePage[]> {
   const pages = await readAccountPages(accountKey);
   const valid = pages.filter(
@@ -403,9 +419,7 @@ export async function listPendingOfflinePages(accountKey: string, strict = true)
   const available = await Promise.all(
     pages.map(async (page) => {
       const keys = pendingKeysOf(page);
-      const pendingCopyKeys = (
-        await Promise.all(keys.map(async (key) => (key && (await hasOfflineDocument(key)) ? key : null)))
-      ).filter((key): key is string => key !== null);
+      const pendingCopyKeys = await availablePendingKeys(keys, strict);
       return pendingCopyKeys.length ? { ...page, pendingCopyKeys } : null;
     }),
   );

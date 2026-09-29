@@ -8,7 +8,7 @@ import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
 import { api, ApiClientError } from "./api";
-import { waitForOfflinePersistence } from "./collaboration";
+import { OfflineStorageTimeoutError, waitForOfflinePersistence } from "./collaboration";
 import { EmbedFeatureContext } from "./editor-blocks";
 import { notesSchema } from "./mentions";
 import {
@@ -21,9 +21,9 @@ import { useEffectiveColorScheme } from "./ThemeControl";
 import {
   compactDocumentUpdates,
   clearRevokedOfflinePages,
+  availablePendingKeys,
   documentPendingMarker,
   getOfflinePage,
-  hasOfflineDocument,
   listPendingOfflinePages,
   markOfflinePagePending,
   markOfflinePageRevoked,
@@ -309,17 +309,7 @@ export function OfflineWorkspace({
                         pending.filter((page) => page.pageId === selected.pageId).flatMap(pendingKeysOf),
                       );
                       if (!complete) {
-                        const fallback = await Promise.all(
-                          pendingKeysOf(selected).map(async (key) => {
-                            try {
-                              return (await hasOfflineDocument(key)) ? key : null;
-                            } catch {
-                              // Best-effort export will count this unreadable copy without hiding other copies.
-                              return key;
-                            }
-                          }),
-                        );
-                        for (const key of fallback) if (key) keys.add(key);
+                        for (const key of await availablePendingKeys(pendingKeysOf(selected), false)) keys.add(key);
                       }
                       if (!keys.size) {
                         setNotice(
@@ -379,6 +369,7 @@ function OfflineEditor({
     flushRef.current = flush;
   }, []);
   const [error, setError] = useState("");
+  const [loadingSlow, setLoadingSlow] = useState(false);
   useEffect(() => {
     let active = true;
     const doc = new Y.Doc();
@@ -406,8 +397,27 @@ function OfflineEditor({
       () => {
         if (active) setCopy({ doc, persistence, provider });
       },
-      () => {
-        if (active) setError("This document copy could not be read from this device.");
+      (cause) => {
+        if (!active) return;
+        if (!(cause instanceof OfflineStorageTimeoutError)) {
+          setError("This document copy could not be read from this device.");
+          return;
+        }
+        setLoadingSlow(true);
+        void persistence["_db"]
+          .then(() => persistence.whenSynced)
+          .then(
+            () => {
+              if (!active) return;
+              setLoadingSlow(false);
+              setCopy({ doc, persistence, provider });
+            },
+            () => {
+              if (!active) return;
+              setLoadingSlow(false);
+              setError("This document copy could not be read from this device.");
+            },
+          );
       },
     );
     return () => {
@@ -444,6 +454,7 @@ function OfflineEditor({
         </button>
       </div>
       {error && <p role="alert">{error}</p>}
+      {loadingSlow && <output>Offline storage is still loading. Reopen this copy to retry if it stays here.</output>}
       {copy ? (
         <OfflineBlockEditor
           copy={copy}
@@ -453,7 +464,7 @@ function OfflineEditor({
           registerFlush={registerFlush}
         />
       ) : (
-        !error && <p>Opening local document…</p>
+        !error && !loadingSlow && <p>Opening local document…</p>
       )}
     </>
   );

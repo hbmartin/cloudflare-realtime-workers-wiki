@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
 import type { ClientMemberContext } from "../shared/types";
 import { ApiClientError } from "./api";
-import { createCollaboration } from "./collaboration";
+import { createCollaboration, OfflineStorageTimeoutError } from "./collaboration";
 import { EditorPage } from "./EditorPage";
 
 const mocks = vi.hoisted(() => {
@@ -30,7 +30,7 @@ const mocks = vi.hoisted(() => {
     handlers,
     provider,
     ready: Promise.resolve() as Promise<void>,
-    lateReady: undefined as Promise<void> | undefined,
+    lateReady: Promise.resolve() as Promise<void>,
     slashItems: null as null | ((query: string) => Promise<Array<{ title: string; onItemClick: () => void }>>),
     unsynced: false,
   };
@@ -43,7 +43,11 @@ vi.mock("./api", async (importOriginal) => ({
 
 vi.mock("./collaboration", () => ({
   OFFLINE_COPY_MISSING_MESSAGE: "This offline document copy is no longer on this device.",
-  OFFLINE_STORAGE_TIMEOUT_MESSAGE: "Offline document storage did not finish loading.",
+  OfflineStorageTimeoutError: class MockOfflineStorageTimeoutError extends Error {
+    constructor() {
+      super("Offline document storage did not finish loading.");
+    }
+  },
   createCollaboration: vi.fn(() => ({
     doc: {
       getMap: vi.fn(() => new Map()),
@@ -159,7 +163,7 @@ describe("EditorPage close reconciliation", () => {
     mocks.provider.disconnect.mockReset();
     mocks.provider.on.mockClear();
     mocks.ready = Promise.resolve();
-    mocks.lateReady = undefined;
+    mocks.lateReady = Promise.resolve();
     mocks.slashItems = null;
     mocks.unsynced = false;
     Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
@@ -263,6 +267,7 @@ describe("EditorPage close reconciliation", () => {
   it("keeps the editor closed when offline storage is unavailable", async () => {
     vi.useRealTimers();
     mocks.ready = Promise.reject(new Error("IndexedDB unavailable"));
+    mocks.lateReady = mocks.ready;
 
     render(
       <EditorPage
@@ -287,7 +292,7 @@ describe("EditorPage close reconciliation", () => {
   it("opens the editor when an offline copy finishes loading after the deadline", async () => {
     vi.useRealTimers();
     let finishLoading!: () => void;
-    mocks.ready = Promise.reject(new Error("Offline document storage did not finish loading."));
+    mocks.ready = Promise.reject(new OfflineStorageTimeoutError());
     mocks.lateReady = new Promise<void>((resolve) => {
       finishLoading = resolve;
     });
@@ -304,12 +309,12 @@ describe("EditorPage close reconciliation", () => {
       />,
     );
     expect(
-      await screen.findByText("Offline storage is still loading. Editing will resume when it is ready."),
+      await screen.findByText("Offline storage is still loading. Reopen this page to retry if it stays here."),
     ).toBeInTheDocument();
     await act(async () => finishLoading());
     await waitFor(() => {
       expect(
-        screen.queryByText("Offline storage is still loading. Editing will resume when it is ready."),
+        screen.queryByText("Offline storage is still loading. Reopen this page to retry if it stays here."),
       ).not.toBeInTheDocument();
       expect(screen.getByLabelText("Page title")).not.toHaveAttribute("readonly");
     });

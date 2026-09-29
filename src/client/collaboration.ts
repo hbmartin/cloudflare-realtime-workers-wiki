@@ -16,6 +16,12 @@ import {
 
 export const OFFLINE_COPY_MISSING_MESSAGE = "This offline document copy is no longer on this device.";
 export const OFFLINE_STORAGE_TIMEOUT_MESSAGE = "Offline document storage did not finish loading.";
+export class OfflineStorageTimeoutError extends Error {
+  override name = "OfflineStorageTimeoutError";
+  constructor() {
+    super(OFFLINE_STORAGE_TIMEOUT_MESSAGE);
+  }
+}
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -28,7 +34,7 @@ export type CollaborationBundle = {
    */
   ready: Promise<void>;
   /** Settles if an initially slow store finishes after the readiness deadline. */
-  lateReady?: Promise<void>;
+  lateReady: Promise<void>;
   readonly hasUnsyncedChanges: boolean;
   stop: () => void;
   destroy: () => void;
@@ -192,12 +198,19 @@ export function createCollaboration(
     }
   });
   void synced.catch(() => undefined);
+  const lateReady = indexeddb["_db"].then(() => synced);
+  void lateReady.catch(() => undefined);
   const readyAbort = new AbortController();
   const ready = waitForOfflinePersistence(indexeddb, readyAbort.signal)
     .then(() => synced)
     .catch((error) => {
       if (destroyed) return;
-      if (error instanceof Error && error.message === OFFLINE_STORAGE_TIMEOUT_MESSAGE) throw error;
+      if (error instanceof OfflineStorageTimeoutError) {
+        console.warn("Offline document storage is still loading", error);
+        void reportClientError("client.offline_storage_failed", error);
+        onStatus("offline");
+        throw error;
+      }
       console.error("Failed to load offline document state", error);
       void reportClientError("client.offline_storage_failed", error);
       onStatus("offline");
@@ -241,7 +254,7 @@ export function createCollaboration(
     indexeddb,
     provider,
     ready,
-    lateReady: synced,
+    lateReady,
     get hasUnsyncedChanges() {
       return durability.hasUnsyncedChanges;
     },
@@ -420,7 +433,7 @@ export async function waitForOfflinePersistence(persistence: IndexeddbPersistenc
     await Promise.race([
       persistence["_db"].then(() => persistence.whenSynced),
       new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error(OFFLINE_STORAGE_TIMEOUT_MESSAGE)), 30_000);
+        timeout = setTimeout(() => reject(new OfflineStorageTimeoutError()), 30_000);
       }),
       ...(signal
         ? [
