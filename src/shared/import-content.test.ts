@@ -465,6 +465,13 @@ describe("import content", () => {
     expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(10_000));
   });
 
+  it("imports a standalone base64 image above the short-line lexer limit", () => {
+    const data = `data:image/png;base64,${"A".repeat(100_000)}`;
+    const parsed = markdownToDocument(`![large](${data})`);
+    expect(parsed.document.content?.[0]?.content?.[0]?.content?.[0]?.type).toBe("image");
+    expect(parsed.references).toEqual([data]);
+  });
+
   it("recognizes a data image with unmatched code punctuation in its label", () => {
     const data = `data:image/png;base64,${"A".repeat(12_000)}`;
     const parsed = markdownToDocument(`See ![a \` tick](${data}) below`);
