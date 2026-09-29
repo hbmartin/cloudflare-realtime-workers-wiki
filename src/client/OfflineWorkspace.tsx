@@ -456,7 +456,10 @@ function OfflineEditor({
       {error && <p role="alert">{error}</p>}
       {loadingSlow && (
         <output>
-          Offline storage is still loading. <button onClick={() => window.location.reload()}>Reload to retry</button>
+          Offline storage is still loading.{" "}
+          <button type="button" onClick={() => window.location.reload()}>
+            Reload to retry
+          </button>
         </output>
       )}
       {copy ? (

@@ -64,6 +64,16 @@ function recoveryMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message === OFFLINE_COPY_MISSING_MESSAGE ? error.message : fallback;
 }
 
+function beginRecoveryAction(
+  actions: Map<string, number>,
+  entries: { current: readonly { key: string }[] },
+  entryKey: string,
+) {
+  const attempt = (actions.get(entryKey) ?? 0) + 1;
+  actions.set(entryKey, attempt);
+  return () => actions.get(entryKey) === attempt && entries.current.some((entry) => entry.key === entryKey);
+}
+
 export type EditorPageProps = {
   page: Page;
   metadata?: ReactNode;
@@ -99,7 +109,7 @@ export function EditorPage({
   const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [preparedRecoveryCopy, setPreparedRecoveryCopy] = useState<{ key: string; markdown: string } | null>(null);
-  const recoveryAction = useRef(0);
+  const recoveryActions = useRef(new Map<string, number>());
   const clipboardItemSupported =
     typeof ClipboardItem !== "undefined" && Boolean(navigator.clipboard && "write" in navigator.clipboard);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
@@ -527,12 +537,15 @@ export function EditorPage({
         await next.ready;
         if (active) {
           setStorageLoadingSlow(false);
+          setStorageError(null);
           setBundle(next);
         }
       } catch (error) {
         if (!active) return;
-        if (error instanceof OfflineStorageTimeoutError) setStorageLoadingSlow(true);
-        else
+        if (error instanceof OfflineStorageTimeoutError) {
+          setStorageLoadingSlow(true);
+          setStatus("offline");
+        } else
           setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
         void (async () => {
           try {
@@ -544,7 +557,8 @@ export function EditorPage({
           } catch (lateError) {
             if (!active) return;
             console.error("Failed to load offline document state", lateError);
-            void reportClientError("client.offline_storage_failed", lateError);
+            if (error instanceof OfflineStorageTimeoutError)
+              void reportClientError("client.offline_storage_failed", lateError);
             setStorageLoadingSlow(false);
             setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
           }
@@ -568,6 +582,7 @@ export function EditorPage({
         });
       setBundle(null);
       setStorageLoadingSlow(false);
+      setStorageError(null);
     };
   }, [
     member.role,
@@ -710,7 +725,19 @@ export function EditorPage({
       {storageError && <div className="notice notice-danger">{storageError}</div>}
       {storageLoadingSlow && (
         <div className="notice">
-          Offline storage is still loading. <button onClick={() => window.location.reload()}>Reload to retry</button>
+          Offline storage is still loading.{" "}
+          <button
+            type="button"
+            onClick={() => {
+              if (titleDirtyRef.current) {
+                setTitleError("Wait for the title to save before reloading.");
+                return;
+              }
+              window.location.reload();
+            }}
+          >
+            Reload to retry
+          </button>
         </div>
       )}
       {catalogWarning && <div className="notice">{catalogWarning}</div>}
@@ -732,10 +759,7 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={async () => {
-                const attempt = ++recoveryAction.current;
-                const stillCurrent = () =>
-                  recoveryAction.current === attempt &&
-                  recoveryRef.current.some((current) => current.key === entry.key);
+                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
                 try {
                   const doc = await loadOfflineCopy(entry.key);
                   try {
@@ -757,10 +781,7 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={() => {
-                const attempt = ++recoveryAction.current;
-                const stillCurrent = () =>
-                  recoveryAction.current === attempt &&
-                  recoveryRef.current.some((current) => current.key === entry.key);
+                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
                 void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`).then(
                   () => {
                     if (stillCurrent()) setRecoveryError(null);
@@ -778,10 +799,7 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={async () => {
-                const attempt = ++recoveryAction.current;
-                const stillCurrent = () =>
-                  recoveryAction.current === attempt &&
-                  recoveryRef.current.some((current) => current.key === entry.key);
+                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key);
                 const showError = (message: string) => {
                   if (stillCurrent()) setRecoveryError(message);
                 };
@@ -840,7 +858,7 @@ export function EditorPage({
               <button
                 className="quiet-button"
                 onClick={() => {
-                  recoveryAction.current += 1;
+                  recoveryActions.current.set(entry.key, (recoveryActions.current.get(entry.key) ?? 0) + 1);
                   setPreparedRecoveryCopy((prepared) => (prepared?.key === entry.key ? null : prepared));
                   dismissedRecovery.current[entry.key] = page.contentEpoch;
                   try {

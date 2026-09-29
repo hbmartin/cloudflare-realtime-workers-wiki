@@ -115,16 +115,33 @@ function offlinePurgeNotice() {
     for (let index = localStorage.length - 1; index >= 0; index -= 1) {
       const key = localStorage.key(index);
       if (!key?.startsWith(OFFLINE_PURGE_WARNING_PREFIX)) continue;
-      if (key.includes("\0")) {
-        localStorage.setItem(`${OFFLINE_PURGE_WARNING_PREFIX}legacy`, "1");
-        localStorage.removeItem(key);
-      }
       return OFFLINE_PURGE_WARNING;
     }
   } catch {
     // Storage can be disabled, but the current tab still needs the warning.
   }
   return transientPurgeWarnings.size ? OFFLINE_PURGE_WARNING : undefined;
+}
+
+async function migrateLegacyPurgeWarnings() {
+  const legacy: string[] = [];
+  try {
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(OFFLINE_PURGE_WARNING_PREFIX) && key.includes("\0")) legacy.push(key);
+    }
+  } catch {
+    return;
+  }
+  for (const key of legacy) {
+    try {
+      const accountKey = key.slice(OFFLINE_PURGE_WARNING_PREFIX.length);
+      localStorage.setItem(`${OFFLINE_PURGE_WARNING_PREFIX}${await sha256Hex(accountKey)}`, "1");
+      localStorage.removeItem(key);
+    } catch {
+      // Retain the original warning if storage cannot be changed.
+    }
+  }
 }
 
 async function rememberOfflinePurgeVerification(accountKey: string, verified: boolean) {
@@ -968,7 +985,7 @@ export function App() {
       showState({ screen: "loading" });
       try {
         await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
-        await load();
+        showState({ screen: "signin" });
       } catch (error) {
         showState({
           screen: "signout-cleanup",
@@ -977,7 +994,7 @@ export function App() {
         });
       }
     },
-    [load, showState],
+    [showState],
   );
 
   useEffect(() => {
@@ -1332,6 +1349,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
   const [busy, setBusy] = useState(false);
   const [purgeNotice, setPurgeNotice] = useState(offlinePurgeNotice);
   useEffect(() => {
+    void migrateLegacyPurgeWarnings().then(() => setPurgeNotice(offlinePurgeNotice()));
     const onWarningChanged = (event: StorageEvent) => {
       if (event.key === null || event.key.startsWith(OFFLINE_PURGE_WARNING_PREFIX))
         setPurgeNotice(offlinePurgeNotice());
@@ -1408,6 +1426,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
               .then(async (result) => {
                 if (result.error) throw new Error(result.error.message || "Passkey sign-in failed.");
                 await onComplete();
+                setPurgeNotice(offlinePurgeNotice());
               })
               .catch((cause) => setError(signInFailure(cause, "Passkey sign-in failed.")))
               .finally(() => setBusy(false));

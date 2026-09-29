@@ -7,6 +7,7 @@ export const CLIENT_ERROR_EVENTS = [
   "client.api_response_empty",
   "client.api_unauthorized_handler_failed",
   "client.offline_storage_failed",
+  "client.offline_storage_slow",
   "client.realtime_connection_failed",
 ] as const;
 
