@@ -1898,17 +1898,31 @@ export async function consumeDeliveryMessage(
     }
   } else if (row.topic === "slack_capture") {
     if (typeof payload.captureId !== "string") return await rejectPayload("Slack capture receipt is invalid.");
+    const expected = await env.DB.prepare(`SELECT installation_generation,attempt FROM slack_captures WHERE id=?`)
+      .bind(payload.captureId)
+      .first<{ installation_generation: number; attempt: number }>();
     try {
       const job = await prepareSlackCapture(env, payload.captureId);
       if (job) await startJobExecution(env, job);
     } catch (error) {
       if (error instanceof HttpError && error.status >= 400 && error.status < 500 && error.status !== 429) {
-        await env.DB.prepare(
+        const failed = await env.DB.prepare(
           `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
-           WHERE id=? AND job_id IS NULL AND state IN ('pending','running')`,
+           WHERE id=? AND job_id IS NULL AND state IN ('pending','running')
+             AND installation_generation=? AND attempt=?`,
         )
-          .bind(error.code, Date.now(), payload.captureId)
+          .bind(
+            error.code,
+            Date.now(),
+            payload.captureId,
+            expected?.installation_generation ?? -1,
+            expected?.attempt ?? -1,
+          )
           .run();
+        if (!failed.meta.changes) {
+          message.retry({ delaySeconds: 2 });
+          return "retried";
+        }
         await captureFeedbackStatement(env.DB, payload.captureId, "failed", Date.now()).run();
         return await rejectPayload(error.code);
       }
@@ -2003,6 +2017,7 @@ export async function expireJobArtifacts(env: Env) {
     const keys = [...new Set([row.input_key, row.output_key].filter((key): key is string => Boolean(key)))];
     if (keys.length) await env.BUCKET.delete(keys);
     if (row.type === "import") {
+      await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/input/`);
       await deleteR2AttemptArtifacts(env.BUCKET, `jobs/${row.id}`, row.attempt, "documents/");
       await deleteR2Prefix(env.BUCKET, `jobs/${row.id}/documents/`);
     }

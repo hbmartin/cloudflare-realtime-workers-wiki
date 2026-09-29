@@ -443,6 +443,13 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
     await validateChannel(env, installation, state.source.channelId);
     await requireChannelMember(env, installation, state.source.channelId, session.slack_user_id);
     if (session.result_page_id) {
+      const legacyHash = await sha256Hex(canonicalJson({ kind, dest, taskFields, body }));
+      if (session.request_hash && session.request_hash !== legacyHash)
+        throw new HttpError(
+          409,
+          "already_saved",
+          "This form was already saved with different values. Open a new form to make another change.",
+        );
       await pageForMember(env, member, session.result_page_id);
       if (!state.copied) await queueCopy(env, session, member.workspace.id);
       return {
@@ -453,27 +460,44 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
     // A queued copy from the previous shortcut implementation already owns this
     // Slack source. Finish that page instead of creating a second imported page.
     const legacy = await env.DB.prepare(
-      `SELECT * FROM slack_product_sessions WHERE installation_id=? AND generation=? AND slack_user_id=? AND id<>?
+      `SELECT * FROM slack_product_sessions WHERE installation_id=? AND slack_user_id=? AND id<>?
         AND result_page_id IS NOT NULL AND capture_id IS NULL
         AND json_extract(state_json,'$.source.channelId')=?
         AND json_extract(state_json,'$.source.ts')=?
-        AND json_extract(state_json,'$.source.thread')=?
+        AND (json_extract(state_json,'$.source.thread')=?
+          OR (?=1 AND json_extract(state_json,'$.source.author')='Slack thread'))
         ORDER BY created_at DESC,id DESC LIMIT 1`,
     )
       .bind(
         installation.id,
-        installation.generation,
         session.slack_user_id,
         session.id,
         state.source.channelId,
         state.source.ts,
+        state.source.thread ? 1 : 0,
         state.source.thread ? 1 : 0,
       )
       .first<Session>();
     if (legacy?.result_page_id) {
       await pageForMember(env, member, legacy.result_page_id);
       const legacyState = JSON.parse(legacy.state_json) as State;
-      if (!legacyState.copied) await queueCopy(env, legacy, member.workspace.id);
+      if (!legacyState.copied) {
+        if (legacy.generation !== installation.generation)
+          await env.DB.prepare(
+            `UPDATE slack_product_sessions SET generation=?,identity_json=?
+             WHERE id=? AND installation_id=? AND slack_user_id=? AND generation=?`,
+          )
+            .bind(
+              installation.generation,
+              session.identity_json,
+              legacy.id,
+              installation.id,
+              session.slack_user_id,
+              legacy.generation,
+            )
+            .run();
+        await queueCopy(env, legacy, member.workspace.id);
+      }
       return {
         response_action: "update",
         view: modal(session.id, [

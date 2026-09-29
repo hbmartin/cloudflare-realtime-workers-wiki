@@ -124,62 +124,70 @@ function markdownDestination(value: string, start: number) {
   return value[cursor] === ")" ? { href, end: cursor + 1 } : null;
 }
 
+function unescapeMarkdownPunctuation(text: string) {
+  return text.replace(/\\([\\`*_{}[\]()#+\-.!|>~])/g, "$1");
+}
+
 function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
-  // Protect backslash-escaped punctuation while the small inline parser scans
-  // delimiters. Restoring it only in text nodes keeps Slack capture text literal.
-  const sentinel = `\uE000${crypto.randomUUID()}\uE001`;
-  const escaped: string[] = [];
-  const protectedValue = value.replace(/\\([\\`*_{}[\]()#+\-.!|>~])/g, (_match, character: string) => {
-    const token = `${sentinel}${escaped.length}${sentinel}`;
-    escaped.push(character);
-    return token;
-  });
-  const restore = (text: string) =>
-    text.replace(
-      new RegExp(`${sentinel}(\\d+)${sentinel}`, "g"),
-      (_match, index: string) => escaped[Number(index)] ?? "",
-    );
   const output: ProseMirrorJson[] = [];
-  const pattern = /(!?)\[([^\]]*)\]\(|\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|\*([^*]+)\*|_([^_]+)_/g;
+  // Escapes are a scanner alternative, so delimiters inside code spans stay
+  // literal while escaped punctuation outside them cannot open formatting.
+  const pattern =
+    /\\([\\`*_{}[\]()#+\-.!|>~])|(!?)\[((?:\\.|[^\]\\])*)\]\(|\*\*((?:\\.|[^*])+)\*\*|__((?:\\.|[^_])+)__|`([^`]+)`|\*((?:\\.|[^*])+)\*|_((?:\\.|[^_])+)_(?!\w)/g;
   let offset = 0;
   let match: RegExpExecArray | null;
-  while ((match = pattern.exec(protectedValue))) {
-    output.push(...inline(restore(protectedValue.slice(offset, match.index))));
-    const [whole, image, label, boldA, boldB, code, italicA, italicB] = match;
+  while ((match = pattern.exec(value))) {
+    output.push(...inline(value.slice(offset, match.index)));
+    const [whole, escaped, image, label, boldA, boldB, code, italicA, italicB] = match;
+    if (escaped !== undefined) {
+      output.push(...inline(escaped));
+      offset = pattern.lastIndex;
+      continue;
+    }
     if (label !== undefined) {
-      const destination = markdownDestination(protectedValue, pattern.lastIndex);
+      const destination = markdownDestination(value, pattern.lastIndex);
       if (!destination) {
-        output.push(...inline(restore(whole)));
+        output.push(...inline(unescapeMarkdownPunctuation(whole)));
         offset = pattern.lastIndex;
         continue;
       }
       pattern.lastIndex = destination.end;
-      const rawUrl = restore(destination.href);
+      const rawUrl = destination.href;
       const url = safeLink(rawUrl);
       if (!url) {
         issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
-        output.push(...inline(restore(label ?? "")));
+        output.push(...inline(unescapeMarkdownPunctuation(label ?? "")));
       } else if (image) {
         references.push(url);
         // Images are not inline nodes in this schema, so both branches degrade to the
         // label; the issue keeps that downgrade visible in the import warnings.
         issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
-        output.push(...inline(restore(label ?? "")));
+        output.push(...inline(unescapeMarkdownPunctuation(label ?? "")));
       } else {
         references.push(url);
-        output.push(...inline(restore(label ?? ""), [{ type: "link", attrs: { href: url } }]));
+        output.push(...inline(unescapeMarkdownPunctuation(label ?? ""), [{ type: "link", attrs: { href: url } }]));
       }
     } else if (boldA !== undefined || boldB !== undefined) {
-      output.push(...inline(restore(boldA ?? boldB ?? ""), [{ type: "bold" }]));
+      output.push(...inline(unescapeMarkdownPunctuation(boldA ?? boldB ?? ""), [{ type: "bold" }]));
     } else if (code !== undefined) {
-      output.push(...inline(restore(code), [{ type: "code" }]));
+      output.push(...inline(code, [{ type: "code" }]));
     } else {
-      output.push(...inline(restore(italicA ?? italicB ?? ""), [{ type: "italic" }]));
+      output.push(...inline(unescapeMarkdownPunctuation(italicA ?? italicB ?? ""), [{ type: "italic" }]));
     }
     offset = pattern.lastIndex;
   }
-  output.push(...inline(restore(protectedValue.slice(offset))));
-  return output;
+  output.push(...inline(value.slice(offset)));
+  return output.reduce<ProseMirrorJson[]>((merged, node) => {
+    const previous = merged.at(-1);
+    if (
+      previous?.type === "text" &&
+      node.type === "text" &&
+      JSON.stringify(previous.marks ?? []) === JSON.stringify(node.marks ?? [])
+    ) {
+      merged[merged.length - 1] = { ...previous, text: (previous.text ?? "") + (node.text ?? "") };
+    } else merged.push(node);
+    return merged;
+  }, []);
 }
 
 function markdownImage(value: string) {

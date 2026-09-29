@@ -28,6 +28,20 @@ describe("import content", () => {
     ]);
   });
 
+  it("keeps backslashes literal inside code spans while unescaping surrounding text", () => {
+    const parsed = markdownToDocument("Before `\\d+\\.\\d+` then `a\\\\b` and `C:\\` after \\`literal\\`");
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "Before " },
+      { type: "text", text: "\\d+\\.\\d+", marks: [{ type: "code" }] },
+      { type: "text", text: " then " },
+      { type: "text", text: "a\\\\b", marks: [{ type: "code" }] },
+      { type: "text", text: " and " },
+      { type: "text", text: "C:\\", marks: [{ type: "code" }] },
+      { type: "text", text: " after `literal`" },
+    ]);
+  });
+
   it.each([
     ["Folder_(one)/Child.md", "Folder_(one)/Child.md"],
     ["Folder_\\(one\\)/Child.md", "Folder_(one)/Child.md"],

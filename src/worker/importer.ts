@@ -1581,7 +1581,11 @@ export function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">)
 
 async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   let options = importOptions(job);
-  if (options.captureId) job.input_key = await resumeSlackCaptureJob(env, options.captureId, job.id, job.attempt);
+  const captureId = options.captureId;
+  if (captureId)
+    job.input_key = await step.do("resume slack capture", () =>
+      resumeSlackCaptureJob(env, captureId, job.id, job.attempt),
+    );
   // A deployment can supersede confirmation while a workflow is queued or suspended.
   const refreshing = options.confirmed && !hasCurrentImportConfirmation(options);
   if (refreshing) {

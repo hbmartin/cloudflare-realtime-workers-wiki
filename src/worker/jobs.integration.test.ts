@@ -1624,24 +1624,26 @@ describe("job execution", () => {
     const currentKey = `jobs/${jobId}/attempts/2/documents/current.bin`;
     const futureKey = `jobs/${jobId}/attempts/3/documents/future.bin`;
     const legacyKey = `jobs/${jobId}/documents/legacy.bin`;
+    const oldInput = `jobs/${jobId}/input/slack-0.md`;
+    const currentInput = `jobs/${jobId}/input/slack-1.md`;
     await Promise.all(
-      [oldKey, currentKey, futureKey, legacyKey].map((key) => env.BUCKET.put(key, new Uint8Array([1]))),
+      [oldKey, currentKey, futureKey, legacyKey, oldInput, currentInput].map((key) =>
+        env.BUCKET.put(key, new Uint8Array([1])),
+      ),
     );
     await env.DB.prepare(
       `INSERT INTO jobs
         (id, workspace_id, type, status, requested_by, input_key, expires_at, attempt, created_at, updated_at)
        VALUES (?, ?, 'import', 'succeeded', ?, ?, ?, 2, ?, ?)`,
     )
-      .bind(jobId, installed.workspaceId, installed.userId, currentKey, timestamp - 1, timestamp, timestamp)
+      .bind(jobId, installed.workspaceId, installed.userId, currentInput, timestamp - 1, timestamp, timestamp)
       .run();
 
     await expireJobArtifacts(env);
 
-    expect(await Promise.all([oldKey, currentKey, legacyKey].map((key) => env.BUCKET.get(key)))).toEqual([
-      null,
-      null,
-      null,
-    ]);
+    expect(
+      await Promise.all([oldKey, currentKey, legacyKey, oldInput, currentInput].map((key) => env.BUCKET.get(key))),
+    ).toEqual([null, null, null, null, null]);
     expect(await env.BUCKET.get(futureKey)).toBeTruthy();
     expect((await env.DB.prepare(`SELECT input_key FROM jobs WHERE id = ?`).bind(jobId).first())?.input_key).toBeNull();
   });
