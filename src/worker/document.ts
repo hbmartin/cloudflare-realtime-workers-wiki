@@ -1302,12 +1302,18 @@ export class Document extends YServer {
   private async compactOnce(forceVersion = false, suppressExternalEffects = false) {
     if (this.metadata.content_kind === "document") {
       migrateLegacyColumns(this.document);
-      if (duplicateDateTokens(this.document).length) {
+      let duplicates = duplicateDateTokens(this.document);
+      if (duplicates.length) {
         const { pageId, epoch } = this.ids;
         let preferredBlocks = this.priorDateBlocks ?? new Map<string, string>();
         try {
-          if (!this.priorDateBlocks) preferredBlocks = await priorDateTokenBlocks(this.bindings, pageId, epoch);
+          if (!this.priorDateBlocks) {
+            preferredBlocks = await priorDateTokenBlocks(this.bindings, pageId, epoch);
+            this.priorDateBlocks = preferredBlocks;
+            duplicates = duplicateDateTokens(this.document);
+          }
         } catch (error) {
+          duplicates = duplicateDateTokens(this.document);
           logger.warn(
             "document.date_token_origin.unavailable",
             "document",
@@ -1318,8 +1324,7 @@ export class Document extends YServer {
         }
         // The previous projection fetch can yield to incoming websocket edits.
         // Repair the live tree after it returns, then capture the compaction.
-        const currentDuplicates = duplicateDateTokens(this.document);
-        if (currentDuplicates.length) repairDuplicateDateTokens(this.document, currentDuplicates, preferredBlocks);
+        if (duplicates.length) repairDuplicateDateTokens(this.document, duplicates, preferredBlocks);
       }
     }
     this.flushPendingUpdates();
@@ -1429,9 +1434,9 @@ export class Document extends YServer {
       let versionKey: string | null = null;
       let versionStatementIndex = -1;
       let pageProjected = false;
+      const effectsSuppressed = suppressExternalEffects && page?.import_job_id?.startsWith("notion-create:") === true;
 
       if (page) {
-        const effectsSuppressed = suppressExternalEffects && page.import_job_id?.startsWith("notion-create:") === true;
         const [oldPageTargets, oldUserTargets, watcherRows] = await Promise.all([
           this.bindings.DB.prepare(`SELECT target_page_id id FROM page_references WHERE source_page_id = ?`)
             .bind(pageId)
@@ -1743,7 +1748,7 @@ export class Document extends YServer {
 
         const results = await this.bindings.DB.batch(statements);
         pageProjected = Boolean(results[0]?.meta.changes);
-        if (pageProjected) this.priorDateBlocks = dateTokenBlocks(json);
+        if (pageProjected && this.priorDateBlocks) this.priorDateBlocks = dateTokenBlocks(json);
         const superseded = supersededProjection?.r2_key;
         if (pageProjected && superseded && superseded !== structuredKey) {
           this.state.waitUntil(
@@ -1765,15 +1770,6 @@ export class Document extends YServer {
         }
 
         if (pageProjected && !effectsSuppressed) {
-          await reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
-            logger.error(
-              "document.date_reminder_reconcile.failed",
-              "document",
-              "Date reminder reconciliation failed.",
-              { pageId, epoch },
-              error,
-            ),
-          );
           this.state.waitUntil(
             sweepOutbox(this.bindings).catch((error) =>
               logger.error(
@@ -1846,6 +1842,19 @@ export class Document extends YServer {
       });
       this.metadata.snapshot_seq = maximum;
       this.metadata.last_version_at = versionAt;
+
+      if (pageProjected && !effectsSuppressed)
+        this.state.waitUntil(
+          reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
+            logger.error(
+              "document.date_reminder_reconcile.failed",
+              "document",
+              "Date reminder reconciliation failed.",
+              { pageId, epoch },
+              error,
+            ),
+          ),
+        );
 
       if (pageProjected && versionKey) {
         this.state.waitUntil(

@@ -110,12 +110,13 @@ describe("Notion-compatible API", () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);
     const me = await (await SELF.fetch(authenticated(installed.cookie, "/api/me"))).json<{ user: { id: string } }>();
+    const nextYear = new Date().getUTCFullYear() + 1;
     const mention = {
       tokenId: crypto.randomUUID(),
       revision: crypto.randomUUID(),
       createdBy: me.user.id,
       kind: "timed" as const,
-      value: "2026-10-01T14:00:00.000Z",
+      value: `${nextYear}-10-01T14:00:00.000Z`,
       timezone: "America/Chicago",
     };
     const inserted = await env.DOCUMENT.getByName(`${installed.pageId}~1`).fetch(
@@ -230,7 +231,11 @@ describe("Notion-compatible API", () => {
       paragraph: { rich_text: Array<{ mention: { noteFlare: { payload: string } } }> };
     }>();
     expect(JSON.parse(preserved.paragraph.rich_text[0]!.mention.noteFlare.payload)).toMatchObject(mention);
-    for (const start of ["2026-10-01T09:00:00-05:00", "2026-10-01T09:00:00", "2026-10-01T14:00:00.000000Z"]) {
+    for (const start of [
+      `${nextYear}-10-01T09:00:00-05:00`,
+      `${nextYear}-10-01T09:00:00`,
+      `${nextYear}-10-01T14:00:00.000000Z`,
+    ]) {
       const roundTrip = structuredClone(originalRichText);
       (roundTrip[0]!.mention as { date: { start: string } }).date.start = start;
       const response = await SELF.fetch(
@@ -247,7 +252,7 @@ describe("Notion-compatible API", () => {
       expect(JSON.parse(normalized.paragraph.rich_text[0]!.mention.noteFlare.payload)).toMatchObject(mention);
     }
     const invalidRichText = structuredClone(originalRichText);
-    (invalidRichText[0]!.mention as { date: { start: string } }).date.start = "2026-02-30T09:00:00Z";
+    (invalidRichText[0]!.mention as { date: { start: string } }).date.start = `${nextYear}-02-30T09:00:00Z`;
     expect(
       (
         await SELF.fetch(
@@ -261,7 +266,7 @@ describe("Notion-compatible API", () => {
     ).toBe(400);
     const editedRichText = structuredClone(originalRichText);
     const editedMention = editedRichText[0]!.mention as { date: { start: string } };
-    editedMention.date.start = "2026-10-05T14:00:00.000Z";
+    editedMention.date.start = `${nextYear}-10-05T14:00:00.000Z`;
     const edited = await SELF.fetch(
       notionRequest(createdIntegration.token, `/blocks/${block!.id}`, {
         method: "PATCH",
@@ -276,7 +281,7 @@ describe("Notion-compatible API", () => {
     expect(JSON.parse(updated.paragraph.rich_text[0]!.mention.noteFlare.payload)).toMatchObject({
       tokenId: mention.tokenId,
       createdBy: mention.createdBy,
-      value: "2026-10-05T14:00:00.000Z",
+      value: `${nextYear}-10-05T14:00:00.000Z`,
     });
     const movedMention = JSON.parse(updated.paragraph.rich_text[0]!.mention.noteFlare.payload) as {
       tokenId: string;

@@ -35,7 +35,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { dateTokens } from "../shared/document-projection";
 import { dateMentionFromProps } from "../shared/date-mentions";
-import { MISSING_GRACE_MS } from "./date-reminders";
+import { MISSING_GRACE_MS, reconcileDateRemindersForPage } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -548,6 +548,7 @@ async function locatedBlock(env: Env, principal: IntegrationPrincipal, id: strin
     page,
     block,
     document: envelope.document,
+    sequence: envelope.sequence,
     internalId: row.internal_id,
     metadata: await metadataForPage(env, page.id),
   };
@@ -1231,19 +1232,30 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   }
   if (suppliedDates.size) {
     const liveDates = dateTokens(located.document);
-    const rows = await c.env.DB.prepare(
-      `SELECT token_id,user_id,token_revision,timezone,missing_since FROM date_reminders
+    const possibleMoves = [...suppliedDates.keys()].filter((id) => !liveDates.has(id));
+    if (possibleMoves.length)
+      await reconcileDateRemindersForPage(
+        c.env,
+        located.page.id,
+        located.page.content_epoch,
+        located.document,
+        located.sequence,
+      );
+    const rows = possibleMoves.length
+      ? await c.env.DB.prepare(
+          `SELECT token_id,user_id,token_revision,timezone,missing_since FROM date_reminders
        WHERE page_id=? AND content_epoch=? AND token_id IN (SELECT value FROM json_each(?))
          AND state IN ('active','claimed','delivered')`,
-    )
-      .bind(located.page.id, located.page.content_epoch, JSON.stringify(Array.from(suppliedDates.keys())))
-      .all<{
-        token_id: string;
-        user_id: string;
-        token_revision: string;
-        timezone: string;
-        missing_since: number | null;
-      }>();
+        )
+          .bind(located.page.id, located.page.content_epoch, JSON.stringify(possibleMoves))
+          .all<{
+            token_id: string;
+            user_id: string;
+            token_revision: string;
+            timezone: string;
+            missing_since: number | null;
+          }>()
+      : { results: [] };
     for (const reminder of rows.results) {
       const supplied = suppliedDates.get(reminder.token_id);
       if (!supplied || liveDates.has(supplied.tokenId)) continue;

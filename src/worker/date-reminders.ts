@@ -66,10 +66,6 @@ async function roomEnvelope(env: Env, pageId: string, epoch: number) {
   return envelope;
 }
 
-async function roomDocument(env: Env, pageId: string, epoch: number) {
-  return (await roomEnvelope(env, pageId, epoch)).document;
-}
-
 async function pageDateToken(env: Env, page: Pick<PageRow, "id" | "content_epoch">, tokenId: string) {
   const envelope = await roomEnvelope(env, page.id, page.content_epoch);
   return { token: dateTokens(envelope.document).get(tokenId) ?? null, sequence: envelope.sequence };
@@ -166,17 +162,6 @@ export async function putDateReminder(
         .bind(page.id, tokenId, member.user.id)
         .first<ReminderRow>());
     if (!savedRow) throw new HttpError(503, "reminder_unavailable", "Reminder could not be saved.");
-    const latest = await pageDateToken(env, page, tokenId);
-    if (!latest.token || latest.token.createdBy !== member.user.id || latest.token.revision !== input.revision) {
-      await reconcileDateRemindersForPage(
-        env,
-        page.id,
-        page.content_epoch,
-        await roomDocument(env, page.id, page.content_epoch),
-        latest.sequence,
-      );
-      throw new HttpError(409, "date_token_changed", "This date changed. Reopen the reminder and try again.");
-    }
     return reminderJson(savedRow);
   }
   throw new HttpError(409, "date_token_changed", "This date changed. Reopen the reminder and try again.");
@@ -337,12 +322,13 @@ async function sweepDateReminders(env: Env) {
           .run();
         continue;
       }
+      const envelope = await roomEnvelope(env, row.page_id, row.content_epoch);
       await reconcileDateRemindersForPage(
         env,
         row.page_id,
         row.content_epoch,
-        await roomDocument(env, row.page_id, row.content_epoch),
-        undefined,
+        envelope.document,
+        envelope.sequence,
         cutoffs,
       );
     } catch (error) {
@@ -424,11 +410,12 @@ async function deliverDueDateReminders(env: Env) {
           .run();
         continue;
       }
-      const document = await roomDocument(env, row.page_id, row.content_epoch);
+      const envelope = await roomEnvelope(env, row.page_id, row.content_epoch);
+      const document = envelope.document;
       const token = dateTokens(document).get(row.token_id);
       const choice = reminderChoice(JSON.parse(row.choice_json));
       if (!token || token.createdBy !== row.user_id || !choice || dateMentionDueAt(token, choice) !== row.due_at) {
-        await reconcileDateRemindersForPage(env, row.page_id, row.content_epoch, document);
+        await reconcileDateRemindersForPage(env, row.page_id, row.content_epoch, document, envelope.sequence);
         continue;
       }
       const receiptId = `${row.id}:${row.generation}`;
@@ -436,8 +423,21 @@ async function deliverDueDateReminders(env: Env) {
         env.DB.prepare(
           `UPDATE date_reminders SET state='delivered',delivery_receipt_id=?,token_revision=?,claim_id=NULL,
              claimed_at=NULL,missing_since=NULL,checked_at=?,updated_at=?
-           WHERE id=? AND generation=? AND state='claimed' AND claim_id=?`,
-        ).bind(receiptId, token.revision, timestamp, timestamp, row.id, row.generation, claimId),
+           WHERE id=? AND generation=? AND state='claimed' AND claim_id=?
+             AND EXISTS (SELECT 1 FROM document_projections
+               WHERE page_id=? AND content_epoch=? AND sequence=?)`,
+        ).bind(
+          receiptId,
+          token.revision,
+          timestamp,
+          timestamp,
+          row.id,
+          row.generation,
+          claimId,
+          row.page_id,
+          row.content_epoch,
+          envelope.sequence,
+        ),
         ...notificationFanoutStatements(env.DB, {
           workspaceId: row.workspace_id,
           spaceId: page.space_id,
@@ -497,6 +497,13 @@ async function deliverDueDateReminders(env: Env) {
 }
 
 export async function processDueDateReminders(env: Env) {
+  await env.DB.prepare(
+    `UPDATE date_reminders SET state='canceled',generation=generation+1,
+       claim_id=NULL,claimed_at=NULL,delivery_receipt_id=NULL,updated_at=?
+     WHERE id IN (SELECT id FROM date_reminders WHERE state='missing' LIMIT 100)`,
+  )
+    .bind(Date.now())
+    .run();
   let deliveryFailed = false;
   let deliveryFailure: unknown;
   try {
