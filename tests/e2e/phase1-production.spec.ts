@@ -167,6 +167,29 @@ test("offers safe paste choices and keeps the link when preview fetch fails", as
   await expect(page.locator(".bn-editor")).toBeFocused();
 });
 
+test("does not overwrite a changed paragraph from a stale paste choice", async ({ page }) => {
+  await signInOwner(page);
+  await createDocument(page);
+  const paragraph = page.locator('.bn-editor [data-content-type="paragraph"]').last();
+  await paragraph.click();
+  await page.locator(".bn-editor").focus();
+  await page.evaluate((url) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", url);
+    document.activeElement?.dispatchEvent(
+      new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }),
+    );
+  }, embedProviders[0]!.fixture);
+  const choices = page.locator(".paste-url-choice");
+  await expect(choices.getByRole("button", { name: "Embed" })).toBeVisible();
+  await paragraph.click();
+  await page.keyboard.type("Keep this paragraph");
+  await choices.getByRole("button", { name: "Embed" }).click();
+  await expect(paragraph).toContainText("Keep this paragraph");
+  await expect(page.locator(".editor-embed")).toHaveCount(0);
+  await expect(page.getByRole("alert")).toContainText(`Paste this URL again: ${embedProviders[0]!.fixture}`);
+});
+
 test("hides expanded paste actions when bootstrap disables them", async ({ page }) => {
   await page.route("**/api/me", async (route) => {
     const response = await route.fetch();

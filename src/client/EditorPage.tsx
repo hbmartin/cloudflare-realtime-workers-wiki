@@ -672,23 +672,7 @@ function CollaborativeEditor({
     const { url, blockId } = pasteChoice;
     const block = editor.getBlock(blockId);
     if (!block || block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) {
-      const link = { type: "link", href: url, content: url };
-      let inserted = false;
-      try {
-        editor.insertInlineContent([link] as never, { updateSelection: true });
-        inserted = true;
-      } catch {
-        const last = editor.document.at(-1);
-        if (last) {
-          try {
-            editor.insertBlocks([{ type: "paragraph", content: [link] }] as never, last, "after");
-            inserted = true;
-          } catch {
-            // The URL remains visible below so it can be copied again.
-          }
-        }
-      }
-      if (!inserted) onError(`The paragraph changed. Paste this URL again: ${url}`);
+      onError(`The paragraph changed. Paste this URL again: ${url}`);
       setPasteChoice(null);
       editor.focus();
       return;

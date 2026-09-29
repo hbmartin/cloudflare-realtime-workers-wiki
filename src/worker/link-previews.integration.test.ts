@@ -125,6 +125,72 @@ describe("link previews", () => {
     expect(await env.BUCKET.get(newKey)).toBeTruthy();
   });
 
+  it("keeps the prior image when refreshed metadata has no usable image", async () => {
+    const fetcher = vi.fn(async (url: string) =>
+      url === pageUrl
+        ? new Response(`<title>Updated</title><meta property="og:image" content="${imageUrl}">`, {
+            headers: { "content-type": "text/html" },
+          })
+        : new Response(png, { headers: { "content-type": "image/png" } }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    const first = await linkPreview(env, "workspace", pageUrl);
+    const key = (await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE id=?")
+      .bind(first.id)
+      .first<{ image_key: string }>())!.image_key;
+    await env.DB.prepare("UPDATE link_preview_cache SET expires_at=1 WHERE id=?").bind(first.id).run();
+    fetcher.mockImplementation(async (url: string) => {
+      if (url === imageUrl) throw new Error("Image unavailable");
+      return new Response(`<title>New title</title><meta property="og:image" content="${imageUrl}">`, {
+        headers: { "content-type": "text/html" },
+      });
+    });
+    const refreshed = await linkPreview(env, "workspace", pageUrl);
+    expect(refreshed.title).toBe("New title");
+    expect(refreshed.imageUrl).toBe(first.imageUrl);
+    expect(await env.BUCKET.get(key)).toBeTruthy();
+  });
+
+  it("does not claim a replacement row using a stale cache snapshot", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("<title>Original</title>", { headers: { "content-type": "text/html" } })),
+    );
+    const first = await linkPreview(env, "workspace", pageUrl);
+    await env.DB.prepare("UPDATE link_preview_cache SET expires_at=1 WHERE id=?").bind(first.id).run();
+    const fetcher = vi.fn();
+    vi.stubGlobal("fetch", fetcher);
+    const db = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            const prepared = target.prepare(sql);
+            if (!sql.startsWith("UPDATE link_preview_cache SET refresh_until")) return prepared;
+            return {
+              bind: (...args: unknown[]) => ({
+                run: async () => {
+                  await target.prepare("DELETE FROM link_preview_cache WHERE id=?").bind(first.id).run();
+                  await target
+                    .prepare(
+                      `INSERT INTO link_preview_cache
+                     (id,workspace_id,canonical_url,title,description,site_name,expires_at,fetched_at,refresh_until)
+                     VALUES (?,?,?,?,?,?,?,?,0)`,
+                    )
+                    .bind(first.id, "workspace", pageUrl, "Replacement", "", "site", Date.now() + 60_000, Date.now())
+                    .run();
+                  return prepared.bind(...args).run();
+                },
+              }),
+            };
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    expect((await linkPreview({ ...env, DB: db as D1Database }, "workspace", pageUrl)).title).toBe("Replacement");
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("decodes numeric titles and escaped image query strings", async () => {
     const encodedImage = `${imageUrl}?w=1200&amp;h=630`;
     const decodedImage = `${imageUrl}?w=1200&h=630`;
@@ -195,7 +261,7 @@ describe("link previews", () => {
     ).toBe(0);
   });
 
-  it("reclaims an image when D1 commit and immediate R2 cleanup both fail", async () => {
+  it("reclaims a staged image after D1 fails before committing", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string) =>
@@ -216,25 +282,45 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    const bucket = new Proxy(env.BUCKET, {
-      get(target, property) {
-        if (property === "delete")
-          return async () => {
-            throw new Error("R2 unavailable");
-          };
-        const value = Reflect.get(target, property);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-    await expect(linkPreview({ ...env, DB: db, BUCKET: bucket }, "workspace", pageUrl)).rejects.toThrow(
-      "D1 unavailable",
-    );
+    await expect(linkPreview({ ...env, DB: db }, "workspace", pageUrl)).rejects.toThrow("D1 unavailable");
     const staged = await env.DB.prepare("SELECT image_key FROM link_preview_image_gc").first<{ image_key: string }>();
     expect(staged).toBeTruthy();
     expect(await env.BUCKET.get(staged!.image_key)).toBeTruthy();
     await env.DB.prepare("UPDATE link_preview_image_gc SET queued_at = 1").run();
     await pruneLinkPreviews(env);
     expect(await env.BUCKET.get(staged!.image_key)).toBeNull();
+  });
+
+  it("retains an image when D1 commits but its batch response fails", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url === pageUrl
+          ? new Response(`<meta property="og:image" content="${imageUrl}">`, {
+              headers: { "content-type": "text/html" },
+            })
+          : new Response(png, { headers: { "content-type": "image/png" } }),
+      ),
+    );
+    const db = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            await target.batch(statements);
+            throw new Error("D1 response lost");
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(linkPreview({ ...env, DB: db }, "workspace", pageUrl)).rejects.toThrow("D1 response lost");
+    const row = await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE workspace_id=?")
+      .bind("workspace")
+      .first<{ image_key: string }>();
+    expect(row?.image_key).toBeTruthy();
+    expect(await env.BUCKET.get(row!.image_key)).toBeTruthy();
+    await pruneLinkPreviews(env);
+    expect(await env.BUCKET.get(row!.image_key)).toBeTruthy();
   });
 
   it("cannot overwrite a newer preview after losing the refresh lease", async () => {

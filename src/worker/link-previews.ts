@@ -1,5 +1,6 @@
 import type { Env } from "./env";
 import { HttpError, sha256 } from "./http";
+import { logger } from "./observability";
 
 const SUCCESS_TTL = 24 * 60 * 60 * 1000;
 const FAILURE_TTL = 5 * 60 * 1000;
@@ -247,9 +248,19 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     const claimedAt = Date.now();
     leaseUntil = claimedAt + REFRESH_LEASE;
     const claimed = await env.DB.prepare(
-      "UPDATE link_preview_cache SET refresh_until = ? WHERE id = ? AND workspace_id = ? AND expires_at <= ? AND refresh_until <= ?",
+      `UPDATE link_preview_cache SET refresh_until = ? WHERE id = ? AND workspace_id = ?
+       AND expires_at <= ? AND refresh_until <= ? AND fetched_at = ? AND expires_at = ? AND image_key IS ?`,
     )
-      .bind(leaseUntil, id, workspaceId, claimedAt, claimedAt)
+      .bind(
+        leaseUntil,
+        id,
+        workspaceId,
+        claimedAt,
+        claimedAt,
+        existing.fetched_at,
+        existing.expires_at,
+        existing.image_key,
+      )
       .run();
     if (!claimed.meta.changes) {
       const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
@@ -267,8 +278,14 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     if (size >= MAX_WORKSPACE_PREVIEWS) {
       try {
         await pruneLinkPreviews(env, workspaceId);
-      } catch {
-        // Failed maintenance leaves the durable URL usable and the cap enforced.
+      } catch (error) {
+        logger.warn(
+          "link_preview.prune.failed",
+          "link_preview",
+          "Preview cache cleanup failed at the workspace cap.",
+          { workspaceId },
+          error,
+        );
       }
       size = await workspaceCacheSize(env, workspaceId);
     }
@@ -291,6 +308,7 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
         return current.refresh_until > now && current.fetched_at <= 0
           ? waitForRefresh(env, workspaceId, id)
           : responsePreview(current);
+      throw new HttpError(503, "preview_pending", "Link preview is still being fetched. Try again shortly.");
     }
   }
 
@@ -299,6 +317,7 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
   let siteName = url.hostname;
   let imageKey: string | null = null;
   let imageMime: string | null = null;
+  let hasImageMetadata = false;
   let succeeded = false;
   try {
     const signal = AbortSignal.timeout(FETCH_TIMEOUT);
@@ -312,6 +331,7 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     siteName = parsed.siteName || siteName;
     succeeded = true;
     if (parsed.image) {
+      hasImageMetadata = true;
       let stagedKey: string | null = null;
       try {
         const image = await fetchPublic(publicUrl(parsed.image, page.url.href), signal);
@@ -338,6 +358,10 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
     }
   } catch {
     // A failed external request is a short-lived plain link card.
+  }
+  if (succeeded && hasImageMetadata && !imageKey && existing?.image_key) {
+    imageKey = existing.image_key;
+    imageMime = existing.image_mime;
   }
   if (!succeeded && existing && existing.fetched_at > 0) {
     title = existing.title;
@@ -369,13 +393,9 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
            AND image_key = ? AND refresh_until = 0)`,
       ).bind(imageKey, id, workspaceId, imageKey),
     );
-  let saved: D1Result[];
-  try {
-    saved = await env.DB.batch(statements);
-  } catch (cause) {
-    if (imageKey && imageKey !== existing?.image_key) await discardImage(env, imageKey);
-    throw cause;
-  }
+  // An RPC failure can arrive after D1 commits. Keep the staged GC entry in that
+  // case; scheduled cleanup skips keys still referenced by a cache row.
+  const saved: D1Result[] = await env.DB.batch(statements);
   if (!saved[1]?.meta.changes) {
     if (imageKey && imageKey !== existing?.image_key) await discardImage(env, imageKey);
     const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
