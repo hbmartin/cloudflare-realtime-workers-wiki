@@ -105,7 +105,7 @@ function markdownInline(
   if (!prepared) {
     const plain = unescapeMarkdown(value, true);
     if (plain !== null) return inline(plain);
-    if (value.length > 8192) return boundedMarkdownInline(value, issues, references);
+    if (value.length > 8192 || value.includes("data:image/")) return boundedMarkdownInline(value, issues, references);
   }
   const output: ProseMirrorJson[] = [];
   const appendPlain = (text: string, marks: ProseMirrorJson["marks"] = []) => {
@@ -119,6 +119,9 @@ function markdownInline(
   };
   const append = (text: string, marks: ProseMirrorJson["marks"] = []) => {
     if (!imageMarkers?.size) return appendPlain(text, marks);
+    text = text.replace(/!([\uE000-\uF8FF])\)/g, (whole, marker: string) =>
+      imageMarkers.has(marker) ? marker : whole,
+    );
     let start = 0;
     for (let index = 0; index < text.length; index += 1) {
       const image = imageMarkers.get(text[index]!);
@@ -170,23 +173,25 @@ type DataImage = { kind: "image"; start: number; end: number; label: string; hre
 const DATA_IMAGE_LABEL_LIMIT = 514;
 
 function closingParenWithin(value: string) {
-  let nextClosing = -1;
-  let scannedTo = 0;
-  return (index: number) => {
-    if (nextClosing < index) {
-      const limit = Math.min(value.length, index + 8192);
-      const start = Math.max(index, scannedTo);
-      const found = value.slice(start, limit).indexOf(")");
-      nextClosing = found < 0 ? -1 : start + found;
-      scannedTo = limit;
+  const opens: number[] = [];
+  const closes = new Map<number, number>();
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === "\\") {
+      index += 1;
+      continue;
     }
-    return nextClosing >= index && nextClosing < index + 8192;
-  };
+    if (value[index] === "(") opens.push(index);
+    else if (value[index] === ")" && opens.length) closes.set(opens.pop()!, index);
+  }
+  return (index: number) => (closes.get(index) ?? Infinity) - index < 8192;
 }
 
-function inlineSpans(value: string, recognizeImages: boolean): { codes: CodeRange[]; images: DataImage[] } | null {
+function inlineSpans(
+  value: string,
+  recognizeImages: boolean,
+  boundedClose = closingParenWithin(value),
+): { codes: CodeRange[]; images: DataImage[] } | null {
   const runs: Array<{ start: number; end: number; length: number; escaped: boolean }> = [];
-  const boundedClose = closingParenWithin(value);
   const destinations: Array<{ start: number; end: number }> = [];
   const possibleOpeners = new Set<number>();
   let destinationDepth = 0;
@@ -309,8 +314,13 @@ function enclosingBracket(brackets: number[], value: string, start: number, anch
   return Infinity;
 }
 
-function safeInlineCut(value: string, start: number, maximum: number, codes: CodeRange[]) {
-  const boundedClose = closingParenWithin(value);
+function safeInlineCut(
+  value: string,
+  start: number,
+  maximum: number,
+  codes: CodeRange[],
+  boundedClose: (index: number) => boolean,
+) {
   const brackets: number[] = [];
   let parenDepth = 0;
   let linkStart = -1;
@@ -411,15 +421,29 @@ function safeDenseBoundary(value: string, boundary: number) {
 
 function dataImageLabelEnd(value: string, start: number) {
   const limit = Math.min(value.length, start + DATA_IMAGE_LABEL_LIMIT);
-  for (let candidate = start + 2; candidate < limit; candidate += 1) {
-    if (value[candidate] !== "]" || value[candidate + 1] !== "(") continue;
-    if (!/^data:image\/(?:png|gif|jpeg|webp);base64,/i.test(value.slice(candidate + 2, candidate + 42))) continue;
-    const codes = codeRanges(value.slice(start, candidate + 1)) ?? [];
+  const codes = codeRanges(value.slice(start, limit)) ?? [];
+  const candidates: number[] = [];
+  for (let position = start + 2; position < limit; position += 1)
+    if (
+      value[position] === "]" &&
+      value[position + 1] === "(" &&
+      /^data:image\/(?:png|gif|jpeg|webp);base64,/i.test(value.slice(position + 2, position + 42))
+    )
+      candidates.push(position);
+  for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+    const candidate = candidates[candidateIndex]!;
+    const nextCandidate = candidates[candidateIndex + 1] ?? limit;
+    const nextImageOpener = value.indexOf("![", candidate + 2);
+    const codeCanCloseInLabel = nextCandidate < limit && (nextImageOpener < 0 || nextImageOpener >= nextCandidate);
     let codeIndex = 0;
     let depth = 1;
     for (let index = start + 2; index <= candidate; index += 1) {
       const code = codes[codeIndex];
-      if (code && index === start + code.start) {
+      if (
+        code &&
+        index === start + code.start &&
+        (start + code.end <= candidate || (start + code.end <= nextCandidate && codeCanCloseInLabel))
+      ) {
         index = start + code.end - 1;
         codeIndex += 1;
       } else if (value[index] === "\\") index += 1;
@@ -528,38 +552,71 @@ function boundedMarkdownInline(
   references: string[],
   imageMarkers?: Map<string, DataImage>,
 ) {
-  if (!imageMarkers)
+  if (!imageMarkers && value.length > 8192)
     issues.push({ code: "inline_markup_simplified", detail: "Long inline content was parsed in bounded sections." });
   const output: ProseMirrorJson[] = [];
   const recordImage = (image: Pick<DataImage, "href">) => {
     references.push(image.href);
     issues.push({ code: "image_not_imported", detail: image.href.slice(0, 120) });
   };
-  const spans = inlineSpans(value, true);
+  const append = (section: ProseMirrorJson[]) => {
+    for (const node of section) {
+      const parts: ProseMirrorJson[] = [];
+      if (imageMarkers?.size && node.type === "text" && node.text) {
+        node.text = node.text.replace(/!([\uE000-\uF8FF])\)/g, (whole, marker: string) =>
+          imageMarkers.has(marker) ? marker : whole,
+        );
+        let start = 0;
+        for (let index = 0; index < node.text.length; index += 1) {
+          const image = imageMarkers.get(node.text[index]!);
+          if (!image) continue;
+          if (index > start) parts.push({ ...node, text: node.text.slice(start, index) });
+          if (image.label) parts.push({ ...node, text: image.label });
+          recordImage(image);
+          start = index + 1;
+        }
+        if (start < node.text.length) parts.push({ ...node, text: node.text.slice(start) });
+      } else parts.push(node);
+      for (const part of parts) {
+        const previous = output.at(-1);
+        if (part.type === "text" && !part.marks && previous?.type === "text" && !previous.marks)
+          previous.text = (previous.text ?? "") + (part.text ?? "");
+        else output.push(part);
+      }
+    }
+  };
+  const boundedClose = closingParenWithin(value);
+  const spans = inlineSpans(value, true, boundedClose);
   if (!spans) {
     let start = 0;
     for (let position = value.indexOf("!["); position >= 0; position = value.indexOf("![", position + 2)) {
       const image = longDataImage(value, position);
       if (!image) continue;
-      output.push(...inline(unescapeMarkdown(value.slice(start, position))), ...inline(image.label));
+      append(inline(unescapeMarkdown(value.slice(start, position))));
+      append(inline(image.label));
       recordImage(image);
       start = image.end;
       position = image.end - 2;
     }
-    output.push(...inline(unescapeMarkdown(value.slice(start))));
+    append(inline(unescapeMarkdown(value.slice(start))));
     return output;
   }
   if (!imageMarkers && spans.images.length && spans.images.length <= 6400) {
     const markers = new Map<string, DataImage>();
+    const usedMarkers = new Set<number>();
+    for (let index = 0; index < value.length; index += 1) {
+      const code = value.charCodeAt(index);
+      if (code >= 0xe000 && code <= 0xf8ff) usedMarkers.add(code);
+    }
     let nextMarker = 0xe000;
     let cursor = 0;
     let transformed = "";
     for (const image of spans.images) {
-      while (nextMarker <= 0xf8ff && value.includes(String.fromCharCode(nextMarker))) nextMarker += 1;
+      while (nextMarker <= 0xf8ff && usedMarkers.has(nextMarker)) nextMarker += 1;
       if (nextMarker > 0xf8ff) break;
       const marker = String.fromCharCode(nextMarker++);
       markers.set(marker, image);
-      transformed += value.slice(cursor, image.start) + marker;
+      transformed += value.slice(cursor, image.start) + `!${marker})`;
       cursor = image.end;
     }
     if (markers.size === spans.images.length)
@@ -570,18 +627,9 @@ function boundedMarkdownInline(
     .filter((range) => range.end - range.start > 8192)
     .map((range) => ({ kind: "code", ...range }));
   for (const image of spans.images) {
-    if (image.end - image.start <= 8192) continue;
     specials.push(image);
   }
   specials.sort((left, right) => left.start - right.start);
-  const append = (section: ProseMirrorJson[]) => {
-    for (const node of section) {
-      const previous = output.at(-1);
-      if (node.type === "text" && !node.marks && previous?.type === "text" && !previous.marks)
-        previous.text = (previous.text ?? "") + (node.text ?? "");
-      else output.push(node);
-    }
-  };
   const appendDense = (section: string) => {
     const { tokenizer } = markdownLexer();
     const sectionCodes = codeRanges(section) ?? [];
@@ -676,7 +724,7 @@ function boundedMarkdownInline(
     }
     let cut = Math.min(start + 8192, value.length, special?.start ?? value.length);
     if (cut < value.length) {
-      cut = safeInlineCut(value, start, cut, effectiveCodes);
+      cut = safeInlineCut(value, start, cut, effectiveCodes, boundedClose);
       if (trailingEscape(value, cut, start) && value[cut] !== undefined) cut -= 1;
     }
     if (cut <= start) cut = Math.min(start + 8192, special?.start ?? value.length);
@@ -702,26 +750,7 @@ function boundedMarkdownInline(
     }
     start = cut;
   }
-  if (!imageMarkers?.size) return output;
-  const resolved: ProseMirrorJson[] = [];
-  for (const node of output) {
-    if (node.type !== "text" || !node.text) {
-      resolved.push(node);
-      continue;
-    }
-    let start = 0;
-    for (let index = 0; index < node.text.length; index += 1) {
-      const image = imageMarkers.get(node.text[index]!);
-      if (!image) continue;
-      if (index > start) resolved.push({ ...node, text: node.text.slice(start, index) });
-      resolved.push({ ...node, text: image.label });
-      references.push(image.href);
-      issues.push({ code: "image_not_imported", detail: image.href.slice(0, 120) });
-      start = index + 1;
-    }
-    if (start < node.text.length) resolved.push({ ...node, text: node.text.slice(start) });
-  }
-  return resolved;
+  return output;
 }
 
 function markdownImage(value: string) {

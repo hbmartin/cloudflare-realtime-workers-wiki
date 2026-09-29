@@ -469,8 +469,23 @@ describe("import content", () => {
     );
     expect(parsed.references).toContain(image);
     expect(parsed.references).toContain("https://example.com/x");
-    expect(JSON.stringify(parsed.document)).not.toContain("](${image})");
+    expect(JSON.stringify(parsed.document)).not.toContain(`](${image})`);
     expect(JSON.stringify(parsed.document)).toContain("italic");
+  });
+
+  it("keeps adjacent underscore emphasis while removing a data image", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`_note_![icon](${image}) ${"x".repeat(9_000)}`);
+    expect(parsed.references).toEqual([image]);
+    expect(JSON.stringify(parsed.document)).toContain('"type":"italic"');
+    expect(JSON.stringify(parsed.document)).not.toContain(`](${image})`);
+  });
+
+  it("keeps a later link after an earlier destination with code-like punctuation", () => {
+    const image = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const parsed = markdownToDocument(`[a](a.md) [b](https://x.test/a\`b) ![i](${image}) and \`code\``);
+    expect(parsed.references).toEqual(["a.md", "https://x.test/a`b", image]);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
   });
 
   it("recognizes a long image after an unclosed destination inside a code span", () => {

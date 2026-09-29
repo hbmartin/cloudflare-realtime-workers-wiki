@@ -701,13 +701,19 @@ describe("job execution", () => {
          VALUES (?,?,'search_reindex','queued',?,?,?)`,
       ).bind(queuedId, installed.workspaceId, installed.userId, now - 60_000, now - 60_000),
     ]);
+    await env.DB.prepare(`UPDATE pages SET import_job_id=? WHERE id=?`).bind(jobId, installed.pageId).run();
     const get = vi.fn(async (_id: string) => ({ status: vi.fn(async () => ({ status: "errored" })) }));
     let newlyFailedCleanedBeforeQueuedStart = false;
     const create = vi.fn(async ({ id }: { id: string }) => {
       newlyFailedCleanedBeforeQueuedStart =
         (await env.DB.prepare(`SELECT cleanup_target FROM jobs WHERE id=?`)
           .bind(jobId)
-          .first<string>("cleanup_target")) === null;
+          .first<string>("cleanup_target")) === null &&
+        (await env.DB.prepare(`SELECT id FROM pages WHERE id=?`).bind(installed.pageId).first()) === null &&
+        (await env.DB.prepare(`SELECT count(*) AS total FROM jobs WHERE id IN (SELECT value FROM json_each(?))
+          AND cleanup_target='failed'`)
+          .bind(JSON.stringify(old))
+          .first<number>("total")) === old.length;
       return { id };
     });
     await recoverQueuedJobs(bindingsWith({ NOTES_WORKFLOW: { get, create } }));
