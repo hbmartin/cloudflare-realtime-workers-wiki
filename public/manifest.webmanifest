@@ -1,0 +1,14 @@
+{
+  "name": "NoteFlare",
+  "short_name": "NoteFlare",
+  "description": "Your team wiki, including previously visited documents when offline.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f5f0",
+  "theme_color": "#f7f5f0",
+  "icons": [
+    { "src": "/logo.jpg", "sizes": "1600x1600", "type": "image/jpeg", "purpose": "any" },
+    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any" }
+  ]
+}
