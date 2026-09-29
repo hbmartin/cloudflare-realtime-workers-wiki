@@ -106,8 +106,7 @@ function markdownInline(
   if (!prepared) {
     const plain = unescapeMarkdown(value, true);
     if (plain !== null) return inline(plain);
-    if (value.length > 8192 || (value.match(/[<\\]/g)?.length ?? 0) > 128 || (value.match(/[*_`]/g)?.length ?? 0) > 512)
-      return boundedMarkdownInline(value, issues, references);
+    if (value.length > 8192) return boundedMarkdownInline(value, issues, references);
     if (value.includes("data:image/"))
       return markdownInline(value, issues, references, Lexer.lexInline(value, { gfm: false }), undefined, true);
   }
@@ -167,14 +166,18 @@ function markdownInline(
       else if (token.type === "link" || token.type === "image") {
         const rawUrl = token.href;
         const url = safeLink(rawUrl);
-        const wantsRawLabel = token.type === "image" || token.raw.includes("\\[") || token.raw.includes("\\]");
+        const mayHaveEscapedBracket =
+          !token.raw.startsWith("<") && (token.raw.includes("\\[") || token.raw.includes("\\]"));
+        const wantsRawLabel = token.type === "image" || mayHaveEscapedBracket;
         const candidateEnd = wantsRawLabel && !token.raw.startsWith("<") ? linkLabelEnd(token.raw, 0, 8192) : null;
         const labelEnd =
-          candidateEnd !== null && simpleLongLink(token.raw, 0, candidateEnd)?.end === token.raw.length
+          candidateEnd !== null &&
+          unescapeMarkdown(token.raw.slice(token.type === "image" ? 2 : 1, candidateEnd)) === token.text
             ? candidateEnd
             : null;
         const rawLabel = labelEnd === null ? token.text : token.raw.slice(token.type === "image" ? 2 : 1, labelEnd);
-        const escapedBracket = rawLabel.includes("\\[") || rawLabel.includes("\\]");
+        const escapedBracket =
+          mayHaveEscapedBracket && (labelEnd === null || rawLabel.includes("\\[") || rawLabel.includes("\\]"));
         const emitLabel = (labelMarks: NonNullable<ProseMirrorJson["marks"]>) => {
           if (escapedBracket && labelEnd !== null) {
             const { tokenizer, lexer } = markdownLexer();
@@ -254,26 +257,13 @@ function availableImageMarkers() {
   return markerPool;
 }
 
-function angledDestinationCheck(value: string) {
-  let lastOpener = -1;
-  let scannedTo = -1;
-  let onlyWhitespace = true;
-  return (opener: number, index: number) => {
-    if (opener < 0 || index <= opener || index - opener > 8192) return false;
-    if (opener !== lastOpener || index < scannedTo) {
-      lastOpener = opener;
-      scannedTo = opener + 1;
-      onlyWhitespace = true;
-    }
-    while (scannedTo < index) {
-      if (!/\s/.test(value[scannedTo++]!)) onlyWhitespace = false;
-    }
-    return onlyWhitespace;
-  };
+function startsAngledDestination(value: string, opener: number, index: number) {
+  if (opener < 0 || index <= opener || index - opener > 8192) return false;
+  for (let position = index - 1; position > opener; position -= 1) if (!/\s/.test(value[position]!)) return false;
+  return true;
 }
 
 function closingParenWithin(value: string) {
-  const startsAngledDestination = angledDestinationCheck(value);
   const candidates = new Map<number, number>();
   const pending: Array<{ index: number; depth: number }> = [];
   const closes = new Map<number, number>();
@@ -322,7 +312,7 @@ function closingParenWithin(value: string) {
       quote = value[index]!;
       continue;
     }
-    if (value[index] === "<" && startsAngledDestination(candidates.get(depth) ?? -1, index)) {
+    if (value[index] === "<" && startsAngledDestination(value, candidates.get(depth) ?? -1, index)) {
       angled = true;
       continue;
     }
@@ -366,7 +356,6 @@ function inlineSpans(
   recognizeImages: boolean,
   boundedClose = lazyClosingParenWithin(value),
 ): { codes: CodeRange[]; images: DataImage[] } | null {
-  const startsAngledDestination = angledDestinationCheck(value);
   const runs: Array<{ start: number; end: number; length: number; escaped: boolean }> = [];
   const destinations: Array<{ start: number; end: number }> = [];
   const possibleOpeners = new Set<number>();
@@ -404,7 +393,7 @@ function inlineSpans(
       destinationQuote = value[index]!;
       continue;
     }
-    if (destinationDepth === 1 && value[index] === "<" && startsAngledDestination(destinationStart, index)) {
+    if (destinationDepth === 1 && value[index] === "<" && startsAngledDestination(value, destinationStart, index)) {
       destinationAngled = true;
       continue;
     }
@@ -534,7 +523,6 @@ function safeInlineCut(
   codes: CodeRange[],
   boundedClose: (index: number) => boolean,
 ) {
-  const startsAngledDestination = angledDestinationCheck(value);
   const brackets: number[] = [];
   let parenDepth = 0;
   let destinationStart = -1;
@@ -587,7 +575,7 @@ function safeInlineCut(
       quote = character;
       continue;
     }
-    if (parenDepth === 1 && character === "<" && startsAngledDestination(destinationStart, index)) {
+    if (parenDepth === 1 && character === "<" && startsAngledDestination(value, destinationStart, index)) {
       angled = true;
       continue;
     }
@@ -626,7 +614,6 @@ function trailingEscape(value: string, boundary: number, start = 0) {
 }
 
 function safeDenseBoundary(value: string, boundary: number) {
-  const startsAngledDestination = angledDestinationCheck(value);
   const boundedClose = closingParenWithin(value);
   const brackets: number[] = [];
   const codes = codeRanges(value) ?? [];
@@ -669,7 +656,7 @@ function safeDenseBoundary(value: string, boundary: number) {
       quote = character;
       continue;
     }
-    if (parenDepth === 1 && character === "<" && startsAngledDestination(destinationStart, index)) {
+    if (parenDepth === 1 && character === "<" && startsAngledDestination(value, destinationStart, index)) {
       angled = true;
       continue;
     }
@@ -1047,7 +1034,10 @@ function markdownImage(value: string) {
   if (!trimmed.startsWith("![")) return null;
   if (trimmed.length > 64_000) {
     const recovered = longDataImage(trimmed, 0);
-    return recovered?.end === trimmed.length ? { label: recovered.label, href: recovered.href } : null;
+    return recovered?.end === trimmed.length &&
+      /^data:image\/(?:png|gif|jpeg|webp);base64,[A-Za-z0-9+/=]+$/i.test(recovered.href)
+      ? { label: recovered.label, href: recovered.href }
+      : null;
   }
   const labelEnd = linkLabelEnd(trimmed, 0, 8192);
   if (labelEnd === null) return null;

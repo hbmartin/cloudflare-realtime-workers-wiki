@@ -363,6 +363,14 @@ describe("import content", () => {
     expect(parsed.references).toContain("https://example.com/path");
   });
 
+  it("keeps escaped-bracket labels intact when a destination needs Marked's grammar", () => {
+    const parsed = markdownToDocument("[x ``]( y` z](https://e.com/a\\[0\\])");
+    const text = parsed.document
+      .content![0]!.content![0]!.content![0]!.content!.map((node) => node.text ?? "")
+      .join("");
+    expect(text).toContain("x ``]( y` z");
+  });
+
   it("does not treat backticks or destinations inside autolinks as prose markup", () => {
     const parsed = markdownToDocument(
       `${"< ".repeat(140)}<https://x.test/a\`b](fake> then \`[hidden](hidden.md)\` [visible](visible.md) ${"x".repeat(9_000)}`,
