@@ -269,6 +269,7 @@ describe("OAuth MCP foundation", () => {
     const location = new URL(approve.headers.get("location")!);
     expect(location.origin).toBe("http://127.0.0.1:3800");
     expect(location.searchParams.get("state")).toBe(params.state);
+    expect(location.searchParams.get("iss")).toBe(ORIGIN);
     const code = location.searchParams.get("code")!;
     const tokenRequest = {
       grant_type: "authorization_code",

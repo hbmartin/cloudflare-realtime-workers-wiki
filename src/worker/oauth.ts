@@ -414,10 +414,11 @@ async function consentMember(request: Request, env: Env) {
   return member;
 }
 
-function authorizationRedirect(request: AuthorizationRequest, params: Record<string, string>) {
+function authorizationRedirect(request: AuthorizationRequest, params: Record<string, string>, env: Env) {
   const redirect = new URL(request.redirectUri);
   for (const [key, value] of Object.entries(params)) redirect.searchParams.set(key, value);
   redirect.searchParams.set("state", request.state);
+  redirect.searchParams.set("iss", origin(env));
   return Response.redirect(redirect, 302);
 }
 
@@ -477,7 +478,7 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
   const member = await consentMember(request, env);
   const params = await formParams(request);
   const input = await authorizationRequest(params, env);
-  if (singleton(params, "decision") === "deny") return authorizationRedirect(input, { error: "access_denied" });
+  if (singleton(params, "decision") === "deny") return authorizationRedirect(input, { error: "access_denied" }, env);
   if (singleton(params, "decision") !== "approve") throw new HttpError(400, "invalid_request", "Choose Allow or Deny.");
   const code = randomCredential();
   const issued = await env.DB.prepare(
@@ -500,7 +501,7 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
     )
     .run();
   if (!issued.meta.changes) throw new HttpError(403, "account_security_required", "Complete account protection again.");
-  return authorizationRedirect(input, { code });
+  return authorizationRedirect(input, { code }, env);
 }
 
 async function pkceChallenge(verifier: string) {
