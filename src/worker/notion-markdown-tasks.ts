@@ -139,7 +139,7 @@ export async function failMarkdownTask(env: Env, row: MarkdownTaskRow, error: un
   )
     .bind(
       retry ? "retrying" : "failed",
-      retry ? (row.error_json ?? JSON.stringify(error)) : JSON.stringify(error),
+      row.error_json ?? JSON.stringify(error),
       retry ? now + delay : now,
       now,
       retry ? row.expires_at : now + RESULT_RETENTION_MS,

@@ -255,31 +255,23 @@ function parseGroupPreservingMath(
     tokenOffset = located + token.raw.length;
     if (token.type === "code") codeRanges.push({ from: located, to: tokenOffset });
     if (token.type !== "paragraph" && token.type !== "text") continue;
-    const runs: Array<{ from: number; to: number; length: number }> = [];
+    let opener: { from: number; length: number } | null = null;
     for (let index = 0; index < token.raw.length; index += 1) {
       if (token.raw[index] !== "`") continue;
       let end = index + 1;
       while (token.raw[end] === "`") end += 1;
       const length = end - index;
-      let slashes = 0;
-      for (let before = index - 1; before >= 0 && token.raw[before] === "\\"; before -= 1) slashes += 1;
-      const escaped = slashes % 2 === 1;
-      if (!escaped || length > 1)
-        runs.push({ from: index + Number(escaped), to: end, length: length - Number(escaped) });
+      if (opener) {
+        if (opener.length === length) {
+          codeRanges.push({ from: located + opener.from, to: located + end });
+          opener = null;
+        }
+      } else {
+        let slashes = 0;
+        for (let before = index - 1; before >= 0 && token.raw[before] === "\\"; before -= 1) slashes += 1;
+        if (slashes % 2 === 0) opener = { from: index, length };
+      }
       index = end - 1;
-    }
-    const nextByLength = new Map<number, number>();
-    const closers: number[] = [];
-    for (let index = runs.length - 1; index >= 0; index -= 1) {
-      closers[index] = nextByLength.get(runs[index]!.length) ?? -1;
-      nextByLength.set(runs[index]!.length, index);
-    }
-    for (let index = 0; index < runs.length; index += 1) {
-      const open = runs[index]!;
-      const closeIndex = closers[index]!;
-      if (closeIndex < 0) continue;
-      codeRanges.push({ from: located + open.from, to: located + runs[closeIndex]!.to });
-      index = closeIndex;
     }
   }
   codeRanges.sort((left, right) => left.from - right.from);
@@ -297,7 +289,6 @@ function parseGroupPreservingMath(
     rawBlocks.push(...parsed.rawBlocks);
   };
   for (const { block, span } of protectedMath) {
-    codeIndex = 0;
     const originalRaw = markdown.slice(span.from, span.to).trimEnd();
     const raw = originalRaw.replaceAll(/\r\n?/g, "\n");
     let found = normalizedSource.indexOf(raw, cursor);
@@ -312,8 +303,6 @@ function parseGroupPreservingMath(
       found = normalizedSource.indexOf(raw, found + 1);
     }
     if (found < 0) {
-      if (normalizedSource.includes(raw))
-        throw new MarkdownWriteError("Math blocks cannot be moved or placed inside Markdown code.");
       if (
         allowDeletingContent &&
         edits.some((edit) => edit.from <= span.from && edit.to >= span.from + originalRaw.length)
@@ -398,9 +387,12 @@ export function markdownMutations(
     for (const [index, span] of projection.spans.slice(group.first, group.after).entries()) {
       const marker = projection.markdown.slice(span.from, span.to).trim();
       if (!marker.startsWith('<unknown url="notion://blocks/')) continue;
-      if (original[index]?.type === "math") continue;
+      const math = original[index]?.type === "math";
       const contentEnd = span.from + projection.markdown.slice(span.from, span.to).trimEnd().length;
-      if (!allowDeletingContent || !group.edits.some((edit) => edit.from <= span.from && edit.to >= contentEnd))
+      if (
+        !allowDeletingContent ||
+        !group.edits.some((edit) => edit.from <= span.from && edit.to >= (math ? contentEnd : span.to))
+      )
         throw new MarkdownWriteError("A range cannot partially overwrite unknown content.");
     }
     const groupSource = replacementText(projection.markdown, from, to, group.edits);
