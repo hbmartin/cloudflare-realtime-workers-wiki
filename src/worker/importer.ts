@@ -27,7 +27,7 @@ import type { Env } from "./env";
 import type { JobRow } from "./jobs";
 import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { correlationHeaders, logger, traced } from "./observability";
-import { HttpError, normalizeFilename, safeHttpError } from "./http";
+import { HttpError, normalizeFilename, safeHttpError, type HttpErrorStatus } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { sidebarHiddenPageIds } from "./page-access";
 import { captureFeedbackStatement, recheckSlackCapturePublication, resumeSlackCaptureJob } from "./slack-capture";
@@ -1583,7 +1583,11 @@ async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
   let options = importOptions(job);
   const captureId = options.captureId;
   if (captureId) {
-    const resumed = await step.do("resume slack capture", async () => {
+    type SlackResume =
+      | string
+      | { ok: true; inputKey: string }
+      | { ok: false; status: HttpErrorStatus; code: string; message: string };
+    const resumed = await step.do<SlackResume>("resume slack capture", async () => {
       try {
         return { ok: true, inputKey: await resumeSlackCaptureJob(env, captureId, job.id, job.attempt) } as const;
       } catch (error) {

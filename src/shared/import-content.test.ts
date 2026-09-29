@@ -62,6 +62,16 @@ describe("import content", () => {
     expect(content.map((node) => node.text).join("")).toBe(`${prefix}${italic}${suffix}`);
   });
 
+  it("keeps bold inside an unmatched outer italic delimiter", () => {
+    const content = markdownToDocument("*read the **important** part*").document.content![0]!.content![0]!.content![0]!
+      .content!;
+    expect(content).toEqual([
+      { type: "text", text: "*read the " },
+      { type: "text", text: "important", marks: [{ type: "bold" }] },
+      { type: "text", text: " part*" },
+    ]);
+  });
+
   it("scans long unclosed emphasis with backslashes without backtracking", () => {
     const source = `**Path ${"\\alpha ".repeat(90)}`;
     const parsed = markdownToDocument(source);

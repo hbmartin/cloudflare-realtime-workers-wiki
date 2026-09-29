@@ -885,10 +885,13 @@ export async function finishPendingJobCleanup(
       ...(typeof captureId === "string"
         ? [
             env.DB.prepare(
-              `UPDATE slack_captures SET state='failed',error_category='canceled',updated_at=?
-               WHERE id=? AND job_id=? AND state='running'
-                 AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND status='canceled')`,
-            ).bind(completedAt, captureId, job.id, job.id),
+              `UPDATE slack_captures SET state='failed',
+                 error_category=(SELECT CASE WHEN status='canceled' THEN 'canceled'
+                   ELSE COALESCE(error_code,'job_failed') END FROM jobs WHERE id=?),updated_at=?
+               WHERE id=? AND ((job_id=? AND state='running') OR (job_id IS NULL AND state='pending'))
+                 AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND status IN ('canceled','failed')
+                   AND workspace_id=slack_captures.workspace_id AND requested_by=slack_captures.requested_by)`,
+            ).bind(job.id, completedAt, captureId, job.id, job.id),
             captureFeedbackStatement(env.DB, captureId, "failed", completedAt),
           ]
         : []),
@@ -937,24 +940,27 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
     await notifyJobs(env, job.workspace_id);
     return;
   }
-  const pending = await env.DB.prepare(
-    `UPDATE jobs SET status = 'failed', cleanup_target = COALESCE(cleanup_target, 'failed'),
-       progress_label = 'Failure cleanup pending', error_code = ?, error_message = ?, updated_at = ?
-     WHERE id = ? AND attempt = ? AND status = 'running'`,
-  )
-    .bind(errorCode, message, Date.now(), job.id, job.attempt)
-    .run();
-  if (!pending.meta.changes) return;
   const captureId = job.type === "import" ? jsonRecord(job.options_json).captureId : null;
-  if (typeof captureId === "string") {
-    await env.DB.prepare(
-      `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
-       WHERE id=? AND job_id=? AND state='running'`,
-    )
-      .bind(errorCode, Date.now(), captureId, job.id)
-      .run();
-    await captureFeedbackStatement(env.DB, captureId, "failed", Date.now()).run();
-  }
+  const timestamp = Date.now();
+  const [pending] = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE jobs SET status = 'failed', cleanup_target = COALESCE(cleanup_target, 'failed'),
+         progress_label = 'Failure cleanup pending', error_code = ?, error_message = ?, updated_at = ?
+       WHERE id = ? AND attempt = ? AND status = 'running'`,
+    ).bind(errorCode, message, timestamp, job.id, job.attempt),
+    ...(typeof captureId === "string"
+      ? [
+          env.DB.prepare(
+            `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
+             WHERE id=? AND workspace_id=? AND requested_by=?
+               AND ((job_id=? AND state='running') OR (job_id IS NULL AND state='pending'))
+               AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND attempt=? AND status='failed')`,
+          ).bind(errorCode, timestamp, captureId, job.workspace_id, job.requested_by, job.id, job.id, job.attempt),
+          captureFeedbackStatement(env.DB, captureId, "failed", timestamp),
+        ]
+      : []),
+  ]);
+  if (!pending?.meta.changes) return;
   await notifyJobs(env, job.workspace_id);
   await finishPendingJobCleanup(env, job, { terminateWorkflow: false }).catch((cleanupError) => {
     logger.error(
@@ -1237,7 +1243,10 @@ export async function recoverQueuedJobs(env: Env) {
   const cutoff = Date.now() - 30_000;
   const queued = await env.DB.prepare(
     `SELECT id, workflow_instance_id, attempt, correlation_id FROM jobs
-      WHERE status = 'queued' AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
+      WHERE status = 'queued' AND updated_at <= ?
+        AND NOT EXISTS (SELECT 1 FROM slack_captures
+          WHERE slack_captures.id=jobs.id AND slack_captures.state='pending' AND slack_captures.job_id IS NULL)
+      ORDER BY updated_at LIMIT 25`,
   )
     .bind(cutoff)
     .all<Pick<JobRow, "id" | "workflow_instance_id" | "attempt" | "correlation_id">>();

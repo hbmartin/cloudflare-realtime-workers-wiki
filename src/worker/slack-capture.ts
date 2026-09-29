@@ -270,7 +270,8 @@ async function sourceMessages(
     if (messages.length > MAX_CAPTURE_MESSAGES)
       throw new HttpError(422, "thread_too_large", "This thread exceeds the capture limit of 2,000 messages.");
     cursor = result.response_metadata?.next_cursor || undefined;
-    if (result.has_more && !cursor) throw new Error("Slack did not return the next thread cursor.");
+    if (result.has_more && !cursor)
+      throw new HttpError(422, "slack_source", "Slack could not verify the full thread. Retry the capture.");
   } while (cursor);
   if (!messages.some((message) => message.ts === capture.source_ts))
     throw new HttpError(404, "slack_source", "The Slack source is no longer available.");
@@ -426,7 +427,7 @@ async function stageCaptureInput(
 export async function resumeSlackCaptureJob(env: Env, captureId: string, jobId: string, attempt: number) {
   const capture = await env.DB.prepare(`SELECT * FROM slack_captures WHERE id=?`).bind(captureId).first<CaptureRow>();
   if (capture?.state === "pending" && capture.job_id === null)
-    throw new HttpError(503, "slack_capture_link_pending", "The Slack capture receipt is still being linked.");
+    throw new HttpError(409, "slack_capture_link_pending", "The Slack capture receipt was not linked to this job.");
   if (!capture || capture.job_id !== jobId)
     throw new HttpError(409, "slack_capture_unavailable", "This Slack capture cannot be resumed.");
   if (capture.state !== "running" && (capture.state !== "failed" || attempt < 2))
@@ -436,7 +437,10 @@ export async function resumeSlackCaptureJob(env: Env, captureId: string, jobId: 
       .bind(jobId)
       .first<{ input_key: string | null }>();
     const inputKey = captureInputKey(capture);
-    if (current?.input_key === inputKey && (await env.BUCKET.head(inputKey))) return inputKey;
+    if (current?.input_key === inputKey && (await env.BUCKET.head(inputKey))) {
+      await deleteSupersededCaptureInputs(env, capture);
+      return inputKey;
+    }
   }
   const { session, installation } = await authorizedCaptureContext(env, capture);
   const inputKey = await stageCaptureInput(env, capture, session, installation);
@@ -542,14 +546,29 @@ async function failCaptureWithJob(env: Env, capture: CaptureRow, job: JobRow) {
   ]);
 }
 
+async function failUnlinkedCapture(env: Env, capture: CaptureRow, category: string) {
+  const timestamp = Date.now();
+  await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
+       WHERE id=? AND installation_generation=? AND state='pending' AND job_id IS NULL`,
+    ).bind(category, timestamp, capture.id, capture.installation_generation),
+    captureFeedbackStatement(env.DB, capture.id, "failed", timestamp),
+  ]);
+}
+
 export async function prepareSlackCapture(env: Env, captureId: string): Promise<JobRow | null> {
   const capture = await env.DB.prepare(`SELECT * FROM slack_captures WHERE id = ?`).bind(captureId).first<CaptureRow>();
   if (!capture || capture.state === "succeeded" || capture.state === "failed") return null;
   const existingJob = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(capture.id).first<JobRow>();
   if (existingJob) {
-    if (existingJob.workspace_id !== capture.workspace_id || existingJob.requested_by !== capture.requested_by)
-      throw new Error("The Slack capture job receipt could not be verified.");
+    if (existingJob.workspace_id !== capture.workspace_id || existingJob.requested_by !== capture.requested_by) {
+      await failUnlinkedCapture(env, capture, "slack_capture_job_conflict");
+      throw new HttpError(409, "slack_capture_job_conflict", "The Slack capture job receipt could not be verified.");
+    }
     if (capture.state === "running" && capture.job_id === existingJob.id) {
+      if (existingJob.status === "queued" || existingJob.status === "running")
+        await deleteSupersededCaptureInputs(env, capture);
       if (existingJob.status === "queued") return existingJob;
       if (existingJob.status === "running") return null;
       if (existingJob.status === "canceling" || existingJob.cleanup_target) return null;
@@ -578,7 +597,17 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
            AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND input_key=? AND status IN ('queued','running'))`,
       ).bind(existingJob.id, timestamp, capture.id, capture.installation_generation, existingJob.id, inputKey),
     ]);
-    if (!linked[1]?.meta.changes) throw new Error("The Slack capture changed during job staging.");
+    if (!linked[1]?.meta.changes) {
+      const currentJob = await env.DB.prepare(`SELECT workspace_id,requested_by FROM jobs WHERE id=?`)
+        .bind(capture.id)
+        .first<Pick<JobRow, "workspace_id" | "requested_by">>();
+      if (
+        currentJob &&
+        (currentJob.workspace_id !== capture.workspace_id || currentJob.requested_by !== capture.requested_by)
+      )
+        await failUnlinkedCapture(env, capture, "slack_capture_job_conflict");
+      throw new Error("The Slack capture changed during job staging.");
+    }
     await deleteSupersededCaptureInputs(env, capture);
     return (await env.DB.prepare(`SELECT * FROM jobs WHERE id=?`).bind(existingJob.id).first<JobRow>())!;
   }
@@ -635,6 +664,11 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
       .bind(capture.id)
       .first<Pick<CaptureRow, "installation_generation" | "job_id" | "state">>();
     if (current?.installation_generation !== capture.installation_generation) await env.BUCKET.delete(inputKey);
+    if (job && (job.workspace_id !== capture.workspace_id || job.requested_by !== capture.requested_by)) {
+      await failUnlinkedCapture(env, capture, "slack_capture_job_conflict");
+      await env.BUCKET.delete(inputKey);
+      throw new HttpError(409, "slack_capture_job_conflict", "The Slack capture job receipt could not be verified.");
+    }
     if (current?.job_id !== job?.id || current?.state !== "running")
       throw new Error("The Slack capture changed during job staging.");
   }
