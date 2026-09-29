@@ -177,6 +177,47 @@ describe("Notion-compatible API", () => {
     const block = blocks.results.find((entry) => entry.paragraph?.rich_text?.[0]?.type === "mention");
     expect(block).toBeTruthy();
     const originalRichText = block!.paragraph.rich_text;
+    const copiedTarget = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/blocks/${installed.pageId}/children`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ children: [{ object: "block", type: "paragraph", paragraph: { rich_text: [] } }] }),
+      }),
+    );
+    expect(copiedTarget.status).toBe(200);
+    const targetId = (await copiedTarget.json<{ results: Array<{ id: string }> }>()).results[0]!.id;
+    const copy = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/blocks/${targetId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paragraph: { rich_text: originalRichText } }),
+      }),
+    );
+    expect(copy.status).toBe(200);
+    expect(
+      (await copy.json<{ paragraph: { rich_text: Array<{ type: string; plain_text: string }> } }>()).paragraph
+        .rich_text,
+    ).toEqual([expect.objectContaining({ type: "text", plain_text: originalRichText[0]!.plain_text })]);
+    const reminder = await SELF.fetch(
+      authenticated(installed.cookie, `/api/pages/${installed.pageId}/date-reminders/${mention.tokenId}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ revision: mention.revision, choice: "at_time" }),
+      }),
+    );
+    expect(reminder.status).toBe(200);
+    const copiedWithReminder = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/blocks/${targetId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paragraph: { rich_text: originalRichText } }),
+      }),
+    );
+    expect(copiedWithReminder.status).toBe(200);
+    expect(
+      (await copiedWithReminder.json<{ paragraph: { rich_text: Array<{ type: string }> } }>()).paragraph.rich_text[0]
+        ?.type,
+    ).toBe("text");
     const patched = await SELF.fetch(
       notionRequest(createdIntegration.token, `/blocks/${block!.id}`, {
         method: "PATCH",

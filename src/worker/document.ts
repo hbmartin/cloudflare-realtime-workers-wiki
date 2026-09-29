@@ -284,8 +284,12 @@ async function priorDateTokenBlocks(env: Env, pageId: string, epoch: number) {
   const envelope = await stored.json<DocumentContentEnvelope>();
   if (envelope.pageId !== pageId || envelope.contentEpoch !== epoch || envelope.document.type !== "doc")
     return new Map<string, string>();
+  return dateTokenBlocks(envelope.document);
+}
+
+function dateTokenBlocks(document: ProseMirrorJson) {
   const preferred = new Map<string, string>();
-  for (const block of flattenDocumentBlocks(envelope.document))
+  for (const block of flattenDocumentBlocks(document))
     for (const tokenId of dateTokens(block.node).keys()) if (!preferred.has(tokenId)) preferred.set(tokenId, block.id);
   return preferred;
 }
@@ -525,6 +529,7 @@ export class Document extends YServer {
   // a resident room still reconciles on its own schedule.
   private reconciledOnStart = false;
   private compaction: Promise<void> | null = null;
+  private priorDateBlocks: Map<string, string> | null = null;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env as Cloudflare.Env);
@@ -1297,12 +1302,11 @@ export class Document extends YServer {
   private async compactOnce(forceVersion = false, suppressExternalEffects = false) {
     if (this.metadata.content_kind === "document") {
       migrateLegacyColumns(this.document);
-      const duplicates = duplicateDateTokens(this.document);
-      if (duplicates.length) {
+      if (duplicateDateTokens(this.document).length) {
         const { pageId, epoch } = this.ids;
-        let preferredBlocks = new Map<string, string>();
+        let preferredBlocks = this.priorDateBlocks ?? new Map<string, string>();
         try {
-          preferredBlocks = await priorDateTokenBlocks(this.bindings, pageId, epoch);
+          if (!this.priorDateBlocks) preferredBlocks = await priorDateTokenBlocks(this.bindings, pageId, epoch);
         } catch (error) {
           logger.warn(
             "document.date_token_origin.unavailable",
@@ -1312,7 +1316,10 @@ export class Document extends YServer {
             error,
           );
         }
-        repairDuplicateDateTokens(this.document, duplicates, preferredBlocks);
+        // The previous projection fetch can yield to incoming websocket edits.
+        // Repair the live tree after it returns, then capture the compaction.
+        const currentDuplicates = duplicateDateTokens(this.document);
+        if (currentDuplicates.length) repairDuplicateDateTokens(this.document, currentDuplicates, preferredBlocks);
       }
     }
     this.flushPendingUpdates();
@@ -1736,6 +1743,7 @@ export class Document extends YServer {
 
         const results = await this.bindings.DB.batch(statements);
         pageProjected = Boolean(results[0]?.meta.changes);
+        if (pageProjected) this.priorDateBlocks = dateTokenBlocks(json);
         const superseded = supersededProjection?.r2_key;
         if (pageProjected && superseded && superseded !== structuredKey) {
           this.state.waitUntil(
@@ -1757,15 +1765,13 @@ export class Document extends YServer {
         }
 
         if (pageProjected && !effectsSuppressed) {
-          this.state.waitUntil(
-            reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
-              logger.error(
-                "document.date_reminder_reconcile.failed",
-                "document",
-                "Date reminder reconciliation failed.",
-                { pageId, epoch },
-                error,
-              ),
+          await reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
+            logger.error(
+              "document.date_reminder_reconcile.failed",
+              "document",
+              "Date reminder reconciliation failed.",
+              { pageId, epoch },
+              error,
             ),
           );
           this.state.waitUntil(
