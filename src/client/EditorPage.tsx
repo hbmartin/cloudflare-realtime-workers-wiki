@@ -587,6 +587,7 @@ function CollaborativeEditor({
 }) {
   const [commentError, setCommentError] = useState("");
   const [pasteChoice, setPasteChoice] = useState<{ url: string; blockId: string } | null>(null);
+  const [pasteNotice, setPasteNotice] = useState("");
   const editorShellRef = useRef<HTMLDivElement>(null);
   const pasteChoiceRef = useRef<HTMLFieldSetElement>(null);
   const commentsPanel = useRef<HTMLDivElement>(null);
@@ -627,12 +628,12 @@ function CollaborativeEditor({
       event.preventDefault();
       event.stopPropagation();
       setPasteChoice(null);
-      onError("");
+      setPasteNotice("");
       editor.focus();
     };
     choice?.addEventListener("keydown", onKeyDown);
     return () => choice?.removeEventListener("keydown", onKeyDown);
-  }, [editor, onError, pasteChoice]);
+  }, [editor, pasteChoice]);
   useEffect(() => {
     const root = editorShellRef.current;
     if (!root) return undefined;
@@ -672,28 +673,34 @@ function CollaborativeEditor({
     if (!pasteChoice) return;
     const { url, blockId } = pasteChoice;
     if (!editable || !editor.isEditable) {
-      onError(`This page is read-only. Paste this URL when editing is available: ${url}`);
+      setPasteNotice(`This page is read-only. Paste this URL when editing is available: ${url}`);
       setPasteChoice(null);
+      editor.focus();
       return;
     }
     const block = editor.getBlock(blockId);
+    const linkBlock = { type: "paragraph", content: [{ type: "link", href: url, content: url }] };
     if (!block || block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) {
-      if (block && JSON.stringify(block.content).includes(url)) {
-        onError(
+      const alreadyHasUrl =
+        Array.isArray(block?.content) &&
+        block.content.some(
+          (item) =>
+            item &&
+            typeof item === "object" &&
+            (("href" in item && item.href === url) || ("text" in item && item.text === url)),
+        );
+      if (alreadyHasUrl) {
+        setPasteNotice(
           `The paragraph changed and already contains this URL. Paste it again to choose a different format: ${url}`,
         );
       } else {
         const last = editor.document.at(-1);
         try {
           if (!last) throw new Error("No block to insert after.");
-          editor.insertBlocks(
-            [{ type: "paragraph", content: [{ type: "link", href: url, content: url }] }] as never,
-            last,
-            "after",
-          );
-          onError(`The paragraph changed, so the URL was added as a link at the end of the page: ${url}`);
+          editor.insertBlocks([linkBlock] as never, last, "after");
+          setPasteNotice(`The paragraph changed, so the URL was added as a link at the end of the page: ${url}`);
         } catch {
-          onError(`The paragraph changed. Paste this URL again: ${url}`);
+          setPasteNotice(`The paragraph changed. Paste this URL again: ${url}`);
         }
       }
       setPasteChoice(null);
@@ -701,16 +708,14 @@ function CollaborativeEditor({
       return;
     }
     if (kind === "link") {
-      editor.replaceBlocks([block], [
-        { type: "paragraph", content: [{ type: "link", href: url, content: url }] },
-      ] as never);
+      editor.replaceBlocks([block], [linkBlock] as never);
     } else if (kind === "embed") {
       editor.replaceBlocks([block], [{ type: "embed", props: { url, title: "Embedded link" } }] as never);
     } else {
       // Store the URL immediately; the bookmark resolves disposable metadata in the background.
       editor.replaceBlocks([block], [{ type: "bookmark", props: { url, title: url } }] as never);
     }
-    onError("");
+    setPasteNotice("");
     setPasteChoice(null);
     editor.focus();
   };
@@ -853,6 +858,7 @@ function CollaborativeEditor({
           if (block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) return;
           event.preventDefault();
           event.stopPropagation();
+          setPasteNotice("");
           setPasteChoice({ url: value, blockId: block.id });
         }}
       >
@@ -884,16 +890,16 @@ function CollaborativeEditor({
         {pasteChoice && (
           <fieldset ref={pasteChoiceRef} className="paste-url-choice">
             <legend>Paste as</legend>
-            <button type="button" onClick={() => choosePaste("link")}>
+            <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("link")}>
               Link
             </button>
             {member.features?.expandedEmbeds && pasteChoice.url.startsWith("https://") && (
-              <button type="button" onClick={() => choosePaste("preview")}>
+              <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("preview")}>
                 Preview card
               </button>
             )}
             {resolveEmbed(pasteChoice.url, member.features?.expandedEmbeds) && (
-              <button type="button" onClick={() => choosePaste("embed")}>
+              <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("embed")}>
                 Embed
               </button>
             )}
@@ -901,7 +907,7 @@ function CollaborativeEditor({
               type="button"
               onClick={() => {
                 setPasteChoice(null);
-                onError("");
+                setPasteNotice("");
                 editor.focus();
               }}
             >
@@ -909,6 +915,7 @@ function CollaborativeEditor({
             </button>
           </fieldset>
         )}
+        {pasteNotice && <output className="muted">{pasteNotice}</output>}
       </div>
     </EmbedFeatureContext.Provider>
   );

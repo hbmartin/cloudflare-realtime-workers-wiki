@@ -159,8 +159,11 @@ describe("link previews", () => {
     );
     const first = await linkPreview(env, "workspace", pageUrl);
     await env.DB.prepare("UPDATE link_preview_cache SET expires_at=1 WHERE id=?").bind(first.id).run();
-    const fetcher = vi.fn();
+    const fetcher = vi.fn(
+      async () => new Response("<title>Updated remote</title>", { headers: { "content-type": "text/html" } }),
+    );
     vi.stubGlobal("fetch", fetcher);
+    let replaced = false;
     const db = new Proxy(env.DB, {
       get(target, property) {
         if (property === "prepare")
@@ -170,15 +173,18 @@ describe("link previews", () => {
             return {
               bind: (...args: unknown[]) => ({
                 run: async () => {
-                  await target.prepare("DELETE FROM link_preview_cache WHERE id=?").bind(first.id).run();
-                  await target
-                    .prepare(
-                      `INSERT INTO link_preview_cache
-                     (id,workspace_id,canonical_url,title,description,site_name,expires_at,fetched_at,refresh_until)
-                     VALUES (?,?,?,?,?,?,?,?,0)`,
-                    )
-                    .bind(first.id, "workspace", pageUrl, "Replacement", "", "site", 1, Date.now())
-                    .run();
+                  if (!replaced) {
+                    replaced = true;
+                    await target.prepare("DELETE FROM link_preview_cache WHERE id=?").bind(first.id).run();
+                    await target
+                      .prepare(
+                        `INSERT INTO link_preview_cache
+                         (id,workspace_id,canonical_url,title,description,site_name,expires_at,fetched_at,refresh_until)
+                         VALUES (?,?,?,?,?,?,?,?,0)`,
+                      )
+                      .bind(first.id, "workspace", pageUrl, "Replacement", "", "site", 1, Date.now())
+                      .run();
+                  }
                   return prepared.bind(...args).run();
                 },
               }),
@@ -188,18 +194,15 @@ describe("link previews", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    await expect(linkPreview({ ...env, DB: db as D1Database }, "workspace", pageUrl)).rejects.toMatchObject({
-      status: 503,
-      code: "preview_pending",
-    });
+    expect((await linkPreview({ ...env, DB: db as D1Database }, "workspace", pageUrl)).title).toBe("Updated remote");
     expect(
       (
         await env.DB.prepare("SELECT title FROM link_preview_cache WHERE id=?")
           .bind(first.id)
           .first<{ title: string }>()
       )?.title,
-    ).toBe("Replacement");
-    expect(fetcher).not.toHaveBeenCalled();
+    ).toBe("Updated remote");
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it("decodes numeric titles and escaped image query strings", async () => {

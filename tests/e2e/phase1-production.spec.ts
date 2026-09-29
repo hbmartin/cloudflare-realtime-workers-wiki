@@ -193,7 +193,7 @@ test("does not overwrite a changed paragraph from a stale paste choice", async (
     "href",
     embedProviders[0]!.fixture,
   );
-  await expect(page.getByRole("alert")).toContainText("added as a link at the end of the page");
+  await expect(page.getByRole("status")).toContainText("added as a link at the end of the page");
 });
 
 test("hides expanded paste actions when bootstrap disables them", async ({ page }) => {

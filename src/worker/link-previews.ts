@@ -245,35 +245,46 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
   await beforeFetch?.();
   let leaseUntil = 0;
   if (existing) {
-    const claimedAt = Date.now();
-    leaseUntil = claimedAt + REFRESH_LEASE;
-    const claimed = await env.DB.prepare(
-      `UPDATE link_preview_cache SET refresh_until = ? WHERE id = ? AND workspace_id = ?
-       AND expires_at <= ? AND refresh_until <= ? AND fetched_at = ? AND expires_at = ? AND image_key IS ?`,
-    )
-      .bind(
-        leaseUntil,
-        id,
-        workspaceId,
-        claimedAt,
-        claimedAt,
-        existing.fetched_at,
-        existing.expires_at,
-        existing.image_key,
+    let claimedLease = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const claimedAt = Date.now();
+      leaseUntil = claimedAt + REFRESH_LEASE;
+      const claimed = await env.DB.prepare(
+        `UPDATE link_preview_cache SET refresh_until = ? WHERE id = ? AND workspace_id = ?
+         AND expires_at <= ? AND refresh_until <= ? AND fetched_at = ? AND expires_at = ? AND image_key IS ?`,
       )
-      .run();
-    if (!claimed.meta.changes) {
+        .bind(
+          leaseUntil,
+          id,
+          workspaceId,
+          claimedAt,
+          claimedAt,
+          existing.fetched_at,
+          existing.expires_at,
+          existing.image_key,
+        )
+        .run();
+      if (claimed.meta.changes) {
+        claimedLease = true;
+        break;
+      }
       const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
         .bind(id, workspaceId)
         .first<CacheRow>();
-      if (current && current.expires_at <= Date.now() && current.refresh_until <= Date.now())
-        throw new HttpError(503, "preview_pending", "Link preview is still being fetched. Try again shortly.");
-      if (current)
-        return current.refresh_until > now && current.fetched_at <= 0
-          ? waitForRefresh(env, workspaceId, id)
-          : responsePreview(current);
-      existing = null;
+      if (!current) {
+        existing = null;
+        break;
+      }
+      if (current.expires_at <= Date.now() && current.refresh_until <= Date.now()) {
+        existing = current;
+        continue;
+      }
+      return current.refresh_until > now && current.fetched_at <= 0
+        ? waitForRefresh(env, workspaceId, id)
+        : responsePreview(current);
     }
+    if (existing && !claimedLease)
+      throw new HttpError(503, "preview_pending", "Link preview is still being fetched. Try again shortly.");
   }
   if (!existing) {
     let size = await workspaceCacheSize(env, workspaceId);
@@ -393,7 +404,14 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
   try {
     saved = await env.DB.batch(statements);
   } catch (cause) {
-    // D1 can commit and then lose its RPC response. Read back before discarding R2.
+    logger.warn(
+      "link_preview.save.ambiguous",
+      "link_preview",
+      "Preview cache save returned an error.",
+      { workspaceId },
+      cause,
+    );
+    // D1 can commit after its RPC fails. Keep the staged key for scheduled cleanup.
     let current: CacheRow | null;
     try {
       current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
@@ -404,7 +422,6 @@ export async function linkPreview(env: Env, workspaceId: string, value: string, 
       throw cause;
     }
     if (current && current.refresh_until === 0 && current.expires_at > Date.now()) return responsePreview(current);
-    if (imageKey && imageKey !== existing?.image_key) await discardImage(env, imageKey);
     throw cause;
   }
   if (!saved[1]?.meta.changes) {
