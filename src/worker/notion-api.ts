@@ -12,6 +12,7 @@ import {
   type NotionBlock,
 } from "../shared/notion-blocks";
 import { constantTimeEqual, hmacSha256Hex } from "../shared/security";
+import { projectNotionMarkdown } from "../shared/notion-markdown";
 import type { Comment, CommentThread, DocumentContentEnvelope, WorkspaceEvent } from "../shared/types";
 import { PAGE_TITLE_MAX } from "../shared/validation";
 import { processArchiveDisconnectTargets } from "./archive";
@@ -644,6 +645,26 @@ notionApi.get("/pages/:pageId", async (c) => {
       new URL(c.req.url).origin,
     ),
   );
+});
+
+notionApi.get("/pages/:pageId/markdown", async (c) => {
+  const principal = c.get("principal");
+  capability(principal, "readContent");
+  const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
+  const [snapshot, metadata, id] = await Promise.all([
+    liveDocument(c.env, page),
+    metadataForPage(c.env, page.id),
+    publicPageId(c.env, page.id),
+  ]);
+  const ids = new Map([...metadata].map(([internalId, value]) => [internalId, value.id]));
+  const projection = projectNotionMarkdown(snapshot.document, ids);
+  return c.json({
+    object: "page_markdown",
+    id,
+    markdown: projection.markdown,
+    truncated: projection.truncated,
+    unknown_block_ids: projection.unknownBlockIds,
+  });
 });
 
 notionApi.get("/pages/:pageId/properties/:propertyId", async (c) => {

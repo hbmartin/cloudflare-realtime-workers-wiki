@@ -105,6 +105,25 @@ beforeEach(async () => {
 });
 
 describe("Notion-compatible API", () => {
+  it("retrieves Markdown only with a valid read grant", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    const inserted = await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [{ heading_2: { rich_text: [{ text: { content: "Plans" } }] } }] as never,
+    });
+    expect(inserted.results).toHaveLength(1);
+    const markdown = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(markdown).toMatchObject({
+      object: "page_markdown",
+      markdown: "## Plans\n",
+      truncated: false,
+      unknown_block_ids: [],
+    });
+    const missing = await SELF.fetch(notionRequest("invalid", `/pages/${installed.pageId}/markdown`));
+    expect(missing.status).toBe(401);
+  });
   it("round-trips expanded embed URLs through /v1 while framing is disabled", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);
