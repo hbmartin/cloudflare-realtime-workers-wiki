@@ -293,6 +293,42 @@ describe("import content", () => {
     expect(parsed.references.at(-1)).toBe("file999.md");
   });
 
+  it("bounds long paragraphs at whitespace without retrying the same section", () => {
+    const parsed = markdownToDocument(`*${"a ".repeat(5_000)}[end](end.md)`);
+    expect(parsed.references).toContain("end.md");
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content!.map((node) => node.text).join("")).toContain(
+      "end",
+    );
+  });
+
+  it("keeps rich links and code when a long paragraph crosses a section boundary", () => {
+    const parsed = markdownToDocument(`${"word ".repeat(1_700)}**[Title](page.md)** and \`code\``);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(parsed.references).toContain("page.md");
+    expect(content).toContainEqual({
+      type: "text",
+      text: "Title",
+      marks: [{ type: "bold" }, { type: "link", attrs: { href: "page.md" } }],
+    });
+    expect(content).toContainEqual({ type: "text", text: "code", marks: [{ type: "code" }] });
+  });
+
+  it("keeps a link after dense escaped content without lexing the whole paragraph", () => {
+    const parsed = markdownToDocument(`${"\\.".repeat(10_000)} [late](late.md)`);
+    expect(parsed.references).toContain("late.md");
+  });
+
+  it("finishes malformed tags and escapes in a long paragraph", () => {
+    const parsed = markdownToDocument(`${"<? ".repeat(30_000)} ${"\\.".repeat(30_000)}`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+  });
+
+  it("finishes a long paragraph without spaces", () => {
+    const parsed = markdownToDocument(`*${"a".repeat(1_000_000)}`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content!.map((node) => node.text).join(""))
+      .toHaveLength(1_000_001);
+  });
+
   it("keeps code-span brackets in a block image caption", () => {
     const parsed = markdownToDocument("![a `]` b](image.png)");
     expect(parsed.document.content![0]!.content![0]!.content![0]).toMatchObject({
@@ -314,6 +350,19 @@ describe("import content", () => {
     expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
     expect(parsed.references).toContain("image.png");
   });
+
+  it("rejects a malformed image destination with dense emphasis", () => {
+    const parsed = markdownToDocument(`![a](x ${"*x ".repeat(20_000)})`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+  });
+
+  it.each([`![a](image.png "Smile :)")`, `![a](<image).png>)`, "![`C:\\`](image.png)"])(
+    "keeps a block image with a valid quoted or escaped label: %s",
+    (source) => {
+      const parsed = markdownToDocument(source);
+      expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("image");
+    },
+  );
 
   it("uses Marked link and code rules in long content", () => {
     const suffix = " word".repeat(1800);

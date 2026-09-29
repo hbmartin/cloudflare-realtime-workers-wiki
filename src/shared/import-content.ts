@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { Lexer, Tokenizer, type Token } from "marked";
+import { Lexer, type Token, type Tokenizer } from "marked";
 import type { ColumnType, ProseMirrorJson } from "./types";
 
 export type ImportedTable = {
@@ -156,87 +156,93 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
       else output.push(node);
     }
   };
-  // Let Marked identify links, images and code spans over the whole input.
-  // Disabling only emphasis keeps this pass linear even with unmatched `*`.
-  const tokenizer = new Tokenizer({ gfm: false });
-  tokenizer.emStrong = () => undefined;
-  const coarse = Lexer.lexInline(value, { gfm: false, tokenizer });
-  for (const token of coarse) {
-    if (token.raw.length <= 8192) {
-      append(markdownInline(token.raw, issues, references));
-      continue;
-    }
-    if (token.type !== "text") {
-      append(markdownInline("", issues, references, [token]));
-      continue;
-    }
-    let start = 0;
-    while (start < token.raw.length) {
-      let cut = Math.min(start + 8192, token.raw.length);
-      if (cut < token.raw.length) {
-        const whitespace = token.raw.lastIndexOf(" ", cut);
-        if (whitespace > start + 1024) cut = whitespace + 1;
+  const appendDense = (section: string) => {
+    const lexer = new Lexer({ gfm: false });
+    let cursor = 0;
+    let ticks = 0;
+    let candidates = 0;
+    for (let index = 0; index < section.length; index += 1) {
+      const character = section[index];
+      if (character === "\\") {
+        index += 1;
+        continue;
       }
-      const section = token.raw.slice(start, cut);
-      const dense = (section.match(/[*_`]/g)?.length ?? 0) > 512;
-      append(dense ? inline(unescapeMarkdown(section)) : markdownInline(section, issues, references));
-      start = cut;
+      if (character === "`") {
+        let end = index + 1;
+        while (section[end] === "`") end += 1;
+        const run = end - index;
+        if (!ticks || ticks === run) ticks = ticks ? 0 : run;
+        index = end - 1;
+        continue;
+      }
+      if (ticks || (character !== "[" && !(character === "!" && section[index + 1] === "["))) continue;
+      const start = index;
+      if (++candidates > 128) break;
+      const token = (lexer as unknown as { tokenizer: Tokenizer }).tokenizer.link(section.slice(start));
+      if (!token || (token.type !== "link" && token.type !== "image")) continue;
+      append(inline(unescapeMarkdown(section.slice(cursor, start))));
+      append(markdownInline("", issues, references, [token]));
+      cursor = start + token.raw.length;
+      index = cursor - 1;
     }
+    append(inline(unescapeMarkdown(section.slice(cursor))));
+  };
+  // Bound every Marked call. A malformed tag or escape can make its inline
+  // scanner revisit the remainder of its input for each delimiter.
+  for (let start = 0; start < value.length;) {
+    let cut = Math.min(start + 8192, value.length);
+    if (cut < value.length) {
+      const windowStart = start + 1024;
+      const whitespace = value.slice(windowStart, cut).lastIndexOf(" ");
+      if (whitespace >= 0) cut = windowStart + whitespace + 1;
+      else if (value[cut - 1] === "\\") cut -= 1;
+    }
+    const section = value.slice(start, cut);
+    if ((section.match(/[<\\]/g)?.length ?? 0) > 128) {
+      let count = 0;
+      let boundary = 0;
+      while (boundary < section.length && count < 128) {
+        if (section[boundary] === "<" || section[boundary] === "\\") count += 1;
+        boundary += 1;
+      }
+      if (section[boundary - 1] === "\\" && boundary < section.length) boundary += 1;
+      const prefix = section.slice(0, boundary);
+      append(markdownInline(prefix, issues, references, new Lexer({ gfm: false }).inlineTokens(prefix)));
+      appendDense(section.slice(boundary));
+    } else {
+      const lexer = new Lexer({ gfm: false });
+      if ((section.match(/[*_`]/g)?.length ?? 0) > 512)
+        (lexer as unknown as { tokenizer: Tokenizer }).tokenizer.emStrong = () => undefined;
+      append(markdownInline(section, issues, references, lexer.inlineTokens(section)));
+    }
+    start = cut;
   }
   return output;
 }
 
 function markdownImage(value: string) {
   const trimmed = value.trim();
-  // A full-line image has a short label and one complete destination. Reject
-  // a trailing paragraph before running Marked over a large data URL.
+  // Use Marked's image grammar directly, without lexing hostile trailing text.
   const destination = trimmed.indexOf("](");
-  if (
-    !trimmed.startsWith("![") ||
-    !trimmed.endsWith(")") ||
-    trimmed.length > 64_000 ||
-    destination < 0 ||
-    destination > 8192
-  )
-    return null;
-  let end = 2;
-  let brackets = 1;
+  if (!trimmed.startsWith("![") || trimmed.length > 64_000 || destination < 0 || destination > 8192) return null;
+  const image = (new Lexer({ gfm: false }) as unknown as { tokenizer: Tokenizer }).tokenizer.link(trimmed);
+  if (image?.type !== "image" || image.raw !== trimmed) return null;
+  let depth = 1;
   let ticks = 0;
-  while (end < trimmed.length && end <= 8192 && brackets) {
-    const character = trimmed[end]!;
-    if (character === "\\" && end + 1 < trimmed.length) {
-      end += 2;
-      continue;
-    }
+  let end = 2;
+  for (; end < trimmed.length && depth; end += 1) {
+    const character = trimmed[end];
     if (character === "`") {
       let next = end + 1;
       while (trimmed[next] === "`") next += 1;
-      const count = next - end;
-      if (!ticks || ticks === count) ticks = ticks ? 0 : count;
-      end = next;
-      continue;
-    }
-    if (!ticks) {
-      if (character === "[") brackets += 1;
-      else if (character === "]") brackets -= 1;
-    }
-    end += 1;
+      const run = next - end;
+      if (!ticks || ticks === run) ticks = ticks ? 0 : run;
+      end = next - 1;
+    } else if (!ticks && character === "\\") end += 1;
+    else if (!ticks && character === "[") depth += 1;
+    else if (!ticks && character === "]") depth -= 1;
   }
-  if (brackets || trimmed[end] !== "(") return null;
-  let depth = 1;
-  for (let index = end + 1; index < trimmed.length; index += 1) {
-    if (trimmed[index] === "\\") {
-      index += 1;
-      continue;
-    }
-    if (trimmed[index] === "(") depth += 1;
-    if (trimmed[index] === ")") depth -= 1;
-    if (depth === 0 && index !== trimmed.length - 1) return null;
-  }
-  if (depth !== 0) return null;
-  const tokens = Lexer.lexInline(trimmed, { gfm: false });
-  const image = tokens.length === 1 && tokens[0]?.type === "image" ? tokens[0] : null;
-  if (!image) return null;
+  if (depth) return null;
   return { label: unescapeMarkdown(trimmed.slice(2, end - 1)), href: image.href };
 }
 

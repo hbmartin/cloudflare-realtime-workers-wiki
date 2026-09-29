@@ -69,7 +69,6 @@ const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
 const QUEUED_JOB_RECOVERY_DELAY_MS = 30_000;
-const CAPTURE_LOOKUP_RETRY_DELAY_MS = 5_000;
 const ACTIVE_WORKFLOW_STATUSES = new Set(["queued", "running", "paused", "waiting", "waitingForPause"]);
 const UNDETERMINED_WORKFLOW_STATUS = "unknown";
 
@@ -817,20 +816,12 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
       { jobId: job.id },
       lookupError,
     );
-    logger.error(
-      "workflow.capture_import.failed",
+    logger.info(
+      "workflow.capture_import.deferred",
       "workflow",
-      "Capture import failed before receipt lookup.",
+      "Capture recovery deferred until its receipt can be checked.",
       { jobId: job.id, attempt: job.attempt },
-      error,
     );
-    try {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      return await hasUnlinkedCapture(env, job.id);
-    } catch {
-      // A later sweep inspects the terminal Workflow if this D1 lookup and write
-      // fails, so an outage cannot strand the job in running indefinitely.
-    }
     // Defer recovery until D1 can distinguish an unlinked receipt from a real
     // import failure. Neither outcome is safe to assume during an outage.
     return "lookup_failed" as const;
@@ -854,8 +845,7 @@ async function replaceCaptureWorkflow(
       instanceId,
       deferForLookup ? "Waiting to check Slack receipt" : "Queued",
       deferForLookup ? "capture_lookup_unavailable" : null,
-      Date.now() -
-        (deferForLookup ? QUEUED_JOB_RECOVERY_DELAY_MS - CAPTURE_LOOKUP_RETRY_DELAY_MS : QUEUED_JOB_RECOVERY_DELAY_MS),
+      deferForLookup ? Date.now() : Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS,
       job.id,
       job.attempt,
       expectedStatus,
@@ -1034,7 +1024,7 @@ export async function finishPendingJobCleanup(
   }
 }
 
-async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
+async function failJobWithCleanup(env: Env, job: JobRow, error: unknown, deferCleanup = false) {
   const httpError = safeHttpError(error);
   // Typed job failures are user-facing product data, not telemetry. Keep their
   // specific message here; structured logging still sanitizes any later copy.
@@ -1076,6 +1066,7 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
   ]);
   if (!pending?.meta.changes) return;
   await notifyJobs(env, job.workspace_id);
+  if (deferCleanup) return;
   await finishPendingJobCleanup(env, job, { terminateWorkflow: false }).catch((cleanupError) => {
     logger.error(
       "workflow.failure_cleanup.failed",
@@ -1374,13 +1365,13 @@ export async function recoverQueuedJobs(env: Env) {
   if (env.WORKFLOW_INLINE !== "true") {
     const rotateRunningJob = (job: JobRow) =>
       env.DB.prepare(`UPDATE jobs SET updated_at=? WHERE id=? AND attempt=? AND status='running'
-        AND workflow_instance_id=?`)
-        .bind(Date.now(), job.id, job.attempt, job.workflow_instance_id)
+        AND COALESCE(workflow_instance_id,id)=?`)
+        .bind(Date.now(), job.id, job.attempt, job.workflow_instance_id ?? job.id)
         .run();
     // Move live checks to the back of this bounded scan so they cannot starve
     // terminal jobs while long imports continue to make progress.
     const running = await env.DB.prepare(
-      `SELECT * FROM jobs WHERE status='running' AND workflow_instance_id IS NOT NULL
+      `SELECT * FROM jobs WHERE status='running'
          AND updated_at<=? ORDER BY updated_at LIMIT 25`,
     )
       .bind(cutoff)
@@ -1389,11 +1380,18 @@ export async function recoverQueuedJobs(env: Env) {
       try {
         let status: { status: string; error?: unknown } | null = null;
         try {
-          status = await (await env.NOTES_WORKFLOW.get(job.workflow_instance_id!)).status();
+          status = await (await env.NOTES_WORKFLOW.get(job.workflow_instance_id ?? job.id)).status();
         } catch (error) {
           if (!workflowInstanceMissing(error)) throw error;
         }
         if (status && (ACTIVE_WORKFLOW_STATUSES.has(status.status) || status.status === UNDETERMINED_WORKFLOW_STATUS)) {
+          if (status.status === UNDETERMINED_WORKFLOW_STATUS && Date.now() - job.created_at > 2 * 60 * 60_000)
+            logger.warn(
+              "workflow.running_status.unknown",
+              "workflow",
+              "Workflow status remains unknown; preserving the running job until its outcome is authoritative.",
+              { jobId: job.id, attempt: job.attempt },
+            );
           await rotateRunningJob(job);
           continue;
         }
@@ -1408,7 +1406,7 @@ export async function recoverQueuedJobs(env: Env) {
             continue;
           }
         }
-        await failJobWithCleanup(env, job, failure);
+        await failJobWithCleanup(env, job, failure, true);
       } catch (error) {
         logger.error(
           "workflow.running_recovery.failed",

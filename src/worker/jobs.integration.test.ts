@@ -648,10 +648,10 @@ describe("job execution", () => {
       await env.DB.prepare(`SELECT status, cleanup_target, cleanup_token FROM jobs WHERE id = ?`).bind(jobId).first(),
     ).toEqual({ status: "canceled", cleanup_target: null, cleanup_token: null });
   });
-  it("settles a running non-capture job whose Workflow has ended", async () => {
+  it.each([true, false])("settles a running non-capture job whose Workflow has ended (legacy id: %s)", async (legacy) => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();
-    const instanceId = crypto.randomUUID();
+    const instanceId = legacy ? null : crypto.randomUUID();
     const timestamp = Date.now() - 60_000;
     await env.DB.prepare(
       `INSERT INTO jobs(id,workspace_id,type,status,requested_by,workflow_instance_id,created_at,updated_at)
@@ -659,10 +659,11 @@ describe("job execution", () => {
     )
       .bind(jobId, installed.workspaceId, installed.userId, instanceId, timestamp, timestamp)
       .run();
+    const get = vi.fn(async () => ({ status: vi.fn(async () => ({ status: "errored", error: "Search job failed" })) }));
     await recoverQueuedJobs(
       bindingsWith({
         NOTES_WORKFLOW: {
-          get: vi.fn(async () => ({ status: vi.fn(async () => ({ status: "errored", error: "Search job failed" })) })),
+          get,
         } as unknown as Env["NOTES_WORKFLOW"],
       }),
     );
@@ -670,6 +671,7 @@ describe("job execution", () => {
       status: "failed",
       error_code: "job_failed",
     });
+    expect(get).toHaveBeenCalledWith(instanceId ?? jobId);
   });
 
   it("stores a generic workflow-start recovery failure and logs a redacted diagnostic", async () => {
