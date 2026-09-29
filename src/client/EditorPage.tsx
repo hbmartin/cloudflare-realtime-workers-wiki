@@ -33,7 +33,12 @@ import {
   type CollaborationBundle,
   userColor,
 } from "./collaboration";
-import { exportOfflineCopyMarkdown, offlineCopyMarkdownFromKey } from "./offline-export";
+import {
+  downloadOfflineMarkdown,
+  exportOfflineCopyMarkdown,
+  offlineCopyMarkdown,
+  offlineCopyMarkdownFromKey,
+} from "./offline-export";
 import { createDocumentCloseReconciler } from "./document-connection";
 import { reportClientError } from "./telemetry";
 import { editorBlockFactories, EmbedFeatureContext, safeBookmarkUrl } from "./editor-blocks";
@@ -60,8 +65,8 @@ const ACCOUNT_CATALOG_WARNING = "The offline page list could not be updated yet.
 const PENDING_CATALOG_WARNING = "Local changes are saved, but the offline page list could not be updated yet.";
 const SYNCED_CATALOG_WARNING = "Changes are synced, but the offline page list could not be updated yet.";
 const OFFLINE_INIT_ERROR = "Offline storage is unavailable, so editing and collaboration are disabled for this page.";
-type RecoveryAction = "preview" | "export" | "copy";
-const RECOVERY_ACTIONS: readonly RecoveryAction[] = ["preview", "export", "copy"];
+const RECOVERY_ACTIONS = ["preview", "export", "copy"] as const;
+type RecoveryAction = (typeof RECOVERY_ACTIONS)[number];
 
 function recoveryMessage(error: unknown, fallback: string) {
   return error instanceof Error && error.message === OFFLINE_COPY_MISSING_MESSAGE ? error.message : fallback;
@@ -110,6 +115,7 @@ export function EditorPage({
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
   const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
+  const [storageWriteFailed, setStorageWriteFailed] = useState(false);
   const [storageLoadingSlow, setStorageLoadingSlow] = useState(false);
   const [storageRetry, setStorageRetry] = useState(0);
   const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
@@ -159,14 +165,30 @@ export function EditorPage({
   const replaceRecovery = useCallback(
     (next: RecoveryEntry[]) => {
       const previous = recoveryRef.current;
-      recoveryRef.current = next;
+      let merged = next;
       try {
-        localStorage.setItem(recoveryKey, JSON.stringify(next));
+        const saved: unknown = JSON.parse(localStorage.getItem(recoveryKey) ?? "null");
+        const previousKeys = new Set(previous.map((entry) => entry.key));
+        if (Array.isArray(saved))
+          merged = [
+            ...saved.filter(
+              (entry): entry is RecoveryEntry =>
+                entry &&
+                typeof entry.key === "string" &&
+                Number.isInteger(entry.epoch) &&
+                !previousKeys.has(entry.key) &&
+                !next.some((item) => item.key === entry.key),
+            ),
+            ...next,
+          ];
+        localStorage.setItem(recoveryKey, JSON.stringify(merged));
       } catch (error) {
         console.error("Unable to persist offline recovery details", error);
+        setStorageError(OFFLINE_INIT_ERROR);
       }
-      setRecovery(next);
-      const retained = new Set(next.map((entry) => entry.key));
+      recoveryRef.current = merged;
+      setRecovery(merged);
+      const retained = new Set(merged.map((entry) => entry.key));
       for (const entry of previous) {
         if (retained.has(entry.key)) continue;
         for (const action of RECOVERY_ACTIONS) {
@@ -216,11 +238,16 @@ export function EditorPage({
   const titlePageIdRef = useRef(page.id);
   const titleRevisionRef = useRef(page.revision);
   const titleDirtyRef = useRef(false);
-  const titleSavingRef = useRef(false);
+  const titleSavingRef = useRef(0);
   const currentStorageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
   const writeRecovery = recovery.some((entry) => entry.key === currentStorageKey && entry.reason === "storage");
   const editable =
-    member.role !== "viewer" && !sizeWarning?.readOnly && !storageError && !writeRecovery && !accessQuarantine;
+    member.role !== "viewer" &&
+    !sizeWarning?.readOnly &&
+    !storageError &&
+    !writeRecovery &&
+    !storageWriteFailed &&
+    !accessQuarantine;
   const commentsVisible = commentsOpen;
   const [panelTarget, setPanelTarget] = useState<HTMLDivElement | null>(null);
   const offlineMetadata = useRef({ page, spaceName });
@@ -262,7 +289,7 @@ export function EditorPage({
 
   useEffect(() => {
     let active = true;
-    if (storageRetry > 0) queueMicrotask(() => active && setStorageLoadingSlow(false));
+    if (storageRetry > 0) queueMicrotask(() => active && setStorageWriteFailed(false));
     queueMicrotask(() => active && setStatus("connecting"));
     let pendingWrite = Promise.resolve();
     const quarantine = (key = currentStorageKey, reason: RecoveryEntry["reason"] = "epoch") => {
@@ -274,7 +301,6 @@ export function EditorPage({
       };
       if (dismissedRecovery.current[key] === page.contentEpoch && reason === "epoch") return;
       const current = recoveryRef.current;
-      if (reason !== "storage" && current.some((entry) => entry.key === key && entry.reason === "storage")) return;
       if (current.some((entry) => entry.key === key && entry.epoch === value.epoch && entry.reason === reason)) return;
       replaceRecovery([...current.filter((entry) => entry.key !== key), value].sort((a, b) => a.epoch - b.epoch));
     };
@@ -375,6 +401,7 @@ export function EditorPage({
         if (error instanceof ApiClientError && [401, 403, 404, 410].includes(error.status)) {
           if (error.status === 401) {
             if (hasLocalDraft) quarantine(currentStorageKey, "access");
+            setAccessQuarantine(true);
           } else if (hasLocalDraft || olderDrafts.length) {
             if (hasLocalDraft) quarantine(currentStorageKey, "access");
             setAccessQuarantine(true);
@@ -493,6 +520,7 @@ export function EditorPage({
       storageFailed = true;
       console.error("Unable to persist local document update", error);
       if (active) {
+        setStorageWriteFailed(true);
         quarantine(currentStorageKey, "storage");
       }
     };
@@ -563,6 +591,10 @@ export function EditorPage({
       onPageChanged,
       onPageUnavailable,
       onAccessDenied,
+      onUnauthorized: () => {
+        if (next.hasUnsyncedChanges) quarantine(currentStorageKey, "access");
+        setAccessQuarantine(true);
+      },
     });
     const connectionClose = (event: CloseEvent) => {
       if (active) closeReconciler.handleClose(event);
@@ -652,7 +684,7 @@ export function EditorPage({
       setTitle(page.title);
       return;
     }
-    titleSavingRef.current = true;
+    titleSavingRef.current += 1;
     try {
       const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
         method: "PATCH",
@@ -676,8 +708,13 @@ export function EditorPage({
       }
       setTitleError(apiErrorMessage(error, "The title could not be saved."));
     } finally {
-      titleSavingRef.current = false;
+      titleSavingRef.current -= 1;
     }
+  }
+
+  async function recoveryMarkdown(entry: RecoveryEntry) {
+    const liveDoc = entry.key === currentStorageKey && storageWriteFailed ? bundle?.doc : null;
+    return liveDoc ? offlineCopyMarkdown(liveDoc, page.title) : offlineCopyMarkdownFromKey(entry.key, page.title);
   }
 
   return (
@@ -777,7 +814,7 @@ export function EditorPage({
           <button
             type="button"
             onClick={() => {
-              if (titleSavingRef.current) {
+              if (titleSavingRef.current > 0) {
                 setTitleError("Wait for the page title to save before reloading.");
                 return;
               }
@@ -796,14 +833,17 @@ export function EditorPage({
             entry.epoch !== page.contentEpoch || entry.reason === "storage" || accessQuarantine || storageError,
         )
         .map((entry) => (
-          <div className="notice recovery-notice" key={entry.key}>
+          <div
+            className={`notice recovery-notice ${entry.reason === "storage" ? "notice-danger" : ""}`}
+            key={entry.key}
+          >
             <div>
               <strong>Offline copy quarantined</strong>
               <span>
-                {entry.reason === "storage" && entry.epoch === page.contentEpoch
-                  ? "Offline storage could not record these edits. Export this copy before leaving."
-                  : entry.reason === "access" || accessQuarantine
-                    ? "Current access could not be confirmed for these edits. They were not sent to the server."
+                {entry.reason === "access" || accessQuarantine
+                  ? "Current access could not be confirmed for these edits. They were not sent to the server."
+                  : entry.reason === "storage" && entry.epoch === page.contentEpoch
+                    ? "Offline storage could not record some edits. Export the current editor before leaving; the saved copy may be incomplete."
                     : `Edits from epoch ${entry.epoch} were not merged after this page was restored.`}
               </span>
               {Array.from(
@@ -824,14 +864,15 @@ export function EditorPage({
                 const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "preview");
                 const stillSelected = selectRecovery("preview");
                 try {
-                  const doc = await loadOfflineCopy(entry.key);
+                  const liveDoc = entry.key === currentStorageKey && storageWriteFailed ? bundle?.doc : null;
+                  const doc = liveDoc ?? (await loadOfflineCopy(entry.key));
                   try {
                     if (stillCurrent() && stillSelected()) {
                       setRecoveryPreview({ key: entry.key, text: plainYDoc(doc) });
                       recoveryErrorFor(entry.key, "preview", null);
                     }
                   } finally {
-                    doc.destroy();
+                    if (!liveDoc) doc.destroy();
                   }
                 } catch (error) {
                   console.error("Offline copy preview failed", error);
@@ -850,7 +891,17 @@ export function EditorPage({
               className="quiet-button"
               onClick={() => {
                 const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "export");
-                void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`).then(
+                const liveDoc = entry.key === currentStorageKey && storageWriteFailed ? bundle?.doc : null;
+                void (
+                  liveDoc
+                    ? Promise.resolve().then(() =>
+                        downloadOfflineMarkdown(
+                          offlineCopyMarkdown(liveDoc, page.title),
+                          `${page.title}-current-editor.md`,
+                        ),
+                      )
+                    : exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`)
+                ).then(
                   () => {
                     if (stillCurrent()) recoveryErrorFor(entry.key, "export", null);
                   },
@@ -866,7 +917,7 @@ export function EditorPage({
                 );
               }}
             >
-              Export Markdown
+              {entry.key === currentStorageKey && storageWriteFailed ? "Export current editor" : "Export Markdown"}
             </button>
             <button
               className="quiet-button"
@@ -879,7 +930,7 @@ export function EditorPage({
                   if (preparedRecoveryCopy?.key !== entry.key) {
                     const stillSelected = selectRecovery("prepare");
                     try {
-                      const markdown = await offlineCopyMarkdownFromKey(entry.key, page.title);
+                      const markdown = await recoveryMarkdown(entry);
                       if (!stillCurrent() || !stillSelected()) return;
                       setPreparedRecoveryCopy({ key: entry.key, markdown });
                       recoveryErrorFor(entry.key, "copy", null);
@@ -899,7 +950,7 @@ export function EditorPage({
                   }
                   return;
                 }
-                const content = offlineCopyMarkdownFromKey(entry.key, page.title);
+                const content = recoveryMarkdown(entry);
                 try {
                   await navigator.clipboard.write([
                     new ClipboardItem({
@@ -933,22 +984,24 @@ export function EditorPage({
                   ? "Copy prepared Markdown"
                   : "Prepare Markdown to copy"}
             </button>
-            {(entry.epoch !== page.contentEpoch || (entry.reason !== "access" && !accessQuarantine)) && (
-              <button
-                className="quiet-button"
-                onClick={() => {
-                  dismissedRecovery.current[entry.key] = page.contentEpoch;
-                  try {
-                    localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
-                  } catch (error) {
-                    console.error("Unable to update dismissed recovery details", error);
-                  }
-                  replaceRecovery(recoveryRef.current.filter((item) => item.key !== entry.key));
-                }}
-              >
-                Dismiss
-              </button>
-            )}
+            {!accessQuarantine &&
+              !storageWriteFailed &&
+              (entry.epoch !== page.contentEpoch || entry.reason !== "access") && (
+                <button
+                  className="quiet-button"
+                  onClick={() => {
+                    dismissedRecovery.current[entry.key] = page.contentEpoch;
+                    try {
+                      localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
+                    } catch (error) {
+                      console.error("Unable to update dismissed recovery details", error);
+                    }
+                    replaceRecovery(recoveryRef.current.filter((item) => item.key !== entry.key));
+                  }}
+                >
+                  Dismiss
+                </button>
+              )}
             {recoveryPreview?.key === entry.key && <p>{recoveryPreview.text}</p>}
           </div>
         ))}

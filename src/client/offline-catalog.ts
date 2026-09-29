@@ -656,10 +656,10 @@ export async function purgingOfflineAccounts() {
   } catch (error) {
     if (!pending.size) throw error;
     console.error("Offline account catalog could not be checked during purge recovery", error);
-    return [...pending];
+    return { accounts: [...pending], catalogVerified: false };
   }
   for (const account of accounts) if (account.purging) pending.add(account.key);
-  return [...pending];
+  return { accounts: [...pending], catalogVerified: true };
 }
 
 export async function forgetOfflineAccount(accountKey: string) {
@@ -723,6 +723,12 @@ export async function forgetOfflineAccount(accountKey: string) {
   try {
     localStorage.removeItem(`${DOCUMENT_REGISTRY_PREFIX}${accountKey}`);
     for (const name of entryNamesAtStart) localStorage.removeItem(name);
+    const [userId, workspaceId] = accountKey.split("\u0000");
+    const recoveryPrefix = `notes:recovery:${userId}:${workspaceId}:`;
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const name = localStorage.key(index);
+      if (name?.startsWith(recoveryPrefix)) localStorage.removeItem(name);
+    }
     if (registryEntries().length)
       throw new Error("New local document storage appeared during sign-out. Retry removal.");
     localStorage.removeItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`);
