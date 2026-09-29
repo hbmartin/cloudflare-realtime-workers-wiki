@@ -387,10 +387,36 @@ describe("import content", () => {
 
   it("keeps a link wrapped around a small image near a cut", () => {
     const parsed = markdownToDocument(
-      `${"x".repeat(8100)} [![icon](data:image/png;base64,AAAA)](https://example.com) tail`,
+      `${"x".repeat(8180)} [![icon](data:image/png;base64,AAAA)](https://example.com) tail`,
     );
     expect(parsed.references).toContain("https://example.com");
     expect(parsed.references).toContain("data:image/png;base64,AAAA");
+  });
+
+  it("keeps a code span ending in a backslash and a later link in long content", () => {
+    const parsed = markdownToDocument(`Use \`\\\` to escape. ${"word ".repeat(1700)}then \`x\` [later](later.md)`);
+    expect(parsed.references).toContain("later.md");
+    expect(JSON.stringify(parsed.document)).toContain('"text":"\\\\"');
+  });
+
+  it("finds an enclosing link after a distant unmatched bracket", () => {
+    const parsed = markdownToDocument(`[0, 1) ${"x".repeat(8175)} [see \`useState\` docs](https://react.dev/x) tail`);
+    expect(parsed.references).toContain("https://react.dev/x");
+  });
+
+  it("keeps a second large data image after a stray backtick in the first label", () => {
+    const first = `data:image/png;base64,${"A".repeat(12_000)}`;
+    const second = `data:image/png;base64,${"B".repeat(12_000)}`;
+    const parsed = markdownToDocument(`See ![a \` tick](${first}) ![b](${second}) then \`one\``);
+    expect(parsed.references).toEqual([first, second]);
+    expect(JSON.stringify(parsed.document)).not.toContain("B".repeat(10_000));
+  });
+
+  it("strips a small data image after the dense link candidate limit", () => {
+    const data = `data:image/png;base64,${"A".repeat(7_000)}`;
+    const parsed = markdownToDocument(`${"\\.[".repeat(140)} ![i](${data}) ${"x".repeat(8192)}`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
   });
 
   it("keeps a link after an unmatched bracket and a long title-bearing link", () => {
