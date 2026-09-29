@@ -39,7 +39,7 @@ function decodeHtml(value: string) {
 }
 
 function safeLink(value: string) {
-  const trimmed = decodeHtml(value.trim());
+  const trimmed = decodeHtml(value.trim()).replaceAll("\\", "%5C");
   if (!trimmed) return null;
   for (let index = 0; index < trimmed.length; index += 1) {
     const code = trimmed.charCodeAt(index);
@@ -95,54 +95,85 @@ function unescapeMarkdown(value: string, abortOnMarkup = false): string | null {
   return output;
 }
 
-function tooManyEscapes(value: string) {
-  let count = 0;
-  for (const character of value) if (character === "\\" && ++count > 128) return true;
-  return false;
-}
-
 function simplifiedMarkdownInline(value: string, issues: ImportIssue[], references: string[]) {
-  issues.push({ code: "inline_markup_simplified", detail: "Long or heavily escaped inline content was simplified." });
+  issues.push({ code: "inline_markup_simplified", detail: "Long inline content was simplified." });
   const output: ProseMirrorJson[] = [];
   let cursor = 0;
-  let open = -1;
+  const flush = (end: number) => {
+    output.push(...inline(unescapeMarkdown(value.slice(cursor, end))));
+    cursor = end;
+  };
   for (let index = 0; index < value.length; index += 1) {
-    if (value[index] === "[") open = index;
-    if (value[index] === "\n") open = -1;
-    if (value[index] !== "]" || value[index + 1] !== "(" || open < cursor || index - open > 513) continue;
-    let end = index + 2;
-    while (end < value.length && end - index <= 2050 && value[end] !== ")" && value[end] !== "\n") end += 1;
-    if (value[end] !== ")" || end === index + 2) {
-      index = end;
-      open = -1;
+    if (value[index] === "\\" && ESCAPABLE_MARKDOWN.test(value[index + 1] ?? "")) {
+      index += 1;
       continue;
     }
-    const image = open > cursor && value[open - 1] === "!";
-    const start = image ? open - 1 : open;
-    output.push(...inline(unescapeMarkdown(value.slice(cursor, start))));
-    const label = value.slice(open + 1, index);
-    const rawHref = value.slice(index + 2, end);
-    const href = safeLink(unescapeMarkdown(rawHref));
-    if (href) {
-      references.push(href);
-      if (image) issues.push({ code: "image_not_imported", detail: href.slice(0, 120) });
-      output.push(...inline(unescapeMarkdown(label), [{ type: "link", attrs: { href } }]));
-    } else {
-      issues.push({ code: "unsafe_url", detail: rawHref.slice(0, 120) });
-      output.push(...inline(unescapeMarkdown(value.slice(start, end + 1))));
+    if (value[index] === "`") {
+      const ticks = /^`+/.exec(value.slice(index))![0];
+      const close = value.indexOf(ticks, index + ticks.length);
+      if (close >= 0) {
+        flush(index);
+        output.push(...inline(value.slice(index + ticks.length, close), [{ type: "code" }]));
+        index = close + ticks.length - 1;
+        cursor = index + 1;
+      } else index += ticks.length - 1;
+      continue;
     }
-    cursor = end + 1;
-    index = end;
-    open = -1;
+    const image = value[index] === "!" && value[index + 1] === "[";
+    if (value[index] !== "[" && !image) continue;
+    const open = image ? index + 1 : index;
+    let at = open + 1;
+    let brackets = 1;
+    while (at < value.length && at - open <= 2048 && brackets) {
+      if (value[at] === "\\" && at + 1 < value.length) at += 2;
+      else {
+        if (value[at] === "[") brackets += 1;
+        else if (value[at] === "]") brackets -= 1;
+        at += 1;
+      }
+    }
+    if (brackets) {
+      index = at - 1;
+      continue;
+    }
+    if (value[at] !== "(") continue;
+    let parentheses = 1;
+    let angle = false;
+    let quote = "";
+    at += 1;
+    while (at < value.length && at - index <= 4096 && parentheses) {
+      const character = value[at]!;
+      if (character === "\\" && at + 1 < value.length) at += 2;
+      else {
+        if (!quote && character === "<") angle = true;
+        else if (!quote && character === ">") angle = false;
+        else if (!angle && (character === '"' || character === "'"))
+          quote = quote === character ? "" : quote || character;
+        else if (!angle && !quote && character === "(") parentheses += 1;
+        else if (!angle && !quote && character === ")") parentheses -= 1;
+        at += 1;
+      }
+    }
+    if (parentheses) {
+      index = at - 1;
+      continue;
+    }
+    const candidate = value.slice(index, at);
+    const tokens = Lexer.lexInline(candidate, { gfm: false });
+    if (tokens.length !== 1 || (tokens[0]?.type !== "link" && tokens[0]?.type !== "image")) continue;
+    flush(index);
+    output.push(...markdownInline(candidate, issues, references));
+    cursor = at;
+    index = at - 1;
   }
-  output.push(...inline(unescapeMarkdown(value.slice(cursor))));
+  flush(value.length);
   return output;
 }
 
 function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
   const plain = unescapeMarkdown(value, true);
   if (plain !== null) return inline(plain);
-  if (value.length > 64_000 || tooManyEscapes(value)) return simplifiedMarkdownInline(value, issues, references);
+  if (value.length > 4096) return simplifiedMarkdownInline(value, issues, references);
   const output: ProseMirrorJson[] = [];
   const append = (text: string, marks: ProseMirrorJson["marks"] = []) => {
     if (!text) return;
@@ -189,10 +220,10 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
 
 function markdownImage(value: string) {
   const trimmed = value.trim();
-  if (!trimmed.startsWith("![") || trimmed.length > 64_000 || tooManyEscapes(trimmed)) return null;
+  if (!trimmed.startsWith("![") || trimmed.length > 4096) return null;
   const tokens = Lexer.lexInline(trimmed, { gfm: false });
   const image = tokens.length === 1 && tokens[0]?.type === "image" ? tokens[0] : null;
-  return image ? { label: image.text, href: image.href } : null;
+  return image ? { label: unescapeMarkdown(image.text), href: image.href } : null;
 }
 
 export function markdownToDocument(source: string) {

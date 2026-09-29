@@ -724,25 +724,19 @@ async function startJobWorkflow(
       .then((instance) => instance.status())
       .catch(() => null);
     if (!status || status.status === "unknown") throw error;
-    if (!allowRotation && ["complete", "errored", "terminated"].includes(status.status)) throw error;
-    if (allowRotation && ["complete", "errored", "terminated"].includes(status.status)) {
-      const current = await env.DB.prepare(
-        `SELECT * FROM jobs WHERE id=? AND attempt=? AND status='queued' AND COALESCE(workflow_instance_id,id)=?`,
+    if (["complete", "errored", "terminated"].includes(status.status)) {
+      if (!allowRotation) throw error;
+      const replacement = crypto.randomUUID();
+      const changed = await env.DB.prepare(
+        `UPDATE jobs SET workflow_instance_id=?,updated_at=?
+         WHERE id=? AND attempt=? AND status='queued' AND COALESCE(workflow_instance_id,id)=?
+         RETURNING id, workspace_id, workflow_instance_id, attempt, correlation_id`,
       )
-        .bind(job.id, job.attempt, instanceId)
+        .bind(replacement, Date.now(), job.id, job.attempt, instanceId)
         .first<JobRow>();
-      if (current) {
-        const replacement = crypto.randomUUID();
-        const changed = await env.DB.prepare(
-          `UPDATE jobs SET workflow_instance_id=?,updated_at=?
-           WHERE id=? AND attempt=? AND status='queued' AND COALESCE(workflow_instance_id,id)=?`,
-        )
-          .bind(replacement, Date.now(), current.id, current.attempt, instanceId)
-          .run();
-        if (changed.meta.changes) {
-          await notifyJobs(env, current.workspace_id);
-          await startJobWorkflow(env, { ...current, workflow_instance_id: replacement }, false);
-        }
+      if (changed) {
+        await notifyJobs(env, changed.workspace_id);
+        await startJobWorkflow(env, changed, false);
       }
     }
   }
@@ -753,7 +747,7 @@ export async function startJobExecution(
   job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt"> & Partial<Pick<JobRow, "correlation_id">>,
 ) {
   // An unlinked receipt must be re-staged before creating a Workflow instance.
-  if (await hasUnlinkedCapture(env, job.id)) return;
+  if (/^[0-9a-f]{32}$/.test(job.id) && (await hasUnlinkedCapture(env, job.id))) return;
   if (env.WORKFLOW_INLINE !== "true") return startJobWorkflow(env, job);
   const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(job.id, job.attempt)
@@ -797,11 +791,13 @@ async function hasUnlinkedCapture(env: Env, jobId: string) {
   return Boolean(await env.DB.prepare(`SELECT 1 FROM jobs WHERE id=? AND ${UNLINKED_CAPTURE_SQL}`).bind(jobId).first());
 }
 
+function isCaptureImportJob(job: JobRow) {
+  return job.type === "import" && jsonRecord(job.options_json).captureId === job.id;
+}
+
 async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
   if (safeHttpError(error)?.code === "slack_capture_link_pending") return true;
-  if (job.type !== "import") return false;
-  const captureId = jsonRecord(job.options_json).captureId;
-  if (captureId !== job.id) return false;
+  if (!isCaptureImportJob(job)) return false;
   // Older Workflow step results can surface a wrapped error without the
   // original HttpError code. The receipt state is authoritative in that case.
   return hasUnlinkedCapture(env, job.id).catch((lookupError: unknown) => {
@@ -812,9 +808,9 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
       { jobId: job.id },
       lookupError,
     );
-    // A failed lookup is not proof that a receipt is unlinked. Surface the
-    // original job failure so it can be retried rather than looping unseen.
-    return false;
+    // Preserve the capture for a fresh Workflow attempt when the receipt state
+    // cannot be checked. A D1 outage must not send a false failure to Slack.
+    return true;
   });
 }
 
@@ -1217,9 +1213,7 @@ export async function claimJobWorkflowRun(
   if (
     current?.status === "queued" &&
     (current.workflow_instance_id ?? current.id) === event.instanceId &&
-    current.type === "import" &&
-    jsonRecord(current.options_json).captureId === current.id &&
-    (await hasUnlinkedCapture(env, current.id))
+    isCaptureImportJob(current)
   ) {
     await replaceCaptureWorkflow(env, current, "queued");
     return null;
