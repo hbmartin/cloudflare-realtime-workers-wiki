@@ -50,7 +50,6 @@ export function DateReminderPicker({
   useEffect(() => {
     const element = dialog.current;
     if (element && !element.open) element.showModal();
-    (element?.querySelector("select") as HTMLElement | null)?.focus();
     let live = true;
     void api<{ reminder: SavedReminder | null }>(path)
       .then(({ reminder }) => {
@@ -83,6 +82,10 @@ export function DateReminderPicker({
       live = false;
     };
   }, [path, token.timezone]);
+
+  useEffect(() => {
+    if (!busy) (dialog.current?.querySelector("select") as HTMLElement | null)?.focus();
+  }, [busy]);
 
   const reminderChoice = (): ReminderChoice | { absolute: string } | null => {
     if (choice !== "custom") return choice;
@@ -156,7 +159,15 @@ export function DateReminderPicker({
       )}
       <p className="muted">Timezone: {token.timezone}</p>
       {dueAt !== null && (
-        <p>Reminder: {new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(dueAt)}</p>
+        <p>
+          Reminder:{" "}
+          {new Intl.DateTimeFormat(undefined, {
+            dateStyle: "medium",
+            timeStyle: "short",
+            timeZone: token.timezone,
+          }).format(dueAt)}{" "}
+          ({token.timezone})
+        </p>
       )}
       {saved?.state === "delivered" && <p>This reminder was delivered.</p>}
       {error && <p role="alert">{error}</p>}

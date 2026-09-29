@@ -193,6 +193,55 @@ describe("date reminders", () => {
     ).toBe(1);
   });
 
+  it("keeps a due reminder when a date edit changes only its revision", async () => {
+    const installed = await bootstrap();
+    const token: DateMention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: installed.userId,
+      kind: "timed",
+      value: new Date(Date.now() - 60_000).toISOString(),
+      timezone: "UTC",
+    };
+    await addToken(installed.page.id, token);
+    const id = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO date_reminders
+        (id,workspace_id,page_id,content_epoch,token_id,user_id,token_revision,timezone,choice_json,
+         due_at,generation,state,checked_at,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,1,'active',?,?,?)`,
+    )
+      .bind(
+        id,
+        installed.workspaceId,
+        installed.page.id,
+        1,
+        token.tokenId,
+        installed.userId,
+        token.revision,
+        token.timezone,
+        JSON.stringify("at_time"),
+        Date.parse(token.value),
+        timestamp,
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const newRevision = crypto.randomUUID();
+    const stub = env.DOCUMENT.getByName(`${installed.page.id}~1`);
+    await runInDurableObject(stub, async (instance) => {
+      const document = (instance as unknown as { document: Y.Doc }).document;
+      const paragraph = document.getXmlFragment("document-store").get(0) as Y.XmlElement;
+      const mention = paragraph.get(0) as Y.XmlElement;
+      mention.setAttribute("payload", JSON.stringify({ ...token, revision: newRevision }));
+    });
+    await processDueDateReminders(env as unknown as Env);
+    expect(
+      await env.DB.prepare(`SELECT state,token_revision,generation FROM date_reminders WHERE id=?`).bind(id).first(),
+    ).toEqual({ state: "delivered", token_revision: newRevision, generation: 1 });
+  });
+
   it("rejects a different token author and keeps another member's setting private", async () => {
     const installed = await bootstrap();
     const otherId = crypto.randomUUID();

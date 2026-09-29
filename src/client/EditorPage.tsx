@@ -836,7 +836,10 @@ function CollaborativeEditor({
           const preferred = data.configured ? data.preferences[0]?.timezone : undefined;
           return preferred && validTimezone(preferred) ? preferred : browserTimezone;
         })
-        .catch(() => browserTimezone);
+        .catch(() => {
+          dateTimezoneRef.current = null;
+          return browserTimezone;
+        });
       dateTimezoneRef.current = { promise, expiresAt: Date.now() + 30_000 };
     }
     const [data, timezone] = await Promise.all([

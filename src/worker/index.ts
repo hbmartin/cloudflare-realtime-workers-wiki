@@ -3815,6 +3815,7 @@ app.get("/api/pages/:pageId/date-reminders/:tokenId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("pageId"));
   if (page.kind !== "document") throw new HttpError(404, "page_not_found", "Page not found.");
+  requireOrdinaryPage(page);
   return c.json({ reminder: await getDateReminder(c.env, member, page, c.req.param("tokenId")) });
 });
 
@@ -3822,6 +3823,7 @@ app.put("/api/pages/:pageId/date-reminders/:tokenId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("pageId"));
   if (page.kind !== "document") throw new HttpError(404, "page_not_found", "Page not found.");
+  requireOrdinaryPage(page);
   const input = parseReminderInput(await jsonBody(c.req.raw));
   return c.json({ reminder: await putDateReminder(c.env, member, page, c.req.param("tokenId"), input) });
 });
@@ -3830,6 +3832,7 @@ app.delete("/api/pages/:pageId/date-reminders/:tokenId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("pageId"));
   if (page.kind !== "document") throw new HttpError(404, "page_not_found", "Page not found.");
+  requireOrdinaryPage(page);
   await deleteDateReminder(c.env, member, page, c.req.param("tokenId"));
   return c.body(null, 204);
 });

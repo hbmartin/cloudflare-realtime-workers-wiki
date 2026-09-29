@@ -52,6 +52,7 @@ export function dateMentionPasteExtension(userId: string) {
   let dragSource: HTMLElement | null = null;
   let preserveDrop = false;
   let cutIds: Set<string> | null = null;
+  let cutAt = 0;
   return createExtension({
     key: "dateMentionPaste",
     prosemirrorPlugins: [
@@ -60,13 +61,24 @@ export function dateMentionPasteExtension(userId: string) {
           const onDragStart = (event: DragEvent) => {
             dragSource = view.dom.parentElement?.contains(event.target as Node) ? view.dom.parentElement : null;
           };
+          const onDragEnd = () => {
+            dragSource = null;
+            preserveDrop = false;
+          };
           window.addEventListener("dragstart", onDragStart);
-          return { destroy: () => window.removeEventListener("dragstart", onDragStart) };
+          window.addEventListener("dragend", onDragEnd);
+          return {
+            destroy: () => {
+              window.removeEventListener("dragstart", onDragStart);
+              window.removeEventListener("dragend", onDragEnd);
+            },
+          };
         },
         props: {
           handleDOMEvents: {
             cut(view) {
               cutIds = tokenIds(view.state.doc.slice(view.state.selection.from, view.state.selection.to));
+              cutAt = Date.now();
               return false;
             },
             copy() {
@@ -78,7 +90,7 @@ export function dateMentionPasteExtension(userId: string) {
               return false;
             },
             drop(view, event) {
-              preserveDrop = dragSource === view.dom.parentElement && event.dataTransfer?.effectAllowed !== "copy";
+              preserveDrop = dragSource === view.dom.parentElement && event.dataTransfer?.dropEffect === "move";
               dragSource = null;
               return false;
             },
@@ -93,7 +105,8 @@ export function dateMentionPasteExtension(userId: string) {
                 if (mention) existing.add(mention.tokenId);
               }
             });
-            const movedCut = cutIds && [...ids].every((id) => cutIds!.has(id) && !existing.has(id));
+            const movedCut =
+              cutIds && Date.now() - cutAt < 15_000 && [...ids].every((id) => cutIds!.has(id) && !existing.has(id));
             cutIds = null;
             const preserve = preserveDrop || movedCut;
             preserveDrop = false;

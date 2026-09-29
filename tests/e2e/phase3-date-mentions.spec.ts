@@ -2,6 +2,11 @@ import { expect, test } from "@playwright/test";
 import { signInOwner } from "./security-helpers";
 
 test("date picker leaves no token on cancel and edits a saved token", async ({ page }) => {
+  const first = new Date(Date.now() + 45 * 86_400_000);
+  const second = new Date(first.getTime() + 86_400_000);
+  const date = (value: Date) => value.toISOString().slice(0, 10);
+  const label = (value: Date) =>
+    new Intl.DateTimeFormat("en-US", { dateStyle: "medium", timeZone: "UTC" }).format(value);
   await signInOwner(page);
   const previousPage = new URL(page.url()).searchParams.get("page");
   await page.getByRole("button", { name: /Find a page or command/ }).click();
@@ -27,20 +32,20 @@ test("date picker leaves no token on cancel and edits a saved token", async ({ p
   await editor.click();
   await page.keyboard.type("@");
   await page.getByText("Choose date…").click();
-  await insert.getByLabel("Date", { exact: true }).fill("2026-10-10");
+  await insert.getByLabel("Date", { exact: true }).fill(date(first));
   await insert.getByRole("button", { name: "Save date" }).click();
-  const chip = page.getByRole("button", { name: /Date:.*Oct 10, 2026/ });
+  const chip = page.getByRole("button", { name: `Date: ${label(first)}. Edit date` });
   await expect(chip).toBeVisible();
   const secondTab = await page.context().newPage();
   await secondTab.goto(page.url());
-  await expect(secondTab.getByRole("button", { name: /Date:.*Oct 10, 2026/ })).toBeVisible();
+  await expect(secondTab.getByRole("button", { name: `Date: ${label(first)}. Edit date` })).toBeVisible();
   await chip.click();
   const edit = page.getByRole("dialog", { name: "Edit date mention" });
   await expect(edit).toBeVisible();
-  await edit.getByLabel("Date", { exact: true }).fill("2026-10-11");
+  await edit.getByLabel("Date", { exact: true }).fill(date(second));
   await edit.getByRole("button", { name: "Save date" }).click();
-  await expect(page.getByRole("button", { name: /Date:.*Oct 11, 2026/ })).toBeVisible();
-  await expect(secondTab.getByRole("button", { name: /Date:.*Oct 11, 2026/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: `Date: ${label(second)}. Edit date` })).toBeVisible();
+  await expect(secondTab.getByRole("button", { name: `Date: ${label(second)}. Edit date` })).toBeVisible();
 
   await page.getByRole("button", { name: /Remind me about/ }).click();
   const reminder = page.getByRole("dialog", { name: "Remind me" });

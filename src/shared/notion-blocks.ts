@@ -199,7 +199,6 @@ export function proseMirrorInlineToNotion(nodes: ProseMirrorJson[] = []): Notion
               mention: {
                 type: "date",
                 date: { start: mention.value, time_zone: mention.timezone },
-                noteFlare: { payload: JSON.stringify(mention) },
               },
             }
           : { text: { content, link: null } }),
@@ -257,13 +256,10 @@ export function notionRichTextToProseMirror(value: unknown): ProseMirrorJson[] {
     if (item.type === "mention" || "mention" in item) {
       const mention = record(item.mention);
       if (mention.type === "date") {
-        const token = dateMentionFromProps(record(mention.noteFlare));
-        if (token) {
-          output.push({ type: "dateMention", attrs: { payload: JSON.stringify(token) } });
-          continue;
-        }
+        // External clients cannot assign a live token ID or claim its author.
+        // Preserve the readable value without importing reminder identity.
         const fallback = string(item.plain_text, string(record(mention.date).start, "Date"));
-        output.push({ type: "text", text: fallback });
+        output.push({ type: "text", text: fallback, ...(marks.length ? { marks } : {}) });
         continue;
       }
       const entityType = mention.type === "user" ? "user" : "page";

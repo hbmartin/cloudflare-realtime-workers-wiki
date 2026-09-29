@@ -64,11 +64,11 @@ describe("Notion block adapter", () => {
     expect(rich).toMatchObject([
       {
         type: "mention",
-        mention: { type: "date", date: { start: "2026-10-01T14:00:00.000Z" }, noteFlare: { payload } },
+        mention: { type: "date", date: { start: "2026-10-01T14:00:00.000Z" } },
         plain_text: "2026-10-01 09:00 America/Chicago",
       },
     ]);
-    expect(notionRichTextToProseMirror(rich)).toEqual([{ type: "dateMention", attrs: { payload } }]);
+    expect(notionRichTextToProseMirror(rich)).toEqual([{ type: "text", text: "2026-10-01 09:00 America/Chicago" }]);
   });
 
   it("returns unsupported for heading levels outside the API contract", () => {

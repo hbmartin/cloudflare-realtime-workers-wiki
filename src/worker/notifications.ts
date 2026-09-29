@@ -631,6 +631,7 @@ function escapeHtml(value: string) {
 
 function notificationCopy(row: DeliveryRow) {
   const actor = row.actor_name ?? "A collaborator";
+  if (row.event_type === "reminder") return `Reminder: ${row.page_title}`;
   if (row.event_type === "task_assigned") return `${actor} assigned you a task: ${row.page_title}`;
   if (row.event_type === "mention") return `${actor} mentioned you on ${row.page_title}`;
   if (row.event_type === "reply") return `${actor} replied on ${row.page_title}`;
