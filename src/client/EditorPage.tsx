@@ -779,7 +779,6 @@ export function EditorPage({
     };
   }, [
     currentStorageKey,
-    member.role,
     member.user.id,
     member.workspace.id,
     onAccessDenied,
