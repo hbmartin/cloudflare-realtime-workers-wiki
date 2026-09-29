@@ -15,7 +15,7 @@ import {
 } from "./offline-catalog";
 
 export const OFFLINE_COPY_MISSING_MESSAGE = "This offline document copy is no longer on this device.";
-export const OFFLINE_STORAGE_TIMEOUT_MESSAGE = "Offline document storage did not finish loading.";
+const OFFLINE_STORAGE_TIMEOUT_MESSAGE = "Offline document storage did not finish loading.";
 export class OfflineStorageTimeoutError extends Error {
   override name = "OfflineStorageTimeoutError";
   constructor() {
