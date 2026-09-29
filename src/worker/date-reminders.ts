@@ -30,6 +30,10 @@ type ReminderRow = {
 const ACTIVE_SWEEP_INTERVAL = 14 * 60_000;
 const DELIVERED_SWEEP_INTERVAL = 24 * 60 * 60_000;
 const MISSING_GRACE_MS = 2 * 60_000;
+// The scheduler runs every 15 minutes. Rotate busy pages just past the
+// current sweep cutoff so the next tick retries them.
+const BUSY_SWEEP_ROTATION_MS = 2 * 60_000;
+const FAILED_SWEEP_ROTATION_MS = 17 * 60_000;
 export function withinMissingGrace(missingSince: number | null, now: number) {
   return missingSince === null || now - missingSince < MISSING_GRACE_MS;
 }
@@ -63,6 +67,8 @@ async function roomEnvelope(env: Env, pageId: string, epoch: number) {
     }),
   );
   if (!response.ok && response.headers.get("x-notes-content-retry") === "changing")
+    throw new HttpError(503, "content_changing", "Page content is still changing.");
+  if (response.ok && response.headers.get("x-notes-content-current") === "0")
     throw new HttpError(503, "content_changing", "Page content is still changing.");
   if (!response.ok || response.headers.get("x-notes-content-current") !== "1")
     throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
@@ -106,7 +112,14 @@ export async function putDateReminder(
   input: ReminderInput,
 ) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const { token, sequence } = await pageDateToken(env, page, tokenId);
+    let current: Awaited<ReturnType<typeof pageDateToken>>;
+    try {
+      current = await pageDateToken(env, page, tokenId);
+    } catch (error) {
+      if (attempt === 0 && error instanceof HttpError && error.code === "content_changing") continue;
+      throw error;
+    }
+    const { token, sequence } = current;
     if (!token || token.createdBy !== member.user.id)
       throw new HttpError(404, "date_token_not_found", "Date token not found.");
     if (token.revision !== input.revision)
@@ -354,11 +367,18 @@ async function sweepDateReminders(env: Env) {
         envelope.sequence,
         cutoffs,
       );
-      if (!applied) retryAfterMs = 2 * 60_000;
+      if (!applied) retryAfterMs = BUSY_SWEEP_ROTATION_MS;
     } catch (error) {
-      if (error instanceof HttpError && error.code === "content_changing") retryAfterMs = 2 * 60_000;
-      else {
-        retryAfterMs = 17 * 60_000;
+      if (error instanceof HttpError && error.code === "content_changing") {
+        retryAfterMs = BUSY_SWEEP_ROTATION_MS;
+        recordMetric(env, {
+          event: "date_reminder.sweep",
+          component: "scheduler",
+          operation: "content_check",
+          outcome: "deferred",
+        });
+      } else {
+        retryAfterMs = FAILED_SWEEP_ROTATION_MS;
         failures.push(error);
         logger.error(
           "date_reminder.sweep.failed",
@@ -434,6 +454,7 @@ async function deliverDueDateReminders(env: Env) {
     .bind(timestamp, timestamp - 2 * 60_000)
     .all<{ id: string }>();
   const retried = new Set<string>();
+  const envelopes = new Map<string, Promise<DocumentContentEnvelope>>();
   const pendingIds = due.results.map((row) => row.id);
   for (let index = 0; index < pendingIds.length; index += 1) {
     const id = pendingIds[index]!;
@@ -468,7 +489,13 @@ async function deliverDueDateReminders(env: Env) {
           .run();
         continue;
       }
-      const envelope = await roomEnvelope(env, row.page_id, row.content_epoch);
+      const pageKey = `${row.page_id}:${row.content_epoch}`;
+      let pendingEnvelope = envelopes.get(pageKey);
+      if (!pendingEnvelope) {
+        pendingEnvelope = roomEnvelope(env, row.page_id, row.content_epoch);
+        envelopes.set(pageKey, pendingEnvelope);
+      }
+      const envelope = await pendingEnvelope;
       const document = envelope.document;
       const token = dateTokens(document).get(row.token_id);
       const choice = reminderChoice(JSON.parse(row.choice_json));
@@ -540,8 +567,14 @@ async function deliverDueDateReminders(env: Env) {
         });
       }
     } catch (error) {
-      if (!(error instanceof HttpError && error.code === "content_changing"))
-        logger.error("date_reminder.delivery.failed", "scheduler", "Date reminder delivery failed.", { id }, error);
+      if (error instanceof HttpError && error.code === "content_changing")
+        recordMetric(env, {
+          event: "date_reminder.delivery",
+          component: "scheduler",
+          operation: "content_check",
+          outcome: "deferred",
+        });
+      else logger.error("date_reminder.delivery.failed", "scheduler", "Date reminder delivery failed.", { id }, error);
       await releaseReminderClaim(env, row, claimId);
     }
   }

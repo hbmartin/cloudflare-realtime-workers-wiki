@@ -162,8 +162,8 @@ describe("date reminders", () => {
       });
     });
     const during = await content();
-    expect(during.status).toBe(503);
-    expect(during.headers.get("x-notes-content-retry")).toBe("changing");
+    expect(during.status).toBe(200);
+    expect(during.headers.get("x-notes-content-current")).toBe("0");
     await runInDurableObject(stub, async (instance) => {
       (instance as unknown as { compact: () => Promise<void> }).compact = originalCompact!;
     });
@@ -234,6 +234,21 @@ describe("date reminders", () => {
     expect(first.reminder).toMatchObject({ generation: 1, dueAt: Date.parse(token.value) - 300_000 });
     const repeated = await SELF.fetch(request(installed.cookie, path, body(token.revision)));
     expect((await repeated.json<{ reminder: { generation: number } }>()).reminder.generation).toBe(1);
+    const stub = env.DOCUMENT.getByName(`${installed.page.id}~1`);
+    let originalCompact: (() => Promise<void>) | null = null;
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as { document: Y.Doc; compact: () => Promise<void> };
+      originalCompact = room.compact;
+      room.compact = async () => {};
+      room.document.transact(() => {
+        room.document.getXmlFragment("document-store").insert(0, [new Y.XmlElement("paragraph")]);
+      });
+    });
+    expect((await SELF.fetch(request(installed.cookie, path, body(token.revision)))).status).toBe(503);
+    await runInDurableObject(stub, async (instance) => {
+      (instance as unknown as { compact: () => Promise<void> }).compact = originalCompact!;
+    });
+    expect((await SELF.fetch(request(installed.cookie, path, body(token.revision)))).status).toBe(200);
     const privateRead = await SELF.fetch(request(installed.cookie, path));
     expect((await privateRead.json<{ reminder: { id: string } }>()).reminder.id).toBeTruthy();
     expect((await SELF.fetch(request(installed.cookie, path, { method: "DELETE" }))).status).toBe(204);
