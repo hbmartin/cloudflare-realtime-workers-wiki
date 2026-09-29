@@ -91,18 +91,26 @@ export function createCollaboration(
   let hiddenTimer: number | undefined;
   let connectionTimer: number | undefined;
   let connectionAttempt = 0;
+  let connecting = false;
   let destroyed = false;
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
   const barrier = createDurabilityBarrier(provider, durability, 1_000);
   const connect = () => {
     if (destroyed) return;
+    if (provider.wsconnected) {
+      onStatus("connected");
+      return;
+    }
+    if (connecting || provider.wsconnecting) return;
+    connecting = true;
     if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
     connectionTimer = undefined;
     onStatus("connecting");
     void (async () => {
       try {
         if (beforeConnect && !(await beforeConnect())) {
+          provider.disconnect();
           onStatus("offline");
           return;
         }
@@ -121,8 +129,15 @@ export function createCollaboration(
         if (document.visibilityState !== "hidden") {
           connectionTimer = window.setTimeout(connect, connectionRetryDelay(connectionAttempt++));
         }
+      } finally {
+        connecting = false;
       }
     })();
+  };
+  // The provider reconnects internally after a socket closes. Route that
+  // path through the same access check as an explicit connection attempt.
+  provider["_reconnectWS"] = async () => {
+    connect();
   };
 
   const handleStatus = ({ status }: { status: "connecting" | "connected" | "disconnected" }) => {

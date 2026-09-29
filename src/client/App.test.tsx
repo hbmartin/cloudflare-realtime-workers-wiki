@@ -558,9 +558,9 @@ describe("App error handling", () => {
     });
     sessionStorage.setItem("pending-invite", "retry-token");
     render(<App />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Try later.");
+    expect(await screen.findByRole("heading", { name: "Offline access locked" })).toBeInTheDocument();
     expect(sessionStorage.getItem("pending-invite")).toBe("retry-token");
-    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    fireEvent.click(screen.getByRole("button", { name: "Try connecting again" }));
     await screen.findByRole("button", { name: "Simulate document access denial" });
     expect(sessionStorage.getItem("pending-invite")).toBeNull();
   });
@@ -728,7 +728,7 @@ describe("App error handling", () => {
       Response.json({ error: { code: "challenge_required", message: "Verify again." } }, { status: 401 }),
     );
     await expect(late).rejects.toMatchObject({ code: "challenge_required" });
-    expect(screen.getByRole("button", { name: "Simulate document access denial" })).toBeInTheDocument();
+    expect(screen.queryByText("Verify again.")).not.toBeInTheDocument();
 
     signedOut.resolve({ error: null });
     const email = await screen.findByLabelText("Email");
@@ -736,6 +736,28 @@ describe("App error handling", () => {
 
     expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument();
     expect(email).toHaveValue("typing@example.test");
+  });
+
+  it("finishes a pending server sign-out before allowing another email sign-in", async () => {
+    mockShellApi();
+    localStorage.setItem("notes:local-signout", "user\u0000workspace");
+    mocks.signOut.mockResolvedValueOnce({ error: { message: "Server unavailable" } });
+    mocks.signInEmail.mockResolvedValue({ error: { message: "Stop after sign-in check" } });
+    render(<App />);
+    const email = await screen.findByLabelText("Email");
+    fireEvent.change(email, { target: { value: "next@example.test" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(
+      await screen.findByText("Server sign-out could not be confirmed. Connect and try again."),
+    ).toBeInTheDocument();
+    expect(mocks.signInEmail).not.toHaveBeenCalled();
+    expect(localStorage.getItem("notes:local-signout")).toBe("user\u0000workspace");
+
+    mocks.signOut.mockResolvedValueOnce({ error: null });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(mocks.signInEmail).toHaveBeenCalledOnce());
+    expect(localStorage.getItem("notes:local-signout")).toBeNull();
   });
 
   it("resolves a global security-policy 401 through status", async () => {
@@ -856,18 +878,17 @@ describe("App error handling", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Security status unavailable.");
   });
 
-  it("uses service guidance and no sign-out action when startup fails", async () => {
+  it("shows a locked offline state when startup fails without a cached account", async () => {
     vi.mocked(api).mockRejectedValueOnce(new ApiClientError(503, "unavailable", "Install service unavailable."));
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "NoteFlare is unavailable" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Offline access locked" })).toBeInTheDocument();
     const brand = screen.getByText("NoteFlare").closest(".brand");
     expect(brand).not.toBeNull();
     expect(brand!.querySelector('img[src="/apple-touch-icon.png"]')).toHaveAttribute("alt", "");
-    expect(screen.getByText(/Check your connection/)).toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("Install service unavailable.");
-    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.getByText(/No account copy is available here/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Try connecting again" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
   });
 

@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 import { signInOwner } from "./security-helpers";
 
 test.setTimeout(90_000);
@@ -167,20 +168,12 @@ test("opens two visited documents offline and keeps local edits through refresh"
   ).toBeVisible();
   await expect(page.getByRole("button", { name: "Export Markdown" })).toBeVisible();
   await page.unroute(`**/api/pages/${selectedPageId}`);
-  await page.route("**/api/spaces", async (route) => {
-    const response = await route.fetch();
-    const body = (await response.json()) as { spaces: Array<{ effectiveRole: string }> };
-    await route.fulfill({
-      response,
-      json: { spaces: body.spaces.map((space) => ({ ...space, effectiveRole: "viewer" })) },
-    });
-  });
-  await page.getByRole("button", { name: "Reconnect" }).click();
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
   await expect(
     page.getByText("Your access or this document's version changed. The local copy is preserved for export."),
   ).toBeVisible();
-  await page.unroute("**/api/spaces");
-  await page.getByRole("button", { name: "Reconnect" }).click();
+  await expect(page.locator(".offline-document [contenteditable='true']")).toHaveCount(0);
+  await page.getByRole("button", { name: "Open online workspace" }).click();
   await expect(page.getByLabel("Page title")).toHaveValue("Offline beta", { timeout: 30_000 });
   await expect(page.locator(".bn-editor")).toContainText("local edit");
   await expect
@@ -275,4 +268,193 @@ test("shows an online-required state for table and diagram links", async ({ page
     ).toBeVisible();
     await expect(page.locator(".bn-editor")).toHaveCount(0);
   }
+});
+
+test("warns and offers export before offline sign-out removes pending edits", async ({ page, context }) => {
+  await signInOwner(page);
+  await expect
+    .poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller)), { timeout: 30_000 })
+    .toBe(true);
+  const previousPage = new URL(page.url()).searchParams.get("page");
+  await page.getByRole("button", { name: /Find a page or command/ }).click();
+  await page
+    .getByRole("dialog", { name: "Find a page or command" })
+    .getByRole("option", { name: /Create document/ })
+    .click();
+  await page.waitForURL((url) =>
+    Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
+  );
+  await page.getByLabel("Page title").fill("Pending sign-out draft");
+  await page.getByLabel("Page title").blur();
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type("Online seed");
+  await expect(page.locator(".bn-editor")).toContainText("Online seed");
+  await expect
+    .poll(async () =>
+      page.evaluate(async () => {
+        const opened = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          opened.addEventListener("success", () => resolve(opened.result)),
+        );
+        const request = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const entries = await new Promise<Array<{ title: string }>>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        db.close();
+        return entries.some((entry) => entry.title === "Pending sign-out draft");
+      }),
+    )
+    .toBe(true);
+
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
+  await page.locator(".offline-document .bn-editor").click();
+  await page.keyboard.type(" unsynced");
+  await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
+  await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
+  await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
+  await expect(page.getByText("Pending sign-out draft")).toBeVisible();
+  const download = page.waitForEvent("download");
+  await page.getByRole("button", { name: "Export pending copies as Markdown" }).click();
+  expect((await download).suggestedFilename()).toMatch(/noteflare-offline-copies-.*\.md/);
+  await page.getByRole("button", { name: "Sign out and delete local copies" }).click();
+  await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+  expect(await page.evaluate(() => localStorage.getItem("notes:local-signout"))).toBeTruthy();
+  expect(
+    await page.evaluate(
+      async () => (await indexedDB.databases()).filter((entry) => entry.name?.startsWith("account:")).length,
+    ),
+  ).toBe(0);
+});
+
+test("offers an older unscoped Yjs copy for explicit export after authentication", async ({ page }) => {
+  await signInOwner(page);
+  const previousPage = new URL(page.url()).searchParams.get("page");
+  await page.getByRole("button", { name: /Find a page or command/ }).click();
+  await page
+    .getByRole("dialog", { name: "Find a page or command" })
+    .getByRole("option", { name: /Create document/ })
+    .click();
+  await page.waitForURL((url) =>
+    Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
+  );
+  const pageId = new URL(page.url()).searchParams.get("page")!;
+  await page.getByLabel("Page title").fill("Legacy recovery probe");
+  await page.getByLabel("Page title").blur();
+  await expect(page.locator(`[data-tree-page="${pageId}"]`)).toContainText("Legacy recovery probe");
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type("Older local content");
+  await expect(page.locator(".bn-editor")).toContainText("Older local content");
+  const legacyName = await page.evaluate(async (id) => {
+    const member = (await (await fetch("/api/me")).json()) as { workspace: { id: string } };
+    const metadata = (await (await fetch(`/api/pages/${id}`)).json()) as { page: { contentEpoch: number } };
+    const catalogRequest = indexedDB.open("noteflare-offline-catalog");
+    const catalog = await new Promise<IDBDatabase>((resolve) =>
+      catalogRequest.addEventListener("success", () => resolve(catalogRequest.result)),
+    );
+    const pages = catalog.transaction("pages", "readonly").objectStore("pages").getAll();
+    const entries = await new Promise<Array<{ pageId: string; storageKeys: string[] }>>((resolve) =>
+      pages.addEventListener("success", () => resolve(pages.result)),
+    );
+    catalog.close();
+    const sourceKey = entries.find((entry) => entry.pageId === id)?.storageKeys.at(-1);
+    if (!sourceKey) throw new Error("The source document is not available locally.");
+    const sourceRequest = indexedDB.open(sourceKey);
+    const source = await new Promise<IDBDatabase>((resolve) =>
+      sourceRequest.addEventListener("success", () => resolve(sourceRequest.result)),
+    );
+    const updatesRequest = source.transaction("updates", "readonly").objectStore("updates").getAll();
+    const updates = await new Promise<Uint8Array[]>((resolve) =>
+      updatesRequest.addEventListener("success", () => resolve(updatesRequest.result)),
+    );
+    source.close();
+    const name = `${member.workspace.id}:${id}:${metadata.page.contentEpoch}:1`;
+    const legacyRequest = indexedDB.open(name);
+    legacyRequest.addEventListener("upgradeneeded", () => {
+      legacyRequest.result.createObjectStore("updates", { autoIncrement: true });
+      legacyRequest.result.createObjectStore("custom");
+    });
+    const legacy = await new Promise<IDBDatabase>((resolve) =>
+      legacyRequest.addEventListener("success", () => resolve(legacyRequest.result)),
+    );
+    const transaction = legacy.transaction("updates", "readwrite");
+    for (const update of updates) transaction.objectStore("updates").add(update);
+    await new Promise<void>((resolve) => transaction.addEventListener("complete", () => resolve()));
+    legacy.close();
+    return name;
+  }, pageId);
+  await page.reload();
+  await expect(page.getByLabel("Page title")).toHaveValue("Legacy recovery probe");
+  expect(await page.evaluate(async () => (await indexedDB.databases()).map((entry) => entry.name))).toContain(
+    legacyName,
+  );
+  const currentLegacyName = await page.evaluate(async (id) => {
+    const member = (await (await fetch("/api/me")).json()) as { workspace: { id: string } };
+    const metadata = (await (await fetch(`/api/pages/${id}`)).json()) as { page: { contentEpoch: number } };
+    return `${member.workspace.id}:${id}:${metadata.page.contentEpoch}:1`;
+  }, pageId);
+  expect(legacyName).toBe(currentLegacyName);
+  await expect(page.getByText("Earlier local copy available")).toBeVisible();
+  const download = page.waitForEvent("download");
+  await page.getByRole("button", { name: /Export earlier copy from epoch/ }).click();
+  const path = await (await download).path();
+  expect(path).toBeTruthy();
+  expect(await readFile(path!, "utf8")).toContain("Older local content");
+});
+
+test("removes a clean cached copy when live page access is revoked", async ({ page, context }) => {
+  await signInOwner(page);
+  const previousPage = new URL(page.url()).searchParams.get("page");
+  await page.getByRole("button", { name: /Find a page or command/ }).click();
+  await page
+    .getByRole("dialog", { name: "Find a page or command" })
+    .getByRole("option", { name: /Create document/ })
+    .click();
+  await page.waitForURL((url) =>
+    Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
+  );
+  const pageId = new URL(page.url()).searchParams.get("page")!;
+  await page.getByLabel("Page title").fill("Revoked offline copy");
+  await page.getByLabel("Page title").blur();
+  await expect(page.locator(`[data-tree-page="${pageId}"]`)).toContainText("Revoked offline copy");
+  await expect
+    .poll(() =>
+      page.evaluate(async (id) => {
+        const opened = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          opened.addEventListener("success", () => resolve(opened.result)),
+        );
+        const request = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const pages = await new Promise<Array<{ pageId: string; pendingChanges?: boolean }>>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        db.close();
+        const entry = pages.find((item) => item.pageId === id);
+        return Boolean(entry && !entry.pendingChanges);
+      }, pageId),
+    )
+    .toBe(true);
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.getByRole("button", { name: /Revoked offline copy/ })).toBeVisible();
+  await page.route(`**/api/pages/${pageId}`, (route) =>
+    route.fulfill({
+      status: 403,
+      contentType: "application/json",
+      body: JSON.stringify({ error: { code: "forbidden", message: "Access removed." } }),
+    }),
+  );
+  await context.setOffline(false);
+  await page.getByRole("button", { name: "Reconnect" }).click();
+  await expect(page.getByText("Access to that document was removed. Its local copy is being deleted.")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Revoked offline copy/ })).toHaveCount(0);
+  await expect
+    .poll(() =>
+      page.evaluate(
+        async (id) => (await indexedDB.databases()).some((entry) => entry.name?.includes(`:${id}:`)),
+        pageId,
+      ),
+    )
+    .toBe(false);
 });

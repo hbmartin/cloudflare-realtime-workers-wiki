@@ -8,8 +8,11 @@ const mocks = vi.hoisted(() => ({
   persistenceNames: [] as string[],
   providers: [] as Array<{
     synced: boolean;
+    wsconnected: boolean;
+    wsconnecting: boolean;
     sendMessage: ReturnType<typeof vi.fn>;
     connect: ReturnType<typeof vi.fn>;
+    _reconnectWS: () => Promise<void>;
     disconnect: ReturnType<typeof vi.fn>;
     destroy: ReturnType<typeof vi.fn>;
     emit(event: string, value: unknown): void;
@@ -37,8 +40,11 @@ vi.mock("y-indexeddb", () => ({
 vi.mock("y-partyserver/provider", () => ({
   default: class {
     synced = false;
+    wsconnected = false;
+    wsconnecting = false;
     sendMessage = vi.fn();
     connect = vi.fn(async () => undefined);
+    _reconnectWS = async () => undefined;
     disconnect = vi.fn();
     destroy = vi.fn();
     awareness = { setLocalState: vi.fn() };
@@ -188,6 +194,36 @@ describe("collaboration durability barriers", () => {
     expect(provider.connect).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1_000);
     expect(provider.connect).toHaveBeenCalledTimes(2);
+    bundle.destroy();
+  });
+
+  it("checks access again before the provider's automatic reconnect", async () => {
+    mocks.whenSynced = Promise.resolve();
+    const beforeConnect = vi.fn().mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const bundle = createCollaboration("workspace", "page", 1, vi.fn(), "user", beforeConnect);
+    const provider = mocks.providers[0]!;
+    await bundle.ready;
+    expect(provider.connect).toHaveBeenCalledOnce();
+
+    await provider["_reconnectWS"]();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(beforeConnect).toHaveBeenCalledTimes(2);
+    expect(provider.connect).toHaveBeenCalledOnce();
+    expect(provider.disconnect).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
+  it("keeps a connected status when the tab becomes visible", async () => {
+    mocks.whenSynced = Promise.resolve();
+    const onStatus = vi.fn();
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
+    const provider = mocks.providers[0]!;
+    await bundle.ready;
+    provider.wsconnected = true;
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(onStatus).toHaveBeenLastCalledWith("connected");
+    expect(provider.connect).toHaveBeenCalledOnce();
     bundle.destroy();
   });
 

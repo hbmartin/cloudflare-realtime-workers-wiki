@@ -24,6 +24,7 @@ export type OfflinePage = {
   epoch: number;
   canEdit: boolean;
   pendingChanges?: boolean;
+  revoked?: boolean;
   lastSyncedAt: number;
   storageKeys: string[];
 };
@@ -36,6 +37,33 @@ export function offlineAccountKey(member: Pick<ClientMemberContext, "user" | "wo
 
 export function offlineDocumentKey(userId: string, workspaceId: string, pageId: string, epoch: number) {
   return `account:${userId}:${workspaceId}:${pageId}:${epoch}:2`;
+}
+
+export function legacyOfflineDocumentKey(workspaceId: string, pageId: string, epoch: number) {
+  return `${workspaceId}:${pageId}:${epoch}:1`;
+}
+
+export async function legacyOfflineCopies(workspaceId: string, pageId: string, epoch: number) {
+  const candidates = new Set([legacyOfflineDocumentKey(workspaceId, pageId, epoch)]);
+  try {
+    const pointer = JSON.parse(localStorage.getItem(`notes:recovery:${workspaceId}:${pageId}`) ?? "null") as {
+      key?: unknown;
+    } | null;
+    if (
+      typeof pointer?.key === "string" &&
+      pointer.key.startsWith(`${workspaceId}:${pageId}:`) &&
+      /^\d+:1$/.test(pointer.key.slice(`${workspaceId}:${pageId}:`.length))
+    )
+      candidates.add(pointer.key);
+  } catch {
+    // A corrupt pointer must not hide the current-epoch legacy copy.
+  }
+  const copies = await Promise.all(
+    [...candidates].map(async (key) =>
+      (await hasOfflineDocument(key)) ? { key, epoch: Number(key.split(":").at(-2)) } : null,
+    ),
+  );
+  return copies.filter((copy): copy is { key: string; epoch: number } => copy !== null);
 }
 
 function openCatalog() {
@@ -89,6 +117,7 @@ function transactionDone(transaction: IDBTransaction) {
 export async function rememberOfflineAccount(member: ClientMemberContext) {
   const db = await openCatalog();
   const transaction = db.transaction("accounts", "readwrite");
+  const store = transaction.objectStore("accounts");
   const account: OfflineAccount = {
     key: offlineAccountKey(member),
     userId: member.user.id,
@@ -98,7 +127,12 @@ export async function rememberOfflineAccount(member: ClientMemberContext) {
     lastAuthenticatedAt: Date.now(),
     offlineEditingEnabled: member.features?.offlineEditing === true,
   };
-  transaction.objectStore("accounts").put(account);
+  const existing = await requestResult(store.get(account.key) as IDBRequest<OfflineAccount | undefined>);
+  if (existing?.purging) {
+    await transactionDone(transaction);
+    return existing;
+  }
+  store.put(account);
   await transactionDone(transaction);
   return account;
 }
@@ -134,7 +168,8 @@ export async function hasOfflineDocument(key: string): Promise<boolean> {
 export async function listOfflinePages(accountKey: string): Promise<OfflinePage[]> {
   const pages = await readAccountPages(accountKey);
   const valid = pages.filter(
-    (page) => page.accountKey === accountKey && page.kind === "document" && Array.isArray(page.storageKeys),
+    (page) =>
+      page.accountKey === accountKey && page.kind === "document" && !page.revoked && Array.isArray(page.storageKeys),
   );
   const available = await Promise.all(
     valid.map(async (page) => {
@@ -178,7 +213,14 @@ export async function rememberOfflinePage(
   const accountKey = offlineAccountKey(member);
   const key = `${accountKey}\u0000${page.id}`;
   const storageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
-  const transaction = db.transaction("pages", "readwrite");
+  const transaction = db.transaction(["accounts", "pages"], "readwrite");
+  const account = await requestResult(
+    transaction.objectStore("accounts").get(accountKey) as IDBRequest<OfflineAccount | undefined>,
+  );
+  if (!account || account.purging) {
+    await transactionDone(transaction);
+    return undefined;
+  }
   const store = transaction.objectStore("pages");
   const previous = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
   const entry: OfflinePage = {
@@ -191,6 +233,7 @@ export async function rememberOfflinePage(
     epoch: page.contentEpoch,
     canEdit,
     pendingChanges: previous?.epoch === page.contentEpoch && previous.pendingChanges === true,
+    revoked: false,
     lastSyncedAt: Date.now(),
     storageKeys: [...new Set([...(previous?.storageKeys ?? []), storageKey])],
   };
@@ -209,6 +252,37 @@ export async function markOfflinePagePending(accountKey: string, pageId: string,
   await transactionDone(transaction);
 }
 
+export async function markOfflinePageRevoked(accountKey: string, pageId: string) {
+  const db = await openCatalog();
+  const transaction = db.transaction("pages", "readwrite");
+  const store = transaction.objectStore("pages");
+  const key = `${accountKey}\u0000${pageId}`;
+  const page = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
+  const revoked = Boolean(page && !page.pendingChanges);
+  if (page && !page.pendingChanges) store.put({ ...page, revoked: true });
+  await transactionDone(transaction);
+  return revoked;
+}
+
+export async function clearRevokedOfflinePages(accountKey: string) {
+  const db = await openCatalog();
+  for (const page of (await readAccountPages(accountKey)).filter((entry) => entry.revoked && !entry.pendingChanges)) {
+    for (const key of page.storageKeys) {
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(key);
+        request.addEventListener("success", () => resolve());
+        request.addEventListener("error", () => reject(request.error ?? new Error("Offline document removal failed.")));
+        request.addEventListener("blocked", () =>
+          reject(new Error("Close other NoteFlare tabs to remove old copies.")),
+        );
+      });
+    }
+    const transaction = db.transaction("pages", "readwrite");
+    transaction.objectStore("pages").delete(page.key);
+    await transactionDone(transaction);
+  }
+}
+
 export async function markOfflineAccountPurging(accountKey: string) {
   const db = await openCatalog();
   const transaction = db.transaction("accounts", "readwrite");
@@ -218,11 +292,28 @@ export async function markOfflineAccountPurging(accountKey: string) {
   await transactionDone(transaction);
 }
 
+export async function purgingOfflineAccounts() {
+  const db = await openCatalog();
+  const transaction = db.transaction("accounts", "readonly");
+  const accounts = await requestResult(transaction.objectStore("accounts").getAll() as IDBRequest<OfflineAccount[]>);
+  await transactionDone(transaction);
+  return accounts.filter((account) => account.purging).map((account) => account.key);
+}
+
 export async function forgetOfflineAccount(accountKey: string) {
   const db = await openCatalog();
-  const pages = await readAccountPages(accountKey);
   await markOfflineAccountPurging(accountKey);
+  const pages = await readAccountPages(accountKey);
   const keys = new Set(pages.flatMap((page) => page.storageKeys ?? []));
+  // Catalog writes and Yjs store creation are separate transactions. Include
+  // stores left behind by an interrupted catalog write or a previous purge.
+  const [userId, workspaceId] = accountKey.split("\u0000");
+  if (userId && workspaceId && indexedDB.databases) {
+    const databases = await indexedDB.databases();
+    for (const database of databases) {
+      if (database.name?.startsWith(`account:${userId}:${workspaceId}:`)) keys.add(database.name);
+    }
+  }
   for (const key of keys) {
     await new Promise<void>((resolve, reject) => {
       const request = indexedDB.deleteDatabase(key);
@@ -232,6 +323,11 @@ export async function forgetOfflineAccount(accountKey: string) {
         reject(new Error("Close other NoteFlare tabs to remove offline documents.")),
       );
     });
+  }
+  if (userId && workspaceId && indexedDB.databases) {
+    const remaining = await indexedDB.databases();
+    if (remaining.some((database) => database.name?.startsWith(`account:${userId}:${workspaceId}:`)))
+      throw new Error("New local document storage appeared during sign-out. Retry removal.");
   }
   const transaction = db.transaction(["accounts", "pages"], "readwrite");
   transaction.objectStore("accounts").delete(accountKey);

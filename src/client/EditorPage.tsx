@@ -34,6 +34,7 @@ import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 import { useEffectiveColorScheme } from "./ThemeControl";
 import {
   getOfflinePage,
+  legacyOfflineCopies,
   markOfflinePagePending,
   offlineAccountKey,
   offlineDocumentKey,
@@ -86,6 +87,19 @@ export function EditorPage({
     }
   });
   const [recoveryPreview, setRecoveryPreview] = useState("");
+  const [legacyCopies, setLegacyCopies] = useState<Array<{ key: string; epoch: number }>>([]);
+  useEffect(() => {
+    let active = true;
+    void legacyOfflineCopies(member.workspace.id, page.id, page.contentEpoch).then(
+      (copies) => {
+        if (active) setLegacyCopies(copies);
+      },
+      (error) => console.error("Unable to inspect earlier local document copies", error),
+    );
+    return () => {
+      active = false;
+    };
+  }, [member.workspace.id, page.id, page.contentEpoch]);
   const [title, setTitle] = useState(page.title);
   const [titleError, setTitleError] = useState("");
   const [editorError, setEditorError] = useState("");
@@ -148,8 +162,20 @@ export function EditorPage({
     let next: CollaborationBundle;
     const beforeConnect = async () => {
       const accountKey = offlineAccountKey(offlineMember.current);
-      const catalogPage = await getOfflinePage(accountKey, page.id);
+      let catalogPage;
+      try {
+        catalogPage = await getOfflinePage(accountKey, page.id);
+      } catch (error) {
+        if (!next.hasUnsyncedChanges) return true;
+        console.error("Unable to check offline document access", error);
+        quarantine();
+        setAccessQuarantine(true);
+        return false;
+      }
       const hasLocalDraft = catalogPage?.pendingChanges === true || (!catalogPage && next.hasUnsyncedChanges);
+      // A clean copy can rely on the document room's access check. Preflight
+      // only when a locally edited copy might otherwise upload on reconnect.
+      if (!hasLocalDraft) return true;
       try {
         const currentMember = await api<ClientMemberContext>("/api/me");
         if (currentMember.user.id !== member.user.id || currentMember.workspace.id !== member.workspace.id) {
@@ -391,6 +417,43 @@ export function EditorPage({
         </div>
       )}
       {storageError && <div className="notice notice-danger">{storageError}</div>}
+      {legacyCopies.length > 0 && (
+        <div className="notice recovery-notice">
+          <div>
+            <strong>Earlier local copy available</strong>
+            <span>
+              This copy predates account-specific offline storage and may belong to another person who used this device.
+              It will not sync automatically. Export it only if you recognize it. Because it has no account owner,
+              signing out leaves it on this device; clear this site's storage to remove it.
+            </span>
+          </div>
+          {legacyCopies.map((copy) => (
+            <button
+              key={copy.key}
+              className="quiet-button"
+              onClick={async () => {
+                const doc = await loadOfflineCopy(copy.key);
+                try {
+                  const projection = yXmlFragmentToProsemirrorJSON(
+                    doc.getXmlFragment("document-store"),
+                  ) as ProseMirrorJson;
+                  const markdown = `# ${page.title.replaceAll("\n", " ")}\n\n${serializeDocument(projection).markdown}`;
+                  const url = URL.createObjectURL(new Blob([markdown], { type: "text/markdown; charset=utf-8" }));
+                  const anchor = document.createElement("a");
+                  anchor.href = url;
+                  anchor.download = `${page.title.replaceAll(/[\\/:*?"<>|]/g, "-")}-earlier-epoch-${copy.epoch}.md`;
+                  anchor.click();
+                  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+                } finally {
+                  doc.destroy();
+                }
+              }}
+            >
+              Export earlier copy from epoch {copy.epoch}
+            </button>
+          ))}
+        </div>
+      )}
       {recovery && (recovery.epoch !== page.contentEpoch || accessQuarantine) && !storageError && (
         <div className="notice recovery-notice">
           <div>

@@ -12,9 +12,16 @@ import { api, ApiClientError } from "./api";
 import { EmbedFeatureContext } from "./editor-blocks";
 import { notesSchema } from "./mentions";
 import { useEffectiveColorScheme } from "./ThemeControl";
-import { getOfflinePage, markOfflinePagePending, type OfflineAccount, type OfflinePage } from "./offline-catalog";
+import {
+  clearRevokedOfflinePages,
+  getOfflinePage,
+  markOfflinePagePending,
+  markOfflinePageRevoked,
+  type OfflineAccount,
+  type OfflinePage,
+} from "./offline-catalog";
 
-type RecoveryState = "checking" | "offline" | "quarantined";
+type RecoveryState = "checking" | "offline";
 
 export function OfflineWorkspace({
   account,
@@ -27,14 +34,43 @@ export function OfflineWorkspace({
   onRetry: () => void;
   onSignOut: () => void;
 }) {
+  const [availablePages, setAvailablePages] = useState(pages);
   const [selected, setSelected] = useState<OfflinePage | null>(() => {
     const requested = new URL(window.location.href).searchParams.get("page");
     return requested ? (pages.find((page) => page.pageId === requested) ?? null) : (pages[0] ?? null);
   });
   const [recovery, setRecovery] = useState<RecoveryState>("offline");
-  const [reason, setReason] = useState("");
+  const [quarantined, setQuarantined] = useState<Record<string, string>>({});
+  const [notice, setNotice] = useState("");
+  const selectedReason = selected ? quarantined[selected.pageId] : undefined;
+
+  const discardRevokedCopy = useCallback(
+    async (pageId: string) => {
+      if (!(await markOfflinePageRevoked(account.key, pageId))) {
+        setQuarantined((current) => ({
+          ...current,
+          [pageId]: "The server could not confirm access to this edited copy. It remains available for export.",
+        }));
+        setRecovery("offline");
+        return;
+      }
+      setAvailablePages((current) => current.filter((page) => page.pageId !== pageId));
+      setSelected(null);
+      setNotice("Access to that document was removed. Its local copy is being deleted.");
+      const next = new URL(window.location.href);
+      next.searchParams.delete("page");
+      window.history.replaceState(null, "", next);
+      window.setTimeout(() => {
+        void clearRevokedOfflinePages(account.key).catch((error) =>
+          console.error("Unable to remove a revoked offline copy", error),
+        );
+      }, 100);
+    },
+    [account.key],
+  );
 
   const reconnect = useCallback(async () => {
+    if (selectedReason) return;
     setRecovery("checking");
     try {
       const member = await api<ClientMemberContext>("/api/me");
@@ -49,12 +85,20 @@ export function OfflineWorkspace({
           api<{ spaces: Space[] }>("/api/spaces"),
         ]);
         const space = spaces.find((item) => item.id === page.spaceId);
+        if (!space && !stored?.pendingChanges) {
+          await discardRevokedCopy(selected.pageId);
+          return;
+        }
         if (
           !space ||
           (stored?.pendingChanges && (page.contentEpoch !== selected.epoch || space.effectiveRole === "viewer"))
         ) {
-          setReason("Your access or this document's version changed. The local copy is preserved for export.");
-          setRecovery("quarantined");
+          setQuarantined((current) => ({
+            ...current,
+            [selected.pageId]:
+              "Your access or this document's version changed. The local copy is preserved for export.",
+          }));
+          setRecovery("offline");
           return;
         }
         const next = new URL(window.location.href);
@@ -63,6 +107,14 @@ export function OfflineWorkspace({
       }
       onRetry();
     } catch (error) {
+      if (error instanceof ApiClientError && error.status === 401) {
+        onRetry();
+        return;
+      }
+      if (selected && error instanceof ApiClientError && [403, 404, 410].includes(error.status)) {
+        await discardRevokedCopy(selected.pageId);
+        return;
+      }
       if (
         error instanceof TypeError ||
         (error instanceof Error && error.name === "AbortError") ||
@@ -71,10 +123,15 @@ export function OfflineWorkspace({
         setRecovery("offline");
         return;
       }
-      setReason("The server could not confirm access to this copy. It remains available for export.");
-      setRecovery("quarantined");
+      if (selected) {
+        setQuarantined((current) => ({
+          ...current,
+          [selected.pageId]: "The server could not confirm access to this copy. It remains available for export.",
+        }));
+      }
+      setRecovery("offline");
     }
-  }, [account.key, account.userId, account.workspaceId, onRetry, selected]);
+  }, [account.key, account.userId, account.workspaceId, discardRevokedCopy, onRetry, selected, selectedReason]);
 
   useEffect(() => {
     const handleOnline = () => void reconnect();
@@ -93,8 +150,12 @@ export function OfflineWorkspace({
           <strong>{account.workspaceName}</strong>
           <span>Offline copy for {account.userName}</span>
         </div>
-        <button type="button" onClick={() => void reconnect()} disabled={recovery === "checking"}>
-          {recovery === "checking" ? "Checking access…" : "Reconnect"}
+        <button
+          type="button"
+          onClick={selectedReason ? onRetry : () => void reconnect()}
+          disabled={recovery === "checking"}
+        >
+          {selectedReason ? "Open online workspace" : recovery === "checking" ? "Checking access…" : "Reconnect"}
         </button>
         <button type="button" onClick={onSignOut}>
           Sign out and remove local copies
@@ -104,8 +165,9 @@ export function OfflineWorkspace({
         <nav aria-label="Cached documents" className="offline-list">
           <h1>Available offline</h1>
           <p>Only documents opened on this device appear here. Server actions require a connection.</p>
-          {pages.length === 0 && <p>No document copies remain on this device.</p>}
-          {pages.map((page) => (
+          {notice && <output>{notice}</output>}
+          {availablePages.length === 0 && <p>No document copies remain on this device.</p>}
+          {availablePages.map((page) => (
             <button
               type="button"
               key={page.pageId}
@@ -116,7 +178,6 @@ export function OfflineWorkspace({
                 next.searchParams.set("page", page.pageId);
                 window.history.replaceState(null, "", next);
                 setRecovery("offline");
-                setReason("");
               }}
             >
               <strong>{page.title}</strong>
@@ -131,15 +192,15 @@ export function OfflineWorkspace({
           {selected ? (
             <>
               <output className="notice">
-                {recovery === "quarantined"
-                  ? reason
+                {selectedReason
+                  ? selectedReason
                   : "Offline copy. Changes stay on this device until access is checked and server sync is confirmed."}
               </output>
               <OfflineEditor
                 key={selected.pageId}
                 page={selected}
                 accountKey={account.key}
-                quarantined={recovery === "quarantined"}
+                quarantined={Boolean(selectedReason) || recovery === "checking"}
                 editingEnabled={account.offlineEditingEnabled}
               />
             </>
@@ -250,41 +311,50 @@ function OfflineBlockEditor({
     let active = true;
     let timer: number | undefined;
     let generation = 0;
-    let savedGeneration = 0;
-    let writing = false;
-    const writeSnapshot = async () => {
-      if (writing || !active) return;
-      writing = true;
-      if (timer !== undefined) window.clearTimeout(timer);
+    let pendingCommitted = page.pendingChanges === true;
+    let pendingMark: Promise<void> | null = null;
+    let pendingError = false;
+    const verifyStored = async (target: number) => {
       try {
-        while (savedGeneration < generation) {
-          if (!active) break;
-          const target = generation;
-          const db = copy.persistence.db;
-          if (!db) throw new Error("Offline document storage is unavailable.");
-          const transaction = db.transaction("updates", "readwrite");
-          transaction.objectStore("updates").add(Y.encodeStateAsUpdate(copy.doc));
-          await new Promise<void>((resolve, reject) => {
-            transaction.addEventListener("complete", () => resolve());
-            transaction.addEventListener("abort", () => reject(transaction.error));
-            transaction.addEventListener("error", () => reject(transaction.error));
-          });
-          await markOfflinePagePending(accountKey, page.pageId, true);
-          savedGeneration = target;
-        }
-        if (active) setSaveState("saved");
+        await pendingMark;
+        if (pendingError) throw new Error("Offline catalog could not record pending changes.");
+        const db = copy.persistence.db;
+        if (!db) throw new Error("Offline document storage is unavailable.");
+        // y-indexeddb writes each update first. A later transaction on the
+        // same store completes only after those update transactions commit.
+        const transaction = db.transaction("updates", "readonly");
+        await new Promise<void>((resolve, reject) => {
+          transaction.addEventListener("complete", () => resolve());
+          transaction.addEventListener("abort", () => reject(transaction.error));
+          transaction.addEventListener("error", () => reject(transaction.error));
+        });
+        if (active && target === generation) setSaveState("saved");
       } catch {
         if (active) setSaveState("failed");
-      } finally {
-        writing = false;
       }
     };
     const updated = (_update: Uint8Array, origin: unknown) => {
       if (origin === copy.persistence || origin === copy.provider) return;
       generation += 1;
       setSaveState("saving");
+      if (!pendingCommitted && !pendingMark) {
+        pendingError = false;
+        pendingMark = markOfflinePagePending(accountKey, page.pageId, true)
+          .then(
+            () => {
+              pendingCommitted = true;
+            },
+            () => {
+              pendingError = true;
+            },
+          )
+          .finally(() => {
+            pendingMark = null;
+          });
+      }
       if (timer !== undefined) window.clearTimeout(timer);
-      timer = window.setTimeout(() => void writeSnapshot(), 100);
+      const target = generation;
+      timer = window.setTimeout(() => void verifyStored(target), 100);
     };
     copy.doc.on("update", updated);
     return () => {
@@ -292,7 +362,7 @@ function OfflineBlockEditor({
       if (timer !== undefined) window.clearTimeout(timer);
       copy.doc.off("update", updated);
     };
-  }, [accountKey, copy, page.pageId]);
+  }, [accountKey, copy, page.pageId, page.pendingChanges]);
   const options = useMemo(
     () =>
       withCollaboration({
