@@ -67,6 +67,7 @@
     "fractional-indexing-jittered": "1.0.0",
     "hono": "4.13.5",
     "katex": "0.18.5",
+    "marked": "16.4.2",
     "mermaid": "11.17.2",
     "partyserver": "0.5.10",
     "prosemirror-model": "1.25.11",

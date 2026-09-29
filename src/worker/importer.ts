@@ -310,7 +310,9 @@ function normalizedRelativePath(sourcePath: string, href: string) {
   if (!raw || /^[a-z][a-z\d+.-]*:/i.test(raw) || raw.startsWith("//")) return null;
   try {
     const base = new URL(`https://import.invalid/${sourcePath.split("/").map(encodeURIComponent).join("/")}`);
-    const url = new URL(raw, base);
+    // Archive paths commonly use backslashes as separators, while stored
+    // document hrefs retain an encoded literal backslash for browser safety.
+    const url = new URL(raw.replace(/%5c/gi, "/"), base);
     if (url.origin !== base.origin) return null;
     return url.pathname
       .slice(1)
@@ -394,6 +396,7 @@ async function hydrateDocumentAssets(
 ) {
   if (!page.document) return;
   const bySource = new Map<string, ImportAsset>();
+  const visitedLinks = new Set<object>();
   walkDocument(page.document, (node) => {
     const url = typeof node.attrs?.url === "string" ? node.attrs.url : null;
     if (url) {
@@ -407,6 +410,9 @@ async function hydrateDocumentAssets(
     }
     for (const mark of node.marks ?? []) {
       if (mark.type !== "link" || typeof mark.attrs?.href !== "string") continue;
+      // Formatted link labels contain several text nodes with the same mark.
+      if (visitedLinks.has(mark)) continue;
+      visitedLinks.add(mark);
       const path = normalizedRelativePath(page.source, mark.attrs.href);
       const targetId = path ? pageIds.get(path) : null;
       if (targetId) {
@@ -1592,7 +1598,10 @@ async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
         return { ok: true, inputKey: await resumeSlackCaptureJob(env, captureId, job.id, job.attempt) } as const;
       } catch (error) {
         const permanent = safeHttpError(error);
-        if (permanent && permanent.status < 500 && permanent.status !== 429)
+        if (
+          permanent &&
+          ((permanent.status < 500 && permanent.status !== 429) || permanent.code === "slack_capture_link_pending")
+        )
           return { ok: false, status: permanent.status, code: permanent.code, message: permanent.message } as const;
         throw error;
       }

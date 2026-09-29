@@ -13,7 +13,12 @@ import { broadcastWorkspaceEvent } from "./workspace-events";
 import type { ProseMirrorJson } from "../shared/document-projection";
 import { PAGE_TITLE_MAX } from "../shared/validation";
 import { logger } from "./observability";
-import { claimSlackCapture, retryFailedSlackCapture, type SlackCaptureSource } from "./slack-capture";
+import {
+  claimSlackCapture,
+  retryFailedSlackCapture,
+  SLACK_CAPTURE_PAGE_GONE_MESSAGE,
+  type SlackCaptureSource,
+} from "./slack-capture";
 
 const plain = (text: string) => ({ type: "plain_text", text: text.slice(0, 150) });
 
@@ -385,6 +390,8 @@ function resultView(env: Env, id: string, pageId: string, pending: boolean) {
 }
 function captureView(env: Env, id: string, capture: { state: string; page_id: string | null; job_id: string | null }) {
   if (capture.state === "succeeded" && capture.page_id) return resultView(env, id, capture.page_id, false);
+  if (capture.state === "succeeded")
+    return modal(id, [{ type: "section", text: { type: "mrkdwn", text: SLACK_CAPTURE_PAGE_GONE_MESSAGE } }]);
   return modal(id, [
     {
       type: "section",

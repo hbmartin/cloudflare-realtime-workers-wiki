@@ -3,6 +3,7 @@ import {
   captureFeedbackStatement,
   deliverSlackCaptureFeedback,
   failCaptureForJobStatement,
+  isSlackCaptureId,
   prepareSlackCapture,
 } from "./slack-capture";
 import {
@@ -17,7 +18,7 @@ import { WorkflowEntrypoint, type WorkflowEvent, type WorkflowStep } from "cloud
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import * as Y from "yjs";
 import { DIAGRAM_EDGES_ROOT, DIAGRAM_META_ROOT, DIAGRAM_NODES_ROOT } from "../shared/diagram";
-import { boundedLogString, PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
+import { boundedLogString, prefixedErrorLogFields, PERSISTED_ERROR_MESSAGE_LIMIT } from "../shared/error-log";
 import { sha256Hex } from "../shared/import-integrity";
 import { CLEANUP_JOB_STATUS_SQL } from "../shared/job-state";
 import type { ImportPreview, Job, JobStatus, JobType } from "../shared/types";
@@ -67,6 +68,9 @@ const SLACK_BLOCKED_RECHECK_MS = 5 * 60_000;
 const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
+const QUEUED_JOB_RECOVERY_DELAY_MS = 30_000;
+const ACTIVE_WORKFLOW_STATUSES = new Set(["queued", "running", "paused", "waiting", "waitingForPause"]);
+const UNDETERMINED_WORKFLOW_STATUS = "unknown";
 
 export type JobWorkflowParams = { jobId: string; attempt?: number; correlationId?: string };
 export type DeliveryQueueMessage =
@@ -704,6 +708,7 @@ export async function createJob(
 async function startJobWorkflow(
   env: Env,
   job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt"> & Partial<Pick<JobRow, "correlation_id">>,
+  allowRotation = true,
 ) {
   const instanceId = job.workflow_instance_id ?? job.id;
   try {
@@ -722,6 +727,21 @@ async function startJobWorkflow(
       .then((instance) => instance.status())
       .catch(() => null);
     if (!status || status.status === "unknown") throw error;
+    if (["complete", "errored", "terminated"].includes(status.status)) {
+      if (!allowRotation) throw error;
+      const replacement = crypto.randomUUID();
+      const changed = await env.DB.prepare(
+        `UPDATE jobs SET workflow_instance_id=?,updated_at=?
+         WHERE id=? AND attempt=? AND status='queued' AND COALESCE(workflow_instance_id,id)=?
+         RETURNING id, workspace_id, workflow_instance_id, attempt, correlation_id`,
+      )
+        .bind(replacement, Date.now(), job.id, job.attempt, instanceId)
+        .first<JobRow>();
+      if (changed) {
+        await notifyJobs(env, changed.workspace_id);
+        await startJobWorkflow(env, changed, false);
+      }
+    }
   }
 }
 
@@ -729,12 +749,8 @@ export async function startJobExecution(
   env: Env,
   job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt"> & Partial<Pick<JobRow, "correlation_id">>,
 ) {
-  const pendingCapture = await env.DB.prepare(
-    `SELECT 1 FROM slack_captures WHERE id=? AND state='pending' AND job_id IS NULL`,
-  )
-    .bind(job.id)
-    .first();
-  if (pendingCapture) return;
+  // An unlinked receipt must be re-staged before creating a Workflow instance.
+  if (isSlackCaptureId(job.id) && (await hasUnlinkedCapture(env, job.id))) return;
   if (env.WORKFLOW_INLINE !== "true") return startJobWorkflow(env, job);
   const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(job.id, job.attempt)
@@ -755,24 +771,114 @@ export async function startJobExecution(
     else if (row.type === "export") await runExport(env, row, inlineStep as Parameters<typeof runExport>[2]);
     else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
-    if (safeHttpError(error)?.code === "slack_capture_link_pending") {
-      const returned = await env.DB.prepare(
-        `UPDATE jobs SET status='queued',progress_label='Queued',updated_at=?
-         WHERE id=? AND attempt=? AND status='running'`,
-      )
-        .bind(Date.now() - 30_000, row.id, row.attempt)
-        .run();
-      if (returned.meta.changes) await notifyJobs(env, row.workspace_id);
-      return;
-    }
     const current = await env.DB.prepare(
       `SELECT * FROM jobs WHERE id=? AND attempt>=? AND COALESCE(workflow_instance_id,id)=?`,
     )
       .bind(row.id, row.attempt, row.workflow_instance_id ?? row.id)
       .first<JobRow>();
-    if (current?.status === "running") await failJobWithCleanup(env, current, error);
+    if (current?.status === "running") {
+      const recovery = await shouldRequeueCapture(env, current, error);
+      if (recovery) {
+        await replaceCaptureWorkflow(env, current, "running", recovery === "lookup_failed");
+        return;
+      }
+      await failJobWithCleanup(env, current, error);
+    }
     throw error;
   }
+}
+
+const UNLINKED_CAPTURE_SQL = `EXISTS (SELECT 1 FROM slack_captures capture
+  WHERE capture.id=jobs.id AND capture.workspace_id=jobs.workspace_id
+    AND capture.requested_by=jobs.requested_by
+    AND capture.state='pending' AND capture.job_id IS NULL)`;
+
+async function hasUnlinkedCapture(env: Env, jobId: string) {
+  return Boolean(await env.DB.prepare(`SELECT 1 FROM jobs WHERE id=? AND ${UNLINKED_CAPTURE_SQL}`).bind(jobId).first());
+}
+
+function isCaptureImportJob(job: JobRow) {
+  return job.type === "import" && jsonRecord(job.options_json).captureId === job.id;
+}
+
+async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
+  if (safeHttpError(error)?.code === "slack_capture_link_pending") return true;
+  if (!isCaptureImportJob(job)) return false;
+  // Older Workflow step results can surface a wrapped error without the
+  // original HttpError code. The receipt state is authoritative in that case.
+  try {
+    return await hasUnlinkedCapture(env, job.id);
+  } catch (lookupError) {
+    try {
+      const unlinked = await hasUnlinkedCapture(env, job.id);
+      logger.warn(
+        "workflow.capture_lookup.retried",
+        "workflow",
+        "Capture receipt lookup recovered on retry.",
+        { jobId: job.id, attempt: job.attempt },
+        lookupError,
+      );
+      return unlinked;
+    } catch (retryError) {
+      logger.error(
+        "workflow.capture_import.unresolved",
+        "workflow",
+        "Capture import failed while receipt lookup was unavailable.",
+        {
+          jobId: job.id,
+          attempt: job.attempt,
+          ...prefixedErrorLogFields("firstLookup", lookupError),
+          ...prefixedErrorLogFields("retryLookup", retryError),
+        },
+        error,
+      );
+      // The scheduled pass will retry when D1 can answer authoritatively.
+    }
+    // Defer recovery until D1 can distinguish an unlinked receipt from a real
+    // import failure. Neither outcome is safe to assume during an outage.
+    return "lookup_failed" as const;
+  }
+}
+
+async function replaceCaptureWorkflow(
+  env: Env,
+  job: JobRow,
+  expectedStatus: "running" | "queued",
+  deferForLookup = false,
+) {
+  const instanceId = crypto.randomUUID();
+  const returned = await env.DB.prepare(
+    `UPDATE jobs SET status='queued',workflow_instance_id=?,progress_label=?,
+       error_code=?,error_message=NULL,updated_at=?
+     WHERE id=? AND attempt=? AND status=?
+       AND COALESCE(workflow_instance_id,id)=?`,
+  )
+    .bind(
+      instanceId,
+      deferForLookup ? "Waiting to check Slack receipt" : "Queued",
+      deferForLookup ? "capture_lookup_unavailable" : null,
+      deferForLookup ? Date.now() : Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS,
+      job.id,
+      job.attempt,
+      expectedStatus,
+      job.workflow_instance_id ?? job.id,
+    )
+    .run();
+  if (!returned.meta.changes) return false;
+  await notifyJobs(env, job.workspace_id);
+  if (deferForLookup) return true;
+  // prepareSlackCapture may have linked the receipt using the old workflow id
+  // while this catch was running. Start the replacement immediately in that case.
+  const linked = await env.DB.prepare(
+    `SELECT jobs.id,jobs.workflow_instance_id,jobs.attempt,jobs.correlation_id
+       FROM jobs JOIN slack_captures ON slack_captures.id=jobs.id
+      WHERE jobs.id=? AND jobs.workflow_instance_id=? AND jobs.status='queued'
+        AND slack_captures.job_id=jobs.id AND slack_captures.state='running'`,
+  )
+    .bind(job.id, instanceId)
+    .first<Pick<JobRow, "id" | "workflow_instance_id" | "attempt" | "correlation_id">>();
+  if (linked) await startJobExecution(env, linked);
+  return true;
 }
 
 async function notifyJobs(env: Env, workspaceId: string) {
@@ -868,12 +974,12 @@ export async function finishPendingJobCleanup(
 
   const stillOwned = cleanupLeaseGuard(env, identity, token, timestamp);
   try {
-    if (options.terminateWorkflow !== false && job.workflow_instance_id && env.WORKFLOW_INLINE !== "true") {
+    if (options.terminateWorkflow !== false && env.WORKFLOW_INLINE !== "true") {
       let terminating = false;
       try {
-        const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
+        const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id ?? job.id);
         const status = await instance.status();
-        if (["queued", "running", "paused", "waiting", "waitingForPause"].includes(status.status)) {
+        if (ACTIVE_WORKFLOW_STATUSES.has(status.status)) {
           terminating = true;
           await instance.terminate();
         }
@@ -905,7 +1011,7 @@ export async function finishPendingJobCleanup(
       ).bind(completedAt, job.id, job.attempt, token),
       ...(typeof captureId === "string"
         ? [
-            failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, completedAt),
+            failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, completedAt, null, "final"),
             captureFeedbackStatement(env.DB, captureId, "failed", completedAt),
           ]
         : []),
@@ -930,7 +1036,7 @@ export async function finishPendingJobCleanup(
   }
 }
 
-async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
+async function failJobWithCleanup(env: Env, job: JobRow, error: unknown, deferCleanup = false) {
   const httpError = safeHttpError(error);
   // Typed job failures are user-facing product data, not telemetry. Keep their
   // specific message here; structured logging still sanitizes any later copy.
@@ -945,14 +1051,14 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
       error,
     );
   if (job.type !== "import" && job.type !== "template_clone" && job.type !== "export") {
-    await updateJob(env, job, {
-      status: "failed",
-      label: "Failed",
-      errorCode,
-      errorMessage: message,
-    });
-    await notifyJobs(env, job.workspace_id);
-    return;
+    const failed = await env.DB.prepare(
+      `UPDATE jobs SET status='failed',progress_label='Failed',error_code=?,error_message=?,updated_at=?
+        WHERE id=? AND attempt=? AND status='running' AND COALESCE(workflow_instance_id,id)=?`,
+    )
+      .bind(errorCode, message, Date.now(), job.id, job.attempt, job.workflow_instance_id ?? job.id)
+      .run();
+    if (failed.meta.changes) await notifyJobs(env, job.workspace_id);
+    return false;
   }
   const captureId = job.type === "import" ? jsonRecord(job.options_json).captureId : null;
   const timestamp = Date.now();
@@ -960,17 +1066,19 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
     env.DB.prepare(
       `UPDATE jobs SET status = 'failed', cleanup_target = COALESCE(cleanup_target, 'failed'),
          progress_label = 'Failure cleanup pending', error_code = ?, error_message = ?, updated_at = ?
-       WHERE id = ? AND attempt = ? AND status = 'running'`,
-    ).bind(errorCode, message, timestamp, job.id, job.attempt),
+       WHERE id = ? AND attempt = ? AND status = 'running'
+         AND COALESCE(workflow_instance_id,id)=?`,
+    ).bind(errorCode, message, timestamp, job.id, job.attempt, job.workflow_instance_id ?? job.id),
     ...(typeof captureId === "string"
       ? [
-          failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, timestamp),
+          failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, timestamp, null, "failed"),
           captureFeedbackStatement(env.DB, captureId, "failed", timestamp),
         ]
       : []),
   ]);
-  if (!pending?.meta.changes) return;
+  if (!pending?.meta.changes) return false;
   await notifyJobs(env, job.workspace_id);
+  if (deferCleanup) return true;
   await finishPendingJobCleanup(env, job, { terminateWorkflow: false }).catch((cleanupError) => {
     logger.error(
       "workflow.failure_cleanup.failed",
@@ -980,6 +1088,7 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
       cleanupError,
     );
   });
+  return true;
 }
 
 async function updateJob(
@@ -1005,7 +1114,8 @@ async function updateJob(
        progress_label = COALESCE(?, progress_label),
        error_code = ?, error_message = ?,
        result_json = COALESCE(?, result_json), updated_at = ?
-     WHERE id = ? AND attempt = ? AND status = ?`,
+     WHERE id = ? AND attempt = ? AND status = ?
+       ${fields.status === "running" ? `AND NOT ${UNLINKED_CAPTURE_SQL}` : ""}`,
   )
     .bind(
       fields.status ?? null,
@@ -1110,7 +1220,7 @@ export async function resolveJobWorkflowAttempt(
   event: Pick<WorkflowEvent<JobWorkflowParams>, "payload" | "instanceId">,
 ) {
   if (Number.isInteger(event.payload.attempt) && event.payload.attempt! > 0) return event.payload.attempt!;
-  const legacy = await env.DB.prepare(`SELECT attempt FROM jobs WHERE id = ? AND workflow_instance_id = ?`)
+  const legacy = await env.DB.prepare(`SELECT attempt FROM jobs WHERE id = ? AND COALESCE(workflow_instance_id,id) = ?`)
     .bind(event.payload.jobId, event.instanceId)
     .first<{ attempt: number }>();
   return legacy?.attempt ?? null;
@@ -1135,6 +1245,16 @@ export async function claimJobWorkflowRun(
   const current = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(event.payload.jobId, attempt)
     .first<JobRow>();
+  // The queued claim can be blocked while its Slack receipt is unlinked. This
+  // Workflow instance will now finish; give the queued job a fresh instance id.
+  if (
+    current?.status === "queued" &&
+    (current.workflow_instance_id ?? current.id) === event.instanceId &&
+    isCaptureImportJob(current)
+  ) {
+    await replaceCaptureWorkflow(env, current, "queued");
+    return null;
+  }
   return current &&
     current.status === "running" &&
     !current.cleanup_target &&
@@ -1242,6 +1362,11 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         return;
       }
       if (current.status !== "running") return;
+      const recovery = await shouldRequeueCapture(this.env, current, error);
+      if (recovery) {
+        await replaceCaptureWorkflow(this.env, current, "running", recovery === "lookup_failed");
+        return;
+      }
       await failJobWithCleanup(this.env, current, error);
       throw error;
     }
@@ -1249,17 +1374,96 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
 }
 
 export async function recoverQueuedJobs(env: Env) {
-  const cutoff = Date.now() - 30_000;
+  const cutoff = Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS;
+  const terminalCleanups: Array<Pick<JobRow, "id" | "attempt">> = [];
+  if (env.WORKFLOW_INLINE !== "true") {
+    const rotateRunningJob = (job: JobRow) =>
+      env.DB.prepare(`UPDATE jobs SET updated_at=? WHERE id=? AND attempt=? AND status='running'
+        AND COALESCE(workflow_instance_id,id)=?`)
+        .bind(Date.now(), job.id, job.attempt, job.workflow_instance_id ?? job.id)
+        .run();
+    // Move live checks to the back of this bounded scan so they cannot starve
+    // terminal jobs while long imports continue to make progress.
+    const running = await env.DB.prepare(
+      `SELECT * FROM jobs WHERE status='running'
+         AND updated_at<=? ORDER BY updated_at LIMIT 25`,
+    )
+      .bind(cutoff)
+      .all<JobRow>();
+    for (const job of running.results) {
+      try {
+        let status: { status: string; error?: unknown } | null = null;
+        try {
+          status = await (await env.NOTES_WORKFLOW.get(job.workflow_instance_id ?? job.id)).status();
+        } catch (error) {
+          if (!workflowInstanceMissing(error)) throw error;
+        }
+        if (status && (ACTIVE_WORKFLOW_STATUSES.has(status.status) || status.status === UNDETERMINED_WORKFLOW_STATUS)) {
+          if (status.status === UNDETERMINED_WORKFLOW_STATUS && Date.now() - job.created_at > 2 * 60 * 60_000)
+            logger.warn(
+              "workflow.running_status.unknown",
+              "workflow",
+              "Workflow status remains unknown; preserving the running job until its outcome is authoritative.",
+              { jobId: job.id, attempt: job.attempt },
+            );
+          await rotateRunningJob(job);
+          continue;
+        }
+        const failure =
+          status && "error" in status && status.error
+            ? status.error
+            : new Error("Workflow ended before the job reached a terminal state.");
+        if (isCaptureImportJob(job)) {
+          const recovery = await shouldRequeueCapture(env, job, failure);
+          if (recovery) {
+            await replaceCaptureWorkflow(env, job, "running", recovery === "lookup_failed");
+            continue;
+          }
+        }
+        if (await failJobWithCleanup(env, job, failure, true)) terminalCleanups.push(job);
+      } catch (error) {
+        logger.error(
+          "workflow.running_recovery.failed",
+          "workflow",
+          "Running job recovery failed.",
+          { jobId: job.id, attempt: job.attempt },
+          error,
+        );
+        // A repeatedly failing status RPC must not keep terminal jobs beyond
+        // this bounded scan from ever being inspected.
+        try {
+          await rotateRunningJob(job);
+        } catch {
+          // The next sweep can retry once D1 recovers.
+        }
+      }
+    }
+  }
   const queued = await env.DB.prepare(
     `SELECT id, workflow_instance_id, attempt, correlation_id FROM jobs
       WHERE status = 'queued' AND updated_at <= ?
-        AND NOT EXISTS (SELECT 1 FROM slack_captures
-          WHERE slack_captures.id=jobs.id AND slack_captures.state='pending' AND slack_captures.job_id IS NULL)
+        AND NOT ${UNLINKED_CAPTURE_SQL}
       ORDER BY updated_at LIMIT 25`,
   )
     .bind(cutoff)
     .all<Pick<JobRow, "id" | "workflow_instance_id" | "attempt" | "correlation_id">>();
-  for (const job of queued.results) {
+  const cleanTerminal = async (job: Pick<JobRow, "id" | "attempt">) => {
+    try {
+      await finishPendingJobCleanup(env, job, { terminateWorkflow: false });
+    } catch (error) {
+      logger.error(
+        "workflow.pending_cleanup.failed",
+        "workflow",
+        "Pending job cleanup failed.",
+        { jobId: job.id },
+        error,
+      );
+    }
+  };
+  let cleanedTerminal = 0;
+  for (; cleanedTerminal < Math.min(2, terminalCleanups.length); cleanedTerminal += 1)
+    await cleanTerminal(terminalCleanups[cleanedTerminal]!);
+  for (const [index, job] of queued.results.entries()) {
     try {
       await startJobExecution(env, job);
     } catch (error) {
@@ -1279,10 +1483,15 @@ export async function recoverQueuedJobs(env: Env) {
         );
       }
     }
+    if ((index + 1) % 5 === 0 && cleanedTerminal < terminalCleanups.length)
+      await cleanTerminal(terminalCleanups[cleanedTerminal++]!);
   }
+  for (; cleanedTerminal < terminalCleanups.length; cleanedTerminal += 1)
+    await cleanTerminal(terminalCleanups[cleanedTerminal]!);
   const cleanups = await env.DB.prepare(
     `SELECT id, attempt FROM jobs WHERE cleanup_target IS NOT NULL
-      AND status IN (${CLEANUP_JOB_STATUS_SQL}) AND updated_at <= ? ORDER BY updated_at LIMIT 25`,
+      AND status IN (${CLEANUP_JOB_STATUS_SQL}) AND updated_at <= ?
+      ORDER BY updated_at LIMIT 25`,
   )
     .bind(cutoff)
     .all<Pick<JobRow, "id" | "attempt">>();
