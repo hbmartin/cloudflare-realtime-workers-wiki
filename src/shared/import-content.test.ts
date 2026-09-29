@@ -335,6 +335,38 @@ describe("import content", () => {
     }
   });
 
+  it("keeps escaped brackets inside link labels literal", () => {
+    for (const suffix of ["", ` ${"x".repeat(9_000)}`]) {
+      const parsed = markdownToDocument(String.raw`[a \[nested\](wrong.md)](right.md)` + suffix);
+      expect(parsed.references).toEqual(["right.md"]);
+      const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+      expect(content[0]).toMatchObject({
+        text: "a [nested](wrong.md)",
+        marks: [{ type: "link", attrs: { href: "right.md" } }],
+      });
+    }
+    const unsafe = markdownToDocument(String.raw`![a \[nested\](wrong.md)](javascript:bad)`);
+    expect(unsafe.references).toEqual([]);
+    expect(unsafe.issues.some((issue) => issue.code === "unsafe_url")).toBe(true);
+  });
+
+  it("keeps an autolink when a dense split starts at its opening bracket", () => {
+    const parsed = markdownToDocument(`${"< ".repeat(127)}<https://example.com/path> < ${"x".repeat(9_000)}`);
+    expect(parsed.references).toContain("https://example.com/path");
+  });
+
+  it("recovers a long data image nested in an ordinary link", () => {
+    const image = `data:image/png;base64,${"A".repeat(9_000)}`;
+    const parsed = markdownToDocument(`[before ![chart](${image}) after](page.md)`);
+    expect(parsed.references).toEqual([image, "page.md"]);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(8_000));
+  });
+
+  it("does not let prose punctuation hide a later bounded link", () => {
+    const parsed = markdownToDocument(`note (quote "unfinished) ${"a ".repeat(4_500)}[later](later.md)`);
+    expect(parsed.references).toContain("later.md");
+  });
+
   it("does not recover an image inside an unfinished code span", () => {
     const source = "See ![a `b](data:image/png;base64,AAAA) then `";
     for (const suffix of ["", ` ${"x".repeat(9_000)}`]) {

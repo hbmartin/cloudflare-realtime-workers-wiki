@@ -166,17 +166,24 @@ function markdownInline(
       else if (token.type === "link" || token.type === "image") {
         const rawUrl = token.href;
         const url = safeLink(rawUrl);
+        const labelEnd = token.raw.startsWith("<") ? null : linkLabelEnd(token.raw, 0, 8192);
+        const rawLabel = labelEnd === null ? token.text : token.raw.slice(token.type === "image" ? 2 : 1, labelEnd);
+        const escapedBracket = rawLabel.includes("\\[") || rawLabel.includes("\\]");
+        const emitLabel = (labelMarks: NonNullable<ProseMirrorJson["marks"]>) => {
+          if (escapedBracket) appendPlain(unescapeMarkdown(rawLabel), labelMarks);
+          else if (token.type === "image" && !rawLabel.includes("["))
+            output.push(...imageLabelContent({ label: token.text, rawLabel }, labelMarks));
+          else walk(children, labelMarks);
+        };
         if (!url) {
-          walk(children, marks);
+          emitLabel(marks ?? []);
           issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
         } else if (token.type === "image") {
-          const labelEnd = linkLabelEnd(token.raw, 0, 8192);
-          const rawLabel = labelEnd === null ? token.text : token.raw.slice(2, labelEnd);
-          output.push(...imageLabelContent({ label: token.text, rawLabel }, marks ?? []));
+          emitLabel(marks ?? []);
           references.push(url);
           issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
         } else {
-          walk(children, [...marks, { type: "link", attrs: { href: url } }]);
+          emitLabel([...marks, { type: "link", attrs: { href: url } }]);
           references.push(url);
         }
       } else if (children.length) walk(children, marks);
@@ -253,11 +260,16 @@ function closingParenWithin(value: string) {
       if (value[index] === ">") angled = false;
       continue;
     }
-    if (depth && /\s/.test(value[index - 1] ?? "") && (value[index] === '"' || value[index] === "'")) {
+    if (
+      candidates.size &&
+      depth &&
+      /\s/.test(value[index - 1] ?? "") &&
+      (value[index] === '"' || value[index] === "'")
+    ) {
       quote = value[index]!;
       continue;
     }
-    if (depth && value[index] === "<") {
+    if (candidates.get(depth) === index - 1 && value[index] === "<") {
       angled = true;
       continue;
     }
@@ -271,6 +283,7 @@ function closingParenWithin(value: string) {
       const opener = candidates.get(depth);
       if (opener !== undefined) {
         closes.set(opener, index);
+        if (closes.size > 100_000) return () => false;
         candidates.delete(depth);
       }
       depth -= 1;
@@ -284,17 +297,11 @@ function lazyClosingParenWithin(value: string) {
   return (index: number) => (matcher ??= closingParenWithin(value))(index);
 }
 
+const { tokenizer: autolinkTokenizer } = markdownLexer();
 function autolinkEnd(value: string, start: number) {
-  if (value[start] !== "<") return null;
-  const limit = Math.min(value.length, start + 8192);
-  for (let end = start + 1; end < limit; end += 1) {
-    const character = value[end]!;
-    if (character === "<" || character.charCodeAt(0) < 32 || /\s/.test(character)) return null;
-    if (character !== ">") continue;
-    const inner = value.slice(start + 1, end);
-    return /^[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>]+$/.test(inner) || /^[^<>@]+@[^<>@]+\.[^<>@]+$/.test(inner) ? end : null;
-  }
-  return null;
+  if (value[start] !== "<" || trailingEscape(value, start)) return null;
+  const token = autolinkTokenizer.autolink(value.slice(start, start + 8192));
+  return token?.type === "link" ? start + token.raw.length - 1 : null;
 }
 
 function inlineSpans(
@@ -320,6 +327,13 @@ function inlineSpans(
       index += 1;
       continue;
     }
+    if (!destinationDepth && value[index] === "<") {
+      const end = autolinkEnd(value, index);
+      if (end !== null) {
+        index = end;
+        continue;
+      }
+    }
     if (destinationQuote) {
       if (value[index] === destinationQuote) destinationQuote = null;
       continue;
@@ -332,7 +346,7 @@ function inlineSpans(
       destinationQuote = value[index]!;
       continue;
     }
-    if (destinationDepth && value[index] === "<") {
+    if (destinationDepth === 1 && index === destinationStart + 1 && value[index] === "<") {
       destinationAngled = true;
       continue;
     }
@@ -347,7 +361,10 @@ function inlineSpans(
       }
     } else if (value[index] === ")" && destinationDepth) {
       destinationDepth -= 1;
-      if (!destinationDepth) destinations.push({ start: destinationStart, end: index + 1 });
+      if (!destinationDepth) {
+        destinations.push({ start: destinationStart, end: index + 1 });
+        if (destinations.length > 100_000) return null;
+      }
     }
     if (destinationDepth) continue;
     if (value[index] !== "`") continue;
@@ -461,6 +478,7 @@ function safeInlineCut(
 ) {
   const brackets: number[] = [];
   let parenDepth = 0;
+  let destinationStart = -1;
   let linkStart = -1;
   let quote: string | null = null;
   let angled = false;
@@ -487,6 +505,14 @@ function safeInlineCut(
       index += 1;
       continue;
     }
+    if (character === "<") {
+      const end = autolinkEnd(value, index);
+      if (end !== null) {
+        if (end >= maximum) return index > start ? index : maximum;
+        index = end;
+        continue;
+      }
+    }
     if (quote) {
       if (character === quote) quote = null;
       continue;
@@ -499,7 +525,7 @@ function safeInlineCut(
       quote = character;
       continue;
     }
-    if (parenDepth && character === "<") {
+    if (parenDepth === 1 && index === destinationStart + 1 && character === "<") {
       angled = true;
       continue;
     }
@@ -511,9 +537,10 @@ function safeInlineCut(
     } else if (
       character === "(" &&
       (parenDepth || (value[index - 1] === "]" && !trailingEscape(value, index - 1) && boundedClose(index)))
-    )
+    ) {
+      if (!parenDepth) destinationStart = index;
       parenDepth += 1;
-    else if (character === ")" && parenDepth) {
+    } else if (character === ")" && parenDepth) {
       parenDepth -= 1;
       if (!parenDepth) linkStart = -1;
     }
@@ -542,6 +569,7 @@ function safeDenseBoundary(value: string, boundary: number) {
   const codes = codeRanges(value) ?? [];
   let codeIndex = 0;
   let parenDepth = 0;
+  let destinationStart = -1;
   let linkStart = -1;
   let quote: string | null = null;
   let angled = false;
@@ -558,6 +586,14 @@ function safeDenseBoundary(value: string, boundary: number) {
       index += 1;
       continue;
     }
+    if (character === "<") {
+      const end = autolinkEnd(value, index);
+      if (end !== null) {
+        if (end >= boundary) return index;
+        index = end;
+        continue;
+      }
+    }
     if (quote) {
       if (character === quote) quote = null;
       continue;
@@ -570,7 +606,7 @@ function safeDenseBoundary(value: string, boundary: number) {
       quote = character;
       continue;
     }
-    if (parenDepth && character === "<") {
+    if (parenDepth === 1 && index === destinationStart + 1 && character === "<") {
       angled = true;
       continue;
     }
@@ -582,9 +618,10 @@ function safeDenseBoundary(value: string, boundary: number) {
     } else if (
       character === "(" &&
       (parenDepth || (value[index - 1] === "]" && !trailingEscape(value, index - 1) && boundedClose(index)))
-    )
+    ) {
+      if (!parenDepth) destinationStart = index;
       parenDepth += 1;
-    else if (character === ")" && parenDepth) {
+    } else if (character === ")" && parenDepth) {
       parenDepth -= 1;
       if (!parenDepth) linkStart = -1;
     }
@@ -615,7 +652,7 @@ function dataImageLabelEnd(value: string, start: number) {
         code &&
         index === start + code.start &&
         (start + code.end <= candidate ||
-          (start + code.end < limit && !value.slice(candidate + 2, start + code.end).includes("![")))
+          (start + code.end <= limit && !value.slice(candidate + 2, start + code.end).includes("![")))
       ) {
         index = start + code.end - 1;
         codeIndex += 1;
@@ -741,7 +778,7 @@ function boundedMarkdownInline(
           const image = imageMarkers.get(node.text[index]!);
           if (!image) continue;
           if (index > start) parts.push({ ...node, text: node.text.slice(start, index) });
-          if (image.label) parts.push({ ...node, text: image.label });
+          parts.push(...imageLabelContent(image, node.marks ?? []));
           recordImage(image);
           start = index + 1;
         }
@@ -763,7 +800,7 @@ function boundedMarkdownInline(
       const image = longDataImage(value, position);
       if (!image) continue;
       append(inline(unescapeMarkdown(value.slice(start, position))));
-      append(inline(image.label));
+      append(imageLabelContent(image));
       recordImage(image);
       start = image.end;
       position = image.end - 2;
@@ -772,7 +809,7 @@ function boundedMarkdownInline(
     return output;
   }
   const markerOptions = spans.images.length ? availableImageMarkers() : null;
-  const imageMarkersExhausted = Boolean(markerOptions && spans.images.length > markerOptions.candidates.length);
+  let imageMarkersExhausted = Boolean(markerOptions && spans.images.length > markerOptions.candidates.length);
   if (!imageMarkers && spans.images.length && !imageMarkersExhausted) {
     const markers = new Map<string, DataImage>();
     const usedMarkers = new Set<string>();
@@ -782,7 +819,10 @@ function boundedMarkdownInline(
     let transformed = "";
     for (const image of spans.images) {
       while (usedMarkers.has(markerOptions!.candidates[nextMarker]!)) nextMarker += 1;
-      if (nextMarker >= markerOptions!.candidates.length) break;
+      if (nextMarker >= markerOptions!.candidates.length) {
+        imageMarkersExhausted = true;
+        break;
+      }
       const marker = markerOptions!.candidates[nextMarker++]!;
       markers.set(marker, image);
       transformed += value.slice(cursor, image.start) + marker;
@@ -816,15 +856,8 @@ function boundedMarkdownInline(
         const end = autolinkEnd(section, index);
         if (end !== null) {
           append(inline(unescapeMarkdown(section.slice(cursor, index))));
-          const label = section.slice(index + 1, end);
-          const href = safeLink(label.includes("@") && !label.includes(":") ? `mailto:${label}` : label);
-          if (href) {
-            append(inline(label, [{ type: "link", attrs: { href } }]));
-            references.push(href);
-          } else {
-            append(inline(label));
-            issues.push({ code: "unsafe_url", detail: label.slice(0, 120) });
-          }
+          const token = tokenizer.autolink(section.slice(index, end + 1));
+          if (token) append(markdownInline("", issues, references, [token], imageMarkers));
           cursor = end + 1;
           index = end;
           continue;
@@ -853,7 +886,7 @@ function boundedMarkdownInline(
           const image = longDataImage(section, start);
           if (image) {
             append(inline(unescapeMarkdown(section.slice(cursor, start))));
-            append(inline(image.label));
+            append(imageLabelContent(image));
             recordImage(image);
             cursor = image.end;
             index = cursor - 1;
@@ -868,12 +901,13 @@ function boundedMarkdownInline(
         const simple = simpleLongLink(section, start, labelEnd);
         if (!simple) continue;
         const href = safeLink(simple.href);
+        const rawLabel = section.slice(start + (section[start] === "!" ? 2 : 1), labelEnd);
         append(inline(unescapeMarkdown(section.slice(cursor, start))));
         if (!href) {
           issues.push({ code: "unsafe_url", detail: simple.href.slice(0, 120) });
-          append(inline(simple.label));
+          append(imageLabelContent({ label: simple.label, rawLabel }));
         } else if (section[start] === "!") {
-          append(inline(simple.label));
+          append(imageLabelContent({ label: simple.label, rawLabel }));
           recordImage({ href });
         } else {
           append(inline(simple.label, [{ type: "link", attrs: { href } }]));
@@ -901,7 +935,7 @@ function boundedMarkdownInline(
     if (special?.start === start) {
       if (special.kind === "image") {
         recordImage(special);
-        append(inline(special.label));
+        append(imageLabelContent(special));
       } else {
         let content = value.slice(special.openEnd, special.closeStart).replaceAll("\n", " ");
         if (content.startsWith(" ") && content.endsWith(" ") && content.trim()) content = content.slice(1, -1);
