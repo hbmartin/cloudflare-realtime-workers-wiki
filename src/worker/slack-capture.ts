@@ -12,6 +12,10 @@ import type { TaskStatus } from "../shared/tasks";
 
 export const SLACK_CAPTURE_PAGE_GONE_MESSAGE = "Saved to NoteFlare, but the page is no longer available.";
 
+export function isSlackCaptureId(value: string) {
+  return /^[0-9a-f]{32}$/.test(value);
+}
+
 export type SlackCaptureSource = {
   channelId: string;
   ts: string;

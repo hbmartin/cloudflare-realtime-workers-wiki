@@ -39,7 +39,8 @@ function decodeHtml(value: string) {
 }
 
 function safeLink(value: string) {
-  const trimmed = decodeHtml(value.trim()).replaceAll("\\", "%5C");
+  const decoded = decodeHtml(value.trim());
+  const trimmed = /^[a-z][a-z\d+.-]*:/i.test(decoded) ? decoded.replaceAll("\\", "%5C") : decoded.replaceAll("\\", "/");
   if (!trimmed) return null;
   for (let index = 0; index < trimmed.length; index += 1) {
     const code = trimmed.charCodeAt(index);
@@ -95,85 +96,10 @@ function unescapeMarkdown(value: string, abortOnMarkup = false): string | null {
   return output;
 }
 
-function simplifiedMarkdownInline(value: string, issues: ImportIssue[], references: string[]) {
-  issues.push({ code: "inline_markup_simplified", detail: "Long inline content was simplified." });
-  const output: ProseMirrorJson[] = [];
-  let cursor = 0;
-  const flush = (end: number) => {
-    output.push(...inline(unescapeMarkdown(value.slice(cursor, end))));
-    cursor = end;
-  };
-  for (let index = 0; index < value.length; index += 1) {
-    if (value[index] === "\\" && ESCAPABLE_MARKDOWN.test(value[index + 1] ?? "")) {
-      index += 1;
-      continue;
-    }
-    if (value[index] === "`") {
-      const ticks = /^`+/.exec(value.slice(index))![0];
-      const close = value.indexOf(ticks, index + ticks.length);
-      if (close >= 0) {
-        flush(index);
-        output.push(...inline(value.slice(index + ticks.length, close), [{ type: "code" }]));
-        index = close + ticks.length - 1;
-        cursor = index + 1;
-      } else index += ticks.length - 1;
-      continue;
-    }
-    const image = value[index] === "!" && value[index + 1] === "[";
-    if (value[index] !== "[" && !image) continue;
-    const open = image ? index + 1 : index;
-    let at = open + 1;
-    let brackets = 1;
-    while (at < value.length && at - open <= 2048 && brackets) {
-      if (value[at] === "\\" && at + 1 < value.length) at += 2;
-      else {
-        if (value[at] === "[") brackets += 1;
-        else if (value[at] === "]") brackets -= 1;
-        at += 1;
-      }
-    }
-    if (brackets) {
-      index = at - 1;
-      continue;
-    }
-    if (value[at] !== "(") continue;
-    let parentheses = 1;
-    let angle = false;
-    let quote = "";
-    at += 1;
-    while (at < value.length && at - index <= 4096 && parentheses) {
-      const character = value[at]!;
-      if (character === "\\" && at + 1 < value.length) at += 2;
-      else {
-        if (!quote && character === "<") angle = true;
-        else if (!quote && character === ">") angle = false;
-        else if (!angle && (character === '"' || character === "'"))
-          quote = quote === character ? "" : quote || character;
-        else if (!angle && !quote && character === "(") parentheses += 1;
-        else if (!angle && !quote && character === ")") parentheses -= 1;
-        at += 1;
-      }
-    }
-    if (parentheses) {
-      index = at - 1;
-      continue;
-    }
-    const candidate = value.slice(index, at);
-    const tokens = Lexer.lexInline(candidate, { gfm: false });
-    if (tokens.length !== 1 || (tokens[0]?.type !== "link" && tokens[0]?.type !== "image")) continue;
-    flush(index);
-    output.push(...markdownInline(candidate, issues, references));
-    cursor = at;
-    index = at - 1;
-  }
-  flush(value.length);
-  return output;
-}
-
 function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
   const plain = unescapeMarkdown(value, true);
   if (plain !== null) return inline(plain);
-  if (value.length > 4096) return simplifiedMarkdownInline(value, issues, references);
+  if (value.length > 8192) return boundedMarkdownInline(value, issues, references);
   const output: ProseMirrorJson[] = [];
   const append = (text: string, marks: ProseMirrorJson["marks"] = []) => {
     if (!text) return;
@@ -218,12 +144,87 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
   return output;
 }
 
+function boundedMarkdownInline(value: string, issues: ImportIssue[], references: string[]) {
+  issues.push({ code: "inline_markup_simplified", detail: "Long inline content was parsed in bounded sections." });
+  const output: ProseMirrorJson[] = [];
+  const append = (section: ProseMirrorJson[]) => {
+    for (const node of section) {
+      const previous = output.at(-1);
+      if (node.type === "text" && !node.marks && previous?.type === "text" && !previous.marks)
+        previous.text = (previous.text ?? "") + (node.text ?? "");
+      else output.push(node);
+    }
+  };
+  let start = 0;
+  while (start < value.length) {
+    if (value.length - start <= 8192) {
+      append(markdownInline(value.slice(start), issues, references));
+      break;
+    }
+    let bracketDepth = 0;
+    let destinationDepth = 0;
+    let angle = false;
+    let codeTicks = 0;
+    const emphasis = new Set<string>();
+    let lastSafe = -1;
+    for (let index = start; index < start + 8192; index += 1) {
+      const character = value[index]!;
+      if (character === "\\" && ESCAPABLE_MARKDOWN.test(value[index + 1] ?? "")) {
+        index += 1;
+        continue;
+      }
+      if (character === "`") {
+        let end = index + 1;
+        while (value[end] === "`") end += 1;
+        const count = end - index;
+        if (!codeTicks || codeTicks === count) codeTicks = codeTicks ? 0 : count;
+        index = end - 1;
+        continue;
+      }
+      if (codeTicks) continue;
+      if (character === "<" && !angle) angle = true;
+      else if (character === ">") angle = false;
+      else if (character === "[") bracketDepth += 1;
+      else if (character === "]" && bracketDepth) {
+        bracketDepth -= 1;
+        if (!bracketDepth && value[index + 1] === "(") destinationDepth = 1;
+      } else if (character === "(" && destinationDepth) destinationDepth += 1;
+      else if (character === ")" && destinationDepth) destinationDepth -= 1;
+      else if ((character === "*" || character === "_") && !bracketDepth && !destinationDepth) {
+        const count = value[index + 1] === character ? 2 : 1;
+        const marker = character.repeat(count);
+        if (emphasis.has(marker)) emphasis.delete(marker);
+        else emphasis.add(marker);
+        index += count - 1;
+      }
+      if (/\s/.test(character) && !codeTicks && !bracketDepth && !destinationDepth && !angle && !emphasis.size)
+        lastSafe = index + 1;
+    }
+    let cut = lastSafe > start + 4096 ? lastSafe : start + 8192;
+    if (value[cut - 1] === "\\" && ESCAPABLE_MARKDOWN.test(value[cut] ?? "")) cut -= 1;
+    append(markdownInline(value.slice(start, cut), issues, references));
+    start = cut;
+  }
+  return output;
+}
+
 function markdownImage(value: string) {
   const trimmed = value.trim();
-  if (!trimmed.startsWith("![") || trimmed.length > 4096) return null;
+  if (!trimmed.startsWith("![") || trimmed.length > 64_000) return null;
   const tokens = Lexer.lexInline(trimmed, { gfm: false });
   const image = tokens.length === 1 && tokens[0]?.type === "image" ? tokens[0] : null;
-  return image ? { label: unescapeMarkdown(image.text), href: image.href } : null;
+  if (!image) return null;
+  let end = 2;
+  let depth = 1;
+  while (end < trimmed.length && depth) {
+    if (trimmed[end] === "\\" && end + 1 < trimmed.length) end += 2;
+    else {
+      if (trimmed[end] === "[") depth += 1;
+      else if (trimmed[end] === "]") depth -= 1;
+      end += 1;
+    }
+  }
+  return { label: unescapeMarkdown(trimmed.slice(2, end - 1)), href: image.href };
 }
 
 export function markdownToDocument(source: string) {

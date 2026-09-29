@@ -180,7 +180,7 @@ describe("import content", () => {
     const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
     expect(content).toEqual([{ type: "text", text: `**${".".repeat(40_000)}` }]);
     expect(parsed.issues).toEqual([
-      { code: "inline_markup_simplified", detail: "Long inline content was simplified." },
+      { code: "inline_markup_simplified", detail: "Long inline content was parsed in bounded sections." },
     ]);
     const plain = markdownToDocument("\\.".repeat(40_000));
     expect(plain.issues).toEqual([]);
@@ -202,15 +202,15 @@ describe("import content", () => {
     expect(content.map((node) => node.text).join("")).toContain(".".repeat(20_000));
     expect(parsed.issues).toContainEqual({
       code: "inline_markup_simplified",
-      detail: "Long inline content was simplified.",
+      detail: "Long inline content was parsed in bounded sections.",
     });
   });
 
   it("keeps escaped backslashes in link and block image destinations", () => {
     const link = markdownToDocument(String.raw`[doc](folder\\_name/file.md)`);
-    expect(link.references).toEqual(["folder%5C_name/file.md"]);
+    expect(link.references).toEqual(["folder/_name/file.md"]);
     const image = markdownToDocument(String.raw`![diagram](folder\\_name/file.png)`);
-    expect(image.references).toEqual(["folder%5C_name/file.png"]);
+    expect(image.references).toEqual(["folder/_name/file.png"]);
   });
 
   it("preserves Slack and nested-path links when a long paragraph is simplified", () => {
@@ -239,6 +239,36 @@ describe("import content", () => {
     expect(parsed.document.content![0]!.content![0]!.content![0]!.attrs).toMatchObject({
       caption: "my_diagram *v2*",
       name: "my_diagram *v2*",
+    });
+  });
+
+  it("keeps ordinary rich text above four kilobytes and long link destinations", () => {
+    const ordinary = markdownToDocument(`${"word ".repeat(900)}**Important** <https://example.com>`);
+    expect(ordinary.references).toEqual(["https://example.com"]);
+    expect(ordinary.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: "Important",
+      marks: [{ type: "bold" }],
+    });
+    const url = `https://example.com/${"a".repeat(4090)}`;
+    expect(markdownToDocument(`[long](<${url}>) ${"word ".repeat(1800)}`).references).toContain(url);
+  });
+
+  it("keeps a large embedded block image as an image", () => {
+    const data = `data:image/png;base64,${"A".repeat(8192)}`;
+    const parsed = markdownToDocument(`![logo](${data})`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("image");
+    expect(parsed.references).toEqual([data]);
+  });
+
+  it("uses Marked link and code rules in long content", () => {
+    const suffix = " word".repeat(1800);
+    const parsed = markdownToDocument(`[Bob's notes](Bob's%20notes%20abc123.md) \`a\`\`b\` [Spec](spec.md)${suffix}`);
+    expect(parsed.references).toEqual(["Bob's%20notes%20abc123.md", "spec.md"]);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.content).toContainEqual({
+      type: "text",
+      text: "a``b",
+      marks: [{ type: "code" }],
     });
   });
 

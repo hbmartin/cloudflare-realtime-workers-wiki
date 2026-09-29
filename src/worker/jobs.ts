@@ -3,6 +3,7 @@ import {
   captureFeedbackStatement,
   deliverSlackCaptureFeedback,
   failCaptureForJobStatement,
+  isSlackCaptureId,
   prepareSlackCapture,
 } from "./slack-capture";
 import {
@@ -747,7 +748,7 @@ export async function startJobExecution(
   job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt"> & Partial<Pick<JobRow, "correlation_id">>,
 ) {
   // An unlinked receipt must be re-staged before creating a Workflow instance.
-  if (/^[0-9a-f]{32}$/.test(job.id) && (await hasUnlinkedCapture(env, job.id))) return;
+  if (isSlackCaptureId(job.id) && (await hasUnlinkedCapture(env, job.id))) return;
   if (env.WORKFLOW_INLINE !== "true") return startJobWorkflow(env, job);
   const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(job.id, job.attempt)
@@ -773,9 +774,12 @@ export async function startJobExecution(
     )
       .bind(row.id, row.attempt, row.workflow_instance_id ?? row.id)
       .first<JobRow>();
-    if (current?.status === "running" && (await shouldRequeueCapture(env, current, error))) {
-      await replaceCaptureWorkflow(env, current, "running");
-      return;
+    if (current?.status === "running") {
+      const recovery = await shouldRequeueCapture(env, current, error);
+      if (recovery) {
+        await replaceCaptureWorkflow(env, current, "running", recovery === "lookup_failed");
+        return;
+      }
     }
     if (current?.status === "running") await failJobWithCleanup(env, current, error);
     throw error;
@@ -808,23 +812,30 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
       { jobId: job.id },
       lookupError,
     );
-    // Preserve the capture for a fresh Workflow attempt when the receipt state
-    // cannot be checked. A D1 outage must not send a false failure to Slack.
-    return true;
+    // Defer recovery until D1 can distinguish an unlinked receipt from a real
+    // import failure. Neither outcome is safe to assume during an outage.
+    return "lookup_failed" as const;
   });
 }
 
-async function replaceCaptureWorkflow(env: Env, job: JobRow, expectedStatus: "running" | "queued") {
+async function replaceCaptureWorkflow(
+  env: Env,
+  job: JobRow,
+  expectedStatus: "running" | "queued",
+  deferForLookup = false,
+) {
   const instanceId = crypto.randomUUID();
   const returned = await env.DB.prepare(
-    `UPDATE jobs SET status='queued',workflow_instance_id=?,progress_label='Queued',
-       error_code=NULL,error_message=NULL,updated_at=?
+    `UPDATE jobs SET status='queued',workflow_instance_id=?,progress_label=?,
+       error_code=?,error_message=NULL,updated_at=?
      WHERE id=? AND attempt=? AND status=?
        AND COALESCE(workflow_instance_id,id)=?`,
   )
     .bind(
       instanceId,
-      Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS,
+      deferForLookup ? "Waiting to check Slack receipt" : "Queued",
+      deferForLookup ? "capture_lookup_unavailable" : null,
+      Date.now() - (deferForLookup ? 0 : QUEUED_JOB_RECOVERY_DELAY_MS),
       job.id,
       job.attempt,
       expectedStatus,
@@ -833,6 +844,7 @@ async function replaceCaptureWorkflow(env: Env, job: JobRow, expectedStatus: "ru
     .run();
   if (!returned.meta.changes) return false;
   await notifyJobs(env, job.workspace_id);
+  if (deferForLookup) return true;
   // prepareSlackCapture may have linked the receipt using the old workflow id
   // while this catch was running. Start the replacement immediately in that case.
   const linked = await env.DB.prepare(
@@ -1325,8 +1337,9 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         return;
       }
       if (current.status !== "running") return;
-      if (await shouldRequeueCapture(this.env, current, error)) {
-        await replaceCaptureWorkflow(this.env, current, "running");
+      const recovery = await shouldRequeueCapture(this.env, current, error);
+      if (recovery) {
+        await replaceCaptureWorkflow(this.env, current, "running", recovery === "lookup_failed");
         return;
       }
       await failJobWithCleanup(this.env, current, error);

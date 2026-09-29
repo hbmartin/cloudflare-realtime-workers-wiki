@@ -565,7 +565,7 @@ describe("D1 migrations", () => {
     ).toEqual({ last_failed_job_attempt: 3 });
   });
 
-  it("preserves the running attempt to avoid duplicate failure feedback", async () => {
+  it("does not infer the failed attempt from a later capture timestamp", async () => {
     await applyD1Migrations(
       env.DB,
       env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0055"),
@@ -587,7 +587,7 @@ describe("D1 migrations", () => {
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
     expect(
       await env.DB.prepare(`SELECT last_failed_job_attempt FROM slack_captures WHERE id='capture'`).first(),
-    ).toEqual({ last_failed_job_attempt: 4 });
+    ).toEqual({ last_failed_job_attempt: 3 });
   });
 
   it("preserves preloaded account security when a restore inserts the user row later", async () => {
