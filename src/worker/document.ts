@@ -901,9 +901,14 @@ export class Document extends YServer {
           } catch {
             return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
           }
-          if (!this.metadata.dirty && !this.compaction) return this.onRequestObserved(request);
-          return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
+          row = await this.bindings.DB.prepare(
+            `SELECT sequence,r2_key,content_hash FROM ${table} WHERE page_id=? AND content_epoch=?`,
+          )
+            .bind(pageId, epoch)
+            .first<{ sequence: number; r2_key: string; content_hash: string }>();
+          stored = row ? await this.bindings.BUCKET.get(row.r2_key) : null;
         }
+        if (!stored) return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
         let envelope: { pageId: string; contentEpoch: number; sequence: number };
         try {
           envelope = await stored.json();

@@ -157,6 +157,29 @@ describe("Notion Markdown block mutations", () => {
     expect(JSON.stringify(operations)).not.toContain(math.attrs.id);
   });
 
+  it("preserves an opaque math marker while editing neighboring paragraphs", () => {
+    const { first, second } = fixture();
+    const math = {
+      type: "blockContainer",
+      attrs: { id: crypto.randomUUID() },
+      content: [{ type: "math", attrs: { formula: "a$$b" } }],
+    };
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, math, second] }] };
+    const projection = projectNotionMarkdown(document);
+    expect(projection.markdown).toContain('<unknown url="notion://blocks/');
+    const command = parseMarkdownCommand(
+      {
+        type: "replace_content",
+        replace_content: {
+          new_str: projection.markdown.replace("First", "Updated first").replace("Second", "Updated second"),
+        },
+      },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false);
+    expect(JSON.stringify(operations)).not.toContain(math.attrs.id);
+  });
+
   it("preserves display math when replacement text uses CRLF separators", () => {
     const { first, second } = fixture();
     const math = {

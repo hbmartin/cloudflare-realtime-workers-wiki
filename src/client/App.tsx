@@ -814,6 +814,7 @@ async function resolveAppState(alreadyPurgedAccount?: string): Promise<AppState>
     if (accountKey === alreadyPurgedAccount) continue;
     try {
       await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
+      clearLiveRecoveryCopies(accountKey);
     } catch (error) {
       return {
         screen: "signout-cleanup",
@@ -947,6 +948,7 @@ export function App() {
   useEffect(() => {
     const onLocalSignOut = (event: StorageEvent) => {
       if (event.key !== LOCAL_SIGNOUT_KEY || !event.newValue) return;
+      clearLiveRecoveryCopies(event.newValue);
       invalidateUnauthorizedRequests();
       showState({ screen: "signin" });
     };
@@ -999,6 +1001,7 @@ export function App() {
       showState({ screen: "loading" });
       try {
         await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
+        clearLiveRecoveryCopies(accountKey);
         await load(accountKey);
       } catch (error) {
         showState({

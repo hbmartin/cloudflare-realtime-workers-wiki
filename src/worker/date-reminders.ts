@@ -176,7 +176,11 @@ export async function putDateReminder(
       )
         .bind(page.id, page.content_epoch)
         .first<{ sequence: number }>();
-      if (projection?.sequence !== sequence) continue;
+      if (!projection) throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
+      if (projection.sequence !== sequence) {
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+        continue;
+      }
     }
     const savedRow =
       row ??
