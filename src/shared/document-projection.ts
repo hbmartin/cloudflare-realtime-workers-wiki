@@ -74,7 +74,7 @@ function escapeMarkdownInline(value: string) {
 // Block-level constructs are only meaningful at the start of a line.
 function escapeMarkdownText(value: string) {
   return escapeMarkdownInline(value).replace(
-    /(^|\n)([ \t]*)(#{1,6}(?=\s|$)|>|[-+](?=\s|$)|\d{1,9}[.)](?=\s|$)|={2,}$|-{2,}$)/g,
+    /(^|\n)([ \t]*)(#{1,6}(?=\s|$)|>|[-+](?=\s|$)|\d{1,9}[.)](?=\s|$)|={2,}$|-{2,}$|_{3,}$|~{3,})/g,
     (_match, lineStart: string, indent: string, token: string) => `${lineStart}${indent}\\${token}`,
   );
 }
@@ -108,6 +108,7 @@ function safeUrl(value: unknown) {
 }
 
 function markdownCodeSpan(value: string) {
+  value = value.replaceAll(/\r?\n/g, " ");
   let longestRun = 0;
   for (const match of value.matchAll(/`+/g)) longestRun = Math.max(longestRun, match[0].length);
   const delimiter = "`".repeat(longestRun + 1);
@@ -308,15 +309,26 @@ function serializeNode(
     const nested = children.filter((child) => NESTED_BLOCK_TYPES.has(child.type ?? ""));
     const own = children.filter((child) => !NESTED_BLOCK_TYPES.has(child.type ?? ""));
     const label = own.map((child) => serializeInline(child, format)).join("");
-    const nestedOutput = nested.map((child) => serializeNode(child, format, depth + 1, options)).join("");
+    let nestedOutput = nested.map((child) => serializeNode(child, format, depth + 1, options)).join("");
     if (format === "html") return `<li>${label}${nestedOutput}</li>`;
     const marker =
       type === "numberedListItem" ? "1." : type === "checkListItem" ? `- [${node.attrs?.checked ? "x" : " "}]` : "-";
+    if (type === "numberedListItem")
+      nestedOutput = nestedOutput
+        .split("\n")
+        .map((line) => (line ? ` ${line}` : line))
+        .join("\n");
     return `${"  ".repeat(depth)}${marker} ${label.trim()}\n${nestedOutput}`;
   }
   if (type === "codeBlock" || type === "code") {
     const suppliedLanguage = stringAttr(node, "language") ?? "";
-    const language = /^[\w.+-]{0,64}$/.test(suppliedLanguage) ? suppliedLanguage : "";
+    const language =
+      suppliedLanguage.length <= 64 &&
+      !Array.from(suppliedLanguage).some(
+        (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127 || character === "`",
+      )
+        ? suppliedLanguage
+        : "";
     const code = nodeText(node);
     const fence = markdownFence(code, "`");
     return format === "html"
@@ -326,7 +338,7 @@ function serializeNode(
   if (type === "divider" || type === "horizontalRule") return format === "html" ? "<hr>" : "---\n\n";
   if (["image", "audio", "video", "file", "pdf"].includes(type)) {
     const source = safeUrl(node.attrs?.url) ?? "";
-    const url = safeUrl(options.mediaHref?.(source) ?? source) ?? "";
+    const url = safeUrl(options.mediaHref ? options.mediaHref(source) : source) ?? "";
     const caption = stringAttr(node, "caption") ?? type;
     if (format === "markdown") {
       const label = escapeMarkdownInline(caption);
@@ -346,10 +358,9 @@ function serializeNode(
   }
   if (type === "math") {
     const formula = stringAttr(node, "formula") ?? nodeText(node);
-    const fence = markdownFence(formula, "$");
     return format === "html"
       ? `<div class="math" data-formula="${escapeHtml(formula)}"><pre>${escapeHtml(formula)}</pre></div>`
-      : `${fence}\n${formula}\n${fence}\n\n`;
+      : `$$\n${formula.replaceAll("$$", "\\$\\$")}\n$$\n\n`;
   }
   if (type === "mermaid") {
     const source = stringAttr(node, "source") ?? nodeText(node);

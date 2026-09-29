@@ -42,6 +42,27 @@ describe("Notion Markdown projection", () => {
     expect(projection.markdown).not.toContain("Line 1001");
   });
 
+  it("marks an oversized middle block and omits later content as a suffix", () => {
+    const first = notionInputToBlockContainer({ paragraph: { rich_text: [{ text: { content: "First" } }] } });
+    const huge = {
+      type: "blockContainer",
+      attrs: { id: "oversized-block" },
+      content: [{ type: "paragraph", content: [{ type: "text", text: "x".repeat(600_000) }] }],
+    } as ReturnType<typeof notionInputToBlockContainer>;
+    const last = notionInputToBlockContainer({ paragraph: { rich_text: [{ text: { content: "Last" } }] } });
+    const projection = projectNotionMarkdown(page(first, huge, last));
+    expect(projection.truncated).toBe(true);
+    expect(projection.unknownBlockIds).toEqual([huge.attrs!.id, last.attrs!.id]);
+    expect(projection.markdown).toContain("notion://blocks/oversized-block");
+    expect(projection.markdown).not.toContain("\nLast\n");
+  });
+
+  it("keeps consecutive list items tight", () => {
+    const first = notionInputToBlockContainer({ bulleted_list_item: { rich_text: [{ text: { content: "One" } }] } });
+    const second = notionInputToBlockContainer({ bulleted_list_item: { rich_text: [{ text: { content: "Two" } }] } });
+    expect(projectNotionMarkdown(page(first, second)).markdown).toBe("- One\n- Two\n");
+  });
+
   it("uses an inert marker for unsupported content, including nested content", () => {
     const bookmark = notionInputToBlockContainer({ bookmark: { url: "https://example.test" } });
     const nested = notionInputToBlockContainer({

@@ -121,7 +121,7 @@ describe("Notion-compatible API", () => {
       truncated: false,
       unknown_block_ids: [],
     });
-    await client.pages.create({
+    const child = await client.pages.create({
       parent: { type: "page_id", page_id: installed.pageId },
       properties: { title: { type: "title", title: [{ text: { content: "Child specification" } }] } },
     });
@@ -129,6 +129,12 @@ describe("Notion-compatible API", () => {
     expect(withChild.markdown).toContain("Child specification");
     expect(withChild.markdown).toContain("?page=");
     expect(withChild.unknown_block_ids).toEqual([]);
+    await env.DB.prepare(`UPDATE pages SET is_template=1 WHERE id=?`).bind(child.id).run();
+    const withoutTemplate = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(withoutTemplate.markdown).not.toContain("Child specification");
+    await env.DB.prepare(`UPDATE pages SET is_template=0,import_job_id='staged' WHERE id=?`).bind(child.id).run();
+    const withoutStaged = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(withoutStaged.markdown).not.toContain("Child specification");
     const missing = await SELF.fetch(notionRequest("invalid", `/pages/${installed.pageId}/markdown`));
     expect(missing.status).toBe(401);
     const deniedCapability = await SELF.fetch(

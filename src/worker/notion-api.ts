@@ -12,7 +12,7 @@ import {
   type NotionBlock,
 } from "../shared/notion-blocks";
 import { constantTimeEqual, hmacSha256Hex } from "../shared/security";
-import { projectNotionMarkdown } from "../shared/notion-markdown";
+import { MAX_MARKDOWN_BLOCKS, MAX_UNKNOWN_BLOCK_IDS, projectNotionMarkdown } from "../shared/notion-markdown";
 import type { Comment, CommentThread, DocumentContentEnvelope, WorkspaceEvent } from "../shared/types";
 import { PAGE_TITLE_MAX } from "../shared/validation";
 import { processArchiveDisconnectTargets } from "./archive";
@@ -483,15 +483,26 @@ async function metadataForPage(env: Env, pageId: string) {
   return new Map(rows.results.map((row) => [row.internal_id, row]));
 }
 
+function localAttachmentId(rawUrl: string, baseUrl: string) {
+  try {
+    const url = new URL(rawUrl, baseUrl);
+    if (url.origin !== new URL(baseUrl).origin) return null;
+    return /^\/api\/attachments\/([A-Za-z0-9_-]+)\/?$/.exec(url.pathname)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function blockObject(env: Env, page: IntegrationPage, block: NotionBlock, metadata: Map<string, BlockMetadata>) {
   const record = metadata.get(block.internalId);
   const payload = notionPayloadForBlock(block);
   if (["image", "video", "audio", "file", "pdf"].includes(payload.type)) {
     const external = payload.payload.external as { url?: unknown } | undefined;
-    const match = typeof external?.url === "string" ? /\/api\/attachments\/([A-Za-z0-9_-]+)/.exec(external.url) : null;
-    if (match?.[1]) {
+    const attachmentId =
+      typeof external?.url === "string" ? localAttachmentId(external.url, env.BETTER_AUTH_URL) : null;
+    if (attachmentId) {
       const attachment = await env.DB.prepare(`SELECT id FROM attachments WHERE id = ? AND page_id = ?`)
-        .bind(match[1], page.id)
+        .bind(attachmentId, page.id)
         .first<{ id: string }>();
       if (attachment) {
         const expires = Date.now() + 60 * 60_000;
@@ -652,15 +663,37 @@ notionApi.get("/pages/:pageId/markdown", async (c) => {
   capability(principal, "readContent");
   const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
   const snapshot = await liveDocument(c.env, page);
+  const referencedAttachments = new Set<string>();
+  const linkedPages = new Set<string>();
+  const visit = (node: DocumentContentEnvelope["document"]) => {
+    if (node.type === "linkToPage" && typeof node.attrs?.pageId === "string") linkedPages.add(node.attrs.pageId);
+    if (["image", "video", "audio", "file", "pdf"].includes(node.type ?? "") && typeof node.attrs?.url === "string") {
+      const id = localAttachmentId(node.attrs.url, c.req.url);
+      if (id && referencedAttachments.size < MAX_MARKDOWN_BLOCKS) referencedAttachments.add(id);
+    }
+    for (const child of node.content ?? []) visit(child);
+  };
+  visit(snapshot.document);
   const [metadata, id, attachments, childPages] = await Promise.all([
     metadataForPage(c.env, page.id),
     publicPageId(c.env, page.id),
-    c.env.DB.prepare(`SELECT id FROM attachments WHERE page_id = ?`).bind(page.id).all<{ id: string }>(),
+    referencedAttachments.size
+      ? c.env.DB.prepare(`SELECT id FROM attachments WHERE page_id = ? AND id IN (SELECT value FROM json_each(?))`)
+          .bind(page.id, JSON.stringify([...referencedAttachments]))
+          .all<{ id: string }>()
+      : Promise.resolve({ results: [] as Array<{ id: string }> }),
     c.env.DB.prepare(
       `SELECT id, title FROM pages WHERE parent_id = ? AND workspace_id = ? AND archived_at IS NULL
-       AND kind = 'document' ORDER BY position, id LIMIT 1101`,
+       AND import_job_id IS NULL AND is_template=0 AND kind = 'document'
+       AND id NOT IN (SELECT value FROM json_each(?))
+       ORDER BY position, id LIMIT ?`,
     )
-      .bind(page.id, principal.workspaceId)
+      .bind(
+        page.id,
+        principal.workspaceId,
+        JSON.stringify([...linkedPages]),
+        MAX_MARKDOWN_BLOCKS + MAX_UNKNOWN_BLOCK_IDS + 1,
+      )
       .all<{ id: string; title: string }>(),
   ]);
   const signedMedia = new Map(
@@ -690,8 +723,16 @@ notionApi.get("/pages/:pageId/markdown", async (c) => {
     {
       pageHref: (pageId) => new URL(`/?page=${encodeURIComponent(pageId)}`, c.req.url).toString(),
       mediaHref: (url) => {
-        const match = /^\/api\/attachments\/([A-Za-z0-9_-]+)(?:[?#]|$)/.exec(url);
-        return match ? (signedMedia.get(match[1]!) ?? null) : url;
+        const attachmentId = localAttachmentId(url, c.req.url);
+        if (attachmentId) return signedMedia.get(attachmentId) ?? null;
+        try {
+          const parsed = new URL(url, c.req.url);
+          if (parsed.origin === new URL(c.req.url).origin && parsed.pathname.startsWith("/api/attachments/"))
+            return null;
+        } catch {
+          return null;
+        }
+        return url;
       },
     },
     childBlocks,

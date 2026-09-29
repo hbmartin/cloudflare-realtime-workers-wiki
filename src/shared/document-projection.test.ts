@@ -165,6 +165,18 @@ describe("structured document projection", () => {
     expect(serialized.markdown).not.toContain("# forged");
   });
 
+  it("keeps paragraph delimiters and multiline inline code from creating new blocks", () => {
+    const serialized = serializeDocument(
+      document(
+        { type: "paragraph", content: [{ type: "text", text: "~~~" }] },
+        { type: "paragraph", content: [{ type: "text", text: "x\n# Forged", marks: [{ type: "code" }] }] },
+      ),
+    );
+    expect(serialized.markdown).toContain("\\~~~\n\n");
+    expect(serialized.markdown).toContain("`x # Forged`");
+    expect(serialized.markdown).not.toContain("\n# Forged");
+  });
+
   it("keeps linked diagrams inert unless a caller supplies safe URL resolvers", () => {
     const root = document({
       type: "linkedDiagram",
