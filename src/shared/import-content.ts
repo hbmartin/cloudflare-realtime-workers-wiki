@@ -146,26 +146,33 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
 }
 
 type CodeRange = { start: number; openEnd: number; closeStart: number; end: number };
-type DataImage = { kind: "image"; start: number; end: number; label: string; href: string };
+type DataImage = { kind: "image"; start: number; end: number; label: string; href: string; unmatchedCode: boolean };
+const DATA_IMAGE_LABEL_LIMIT = 514;
 
 function closingParenWithin(value: string) {
   let nextClosing = -1;
   return (index: number) => {
     if (nextClosing < index) {
-      const found = value.indexOf(")", index);
-      nextClosing = found < 0 ? value.length : found;
+      const found = value.slice(index, index + 8192).indexOf(")");
+      nextClosing = found < 0 ? Math.min(value.length, index + 8192) : index + found;
     }
-    return nextClosing < value.length && nextClosing < index + 8192;
+    return value[nextClosing] === ")" && nextClosing < index + 8192;
   };
 }
 
 function inlineSpans(value: string, recognizeImages: boolean): { codes: CodeRange[]; images: DataImage[] } | null {
   const runs: Array<{ start: number; end: number; length: number; escaped: boolean }> = [];
   const boundedClose = closingParenWithin(value);
+  const destinations: Array<{ start: number; end: number }> = [];
+  const possibleOpeners = new Set<number>();
   let destinationDepth = 0;
   let destinationLimit = 0;
+  let destinationStart = -1;
   for (let index = 0; index < value.length; index += 1) {
-    if (destinationDepth && index >= destinationLimit) destinationDepth = 0;
+    if (destinationDepth && index >= destinationLimit) {
+      destinations.push({ start: destinationStart, end: index });
+      destinationDepth = 0;
+    }
     if (value[index] === "\\" && value[index + 1] !== "`") {
       index += 1;
       continue;
@@ -175,18 +182,27 @@ function inlineSpans(value: string, recognizeImages: boolean): { codes: CodeRang
       (destinationDepth || (value[index - 1] === "]" && !trailingEscape(value, index - 1) && boundedClose(index)))
     ) {
       destinationDepth += 1;
-      if (destinationDepth === 1) destinationLimit = index + 8192;
-    } else if (value[index] === ")" && destinationDepth) destinationDepth -= 1;
+      if (destinationDepth === 1) {
+        destinationStart = index;
+        destinationLimit = index + 8192;
+      }
+    } else if (value[index] === ")" && destinationDepth) {
+      destinationDepth -= 1;
+      if (!destinationDepth) destinations.push({ start: destinationStart, end: index + 1 });
+    }
     if (destinationDepth) continue;
     if (value[index] !== "`") continue;
     let end = index + 1;
     while (end < value.length && value[end] === "`") end += 1;
     const length = end - index;
-    runs.push({ start: index, end, length, escaped: trailingEscape(value, index) });
+    const escaped = trailingEscape(value, index);
+    if (!escaped || length > 1 || possibleOpeners.has(length)) runs.push({ start: index, end, length, escaped });
+    if (length > Number(escaped)) possibleOpeners.add(length - Number(escaped));
     // Keep hostile paragraphs with millions of delimiters inside Worker memory.
     if (runs.length > 100_000) return null;
     index = end - 1;
   }
+  if (destinationDepth) destinations.push({ start: destinationStart, end: Math.min(value.length, destinationLimit) });
   const next: number[] = [];
   const nextOfLength = new Map<number, number>();
   for (let index = runs.length - 1; index >= 0; index -= 1) {
@@ -197,10 +213,29 @@ function inlineSpans(value: string, recognizeImages: boolean): { codes: CodeRang
   }
   const codes: CodeRange[] = [];
   const images: DataImage[] = [];
+  if (!recognizeImages) {
+    for (let index = 0; index < runs.length; index += 1) {
+      const open = runs[index]!;
+      const closeIndex = next[index]!;
+      if (closeIndex < 0) continue;
+      const close = runs[closeIndex]!;
+      codes.push({
+        start: open.start + Number(open.escaped),
+        openEnd: open.end,
+        closeStart: close.start,
+        end: close.end,
+      });
+      index = closeIndex;
+    }
+    return { codes, images };
+  }
   let runIndex = 0;
+  let destinationIndex = 0;
   for (let position = 0; position < value.length; position += 1) {
     while (runs[runIndex] && runs[runIndex]!.end <= position) runIndex += 1;
-    if (recognizeImages && value[position] === "!" && value[position + 1] === "[") {
+    while (destinations[destinationIndex] && destinations[destinationIndex]!.end <= position) destinationIndex += 1;
+    const inDestination = destinations[destinationIndex] && destinations[destinationIndex]!.start <= position;
+    if (!inDestination && value[position] === "!" && value[position + 1] === "[") {
       const image = longDataImage(value, position);
       if (image) {
         images.push({ kind: "image", start: position, ...image });
@@ -252,13 +287,8 @@ function enclosingBracket(brackets: number[], value: string, start: number, anch
   return Infinity;
 }
 
-function safeInlineCut(
-  value: string,
-  start: number,
-  maximum: number,
-  codes: CodeRange[],
-  boundedClose: (index: number) => boolean,
-) {
+function safeInlineCut(value: string, start: number, maximum: number, codes: CodeRange[]) {
+  const boundedClose = closingParenWithin(value);
   const brackets: number[] = [];
   let parenDepth = 0;
   let linkStart = -1;
@@ -357,9 +387,37 @@ function safeDenseBoundary(value: string, boundary: number) {
   return parenDepth && linkStart >= 0 ? Math.min(linkStart, outer) : Math.min(outer, boundary);
 }
 
+function dataImageLabelEnd(value: string, start: number) {
+  let depth = 1;
+  const limit = Math.min(value.length, start + DATA_IMAGE_LABEL_LIMIT);
+  for (let index = start + 2; index < limit; index += 1) {
+    if (value[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (value[index] === "[") depth += 1;
+    else if (value[index] === "]" && --depth === 0) return value[index + 1] === "(" ? index : null;
+  }
+  return null;
+}
+
+function unmatchedLabelBacktick(value: string) {
+  if (!value.includes("`")) return false;
+  const codes = codeRanges(value) ?? [];
+  let codeIndex = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    if (codes[codeIndex]?.start === index) {
+      index = codes[codeIndex]!.end - 1;
+      codeIndex += 1;
+    } else if (value[index] === "\\") index += 1;
+    else if (value[index] === "`") return true;
+  }
+  return false;
+}
+
 function longDataImage(value: string, start: number) {
   if (!value.startsWith("![", start) || trailingEscape(value, start)) return null;
-  const labelEnd = linkLabelEnd(value, start, 514);
+  const labelEnd = dataImageLabelEnd(value, start);
   if (labelEnd === null) return null;
   const destinationStart = labelEnd + 2;
   const prefix = /^data:image\/(?:png|gif|jpeg|webp);base64,/i.exec(
@@ -380,7 +438,8 @@ function longDataImage(value: string, start: number) {
   if (value[end] !== ")") return null;
   const href = safeLink(value.slice(destinationStart, payloadEnd));
   if (!href) return null;
-  return { label: unescapeMarkdown(value.slice(start + 2, labelEnd)), href, end: end + 1 };
+  const rawLabel = value.slice(start + 2, labelEnd);
+  return { label: unescapeMarkdown(rawLabel), href, end: end + 1, unmatchedCode: unmatchedLabelBacktick(rawLabel) };
 }
 
 function linkLabelEnd(value: string, start: number, maximum: number) {
@@ -470,15 +529,11 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
     return output;
   }
   const { codes: effectiveCodes } = spans;
-  const specials: Array<
-    | { kind: "image"; start: number; end: number; label: string; href: string }
-    | { kind: "code"; start: number; end: number; openEnd: number; closeStart: number }
-  > = effectiveCodes.filter((range) => range.end - range.start > 8192).map((range) => ({ kind: "code", ...range }));
-  let codeIndex = 0;
+  const specials: Array<DataImage | (CodeRange & { kind: "code" })> = effectiveCodes
+    .filter((range) => range.end - range.start > 8192)
+    .map((range) => ({ kind: "code", ...range }));
   for (const image of spans.images) {
-    if (image.end - image.start <= 8192 && !image.label.includes("`")) continue;
-    while (effectiveCodes[codeIndex] && effectiveCodes[codeIndex]!.end <= image.start) codeIndex += 1;
-    if (effectiveCodes[codeIndex] && effectiveCodes[codeIndex]!.start <= image.start) continue;
+    if (image.end - image.start <= 8192 && !image.unmatchedCode) continue;
     specials.push(image);
   }
   specials.sort((left, right) => left.start - right.start);
@@ -496,8 +551,8 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
     let sectionCodeIndex = 0;
     let cursor = 0;
     let candidates = 0;
-    const lowerSection = section.toLowerCase();
-    let nextDataImage = lowerSection.indexOf("data:image/");
+    const dataImagePattern = /data:image\//gi;
+    let nextDataImage = dataImagePattern.exec(section)?.index ?? -1;
     for (let index = 0; index < section.length; index += 1) {
       while (sectionCodes[sectionCodeIndex] && sectionCodes[sectionCodeIndex]!.end <= index) sectionCodeIndex += 1;
       const character = section[index];
@@ -519,9 +574,8 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
       if (character !== "[" && !(character === "!" && section[index + 1] === "[")) continue;
       const start = index;
       if (++candidates > 128) {
-        while (nextDataImage >= 0 && nextDataImage < start)
-          nextDataImage = lowerSection.indexOf("data:image/", nextDataImage + 1);
-        if (character === "!" && nextDataImage >= 0 && nextDataImage - start <= 515) {
+        while (nextDataImage >= 0 && nextDataImage < start) nextDataImage = dataImagePattern.exec(section)?.index ?? -1;
+        if (character === "!" && nextDataImage >= 0 && nextDataImage - start <= DATA_IMAGE_LABEL_LIMIT + 1) {
           const image = longDataImage(section, start);
           if (image) {
             append(inline(unescapeMarkdown(section.slice(cursor, start))));
@@ -545,8 +599,7 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
           issues.push({ code: "unsafe_url", detail: simple.href.slice(0, 120) });
           append(inline(simple.label));
         } else if (section[start] === "!") {
-          references.push(href);
-          issues.push({ code: "image_not_imported", detail: href.slice(0, 120) });
+          recordImage({ href });
           append(inline(simple.label));
         } else {
           references.push(href);
@@ -567,7 +620,6 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
   };
   // Bound every Marked call. A malformed tag or escape can make its inline
   // scanner revisit the remainder of its input for each delimiter.
-  const boundedClose = closingParenWithin(value);
   let specialIndex = 0;
   for (let start = 0; start < value.length;) {
     while (specials[specialIndex] && specials[specialIndex]!.end <= start) specialIndex += 1;
@@ -587,7 +639,7 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
     }
     let cut = Math.min(start + 8192, value.length, special?.start ?? value.length);
     if (cut < value.length) {
-      cut = safeInlineCut(value, start, cut, effectiveCodes, boundedClose);
+      cut = safeInlineCut(value, start, cut, effectiveCodes);
       if (trailingEscape(value, cut, start) && value[cut] !== undefined) cut -= 1;
     }
     if (cut <= start) cut = Math.min(start + 8192, special?.start ?? value.length);

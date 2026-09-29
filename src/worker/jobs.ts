@@ -832,6 +832,20 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
         },
         error,
       );
+      logger.warn(
+        "workflow.capture_lookup.first_failed",
+        "workflow",
+        "First capture receipt lookup failed.",
+        { jobId: job.id, attempt: job.attempt },
+        lookupError,
+      );
+      logger.warn(
+        "workflow.capture_lookup.failed",
+        "workflow",
+        "Capture receipt lookup failed again.",
+        { jobId: job.id, attempt: job.attempt },
+        retryError,
+      );
       // The scheduled pass will retry when D1 can answer authoritatively.
     }
     // Defer recovery until D1 can distinguish an unlinked receipt from a real
@@ -1460,9 +1474,6 @@ export async function recoverQueuedJobs(env: Env) {
       );
     }
   };
-  let cleaned = 0;
-  for (; cleaned < Math.min(2, terminalCleanups.length); cleaned += 1) await cleanTerminal(terminalCleanups[cleaned]!);
-  let started = 0;
   for (const job of queued.results) {
     try {
       await startJobExecution(env, job);
@@ -1483,10 +1494,8 @@ export async function recoverQueuedJobs(env: Env) {
         );
       }
     }
-    started += 1;
-    if (started % 5 === 0 && cleaned < terminalCleanups.length) await cleanTerminal(terminalCleanups[cleaned++]!);
   }
-  for (; cleaned < terminalCleanups.length; cleaned += 1) await cleanTerminal(terminalCleanups[cleaned]!);
+  for (const job of terminalCleanups) await cleanTerminal(job);
   const cleanups = await env.DB.prepare(
     `SELECT id, attempt FROM jobs WHERE cleanup_target IS NOT NULL
       AND status IN (${CLEANUP_JOB_STATUS_SQL}) AND updated_at <= ?

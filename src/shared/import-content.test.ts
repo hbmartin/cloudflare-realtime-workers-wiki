@@ -440,6 +440,27 @@ describe("import content", () => {
     expect(JSON.stringify(parsed.document)).not.toContain("B".repeat(1_000));
   });
 
+  it("keeps small data images atomic when a label has an unmatched backtick", () => {
+    const first = "data:image/png;base64,AAAA";
+    const second = "data:image/png;base64,BBBB";
+    const parsed = markdownToDocument(`See ![a \` tick](${first}) ![b](${second}) then \`one\` ${"x".repeat(9_000)}`);
+    expect(parsed.references).toEqual([first, second]);
+  });
+
+  it("keeps a link wrapped around an image with balanced label code", () => {
+    const image = "data:image/png;base64,AAAA";
+    const parsed = markdownToDocument(`[![a \`b\` c](${image})](https://example.com/x) ${"x".repeat(9_000)}`);
+    expect(parsed.references).toContain(image);
+    expect(parsed.references).toContain("https://example.com/x");
+  });
+
+  it("does not recognize image syntax inside a link title", () => {
+    const parsed = markdownToDocument(
+      `[doc](https://x.test/p "see ![i \`x](data:image/png;base64,AAAA)") ${"x".repeat(9_000)}`,
+    );
+    expect(parsed.references).toEqual(["https://x.test/p"]);
+  });
+
   it("re-pairs code around an image with unmatched label punctuation", () => {
     const first = `data:image/png;base64,${"A".repeat(12_000)}`;
     const second = `data:image/png;base64,${"B".repeat(12_000)}`;
@@ -458,6 +479,11 @@ describe("import content", () => {
     });
   });
 
+  it("keeps references after many escaped backticks with no code opener", () => {
+    const parsed = markdownToDocument(`${"\\` ".repeat(100_001)}[later](later.md)`);
+    expect(parsed.references).toContain("later.md");
+  });
+
   it("strips a small data image after the dense link candidate limit", () => {
     const data = `data:image/png;base64,${"A".repeat(7_000)}`;
     const parsed = markdownToDocument(`${"\\.[".repeat(140)} ![i](${data}) ${"x".repeat(8192)}`);
@@ -470,6 +496,26 @@ describe("import content", () => {
     const parsed = markdownToDocument(`${"\\.[".repeat(140)} ![${"x".repeat(511)}](${data}) ${"x".repeat(8_192)}`);
     expect(parsed.references).toContain(data);
     expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
+  });
+
+  it("uses original string offsets for case-insensitive images after Unicode case expansion", () => {
+    const data = `data:image/png;base64,${"A".repeat(6_000)}`;
+    const parsed = markdownToDocument(`${"\\.[".repeat(140)} ${"İ".repeat(600)} ![i](${data}) ${"x".repeat(8_192)}`);
+    expect(parsed.references).toContain(data);
+    expect(JSON.stringify(parsed.document)).not.toContain("A".repeat(1_000));
+  });
+
+  it("keeps a nearby link when a later unclosed destination crosses a section cut", () => {
+    const parsed = markdownToDocument(
+      `${"x".repeat(8_100)} [a](a.md "t t") [c](${"x".repeat(8_300)} [later](later.md)`,
+    );
+    expect(parsed.references).toContain("a.md");
+    expect(parsed.references).toContain("later.md");
+  });
+
+  it("bounds repeated unclosed destinations across many sections", () => {
+    const parsed = markdownToDocument(("[a](b " + "x".repeat(8_200)).repeat(50) + " [end](end.md)");
+    expect(parsed.references).toContain("end.md");
   });
 
   it("keeps a link after an unmatched bracket and a long title-bearing link", () => {
