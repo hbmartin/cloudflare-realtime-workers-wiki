@@ -591,20 +591,34 @@ test("warns and offers export before offline sign-out removes pending edits", as
 
 test("can finish offline sign-out when database enumeration is unavailable", async ({ page, context }) => {
   await signInOwner(page);
+  await page.getByLabel("Page title").fill("Enumeration fallback draft");
+  await page.getByLabel("Page title").blur();
   await page.locator(".bn-editor").click();
   await page.keyboard.type("Cached before sign-out");
   await expect(page.locator(".bn-editor")).toContainText("Cached before sign-out");
   await context.setOffline(true);
   await page.reload();
   await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
-  await page.evaluate(() => Object.defineProperty(indexedDB, "databases", { value: undefined, configurable: true }));
+  await page.evaluate(() => {
+    const original = indexedDB.databases.bind(indexedDB);
+    (window as Window & { restoreDatabases?: () => void }).restoreDatabases = () =>
+      Object.defineProperty(indexedDB, "databases", { value: original, configurable: true });
+    Object.defineProperty(indexedDB, "databases", { value: undefined, configurable: true });
+  });
   await page.locator(".offline-document .bn-editor").click();
   await page.keyboard.type(" unsynced");
   await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
   await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
   await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
+  await expect(page.getByText("Enumeration fallback draft")).toBeVisible();
   await page.getByRole("button", { name: "Sign out and delete local copies" }).click();
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
+  expect(
+    await page.evaluate(async () => {
+      (window as Window & { restoreDatabases?: () => void }).restoreDatabases?.();
+      return (await indexedDB.databases()).filter((entry) => entry.name?.startsWith("account:")).length;
+    }),
+  ).toBe(0);
 });
 
 test("retains drafts from both epochs in the sign-out review", async ({ page, context }) => {

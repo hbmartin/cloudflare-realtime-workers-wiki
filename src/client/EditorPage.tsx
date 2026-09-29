@@ -42,6 +42,7 @@ import {
   offlineDocumentKey,
   pendingKeysOf,
   persistPendingDocumentUpdate,
+  rememberOfflineAccount,
   rememberOfflinePage,
   storageEpoch,
 } from "./offline-catalog";
@@ -206,6 +207,7 @@ export function EditorPage({
     let nextCatalogRepairAt = 0;
     let pendingRevision = 0;
     let storageFailed = false;
+    let clearRetryTimer: number | undefined;
     const beforeConnect = async () => {
       await pendingWrite;
       if (!active) return false;
@@ -247,6 +249,11 @@ export function EditorPage({
           window.location.reload();
           return false;
         }
+        offlineMember.current = currentMember;
+        await rememberOfflineAccount(currentMember).catch((error) => {
+          console.error("Unable to refresh offline account catalog", error);
+          if (active) setCatalogWarning("The offline page list could not be updated yet.");
+        });
         if (catalogNeedsRepair) {
           writePending(true);
           await pendingWrite;
@@ -356,7 +363,6 @@ export function EditorPage({
               true,
             );
             clearCurrentRecovery();
-            if (active) setCatalogWarning(null);
           }
         })
         .catch((error) => {
@@ -365,6 +371,14 @@ export function EditorPage({
             catalogNeedsRepair = true;
             nextCatalogRepairAt = Date.now() + 5_000;
             setCatalogWarning("Local changes are saved, but the offline page list could not be updated yet.");
+          } else if (!pending && active && revision === pendingRevision) {
+            pendingActive = true;
+            setCatalogWarning("Changes are synced, but the offline page list could not be updated yet.");
+            if (clearRetryTimer !== undefined) window.clearTimeout(clearRetryTimer);
+            clearRetryTimer = window.setTimeout(() => {
+              clearRetryTimer = undefined;
+              if (active && revision === pendingRevision && !next.hasUnsyncedChanges) writePending(false);
+            }, 5_000);
           }
         });
     };
@@ -473,7 +487,8 @@ export function EditorPage({
       next.provider.off("connection-close", connectionClose);
       next.provider.off("sync", connectionSync);
       next.doc.off("update", documentUpdate);
-      next.provider.disconnect();
+      if (clearRetryTimer !== undefined) window.clearTimeout(clearRetryTimer);
+      next.stop();
       void pendingWrite
         .catch(() => {})
         .then(async () => {

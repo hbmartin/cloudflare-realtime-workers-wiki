@@ -19,6 +19,7 @@ export type CollaborationBundle = {
    */
   ready: Promise<void>;
   readonly hasUnsyncedChanges: boolean;
+  stop: () => void;
   destroy: () => void;
 };
 
@@ -93,6 +94,7 @@ export function createCollaboration(
   let connectionAttempt = 0;
   let connecting = false;
   let destroyed = false;
+  let closed = false;
   let indexeddbSynced = false;
   const durability = new CollaborationDurability();
   const barrier = createDurabilityBarrier(provider, durability, 1_000);
@@ -111,6 +113,7 @@ export function createCollaboration(
     void (async () => {
       try {
         if (beforeConnect && !(await beforeConnect())) {
+          if (destroyed) return;
           provider.disconnect();
           onStatus("offline");
           return;
@@ -202,6 +205,20 @@ export function createCollaboration(
   };
   document.addEventListener("visibilitychange", visibility);
 
+  const stop = () => {
+    if (destroyed) return;
+    destroyed = true;
+    if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
+    barrier.destroy();
+    if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
+    document.removeEventListener("visibilitychange", visibility);
+    provider.off("status", handleStatus);
+    provider.off("sync", handleSync);
+    provider.off("custom-message", handleCustomMessage);
+    provider.awareness.setLocalState(null);
+    provider.destroy();
+  };
+
   return {
     doc,
     indexeddb,
@@ -210,17 +227,11 @@ export function createCollaboration(
     get hasUnsyncedChanges() {
       return durability.hasUnsyncedChanges;
     },
+    stop,
     destroy() {
-      destroyed = true;
-      if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
-      barrier.destroy();
-      if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
-      document.removeEventListener("visibilitychange", visibility);
-      provider.off("status", handleStatus);
-      provider.off("sync", handleSync);
-      provider.off("custom-message", handleCustomMessage);
-      provider.awareness.setLocalState(null);
-      provider.destroy();
+      stop();
+      if (closed) return;
+      closed = true;
       void indexeddb.destroy().catch((error) => {
         console.error("Failed to close offline document storage", error);
         void reportClientError("client.offline_storage_failed", error);

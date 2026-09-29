@@ -35,6 +35,17 @@ export type OfflinePage = {
 };
 
 const PENDING_MARKER = "noteflare-pending";
+const DOCUMENT_REGISTRY_PREFIX = "noteflare-document-keys:";
+
+function registeredDocumentKeys(accountKey: string): string[] | null {
+  const raw = localStorage.getItem(`${DOCUMENT_REGISTRY_PREFIX}${accountKey}`);
+  if (raw === null) return null;
+  const parsed: unknown = JSON.parse(raw);
+  const prefix = accountDocumentPrefix(accountKey);
+  if (!prefix || !Array.isArray(parsed) || !parsed.every((key) => typeof key === "string" && key.startsWith(prefix)))
+    throw new Error("Offline document registry is invalid.");
+  return parsed;
+}
 
 function openExistingDocument(key: string): Promise<IDBDatabase | null> {
   return new Promise((resolve, reject) => {
@@ -166,7 +177,17 @@ export function offlineAccountKey(member: Pick<ClientMemberContext, "user" | "wo
 }
 
 export function offlineDocumentKey(userId: string, workspaceId: string, pageId: string, epoch: number) {
-  return `account:${userId}:${workspaceId}:${pageId}:${epoch}:2`;
+  const key = `account:${userId}:${workspaceId}:${pageId}:${epoch}:2`;
+  if (typeof localStorage === "undefined") return key;
+  try {
+    const accountKey = `${userId}\u0000${workspaceId}`;
+    const entries = registeredDocumentKeys(accountKey) ?? [];
+    if (!entries.includes(key))
+      localStorage.setItem(`${DOCUMENT_REGISTRY_PREFIX}${accountKey}`, JSON.stringify([...entries, key]));
+  } catch (error) {
+    console.error("Offline document key could not be registered", error);
+  }
+  return key;
 }
 
 function accountDocumentPrefix(accountKey: string) {
@@ -178,6 +199,33 @@ function parseOfflineDocumentKey(key: string, prefix: string) {
   if (!key.startsWith(prefix)) return null;
   const match = /^([^:]+):(\d+):2$/.exec(key.slice(prefix.length));
   return match ? { pageId: match[1]!, epoch: Number(match[2]) } : null;
+}
+
+async function accountDocumentNames(accountKey: string, strict: boolean): Promise<string[]> {
+  let registered: string[] | null = null;
+  try {
+    registered = registeredDocumentKeys(accountKey);
+  } catch (error) {
+    if (strict) throw error;
+    console.error("Offline document registry could not be read", error);
+  }
+  if (!indexedDB.databases) {
+    if (strict && !registered) throw new Error("This browser cannot verify every saved document before sign-out.");
+    return registered ?? [];
+  }
+  try {
+    const databases = await indexedDB.databases();
+    return [
+      ...new Set([
+        ...databases.map((database) => database.name).filter((name): name is string => !!name),
+        ...(registered ?? []),
+      ]),
+    ];
+  } catch (error) {
+    if (strict && !registered) throw error;
+    console.error("Offline document enumeration failed", error);
+    return registered ?? [];
+  }
 }
 
 function openCatalog() {
@@ -291,7 +339,7 @@ export async function listOfflinePages(accountKey: string): Promise<OfflinePage[
 }
 
 export async function listPendingOfflinePages(accountKey: string): Promise<OfflinePage[]> {
-  const pages = await readAccountPages(accountKey);
+  const pages = await readAccountPages(accountKey, true, true);
   const available = await Promise.all(
     pages.map(async (page) => {
       const keys = pendingKeysOf(page);
@@ -304,29 +352,22 @@ export async function listPendingOfflinePages(accountKey: string): Promise<Offli
   return available.filter((page): page is OfflinePage & { pendingCopyKeys: string[] } => page !== null);
 }
 
-async function withOrphanDocuments(accountKey: string, marked: OfflinePage[], targetPageId?: string) {
+async function withOrphanDocuments(accountKey: string, marked: OfflinePage[], targetPageId?: string, strict = false) {
   const prefix = accountDocumentPrefix(accountKey);
   if (!prefix) return marked;
-  if (!indexedDB.databases) return marked;
-  let databases: IDBDatabaseInfo[];
-  try {
-    databases = await indexedDB.databases();
-  } catch (error) {
-    console.error("Offline document enumeration failed", error);
-    return marked;
-  }
+  const names = await accountDocumentNames(accountKey, strict);
   const knownKeys = new Set(marked.flatMap((page) => page.storageKeys ?? []));
   const byPage = new Map(marked.map((page) => [page.pageId, page]));
   const discovered = await Promise.all(
-    databases.map(async ({ name }) => {
-      if (!name || knownKeys.has(name)) return null;
+    names.map(async (name) => {
+      if (knownKeys.has(name)) return null;
       const parsed = parseOfflineDocumentKey(name, prefix);
-      if (!parsed || (targetPageId && parsed.pageId !== targetPageId)) return null;
+      if (!parsed || (targetPageId !== undefined && parsed.pageId !== targetPageId)) return null;
       try {
         return (await documentPendingMarker(name)) ? { name, ...parsed } : null;
       } catch (error) {
         console.error("Offline orphan marker could not be read", error);
-        return null;
+        return { name, ...parsed };
       }
     }),
   );
@@ -369,7 +410,7 @@ async function withOrphanDocuments(accountKey: string, marked: OfflinePage[], ta
   return marked;
 }
 
-async function readAccountPages(accountKey: string, includeMarkers = true): Promise<OfflinePage[]> {
+async function readAccountPages(accountKey: string, includeMarkers = true, strict = false): Promise<OfflinePage[]> {
   const db = await openCatalog();
   const transaction = db.transaction("pages", "readonly");
   const pages = await requestResult(
@@ -377,7 +418,7 @@ async function readAccountPages(accountKey: string, includeMarkers = true): Prom
   );
   await transactionDone(transaction);
   if (!includeMarkers) return pages;
-  return withOrphanDocuments(accountKey, await Promise.all(pages.map(withPendingMarkers)));
+  return withOrphanDocuments(accountKey, await Promise.all(pages.map(withPendingMarkers)), undefined, strict);
 }
 
 export async function getOfflinePage(accountKey: string, pageId: string): Promise<OfflinePage | null> {
@@ -473,9 +514,8 @@ export async function markOfflinePageRevoked(accountKey: string, pageId: string)
   const key = `${accountKey}\u0000${pageId}`;
   return withPageLock(key, async () => {
     const recovered = await getOfflinePage(accountKey, pageId);
-    if (recovered && pendingKeysOf(recovered).length) return false;
+    if (!recovered || pendingKeysOf(recovered).length) return false;
     const db = await openCatalog();
-    if (!recovered) return false;
     const write = db.transaction("pages", "readwrite");
     const store = write.objectStore("pages");
     const current = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
@@ -487,7 +527,7 @@ export async function markOfflinePageRevoked(accountKey: string, pageId: string)
 
 export async function clearRevokedOfflinePages(accountKey: string) {
   const db = await openCatalog();
-  for (const page of (await readAccountPages(accountKey)).filter((entry) => entry.revoked)) {
+  for (const page of (await readAccountPages(accountKey, false)).filter((entry) => entry.revoked)) {
     await withPageLock(page.key, async () => {
       const current = await getOfflinePage(accountKey, page.pageId);
       if (!current?.revoked || pendingKeysOf(current).length) return;
@@ -529,18 +569,14 @@ export async function purgingOfflineAccounts() {
 
 export async function forgetOfflineAccount(accountKey: string) {
   const prefix = accountDocumentPrefix(accountKey);
+  const names = await accountDocumentNames(accountKey, true);
   const db = await openCatalog();
   await markOfflineAccountPurging(accountKey);
   const pages = await readAccountPages(accountKey, false);
   const keys = new Set(pages.flatMap((page) => page.storageKeys ?? []));
   // Catalog writes and Yjs store creation are separate transactions. Include
   // stores left behind by an interrupted catalog write or a previous purge.
-  if (prefix && indexedDB.databases) {
-    const databases = await indexedDB.databases();
-    for (const database of databases) {
-      if (database.name?.startsWith(prefix)) keys.add(database.name);
-    }
-  }
+  for (const name of names) if (prefix && name.startsWith(prefix)) keys.add(name);
   for (const key of keys) {
     await new Promise<void>((resolve, reject) => {
       const request = indexedDB.deleteDatabase(key);
@@ -552,13 +588,25 @@ export async function forgetOfflineAccount(accountKey: string) {
     });
   }
   if (prefix && indexedDB.databases) {
-    const remaining = await indexedDB.databases();
+    let remaining: IDBDatabaseInfo[] = [];
+    try {
+      remaining = await indexedDB.databases();
+    } catch (error) {
+      if (!registeredDocumentKeys(accountKey)) throw error;
+    }
     if (remaining.some((database) => database.name?.startsWith(prefix)))
       throw new Error("New local document storage appeared during sign-out. Retry removal.");
   }
+  const newlyRegistered = registeredDocumentKeys(accountKey)?.filter((key) => !keys.has(key)) ?? [];
+  if (newlyRegistered.length) throw new Error("New local document storage appeared during sign-out. Retry removal.");
   const transaction = db.transaction(["accounts", "pages"], "readwrite");
   transaction.objectStore("accounts").delete(accountKey);
   const store = transaction.objectStore("pages");
   for (const page of pages) store.delete(page.key);
   await transactionDone(transaction);
+  try {
+    localStorage.removeItem(`${DOCUMENT_REGISTRY_PREFIX}${accountKey}`);
+  } catch (error) {
+    console.error("Offline document registry could not be cleared", error);
+  }
 }

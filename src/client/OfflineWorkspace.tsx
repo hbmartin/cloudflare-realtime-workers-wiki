@@ -123,7 +123,7 @@ export function OfflineWorkspace({
         flushSync(() => setRecovery("finalizing"));
         const stored = await getOfflinePage(account.key, selected.pageId);
         if (!isCurrent()) return;
-        const hasDraft = Boolean(pendingKeysOf(stored ?? selected).length || pendingKeysOf(selected).length);
+        const hasDraft = Boolean(stored && pendingKeysOf(stored).length);
         const space = spaces.find((item) => item.id === page.spaceId);
         if (!space && !hasDraft) {
           await discardRevokedCopy(selected.pageId);
