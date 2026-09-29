@@ -3,7 +3,7 @@ import { BlockNoteView } from "@blocknote/mantine";
 import { useCreateBlockNote } from "@blocknote/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { IndexeddbPersistence, storeState } from "y-indexeddb";
+import { IndexeddbPersistence } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
@@ -20,6 +20,7 @@ import {
   markOfflinePageRevoked,
   PENDING_MARKER,
   pendingKeysOf,
+  persistPendingDocumentUpdate,
   type OfflineAccount,
   type OfflinePage,
 } from "./offline-catalog";
@@ -194,6 +195,11 @@ export function OfflineWorkspace({
         <button type="button" onClick={() => void reconnect()} disabled={recovery !== "offline"}>
           {recovery !== "offline" ? "Checking access…" : "Reconnect"}
         </button>
+        {selectedReason && (
+          <button type="button" onClick={onRetry}>
+            Open online workspace
+          </button>
+        )}
         <button type="button" onClick={onSignOut}>
           Sign out and remove local copies
         </button>
@@ -400,7 +406,6 @@ function OfflineBlockEditor({
     let writing: Promise<void> | null = null;
     let pendingCommitted = false;
     let pendingMark: Promise<void> | null = null;
-    let writesSinceCompact = 0;
     const markPending = () => {
       if (pendingCommitted) return Promise.resolve();
       pendingMark ??= markOfflinePagePending(accountKey, page.pageId, storageKey, true)
@@ -423,25 +428,9 @@ function OfflineBlockEditor({
           const target = generation;
           // Start the document transaction before the first await. The marker
           // is atomic with the Yjs update and recovers an interrupted catalog write.
-          const transaction = db.transaction(["updates", "custom"], "readwrite");
-          transaction.objectStore("updates").add(batch.length === 1 ? batch[0] : Y.mergeUpdates(batch));
-          transaction.objectStore("custom").put(true, PENDING_MARKER);
-          await new Promise<void>((resolve, reject) => {
-            transaction.addEventListener("complete", () => resolve());
-            transaction.addEventListener("abort", () => reject(transaction.error));
-            transaction.addEventListener("error", () => reject(transaction.error));
-          });
+          await persistPendingDocumentUpdate(db, batch.length === 1 ? batch[0]! : Y.mergeUpdates(batch));
           updates.splice(0, batch.length);
           await markPending();
-          writesSinceCompact += batch.length;
-          if (writesSinceCompact >= 500) {
-            writesSinceCompact = 0;
-            try {
-              await storeState(copy.persistence, true);
-            } catch (error) {
-              console.error("Offline document compaction failed", error);
-            }
-          }
           if (active && target === generation) setSaveState("saved");
         }
       })()

@@ -328,11 +328,11 @@ test("recovers a saved draft when the catalog pending write fails", async ({ pag
           request.addEventListener("success", () => resolve(request.result)),
         );
         const read = db.transaction("pages", "readonly").objectStore("pages").getAll();
-        const pages = await new Promise<Array<{ pageId: string }>>((resolve) =>
+        const pages = await new Promise<Array<{ pageId: string; pendingChanges?: boolean }>>((resolve) =>
           read.addEventListener("success", () => resolve(read.result)),
         );
         db.close();
-        return pages.some((entry) => entry.pageId === id);
+        return pages.some((entry) => entry.pageId === id && !entry.pendingChanges);
       }, new URL(page.url()).searchParams.get("page")),
     )
     .toBe(true);
@@ -357,6 +357,123 @@ test("recovers a saved draft when the catalog pending write fails", async ({ pag
   await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedZ");
   await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
   await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
+});
+
+test("keeps an online editor draft when its catalog write fails", async ({ page, context }) => {
+  await signInOwner(page);
+  const previousPage = new URL(page.url()).searchParams.get("page");
+  await page.getByRole("button", { name: /Find a page or command/ }).click();
+  await page
+    .getByRole("dialog", { name: "Find a page or command" })
+    .getByRole("option", { name: /Create document/ })
+    .click();
+  await page.waitForURL((url) =>
+    Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
+  );
+  const pageId = new URL(page.url()).searchParams.get("page")!;
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type("Online seed");
+  await expect(page.locator(".bn-editor")).toContainText("Online seed");
+  await expect
+    .poll(() =>
+      page.evaluate(async (id) => {
+        const request = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        const read = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const pages = await new Promise<Array<{ pageId: string; pendingChanges?: boolean; storageKeys: string[] }>>(
+          (resolve) => read.addEventListener("success", () => resolve(read.result)),
+        );
+        db.close();
+        const entry = pages.find((item) => item.pageId === id);
+        const key = entry?.storageKeys.at(-1);
+        if (!entry || !key || entry.pendingChanges) return false;
+        const documentRequest = indexedDB.open(key);
+        const documentDb = await new Promise<IDBDatabase>((resolve) =>
+          documentRequest.addEventListener("success", () => resolve(documentRequest.result)),
+        );
+        const marker = documentDb.transaction("custom", "readonly").objectStore("custom").get("noteflare-pending");
+        const pending = await new Promise<boolean>((resolve) =>
+          marker.addEventListener("success", () => resolve(Boolean(marker.result))),
+        );
+        documentDb.close();
+        return !pending;
+      }, pageId),
+    )
+    .toBe(true);
+  await context.setOffline(true);
+  await page.evaluate(() => {
+    const put = IDBObjectStore.prototype.put;
+    IDBObjectStore.prototype.put = function (value, key) {
+      if (this.name === "pages" && this.transaction.db.name === "noteflare-offline-catalog") {
+        throw new DOMException("Catalog unavailable", "QuotaExceededError");
+      }
+      return put.call(this, value, key);
+    };
+  });
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type("Z");
+  await expect(
+    page.getByText("Offline storage could not record these local changes. Export this copy before leaving."),
+  ).toBeVisible();
+  await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toContainText("Online seedZ");
+  await page.getByRole("button", { name: "Sign out and remove local copies" }).click();
+  await expect(page.getByRole("heading", { name: "Review local changes" })).toBeVisible();
+});
+
+test("opens the online workspace from a quarantined offline draft", async ({ page, context }) => {
+  await signInOwner(page);
+  const previousPage = new URL(page.url()).searchParams.get("page");
+  await page.getByRole("button", { name: /Find a page or command/ }).click();
+  await page
+    .getByRole("dialog", { name: "Find a page or command" })
+    .getByRole("option", { name: /Create document/ })
+    .click();
+  await page.waitForURL((url) =>
+    Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
+  );
+  const pageId = new URL(page.url()).searchParams.get("page")!;
+  await page.locator(".bn-editor").click();
+  await page.keyboard.type("Online seed");
+  await expect(page.locator(".bn-editor")).toContainText("Online seed");
+  await expect
+    .poll(() =>
+      page.evaluate(async (id) => {
+        const request = indexedDB.open("noteflare-offline-catalog");
+        const db = await new Promise<IDBDatabase>((resolve) =>
+          request.addEventListener("success", () => resolve(request.result)),
+        );
+        const read = db.transaction("pages", "readonly").objectStore("pages").getAll();
+        const pages = await new Promise<Array<{ pageId: string; pendingChanges?: boolean }>>((resolve) =>
+          read.addEventListener("success", () => resolve(read.result)),
+        );
+        db.close();
+        return pages.some((entry) => entry.pageId === id && !entry.pendingChanges);
+      }, pageId),
+    )
+    .toBe(true);
+  await context.setOffline(true);
+  await page.reload();
+  await expect(page.locator(".offline-document .bn-editor")).toBeVisible();
+  await page.locator(".offline-document .bn-editor").click();
+  await page.keyboard.type(" offline draft");
+  await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
+  await page.route(`**/api/pages/${pageId}`, async (route) => {
+    const upstream = await route.fetch();
+    const body = (await upstream.json()) as { page: { contentEpoch: number } };
+    body.page.contentEpoch += 1;
+    await route.fulfill({ response: upstream, json: body });
+  });
+  await context.setOffline(false);
+  await page.getByRole("button", { name: "Reconnect" }).click();
+  await expect(
+    page.getByText("Your access or this document's version changed. The local copy is preserved for export."),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Open online workspace" }).click();
+  await expect(page.getByRole("navigation", { name: "Cached documents" })).toHaveCount(0);
+  await expect(page.locator(`[data-tree-page="${pageId}"]`)).toBeVisible();
 });
 
 test("shows an online-required state for table and diagram links", async ({ page, context }) => {

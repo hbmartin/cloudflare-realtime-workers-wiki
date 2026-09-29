@@ -39,7 +39,9 @@ import {
   offlineAccountKey,
   offlineDocumentKey,
   pendingKeysOf,
+  persistPendingDocumentUpdate,
   rememberOfflinePage,
+  setDocumentPendingMarker,
   storageEpoch,
 } from "./offline-catalog";
 
@@ -98,7 +100,11 @@ export function EditorPage({
   const replaceRecovery = useCallback(
     (next: RecoveryEntry[]) => {
       recoveryRef.current = next;
-      localStorage.setItem(recoveryKey, JSON.stringify(next));
+      try {
+        localStorage.setItem(recoveryKey, JSON.stringify(next));
+      } catch (error) {
+        console.error("Unable to persist offline recovery details", error);
+      }
       setRecovery(next);
     },
     [recoveryKey],
@@ -107,8 +113,9 @@ export function EditorPage({
   useEffect(() => {
     try {
       const saved: unknown = JSON.parse(localStorage.getItem(`${recoveryKey}:dismissed`) ?? "{}");
-      dismissedRecovery.current =
-        saved && typeof saved === "object" && !Array.isArray(saved)
+      dismissedRecovery.current = Array.isArray(saved)
+        ? Object.fromEntries(saved.filter((key): key is string => typeof key === "string").map((key) => [key, -1]))
+        : saved && typeof saved === "object"
           ? Object.fromEntries(Object.entries(saved).filter(([key, value]) => key && Number.isInteger(value)))
           : {};
     } catch {
@@ -166,14 +173,16 @@ export function EditorPage({
 
   useEffect(() => {
     let active = true;
+    let pendingWrite = Promise.resolve();
     const currentStorageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
     const quarantine = (key = currentStorageKey, reason: RecoveryEntry["reason"] = "epoch") => {
+      if (!active) return;
       const value = {
         key,
         epoch: storageEpoch(key) || page.contentEpoch,
         reason,
       };
-      if (dismissedRecovery.current[key] === page.contentEpoch && reason === "epoch") return;
+      if (dismissedRecovery.current[key] !== undefined && reason === "epoch") return;
       const current = recoveryRef.current;
       if (current.some((entry) => entry.key === key && entry.epoch === value.epoch && entry.reason === reason)) return;
       replaceRecovery([...current.filter((entry) => entry.key !== key), value].sort((a, b) => a.epoch - b.epoch));
@@ -181,7 +190,12 @@ export function EditorPage({
     let next: CollaborationBundle;
     let catalogFailures = 0;
     let pendingActive = false;
+    let pendingRevision = 0;
+    let storageFailed = false;
     const beforeConnect = async () => {
+      await pendingWrite;
+      if (!active) return false;
+      const readingRevision = pendingRevision;
       const accountKey = offlineAccountKey(offlineMember.current);
       let catalogPage;
       try {
@@ -196,7 +210,7 @@ export function EditorPage({
         throw error;
       }
       const pendingKeys = catalogPage ? pendingKeysOf(catalogPage) : [];
-      if (pendingKeys.includes(currentStorageKey)) pendingActive = true;
+      if (readingRevision === pendingRevision) pendingActive = pendingKeys.includes(currentStorageKey);
       const olderDrafts = pendingKeys.filter((key) => key !== currentStorageKey);
       for (const key of olderDrafts) quarantine(key);
       const hasLocalDraft =
@@ -256,21 +270,28 @@ export function EditorPage({
       member.user.id,
       beforeConnect,
     );
-    let pendingWrite = Promise.resolve();
     const clearCurrentRecovery = () => {
+      if (!active) return;
       const current = recoveryRef.current;
       const remaining = current.filter((entry) => entry.key !== currentStorageKey);
       if (remaining.length !== current.length) replaceRecovery(remaining);
       setStorageError("");
     };
     const writePending = (pending: boolean) => {
+      if (!pending && storageFailed) return;
       if (pending && pendingActive) return;
-      if (!pending && !pendingActive) return;
+      if (!pending && !pendingActive) {
+        clearCurrentRecovery();
+        return;
+      }
       pendingActive = pending;
+      pendingRevision += 1;
       pendingWrite = pendingWrite
         .then(async () => {
+          if (!pending && storageFailed) return;
           const currentMember = offlineMember.current;
-          if (pending)
+          if (pending) {
+            await setDocumentPendingMarker(currentStorageKey);
             await rememberOfflinePage(
               currentMember,
               offlineMetadata.current.page,
@@ -278,6 +299,7 @@ export function EditorPage({
               currentMember.role !== "viewer",
               false,
             );
+          }
           await markOfflinePagePending(offlineAccountKey(currentMember), page.id, currentStorageKey, pending);
           if (!pending) {
             await rememberOfflinePage(
@@ -299,7 +321,39 @@ export function EditorPage({
         });
     };
     const documentUpdate = (_update: Uint8Array, origin: unknown) => {
-      if (origin !== next.provider && origin !== next.indexeddb) writePending(true);
+      if (origin !== next.provider && origin !== next.indexeddb) {
+        if (dismissedRecovery.current[currentStorageKey] !== undefined) {
+          delete dismissedRecovery.current[currentStorageKey];
+          try {
+            localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
+          } catch (error) {
+            console.error("Unable to update dismissed recovery details", error);
+          }
+        }
+        try {
+          const db = next.indexeddb.db;
+          if (!db) throw new Error("Offline document storage is unavailable.");
+          const stored = persistPendingDocumentUpdate(db, _update);
+          pendingWrite = pendingWrite
+            .then(() => stored)
+            .catch((error) => {
+              storageFailed = true;
+              console.error("Unable to persist local document update", error);
+              if (active) {
+                quarantine(currentStorageKey, "storage");
+                setStorageError(
+                  "Offline storage could not record these local changes. Export this copy before leaving.",
+                );
+              }
+            });
+          writePending(true);
+        } catch (error) {
+          storageFailed = true;
+          console.error("Unable to persist local document update", error);
+          quarantine(currentStorageKey, "storage");
+          setStorageError("Offline storage could not record these local changes. Export this copy before leaving.");
+        }
+      }
     };
     next.doc.on("update", documentUpdate);
     const customMessage = (message: string) => {
@@ -357,6 +411,7 @@ export function EditorPage({
     onPageUnavailable,
     page.id,
     page.contentEpoch,
+    recoveryKey,
     replaceRecovery,
   ]);
 

@@ -33,52 +33,59 @@ export type OfflinePage = {
 const PENDING_MARKER = "noteflare-pending";
 export { PENDING_MARKER };
 
-async function documentPendingMarker(key: string): Promise<boolean> {
+function openExistingDocument(key: string): Promise<IDBDatabase | null> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(key);
     request.addEventListener("upgradeneeded", () => request.transaction?.abort());
     request.addEventListener("error", () => {
-      if (request.error?.name === "AbortError") resolve(false);
-      else reject(request.error ?? new Error("Offline document marker could not be read."));
+      if (request.error?.name === "AbortError") resolve(null);
+      else reject(request.error ?? new Error("Offline document could not be opened."));
     });
     request.addEventListener("success", () => {
       const db = request.result;
-      if (!db.objectStoreNames.contains("custom")) {
-        db.close();
-        resolve(false);
-        return;
-      }
-      const transaction = db.transaction("custom", "readonly");
-      const marker = transaction.objectStore("custom").get(PENDING_MARKER);
-      marker.addEventListener("success", () => {
-        db.close();
-        resolve(Boolean(marker.result));
-      });
-      marker.addEventListener("error", () => {
-        db.close();
-        reject(marker.error);
-      });
+      db.onversionchange = () => db.close();
+      resolve(db);
     });
+    request.addEventListener("blocked", () => reject(new Error("Offline document storage is in use by another tab.")));
   });
+}
+
+async function documentPendingMarker(key: string): Promise<boolean> {
+  const db = await openExistingDocument(key);
+  if (!db) return false;
+  try {
+    if (!db.objectStoreNames.contains("custom")) return false;
+    const transaction = db.transaction("custom", "readonly");
+    const result = await requestResult(transaction.objectStore("custom").get(PENDING_MARKER));
+    await transactionDone(transaction);
+    return Boolean(result);
+  } finally {
+    db.close();
+  }
 }
 
 async function withPendingMarkers(page: OfflinePage): Promise<OfflinePage> {
   const marked = (
-    await Promise.all(page.storageKeys.map(async (key) => ((await documentPendingMarker(key)) ? key : null)))
+    await Promise.all(
+      (page.storageKeys ?? []).map(async (key) => {
+        try {
+          return (await documentPendingMarker(key)) ? key : null;
+        } catch (error) {
+          // A broken document DB may still hold the only copy of local edits.
+          console.error("Offline document marker could not be read", error);
+          return key;
+        }
+      }),
+    )
   ).filter((key): key is string => key !== null);
   if (!marked.length) return page;
   const keys = [...new Set([...pendingKeysOf(page), ...marked])];
-  return { ...page, pendingCopyKeys: keys, pendingChanges: keys.includes(page.storageKeys.at(-1) ?? "") };
+  return { ...page, pendingCopyKeys: keys, pendingChanges: keys.includes(page.storageKeys?.at(-1) ?? "") };
 }
 
 async function clearDocumentPendingMarker(key: string) {
-  const request = indexedDB.open(key);
-  await new Promise<void>((resolve, reject) => {
-    request.addEventListener("upgradeneeded", () => request.transaction?.abort());
-    request.addEventListener("success", () => resolve());
-    request.addEventListener("error", () => reject(request.error));
-  });
-  const db = request.result;
+  const db = await openExistingDocument(key);
+  if (!db) return;
   try {
     if (!db.objectStoreNames.contains("custom")) return;
     const transaction = db.transaction("custom", "readwrite");
@@ -89,11 +96,33 @@ async function clearDocumentPendingMarker(key: string) {
   }
 }
 
+export function persistPendingDocumentUpdate(db: IDBDatabase, update: Uint8Array): Promise<void> {
+  const transaction = db.transaction(["updates", "custom"], "readwrite");
+  transaction.objectStore("updates").add(update);
+  transaction.objectStore("custom").put(true, PENDING_MARKER);
+  return transactionDone(transaction);
+}
+
+export async function setDocumentPendingMarker(key: string) {
+  const db = await openExistingDocument(key);
+  if (!db || !db.objectStoreNames.contains("custom")) {
+    db?.close();
+    throw new Error("Offline document storage is unavailable.");
+  }
+  try {
+    const transaction = db.transaction("custom", "readwrite");
+    transaction.objectStore("custom").put(true, PENDING_MARKER);
+    await transactionDone(transaction);
+  } finally {
+    db.close();
+  }
+}
+
 export function pendingKeysOf(page: OfflinePage): string[] {
   return page.pendingCopyKeys?.length
     ? page.pendingCopyKeys.filter(Boolean)
     : page.pendingChanges
-      ? [page.storageKeys.at(-1)].filter((key): key is string => !!key)
+      ? [page.storageKeys?.at(-1)].filter((key): key is string => !!key)
       : [];
 }
 
@@ -220,19 +249,9 @@ export async function latestOfflineAccount(): Promise<OfflineAccount | null> {
 }
 
 export async function hasOfflineDocument(key: string): Promise<boolean> {
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(key);
-    request.addEventListener("upgradeneeded", () => request.transaction?.abort());
-    request.addEventListener("success", () => {
-      request.result.close();
-      resolve(true);
-    });
-    request.addEventListener("error", () => {
-      if (request.error?.name === "AbortError") resolve(false);
-      else reject(request.error ?? new Error("Offline document lookup failed."));
-    });
-    request.addEventListener("blocked", () => reject(new Error("Offline document storage is in use by another tab.")));
-  });
+  const db = await openExistingDocument(key);
+  db?.close();
+  return Boolean(db);
 }
 
 export async function listOfflinePages(accountKey: string): Promise<OfflinePage[]> {
@@ -270,14 +289,14 @@ export async function listPendingOfflinePages(accountKey: string): Promise<Offli
   return available.filter((page): page is OfflinePage & { pendingCopyKeys: string[] } => page !== null);
 }
 
-async function readAccountPages(accountKey: string): Promise<OfflinePage[]> {
+async function readAccountPages(accountKey: string, includeMarkers = true): Promise<OfflinePage[]> {
   const db = await openCatalog();
   const transaction = db.transaction("pages", "readonly");
   const pages = await requestResult(
     transaction.objectStore("pages").index("byAccount").getAll(accountKey) as IDBRequest<OfflinePage[]>,
   );
   await transactionDone(transaction);
-  return Promise.all(pages.map(withPendingMarkers));
+  return includeMarkers ? Promise.all(pages.map(withPendingMarkers)) : pages;
 }
 
 export async function getOfflinePage(accountKey: string, pageId: string): Promise<OfflinePage | null> {
@@ -353,7 +372,7 @@ export async function markOfflinePagePending(
       const keys = new Set(pendingKeysOf(page));
       if (pendingChanges) keys.add(storageKey);
       else keys.delete(storageKey);
-      const storageKeys = withStorageKey(page.storageKeys, storageKey);
+      const storageKeys = withStorageKey(page.storageKeys ?? [], storageKey);
       store.put({
         ...page,
         storageKeys,
@@ -370,21 +389,22 @@ export async function markOfflinePageRevoked(accountKey: string, pageId: string)
   const key = `${accountKey}\u0000${pageId}`;
   return withPageLock(key, async () => {
     const db = await openCatalog();
-    const transaction = db.transaction("pages", "readwrite");
-    const store = transaction.objectStore("pages");
-    const page = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
-    const revoked = Boolean(page && pendingKeysOf(page).length === 0);
-    if (revoked && page) store.put({ ...page, revoked: true });
-    await transactionDone(transaction);
-    return revoked;
+    const read = db.transaction("pages", "readonly");
+    const page = await requestResult(read.objectStore("pages").get(key) as IDBRequest<OfflinePage | undefined>);
+    await transactionDone(read);
+    if (!page || pendingKeysOf(await withPendingMarkers(page)).length) return false;
+    const write = db.transaction("pages", "readwrite");
+    const store = write.objectStore("pages");
+    const current = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
+    if (current && !pendingKeysOf(current).length) store.put({ ...current, revoked: true });
+    await transactionDone(write);
+    return Boolean(current && !pendingKeysOf(current).length);
   });
 }
 
 export async function clearRevokedOfflinePages(accountKey: string) {
   const db = await openCatalog();
-  for (const page of (await readAccountPages(accountKey)).filter(
-    (entry) => entry.revoked && pendingKeysOf(entry).length === 0,
-  )) {
+  for (const page of (await readAccountPages(accountKey, false)).filter((entry) => entry.revoked)) {
     await withPageLock(page.key, async () => {
       const current = await getOfflinePage(accountKey, page.pageId);
       if (!current?.revoked || pendingKeysOf(current).length) return;
