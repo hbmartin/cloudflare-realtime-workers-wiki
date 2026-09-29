@@ -626,7 +626,7 @@ export async function clearRevokedOfflinePages(accountKey: string) {
   }
 }
 
-export async function markOfflineAccountPurging(accountKey: string) {
+async function markOfflineAccountPurging(accountKey: string) {
   try {
     localStorage.setItem(`${PURGING_ACCOUNT_PREFIX}${accountKey}`, "1");
   } catch (error) {

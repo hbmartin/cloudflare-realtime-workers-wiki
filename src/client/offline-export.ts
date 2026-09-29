@@ -18,10 +18,6 @@ export function downloadOfflineMarkdown(markdown: string, filename: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-export async function exportOfflineCopyMarkdown(key: string, title: string, suffix: string) {
-  downloadOfflineMarkdown(await offlineCopyMarkdownFromKey(key, title), `${title}-${suffix}.md`);
-}
-
 export async function offlineCopyMarkdownFromKey(key: string, title: string) {
   const doc = await loadOfflineCopy(key);
   try {
