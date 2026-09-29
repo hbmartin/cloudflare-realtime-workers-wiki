@@ -130,24 +130,33 @@ function unescapeMarkdownPunctuation(text: string) {
 
 function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
   const output: ProseMirrorJson[] = [];
+  const append = (text: string, marks: ProseMirrorJson["marks"] = []) => {
+    if (!text) return;
+    const previous = output.at(-1);
+    if (!marks.length && previous?.type === "text" && !previous.marks) {
+      previous.text = (previous.text ?? "") + text;
+      return;
+    }
+    output.push(...inline(text, marks));
+  };
   // Escapes are a scanner alternative, so delimiters inside code spans stay
   // literal while escaped punctuation outside them cannot open formatting.
   const pattern =
-    /\\([\\`*_{}[\]()#+\-.!|>~])|(!?)\[((?:\\.|[^\]\\])*)\]\(|\*\*((?:\\.|[^*])+)\*\*|__((?:\\.|[^_])+)__|`([^`]+)`|\*((?:\\.|[^*])+)\*|_((?:\\.|[^_])+)_(?!\w)/g;
+    /\\([\\`*_{}[\]()#+\-.!|>~])|(!?)\[((?:\\.|[^\]\\])*)\]\(|\*\*((?:\\.|[^\\*])+)\*\*|__((?:\\.|[^\\_])+)__|`([^`]+)`|(?<!\*)\*(?!\*)((?:\\.|[^\\*])+)\*(?!\*)|(?<!_)_(?!_)((?:\\.|[^\\_])+)_(?!\w|_)/g;
   let offset = 0;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(value))) {
-    output.push(...inline(value.slice(offset, match.index)));
+    append(value.slice(offset, match.index));
     const [whole, escaped, image, label, boldA, boldB, code, italicA, italicB] = match;
     if (escaped !== undefined) {
-      output.push(...inline(escaped));
+      append(escaped);
       offset = pattern.lastIndex;
       continue;
     }
     if (label !== undefined) {
       const destination = markdownDestination(value, pattern.lastIndex);
       if (!destination) {
-        output.push(...inline(unescapeMarkdownPunctuation(whole)));
+        append(unescapeMarkdownPunctuation(whole));
         offset = pattern.lastIndex;
         continue;
       }
@@ -156,38 +165,28 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
       const url = safeLink(rawUrl);
       if (!url) {
         issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
-        output.push(...inline(unescapeMarkdownPunctuation(label ?? "")));
+        append(unescapeMarkdownPunctuation(label ?? ""));
       } else if (image) {
         references.push(url);
         // Images are not inline nodes in this schema, so both branches degrade to the
         // label; the issue keeps that downgrade visible in the import warnings.
         issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
-        output.push(...inline(unescapeMarkdownPunctuation(label ?? "")));
+        append(unescapeMarkdownPunctuation(label ?? ""));
       } else {
         references.push(url);
-        output.push(...inline(unescapeMarkdownPunctuation(label ?? ""), [{ type: "link", attrs: { href: url } }]));
+        append(unescapeMarkdownPunctuation(label ?? ""), [{ type: "link", attrs: { href: url } }]);
       }
     } else if (boldA !== undefined || boldB !== undefined) {
-      output.push(...inline(unescapeMarkdownPunctuation(boldA ?? boldB ?? ""), [{ type: "bold" }]));
+      append(unescapeMarkdownPunctuation(boldA ?? boldB ?? ""), [{ type: "bold" }]);
     } else if (code !== undefined) {
-      output.push(...inline(code, [{ type: "code" }]));
+      append(code, [{ type: "code" }]);
     } else {
-      output.push(...inline(unescapeMarkdownPunctuation(italicA ?? italicB ?? ""), [{ type: "italic" }]));
+      append(unescapeMarkdownPunctuation(italicA ?? italicB ?? ""), [{ type: "italic" }]);
     }
     offset = pattern.lastIndex;
   }
-  output.push(...inline(value.slice(offset)));
-  return output.reduce<ProseMirrorJson[]>((merged, node) => {
-    const previous = merged.at(-1);
-    if (
-      previous?.type === "text" &&
-      node.type === "text" &&
-      JSON.stringify(previous.marks ?? []) === JSON.stringify(node.marks ?? [])
-    ) {
-      merged[merged.length - 1] = { ...previous, text: (previous.text ?? "") + (node.text ?? "") };
-    } else merged.push(node);
-    return merged;
-  }, []);
+  append(value.slice(offset));
+  return output;
 }
 
 function markdownImage(value: string) {

@@ -27,7 +27,7 @@ import type { Env } from "./env";
 import type { JobRow } from "./jobs";
 import { deleteR2AttemptArtifactKeys, deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { correlationHeaders, logger, traced } from "./observability";
-import { HttpError, normalizeFilename } from "./http";
+import { HttpError, normalizeFilename, safeHttpError } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { sidebarHiddenPageIds } from "./page-access";
 import { captureFeedbackStatement, recheckSlackCapturePublication, resumeSlackCaptureJob } from "./slack-capture";
@@ -1582,10 +1582,20 @@ export function runImport(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">)
 async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   let options = importOptions(job);
   const captureId = options.captureId;
-  if (captureId)
-    job.input_key = await step.do("resume slack capture", () =>
-      resumeSlackCaptureJob(env, captureId, job.id, job.attempt),
-    );
+  if (captureId) {
+    const resumed = await step.do("resume slack capture", async () => {
+      try {
+        return { ok: true, inputKey: await resumeSlackCaptureJob(env, captureId, job.id, job.attempt) } as const;
+      } catch (error) {
+        const permanent = safeHttpError(error);
+        if (permanent && permanent.status < 500 && permanent.status !== 429)
+          return { ok: false, status: permanent.status, code: permanent.code, message: permanent.message } as const;
+        throw error;
+      }
+    });
+    if (!resumed.ok) throw new HttpError(resumed.status, resumed.code, resumed.message);
+    job.input_key = resumed.inputKey;
+  }
   // A deployment can supersede confirmation while a workflow is queued or suspended.
   const refreshing = options.confirmed && !hasCurrentImportConfirmation(options);
   if (refreshing) {

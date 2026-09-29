@@ -42,6 +42,22 @@ describe("import content", () => {
     ]);
   });
 
+  it.each(["*foo\\*", "_bar\\_", "**baz\\**", "__qux\\__"])(
+    "does not turn an escaped closing delimiter into formatting: %s",
+    (source) => {
+      const parsed = markdownToDocument(source);
+      const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+      expect(content).toEqual([{ type: "text", text: source.replaceAll("\\", "") }]);
+    },
+  );
+
+  it("scans long unclosed emphasis with backslashes without backtracking", () => {
+    const source = `**Path ${"\\alpha ".repeat(90)}`;
+    const parsed = markdownToDocument(source);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([{ type: "text", text: source.trim() }]);
+  });
+
   it.each([
     ["Folder_(one)/Child.md", "Folder_(one)/Child.md"],
     ["Folder_\\(one\\)/Child.md", "Folder_(one)/Child.md"],

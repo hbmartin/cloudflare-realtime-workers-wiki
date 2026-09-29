@@ -464,8 +464,10 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
         AND result_page_id IS NOT NULL AND capture_id IS NULL
         AND json_extract(state_json,'$.source.channelId')=?
         AND json_extract(state_json,'$.source.ts')=?
-        AND (json_extract(state_json,'$.source.thread')=?
-          OR (?=1 AND json_extract(state_json,'$.source.author')='Slack thread'))
+        AND ((?=0 AND json_extract(state_json,'$.source.thread')=0
+          AND coalesce(json_extract(state_json,'$.source.author'),'')<>'Slack thread')
+          OR (?=1 AND (json_extract(state_json,'$.source.thread')=1
+            OR json_extract(state_json,'$.source.author')='Slack thread')))
         ORDER BY created_at DESC,id DESC LIMIT 1`,
     )
       .bind(

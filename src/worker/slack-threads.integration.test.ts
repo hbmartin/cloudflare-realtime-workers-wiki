@@ -134,6 +134,7 @@ let posts: Post[] = [];
 let threadHistoryReplies: Array<{ ts: string; thread_ts: string; user: string; text: string; subtype?: string }> = [];
 let threadHistoryPages: Array<Array<{ ts: string; thread_ts?: string; user: string; text: string }>> | null = null;
 let replyFirstParent = false;
+let replyMissingCursor = false;
 let captureSourceAvailable = true;
 let calls: { method: string; payload: Record<string, unknown>; httpMethod: string; url: string }[] = [];
 let channelExtra: Record<string, unknown> = {};
@@ -201,7 +202,7 @@ async function mockSlack(input: RequestInfo | URL, init?: RequestInit) {
           ok: true,
           messages: [{ ts: String(payload.ts), user: "UOWNER", text: "Thread root" }],
           has_more: true,
-          response_metadata: { next_cursor: "reply-page" },
+          response_metadata: { next_cursor: replyMissingCursor ? "" : "reply-page" },
         });
       return Response.json({
         ok: true,
@@ -369,6 +370,7 @@ beforeEach(async () => {
   threadHistoryReplies = [];
   threadHistoryPages = null;
   replyFirstParent = false;
+  replyMissingCursor = false;
   captureSourceAvailable = true;
   calls = [];
   channelExtra = {};
@@ -5164,6 +5166,21 @@ describe("Slack documents and tasks", () => {
     expect(await staged!.text()).toContain("Selected reply");
     expect(await (await env.BUCKET.get(job!.input_key!))!.text()).not.toContain("Other reply");
   });
+  it("retries a reply lookup when Slack reports more pages without a cursor", async () => {
+    replyFirstParent = true;
+    replyMissingCursor = true;
+    threadHistoryPages = [[{ ts: "1700000101.000001", thread_ts: "1700000100.000001", user: "UOWNER", text: "Reply" }]];
+    const captureId = await startCapture("document", "space:workspace-general", "Reply");
+    await env.DB.prepare(
+      "UPDATE slack_product_sessions SET state_json=json_set(state_json,'$.source.threadTs','1700000100.000001') WHERE capture_id=?",
+    )
+      .bind(captureId)
+      .run();
+    await expect(prepareSlackCapture(runtime(), captureId)).rejects.toThrow("next reply cursor");
+    expect(await env.DB.prepare("SELECT count(*) count FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
+      count: 0,
+    });
+  });
   it("rejects oversized thread text before staging an import", async () => {
     threadHistoryPages = [[{ ts: "1700000100.000001", user: "UOWNER", text: "x".repeat(2 * 1024 * 1024 + 1) }]];
     await acceptSlackProductInteraction(
@@ -5413,6 +5430,39 @@ describe("Slack documents and tasks", () => {
     expect(await env.DB.prepare("SELECT state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
       state: "pending",
     });
+    expect(await env.DB.prepare("SELECT count(*) count FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
+      count: 0,
+    });
+  });
+  it("reuses a linked running job on duplicate capture delivery", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Duplicate delivery");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    expect(await prepareSlackCapture(runtime(), captureId)).toMatchObject({ id: job!.id, input_key: job!.input_key });
+    expect(await env.DB.prepare("SELECT attempt FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      attempt: 1,
+    });
+  });
+  it("acknowledges a stale duplicate when its linked capture loses authorization", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Stale duplicate");
+    await prepareSlackCapture(runtime(), captureId);
+    await env.DB.prepare("UPDATE slack_user_links SET migration_state='legacy' WHERE user_id='owner'").run();
+    const ack = vi.fn();
+    const retry = vi.fn();
+    expect(
+      await consumeDeliveryMessage(runtime(), {
+        id: "stale-duplicate-capture",
+        timestamp: new Date(),
+        body: { outboxId: `slack-capture:${captureId}` },
+        attempts: 1,
+        ack,
+        retry,
+      } as unknown as Message<DeliveryQueueMessage>),
+    ).toBe("discarded");
+    expect(ack).toHaveBeenCalledOnce();
+    expect(retry).not.toHaveBeenCalled();
+    expect(await env.DB.prepare("SELECT state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      state: "running",
+    });
   });
   it("retries a failed capture job without discarding its source receipt", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Retry verified import");
@@ -5597,10 +5647,30 @@ describe("Slack documents and tasks", () => {
     const job = await prepareSlackCapture(runtime(), captureId);
     expect(job!.input_key).toBe(`jobs/${captureId}/input/slack-1.md`);
     await expect((await env.BUCKET.get(job!.input_key!))?.text()).resolves.toContain("Queued reconnect");
+    expect(await env.BUCKET.head(oldInputKey)).toBeNull();
     expect(await env.DB.prepare("SELECT job_id,state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
       job_id: captureId,
       state: "running",
     });
+  });
+  it("links an orphan failed job to a failed receipt for Activities retry", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Orphan failure");
+    await env.DB.prepare(
+      `INSERT INTO jobs(id,workspace_id,space_id,type,status,requested_by,input_key,created_at,updated_at)
+       VALUES(?,'workspace','workspace-general','import','failed','owner',?,?,?)`,
+    )
+      .bind(captureId, `jobs/${captureId}/input/slack-0.md`, Date.now(), Date.now())
+      .run();
+    expect(await prepareSlackCapture(runtime(), captureId)).toBeNull();
+    expect(await env.DB.prepare("SELECT job_id,state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      job_id: captureId,
+      state: "failed",
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
+      ).first(),
+    ).toEqual({ count: 1 });
   });
   it("settles the capture receipt when its import job is canceled", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Canceled capture");
@@ -5612,6 +5682,28 @@ describe("Slack documents and tasks", () => {
     ).toEqual({ state: "failed", error_category: "canceled" });
     expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
       status: "canceled",
+    });
+  });
+  it("keeps a frozen legacy thread separate from saving its root message", async () => {
+    const legacyId = await open("new");
+    await env.DB.prepare("UPDATE slack_product_sessions SET state_json=?,result_page_id='page' WHERE id=?")
+      .bind(
+        JSON.stringify({
+          kind: "document",
+          source: {
+            channelId: "CSPACE",
+            ts: "1700000101.000001",
+            thread: false,
+            text: "Thread",
+            author: "Slack thread",
+          },
+        }),
+        legacyId,
+      )
+      .run();
+    const captureId = await startCapture("document", "space:workspace-general", "Root message");
+    expect(await env.DB.prepare("SELECT id FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      id: captureId,
     });
   });
   it("continues an older queued copy instead of importing its Slack source again", async () => {

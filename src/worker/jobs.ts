@@ -1920,6 +1920,11 @@ export async function consumeDeliveryMessage(
           )
           .run();
         if (!failed.meta.changes) {
+          const current = await env.DB.prepare(`SELECT job_id,state FROM slack_captures WHERE id=?`)
+            .bind(payload.captureId)
+            .first<{ job_id: string | null; state: string }>();
+          if (!current || current.job_id || current.state === "failed" || current.state === "succeeded")
+            return await rejectPayload(error.code);
           message.retry({ delaySeconds: 2 });
           return "retried";
         }
