@@ -38,6 +38,7 @@ import {
   markOfflinePagePending,
   offlineAccountKey,
   offlineDocumentKey,
+  pendingKeysOf,
   rememberOfflinePage,
 } from "./offline-catalog";
 
@@ -70,6 +71,7 @@ export function EditorPage({
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
+  const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
@@ -108,13 +110,14 @@ export function EditorPage({
   const offlineTitle = page.title;
   const offlineRole = member.role;
   useEffect(() => {
+    if (!hasConfirmedSync) return;
     void rememberOfflinePage(
       offlineMember.current,
       { ...offlineMetadata.current.page, title: offlineTitle },
       spaceName,
       offlineRole !== "viewer",
     ).catch((error) => console.error("Unable to remember this document for offline use", error));
-  }, [offlineTitle, spaceName, offlineRole]);
+  }, [hasConfirmedSync, offlineTitle, spaceName, offlineRole]);
 
   useEffect(() => {
     if (titlePageIdRef.current !== page.id) {
@@ -135,29 +138,36 @@ export function EditorPage({
 
   useEffect(() => {
     let active = true;
-    const quarantine = () => {
+    const currentStorageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
+    const quarantine = (key = currentStorageKey) => {
       const value = {
-        key: offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch),
-        epoch: page.contentEpoch,
+        key,
+        epoch: Number(key.split(":").at(-2)) || page.contentEpoch,
       };
       const serialized = JSON.stringify(value);
       if (localStorage.getItem(recoveryKey) !== serialized) localStorage.setItem(recoveryKey, serialized);
       setRecovery((current) => (current?.key === value.key && current.epoch === value.epoch ? current : value));
     };
     let next: CollaborationBundle;
+    let catalogFailures = 0;
     const beforeConnect = async () => {
       const accountKey = offlineAccountKey(offlineMember.current);
       let catalogPage;
       try {
         catalogPage = await getOfflinePage(accountKey, page.id);
+        catalogFailures = 0;
       } catch (error) {
         console.error("Unable to read offline document state", error);
-        setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
-        return false;
+        if (++catalogFailures >= 3 && active) {
+          setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+          return false;
+        }
+        throw error;
       }
-      const hasLocalDraft = Boolean(
-        catalogPage?.pendingCopyKeys?.length || catalogPage?.pendingChanges || next.hasUnsyncedChanges,
-      );
+      const pendingKeys = catalogPage ? pendingKeysOf(catalogPage) : [];
+      const olderDraft = pendingKeys.find((key) => key !== currentStorageKey);
+      if (olderDraft) quarantine(olderDraft);
+      const hasLocalDraft = pendingKeys.includes(currentStorageKey) || (!catalogPage && next.hasUnsyncedChanges);
       const controller = new AbortController();
       const deadline = window.setTimeout(() => controller.abort(), 10_000);
       try {
@@ -167,21 +177,21 @@ export function EditorPage({
           return false;
         }
         // A clean copy can rely on the document room's page access check.
-        if (!hasLocalDraft) return true;
+        if (!hasLocalDraft && !olderDraft) return true;
         const [{ page: currentPage }, { spaces }] = await Promise.all([
           api<{ page: Page }>(`/api/pages/${encodeURIComponent(page.id)}`, { signal: controller.signal }),
           api<{ spaces: Space[] }>("/api/spaces", { signal: controller.signal }),
         ]);
         if (!active) return false;
         if (currentPage.contentEpoch !== page.contentEpoch) {
-          if (hasLocalDraft) quarantine();
+          if (hasLocalDraft || olderDraft) quarantine(olderDraft ?? currentStorageKey);
           onPageChanged(currentPage);
           return false;
         }
         const space = spaces.find((item) => item.id === currentPage.spaceId);
         if (!space || (space.effectiveRole === "viewer" && hasLocalDraft)) {
-          if (hasLocalDraft) {
-            quarantine();
+          if (hasLocalDraft || olderDraft) {
+            quarantine(olderDraft ?? currentStorageKey);
             setAccessQuarantine(true);
           } else {
             onPageUnavailable(page.id);
@@ -191,8 +201,10 @@ export function EditorPage({
         return true;
       } catch (error) {
         if (error instanceof ApiClientError && [401, 403, 404, 410].includes(error.status)) {
-          if (hasLocalDraft) {
-            quarantine();
+          if (error.status === 401) {
+            if (hasLocalDraft) quarantine();
+          } else if (hasLocalDraft || olderDraft) {
+            quarantine(olderDraft ?? currentStorageKey);
             setAccessQuarantine(true);
           } else if (error.status === 403) onAccessDenied(page.id, error);
           else onPageUnavailable(page.id);
@@ -212,24 +224,30 @@ export function EditorPage({
       beforeConnect,
     );
     let pendingWrite = Promise.resolve();
+    let pendingActive = false;
     const writePending = (pending: boolean) => {
+      if (pending && pendingActive) return;
+      pendingActive = pending;
       pendingWrite = pendingWrite
         .then(async () => {
           const currentMember = offlineMember.current;
-          await rememberOfflinePage(
-            currentMember,
-            offlineMetadata.current.page,
-            offlineMetadata.current.spaceName,
-            currentMember.role !== "viewer",
-          );
-          await markOfflinePagePending(
-            offlineAccountKey(currentMember),
-            page.id,
-            offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch),
-            pending,
-          );
+          if (pending)
+            await rememberOfflinePage(
+              currentMember,
+              offlineMetadata.current.page,
+              offlineMetadata.current.spaceName,
+              currentMember.role !== "viewer",
+              false,
+            );
+          await markOfflinePagePending(offlineAccountKey(currentMember), page.id, currentStorageKey, pending);
         })
-        .catch((error) => console.error("Unable to update offline sync state", error));
+        .catch((error) => {
+          console.error("Unable to update offline sync state", error);
+          if (pending && active) {
+            quarantine();
+            setStorageError("Offline storage could not record these local changes. Export this copy before leaving.");
+          }
+        });
     };
     const documentUpdate = (_update: Uint8Array, origin: unknown) => {
       if (origin !== next.provider && origin !== next.indexeddb) writePending(true);
@@ -258,6 +276,7 @@ export function EditorPage({
     const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
     const connectionSync = (synced: boolean) => {
       closeReconciler.handleSync(synced);
+      if (synced && active) setHasConfirmedSync(true);
     };
     next.provider.on("connection-close", connectionClose);
     next.provider.on("sync", connectionSync);
@@ -418,7 +437,7 @@ export function EditorPage({
         </div>
       )}
       {storageError && <div className="notice notice-danger">{storageError}</div>}
-      {recovery && (recovery.epoch !== page.contentEpoch || accessQuarantine) && !storageError && (
+      {recovery && (recovery.epoch !== page.contentEpoch || accessQuarantine || storageError) && (
         <div className="notice recovery-notice">
           <div>
             <strong>Offline copy quarantined</strong>

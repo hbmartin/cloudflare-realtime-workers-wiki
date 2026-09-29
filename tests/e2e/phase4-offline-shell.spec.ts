@@ -147,11 +147,17 @@ test("opens two visited documents offline and keeps local edits through refresh"
   await page.getByRole("button", { name: /Offline beta/ }).click();
   await expect(page.locator(".offline-document .bn-editor")).toContainText("Second online copy");
   await page.locator(".offline-document .bn-editor").click();
+  await page.keyboard.type(" quick switch");
+  await page.getByRole("button", { name: /Offline alpha/ }).click();
+  await page.getByRole("button", { name: /Offline beta/ }).click();
+  await expect(page.locator(".offline-document .bn-editor")).toContainText("quick switch");
+  await page.locator(".offline-document .bn-editor").click();
   await page.keyboard.type(" with a local edit");
   await expect(page.locator(".offline-document .bn-editor")).toContainText("local edit");
   await expect(page.getByText("Saved locally · pending server sync")).toBeVisible();
   await page.reload();
   await expect(page.locator(".offline-document .bn-editor")).toContainText("local edit");
+  await expect(page.locator(".offline-document .bn-editor")).toContainText("quick switch");
   const selectedPageId = new URL(page.url()).searchParams.get("page");
   await page.route(`**/api/pages/${selectedPageId}`, async (route) => {
     const response = await route.fetch();

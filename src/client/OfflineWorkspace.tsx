@@ -2,6 +2,7 @@ import { withCollaboration } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
 import { useCreateBlockNote } from "@blocknote/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { IndexeddbPersistence } from "y-indexeddb";
 import YProvider from "y-partyserver/provider";
 import * as Y from "yjs";
@@ -17,11 +18,12 @@ import {
   listPendingOfflinePages,
   markOfflinePagePending,
   markOfflinePageRevoked,
+  pendingKeysOf,
   type OfflineAccount,
   type OfflinePage,
 } from "./offline-catalog";
 
-type RecoveryState = "checking" | "offline";
+type RecoveryState = "checking" | "finalizing" | "offline";
 
 export function OfflineWorkspace({
   account,
@@ -43,10 +45,6 @@ export function OfflineWorkspace({
   const [quarantined, setQuarantined] = useState<Record<string, string>>({});
   const [notice, setNotice] = useState("");
   const selectedId = useRef(selected?.pageId ?? null);
-  const editVersion = useRef(0);
-  const onLocalEdit = useCallback(() => {
-    editVersion.current += 1;
-  }, []);
   const reconnectController = useRef<AbortController | null>(null);
   const selectedReason = selected ? quarantined[selected.pageId] : undefined;
 
@@ -91,7 +89,6 @@ export function OfflineWorkspace({
     if (selectedReason) return;
     reconnectController.current?.abort();
     const controller = new AbortController();
-    const startingEditVersion = editVersion.current;
     reconnectController.current = controller;
     const deadline = window.setTimeout(() => controller.abort(), 10_000);
     const ownsSelection = () =>
@@ -111,13 +108,10 @@ export function OfflineWorkspace({
           api<{ spaces: Space[] }>("/api/spaces", { signal: controller.signal }),
         ]);
         if (!isCurrent()) return;
+        flushSync(() => setRecovery("finalizing"));
         const stored = await getOfflinePage(account.key, selected.pageId);
         if (!isCurrent()) return;
-        if (editVersion.current !== startingEditVersion) {
-          setRecovery("offline");
-          return;
-        }
-        const hasDraft = Boolean(stored?.pendingChanges || stored?.pendingCopyKeys?.length);
+        const hasDraft = Boolean(stored && pendingKeysOf(stored).length);
         const space = spaces.find((item) => item.id === page.spaceId);
         if (!space && !hasDraft) {
           await discardRevokedCopy(selected.pageId);
@@ -196,9 +190,9 @@ export function OfflineWorkspace({
         <button
           type="button"
           onClick={selectedReason ? onRetry : () => void reconnect()}
-          disabled={recovery === "checking"}
+          disabled={recovery !== "offline"}
         >
-          {selectedReason ? "Open online workspace" : recovery === "checking" ? "Checking access…" : "Reconnect"}
+          {selectedReason ? "Open online workspace" : recovery !== "offline" ? "Checking access…" : "Reconnect"}
         </button>
         <button type="button" onClick={onSignOut}>
           Sign out and remove local copies
@@ -227,9 +221,13 @@ export function OfflineWorkspace({
             >
               <strong>{page.title}</strong>
               <span>{page.spaceName}</span>
-              <time dateTime={new Date(page.lastSyncedAt).toISOString()}>
-                Synced {new Date(page.lastSyncedAt).toLocaleString()}
-              </time>
+              {page.lastSyncedAt > 0 ? (
+                <time dateTime={new Date(page.lastSyncedAt).toISOString()}>
+                  Synced {new Date(page.lastSyncedAt).toLocaleString()}
+                </time>
+              ) : (
+                <span>Not yet synced</span>
+              )}
             </button>
           ))}
         </nav>
@@ -246,9 +244,14 @@ export function OfflineWorkspace({
                   type="button"
                   onClick={() => {
                     void listPendingOfflinePages(account.key)
-                      .then((pending) =>
-                        exportPendingOfflinePages(pending.filter((page) => page.pageId === selected.pageId)),
-                      )
+                      .then(async (pending) => {
+                        const copies = pending.filter((page) => page.pageId === selected.pageId);
+                        if (!copies.length) {
+                          setNotice("No unsynced copy is available to export for this page.");
+                          return;
+                        }
+                        await exportPendingOfflinePages(copies);
+                      })
                       .catch((error) =>
                         setNotice(error instanceof Error ? error.message : "Unable to export local changes."),
                       );
@@ -262,8 +265,7 @@ export function OfflineWorkspace({
                 page={selected}
                 accountKey={account.key}
                 quarantined={Boolean(selectedReason)}
-                editingEnabled={account.offlineEditingEnabled}
-                onLocalEdit={onLocalEdit}
+                editingEnabled={account.offlineEditingEnabled && recovery !== "finalizing"}
               />
             </>
           ) : (
@@ -280,13 +282,11 @@ function OfflineEditor({
   accountKey,
   quarantined,
   editingEnabled,
-  onLocalEdit,
 }: {
   page: OfflinePage;
   accountKey: string;
   quarantined: boolean;
   editingEnabled: boolean;
-  onLocalEdit: () => void;
 }) {
   const [copy, setCopy] = useState<{ doc: Y.Doc; persistence: IndexeddbPersistence; provider: YProvider } | null>(null);
   const [error, setError] = useState("");
@@ -343,7 +343,6 @@ function OfflineEditor({
           page={page}
           accountKey={accountKey}
           editable={page.canEdit && editingEnabled && !quarantined}
-          onLocalEdit={onLocalEdit}
         />
       ) : (
         !error && <p>Opening local document…</p>
@@ -357,92 +356,72 @@ function OfflineBlockEditor({
   page,
   accountKey,
   editable,
-  onLocalEdit,
 }: {
   copy: { doc: Y.Doc; persistence: IndexeddbPersistence; provider: YProvider };
   page: OfflinePage;
   accountKey: string;
   editable: boolean;
-  onLocalEdit: () => void;
 }) {
   const storageKey = page.storageKeys.at(-1) ?? "";
+  const initialPending = pendingKeysOf(page).includes(storageKey);
   const [saveState, setSaveState] = useState<"ready" | "saving" | "saved" | "failed">(
-    page.pendingChanges ? "saved" : "ready",
+    initialPending ? "saved" : "ready",
   );
   useEffect(() => {
     let active = true;
-    let timer: number | undefined;
     let generation = 0;
-    let savedGeneration = 0;
-    let writing = false;
-    const updates: Uint8Array[] = [];
-    let pendingCommitted = page.pendingChanges === true;
+    let writes = 0;
+    let pendingCommitted = initialPending;
     let pendingMark: Promise<void> | null = null;
-    let pendingError = false;
-    const persistUpdates = async () => {
-      if (writing || !active || !updates.length) return;
-      writing = true;
-      let failed = false;
-      if (timer !== undefined) window.clearTimeout(timer);
-      try {
-        await pendingMark;
-        if (pendingError) throw new Error("Offline catalog could not record pending changes.");
-        const db = copy.persistence.db;
-        if (!db) throw new Error("Offline document storage is unavailable.");
-        while (updates.length) {
-          const batch = updates.slice();
-          const target = generation;
-          // This incremental write gives the UI a real commit ack.
-          const transaction = db.transaction("updates", "readwrite");
-          transaction.objectStore("updates").add(batch.length === 1 ? batch[0] : Y.mergeUpdates(batch));
-          await new Promise<void>((resolve, reject) => {
-            transaction.addEventListener("complete", () => resolve());
-            transaction.addEventListener("abort", () => reject(transaction.error));
-            transaction.addEventListener("error", () => reject(transaction.error));
-          });
-          updates.splice(0, batch.length);
-          savedGeneration = target;
-        }
-        if (active && savedGeneration === generation) setSaveState("saved");
-      } catch {
-        failed = true;
-        if (active) setSaveState("failed");
-      } finally {
-        writing = false;
-        if (active && !failed && updates.length) timer = window.setTimeout(() => void persistUpdates(), 100);
-      }
-    };
     const updated = (update: Uint8Array, origin: unknown) => {
       if (origin === copy.persistence || origin === copy.provider) return;
-      onLocalEdit();
       generation += 1;
-      updates.push(update);
+      const target = generation;
       setSaveState("saving");
-      if (!pendingCommitted && !pendingMark) {
-        pendingError = false;
-        pendingMark = markOfflinePagePending(accountKey, page.pageId, storageKey, true)
-          .then(
-            () => {
+      try {
+        const db = copy.persistence.db;
+        if (!db) throw new Error("Offline document storage is unavailable.");
+        // Start the transaction during the Yjs update event. It can complete
+        // after this editor unmounts, including on a quick page switch.
+        const transaction = db.transaction("updates", "readwrite");
+        const store = transaction.objectStore("updates");
+        if (++writes % 500 === 0) {
+          store.clear();
+          store.add(Y.encodeStateAsUpdate(copy.doc));
+        } else store.add(update);
+        const committed = new Promise<void>((resolve, reject) => {
+          transaction.addEventListener("complete", () => resolve());
+          transaction.addEventListener("abort", () => reject(transaction.error));
+          transaction.addEventListener("error", () => reject(transaction.error));
+        });
+        if (!pendingCommitted && !pendingMark) {
+          pendingMark = markOfflinePagePending(accountKey, page.pageId, storageKey, true)
+            .then(() => {
               pendingCommitted = true;
-            },
-            () => {
-              pendingError = true;
-            },
-          )
-          .finally(() => {
-            pendingMark = null;
-          });
+            })
+            .finally(() => {
+              pendingMark = null;
+            });
+        }
+        const pending = pendingMark ?? Promise.resolve();
+        void Promise.all([committed, pending]).then(
+          () => {
+            if (active && target === generation) setSaveState("saved");
+          },
+          () => {
+            if (active) setSaveState("failed");
+          },
+        );
+      } catch {
+        if (active) setSaveState("failed");
       }
-      if (timer !== undefined) window.clearTimeout(timer);
-      timer = window.setTimeout(() => void persistUpdates(), 100);
     };
     copy.doc.on("update", updated);
     return () => {
       active = false;
-      if (timer !== undefined) window.clearTimeout(timer);
       copy.doc.off("update", updated);
     };
-  }, [accountKey, copy, onLocalEdit, page.pageId, page.pendingChanges, storageKey]);
+  }, [accountKey, copy, initialPending, page.pageId, storageKey]);
   const options = useMemo(
     () =>
       withCollaboration({

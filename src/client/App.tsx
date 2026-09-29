@@ -705,7 +705,7 @@ async function authenticatedWorkspace(member: ClientMemberContext): Promise<AppS
     await rememberOfflineAccount(member).catch((error) =>
       console.error("Unable to remember this account for offline use", error),
     );
-    void clearRevokedOfflinePages(offlineAccountKey(member)).catch((error) =>
+    await clearRevokedOfflinePages(offlineAccountKey(member)).catch((error) =>
       console.error("Unable to remove revoked offline copies", error),
     );
   }
@@ -767,12 +767,15 @@ async function resolveAppState(): Promise<AppState> {
     return invite ? { screen: "invite", token: invite } : { screen: "signin" };
   }
   if (status.state !== "ready") return { screen: "security", status };
-  let currentMember: ClientMemberContext | null = null;
+  if (locallySignedOut) {
+    const signedOutUserId = locallySignedOut.split("\u0000")[0];
+    if (!status.userId || status.userId === signedOutUserId) return { screen: "signin" };
+    localStorage.removeItem("notes:local-signout");
+  }
   let inviteFailure: ApiClientError | null = null;
   if (invite || status.pendingInvite) {
     try {
       await api("/api/invites/complete", { method: "POST", body: json(invite ? { token: invite } : {}) });
-      currentMember = null;
       clearPendingInvite();
     } catch (cause) {
       if (invite && cause instanceof ApiClientError && cause.code === "invite_invalid") {
@@ -788,13 +791,8 @@ async function resolveAppState(): Promise<AppState> {
       }
     }
   }
-  if (locallySignedOut) {
-    currentMember = await api<ClientMemberContext>("/api/me");
-    if (offlineAccountKey(currentMember) === locallySignedOut) return { screen: "signin" };
-    localStorage.removeItem("notes:local-signout");
-  }
   try {
-    const member = currentMember ?? (await api<ClientMemberContext>("/api/me"));
+    const member = await api<ClientMemberContext>("/api/me");
     return await authenticatedWorkspace(member);
   } catch (error) {
     if (error instanceof ApiClientError && error.status === 401) {
@@ -935,6 +933,7 @@ export function App() {
     async (accountKey: string) => {
       showState({ screen: "loading" });
       try {
+        await markOfflineAccountPurging(accountKey);
         await load();
       } catch (error) {
         showState({
@@ -1266,16 +1265,10 @@ async function finishPendingServerSignOut() {
   if (!accountKey) return;
   const status = await api<SecurityStatus>("/api/security/status");
   if (status.state !== "signed_out") {
-    if (status.state === "ready") {
-      try {
-        const member = await api<ClientMemberContext>("/api/me");
-        if (offlineAccountKey(member) !== accountKey) {
-          localStorage.removeItem("notes:local-signout");
-          return;
-        }
-      } catch {
-        // The account may have lost its workspace. End the server session anyway.
-      }
+    if (!status.userId) throw new Error("The signed-in account could not be verified. Try again.");
+    if (status.userId !== accountKey.split("\u0000")[0]) {
+      localStorage.removeItem("notes:local-signout");
+      return;
     }
     const result = await authClient.signOut();
     if (result.error) throw new Error(result.error.message || "Finish signing out before using another account.");

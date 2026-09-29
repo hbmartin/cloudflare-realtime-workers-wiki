@@ -31,9 +31,15 @@ export type OfflinePage = {
 };
 
 export function pendingKeysOf(page: OfflinePage): string[] {
-  return (
-    page.pendingCopyKeys ?? (page.pendingChanges ? [page.storageKeys.at(-1)].filter((key): key is string => !!key) : [])
-  );
+  return page.pendingCopyKeys?.length
+    ? page.pendingCopyKeys.filter(Boolean)
+    : page.pendingChanges
+      ? [page.storageKeys.at(-1)].filter((key): key is string => !!key)
+      : [];
+}
+
+function storageEpoch(key: string) {
+  return Number(key.split(":").at(-2)) || 0;
 }
 
 let connection: Promise<IDBDatabase> | null = null;
@@ -170,7 +176,11 @@ export async function listOfflinePages(accountKey: string): Promise<OfflinePage[
   const pages = await readAccountPages(accountKey);
   const valid = pages.filter(
     (page) =>
-      page.accountKey === accountKey && page.kind === "document" && !page.revoked && Array.isArray(page.storageKeys),
+      page.accountKey === accountKey &&
+      page.kind === "document" &&
+      !page.revoked &&
+      Array.isArray(page.storageKeys) &&
+      (page.lastSyncedAt > 0 || pendingKeysOf(page).length > 0),
   );
   const available = await Promise.all(
     valid.map(async (page) => {
@@ -222,6 +232,7 @@ export async function rememberOfflinePage(
   page: Page,
   spaceName: string,
   canEdit: boolean,
+  confirmed = true,
 ) {
   if (page.kind !== "document") return undefined;
   const accountKey = offlineAccountKey(member);
@@ -240,20 +251,24 @@ export async function rememberOfflinePage(
     const store = transaction.objectStore("pages");
     const previous = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
     const previousPendingKeys = previous ? pendingKeysOf(previous) : [];
+    const currentOrNewer = !previous || page.contentEpoch >= previous.epoch;
+    const storageKeys = [...new Set([...(previous?.storageKeys ?? []), storageKey])].sort(
+      (left, right) => storageEpoch(left) - storageEpoch(right),
+    );
     const entry: OfflinePage = {
       key,
       accountKey,
       pageId: page.id,
-      title: page.title,
-      spaceName,
+      title: currentOrNewer ? page.title : previous.title,
+      spaceName: currentOrNewer ? spaceName : previous.spaceName,
       kind: page.kind,
-      epoch: page.contentEpoch,
-      canEdit,
-      pendingChanges: previousPendingKeys.includes(storageKey),
+      epoch: currentOrNewer ? page.contentEpoch : previous.epoch,
+      canEdit: currentOrNewer ? canEdit : previous.canEdit,
+      pendingChanges: previousPendingKeys.includes(storageKeys.at(-1) ?? ""),
       pendingCopyKeys: previousPendingKeys,
-      revoked: false,
-      lastSyncedAt: Date.now(),
-      storageKeys: [...new Set([...(previous?.storageKeys ?? []), storageKey])],
+      revoked: confirmed && currentOrNewer ? false : (previous?.revoked ?? false),
+      lastSyncedAt: confirmed && currentOrNewer ? Date.now() : (previous?.lastSyncedAt ?? 0),
+      storageKeys,
     };
     store.put(entry);
     await transactionDone(transaction);
@@ -277,7 +292,9 @@ export async function markOfflinePagePending(
       const keys = new Set(pendingKeysOf(page));
       if (pendingChanges) keys.add(storageKey);
       else keys.delete(storageKey);
-      const storageKeys = page.storageKeys.includes(storageKey) ? page.storageKeys : [...page.storageKeys, storageKey];
+      const storageKeys = [...new Set([...page.storageKeys, storageKey])].sort(
+        (left, right) => storageEpoch(left) - storageEpoch(right),
+      );
       store.put({
         ...page,
         storageKeys,
@@ -296,7 +313,7 @@ export async function markOfflinePageRevoked(accountKey: string, pageId: string)
     const transaction = db.transaction("pages", "readwrite");
     const store = transaction.objectStore("pages");
     const page = await requestResult(store.get(key) as IDBRequest<OfflinePage | undefined>);
-    const revoked = Boolean(page && !page.pendingChanges && !page.pendingCopyKeys?.length);
+    const revoked = Boolean(page && pendingKeysOf(page).length === 0);
     if (revoked && page) store.put({ ...page, revoked: true });
     await transactionDone(transaction);
     return revoked;
@@ -306,11 +323,11 @@ export async function markOfflinePageRevoked(accountKey: string, pageId: string)
 export async function clearRevokedOfflinePages(accountKey: string) {
   const db = await openCatalog();
   for (const page of (await readAccountPages(accountKey)).filter(
-    (entry) => entry.revoked && !entry.pendingChanges && !entry.pendingCopyKeys?.length,
+    (entry) => entry.revoked && pendingKeysOf(entry).length === 0,
   )) {
     await withPageLock(page.key, async () => {
       const current = await getOfflinePage(accountKey, page.pageId);
-      if (!current?.revoked || current.pendingChanges || current.pendingCopyKeys?.length) return;
+      if (!current?.revoked || pendingKeysOf(current).length) return;
       for (const key of current.storageKeys) {
         await new Promise<void>((resolve, reject) => {
           const request = indexedDB.deleteDatabase(key);

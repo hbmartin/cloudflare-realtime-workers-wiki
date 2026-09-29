@@ -69,6 +69,24 @@ function requestFromIp(ip: string, path: string, body: object, cookie = "") {
 }
 
 describe("mandatory account protection", () => {
+  it("reports the signed-in identity even when workspace membership is missing", async () => {
+    const cookie = await enrollAccount(await bootstrap());
+    const user = await env.DB.prepare("SELECT id FROM user WHERE email='owner@example.test'").first<{ id: string }>();
+    const workspace = await env.DB.prepare("SELECT id FROM workspaces LIMIT 1").first<{ id: string }>();
+    await env.DB.prepare(
+      "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES ('replacement','Replacement','replacement@example.test',1,1)",
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES (?, 'replacement','owner',1)",
+    )
+      .bind(workspace!.id)
+      .run();
+    await env.DB.prepare("DELETE FROM workspace_members WHERE user_id=?").bind(user!.id).run();
+    const response = await rawRequest(cookie, "/api/security/status");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ state: "ready", userId: user!.id });
+  });
+
   it("keeps an initial recovery key restricted until its exact value is acknowledged", async () => {
     const cookie = await enrollAccount(await bootstrap());
     const { codes, receipt } = await (
