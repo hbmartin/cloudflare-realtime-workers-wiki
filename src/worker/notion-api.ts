@@ -581,7 +581,9 @@ async function mutateDocument(
       "conflict_error",
       result.error === "duplicate_date_token"
         ? "Move the original date token before reusing its ID."
-        : "The document could not be changed.",
+        : result.error === "revision_changed"
+          ? "This date token changed while moving it. Retry."
+          : "The document could not be changed.",
     );
   }
   if (response.status === 413) throw new NotionError(413, "validation_error", "The mutation exceeds document limits.");
@@ -1279,14 +1281,24 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   if (!node) throw new NotionError(400, "validation_error", "Block content is required.");
   if ([...dateTokens(container).values()].some((token) => token === null))
     throw new NotionError(400, "validation_error", "Date tokens must be unique within a block.");
-  await markRemindersMissing(c.env, located.page.id, located.page.content_epoch, located.sequence, pendingMissing);
+  if (pendingMissing.length) {
+    const marked = await markRemindersMissing(
+      c.env,
+      located.page.id,
+      located.page.content_epoch,
+      located.sequence,
+      pendingMissing,
+    );
+    if (marked !== pendingMissing.length)
+      throw new NotionError(409, "conflict_error", "This date token changed while moving it. Retry.");
+  }
   const mutated = await mutateDocument(
     c.env,
     located.page,
     principal,
     [{ type: "update_block", internalId: located.internalId, node }],
     false,
-    { expectedSequence: located.sequence },
+    pendingMissing.length ? { expectedSequence: located.sequence } : {},
   );
   const updated = findDocumentBlock(mutated.document, located.internalId)!;
   return c.json(await blockObject(c.env, located.page, updated, await metadataForPage(c.env, located.page.id)));

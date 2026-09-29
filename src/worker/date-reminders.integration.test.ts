@@ -135,6 +135,43 @@ afterEach(async () => {
 });
 
 describe("date reminders", () => {
+  it("validates expected document sequences before block mutation", async () => {
+    const installed = await bootstrap();
+    const token: DateMention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: installed.userId,
+      kind: "timed",
+      value: new Date(Date.now() + 3_600_000).toISOString(),
+      timezone: "UTC",
+    };
+    const blockId = await addStructuredTokenBlock(installed.page.id, token);
+    const stub = env.DOCUMENT.getByName(`${installed.page.id}~1`);
+    const envelope = await (
+      await stub.fetch(
+        new Request("https://document.internal/content", {
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        }),
+      )
+    ).json<{ document: Parameters<typeof flattenDocumentBlocks>[0]; sequence: number }>();
+    const block = flattenDocumentBlocks(envelope.document).find((candidate) => candidate.internalId === blockId)!;
+    const mutate = (expectedSequence: unknown) =>
+      stub.fetch(
+        new Request("https://document.internal/api-mutate", {
+          method: "POST",
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "content-type": "application/json" },
+          body: JSON.stringify({
+            actorId: installed.userId,
+            operations: [{ type: "update_block", internalId: blockId, node: block.node }],
+            expectedSequence,
+          }),
+        }),
+      );
+    expect((await mutate(null)).status).toBe(400);
+    expect((await mutate(envelope.sequence - 1)).status).toBe(409);
+    expect((await mutate(envelope.sequence)).status).toBe(200);
+  });
+
   it("requires authentication and a current authored token revision", async () => {
     const installed = await bootstrap();
     const token: DateMention = {
@@ -551,7 +588,9 @@ describe("date reminders", () => {
     const before = await env.DB.prepare(`SELECT checked_at FROM date_reminders WHERE token_id=?`)
       .bind(token.tokenId)
       .first<{ checked_at: number }>();
-    await reconcileDateRemindersForPage(env, installed.page.id, 1, envelope.document, envelope.sequence);
+    expect(await reconcileDateRemindersForPage(env, installed.page.id, 1, envelope.document, envelope.sequence)).toBe(
+      false,
+    );
     const after = await env.DB.prepare(`SELECT checked_at FROM date_reminders WHERE token_id=?`)
       .bind(token.tokenId)
       .first<{ checked_at: number }>();
@@ -584,7 +623,7 @@ describe("date reminders", () => {
     await env.DB.prepare(`UPDATE date_reminders SET state='claimed',claim_id='claim',claimed_at=? WHERE id=?`)
       .bind(Date.now(), reminder.id)
       .run();
-    await markRemindersMissing(env, installed.page.id, 1, projection!.sequence, [reminder]);
+    expect(await markRemindersMissing(env, installed.page.id, 1, projection!.sequence, [reminder])).toBe(1);
     const released = await env.DB.prepare(`SELECT state,claim_id,missing_since FROM date_reminders WHERE id=?`)
       .bind(reminder.id)
       .first<{ state: string; claim_id: string | null; missing_since: number | null }>();
@@ -595,7 +634,7 @@ describe("date reminders", () => {
     await env.DB.prepare(`UPDATE document_projections SET sequence=sequence+1 WHERE page_id=?`)
       .bind(installed.page.id)
       .run();
-    await markRemindersMissing(env, installed.page.id, 1, projection!.sequence, [reminder]);
+    expect(await markRemindersMissing(env, installed.page.id, 1, projection!.sequence, [reminder])).toBe(0);
     const stale = await env.DB.prepare(`SELECT missing_since FROM date_reminders WHERE id=?`)
       .bind(reminder.id)
       .first<{ missing_since: number | null }>();

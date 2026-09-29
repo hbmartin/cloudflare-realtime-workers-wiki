@@ -851,14 +851,8 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
-      for (let attempt = 0; attempt < 4; attempt += 1) {
-        this.flushPendingUpdates();
-        if (!this.compaction && !this.metadata.dirty) break;
-        await this.compact();
-      }
       this.flushPendingUpdates();
-      if (this.compaction || this.metadata.dirty)
-        return Response.json({ error: "Document is still changing." }, { status: 503 });
+      if (this.metadata.dirty) await this.compact();
       const { pageId, epoch } = this.ids;
       if (this.metadata.content_kind === "diagram") {
         const envelope = diagramFromYDoc(this.document, {
@@ -911,15 +905,10 @@ export class Document extends YServer {
       }
       if (this.metadata.read_only) return Response.json({ error: "This document is read-only." }, { status: 409 });
       if (body.expectedSequence !== undefined) {
+        if (!Number.isInteger(body.expectedSequence) || Number(body.expectedSequence) < 0)
+          return Response.json({ error: "Invalid expected sequence." }, { status: 400 });
         this.flushPendingUpdates();
-        if (this.metadata.dirty || this.compaction) await this.compact();
-        this.flushPendingUpdates();
-        if (this.metadata.dirty) await this.compact();
-        if (
-          !Number.isInteger(body.expectedSequence) ||
-          this.metadata.dirty ||
-          this.metadata.snapshot_seq !== body.expectedSequence
-        )
+        if (this.compaction || this.metadata.dirty || this.metadata.snapshot_seq !== body.expectedSequence)
           return Response.json({ error: "revision_changed" }, { status: 409 });
       }
       const operationId =
