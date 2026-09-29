@@ -278,12 +278,41 @@ describe("import content", () => {
     expect(parsed.references).toEqual(["source.md"]);
   });
 
+  it.each(["2*3", "a<b", "arr](x", "2 ** 3", "<https://example.com/_next>"])(
+    "keeps references after unmatched long-line punctuation: %s",
+    (prefix) => {
+      const parsed = markdownToDocument(`${prefix} ${"word ".repeat(1700)}[Spec](spec.md)`);
+      expect(parsed.references).toContain("spec.md");
+    },
+  );
+
+  it("keeps references in dense long paragraphs", () => {
+    const links = Array.from({ length: 1_000 }, (_, index) => `[L${index}](file${index}.md)`).join(" ");
+    const parsed = markdownToDocument(links);
+    expect(parsed.references).toHaveLength(1_000);
+    expect(parsed.references.at(-1)).toBe("file999.md");
+  });
+
   it("keeps code-span brackets in a block image caption", () => {
     const parsed = markdownToDocument("![a `]` b](image.png)");
     expect(parsed.document.content![0]!.content![0]!.content![0]).toMatchObject({
       type: "image",
       attrs: { caption: "a `]` b", name: "a `]` b" },
     });
+  });
+
+  it("unescapes a literal backslash in a block image caption only once", () => {
+    const parsed = markdownToDocument(String.raw`![a\\[b]](image.png)`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]).toMatchObject({
+      type: "image",
+      attrs: { caption: String.raw`a\[b]` },
+    });
+  });
+
+  it("does not scan a trailing long paragraph as one block image", () => {
+    const parsed = markdownToDocument(`![a](image.png) ${"*x ".repeat(3_000)})`);
+    expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("paragraph");
+    expect(parsed.references).toContain("image.png");
   });
 
   it("uses Marked link and code rules in long content", () => {

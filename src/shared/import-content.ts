@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { Lexer, type Token } from "marked";
+import { Lexer, Tokenizer, type Token } from "marked";
 import type { ColumnType, ProseMirrorJson } from "./types";
 
 export type ImportedTable = {
@@ -95,10 +95,12 @@ function unescapeMarkdown(value: string, abortOnMarkup = false): string | null {
   return output;
 }
 
-function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
-  const plain = unescapeMarkdown(value, true);
-  if (plain !== null) return inline(plain);
-  if (value.length > 8192) return boundedMarkdownInline(value, issues, references);
+function markdownInline(value: string, issues: ImportIssue[], references: string[], prepared?: Token[]) {
+  if (!prepared) {
+    const plain = unescapeMarkdown(value, true);
+    if (plain !== null) return inline(plain);
+    if (value.length > 8192) return boundedMarkdownInline(value, issues, references);
+  }
   const output: ProseMirrorJson[] = [];
   const append = (text: string, marks: ProseMirrorJson["marks"] = []) => {
     if (!text) return;
@@ -139,7 +141,7 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
       else append(token.raw, marks);
     }
   };
-  walk(Lexer.lexInline(value, { gfm: false }));
+  walk(prepared ?? Lexer.lexInline(value, { gfm: false }));
   return output;
 }
 
@@ -154,79 +156,40 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
       else output.push(node);
     }
   };
-  let start = 0;
-  while (start < value.length) {
-    if (value.length - start <= 8192) {
-      append(markdownInline(value.slice(start), issues, references));
-      break;
+  // Let Marked identify links, images and code spans over the whole input.
+  // Disabling only emphasis keeps this pass linear even with unmatched `*`.
+  const tokenizer = new Tokenizer({ gfm: false });
+  tokenizer.emStrong = () => undefined;
+  const coarse = Lexer.lexInline(value, { gfm: false, tokenizer });
+  for (const token of coarse) {
+    if (token.raw.length <= 8192) {
+      append(markdownInline(token.raw, issues, references));
+      continue;
     }
-    let bracketDepth = 0;
-    let destinationDepth = 0;
-    let angle = false;
-    let codeTicks = 0;
-    const emphasis = new Set<string>();
-    let delimiterCount = 0;
-    let lastSafe = -1;
-    for (let index = start; index < start + 8192; index += 1) {
-      const character = value[index]!;
-      if (INLINE_MARKUP_CHAR.test(character)) delimiterCount += 1;
-      if (character === "\\" && ESCAPABLE_MARKDOWN.test(value[index + 1] ?? "")) {
-        index += 1;
-        continue;
-      }
-      if (character === "`") {
-        let end = index + 1;
-        while (value[end] === "`") end += 1;
-        const count = end - index;
-        if (!codeTicks || codeTicks === count) codeTicks = codeTicks ? 0 : count;
-        index = end - 1;
-        continue;
-      }
-      if (codeTicks) continue;
-      if (character === "<" && !angle && /[!/?a-z]/i.test(value[index + 1] ?? "")) angle = true;
-      else if (character === ">") angle = false;
-      else if (character === "[") bracketDepth += 1;
-      else if (character === "]" && bracketDepth) {
-        bracketDepth -= 1;
-      } else if (character === "(" && (destinationDepth || (!bracketDepth && value[index - 1] === "]")))
-        destinationDepth += 1;
-      else if (character === ")" && destinationDepth) destinationDepth -= 1;
-      else if ((character === "*" || character === "_") && !bracketDepth && !destinationDepth) {
-        const previous = value[index - 1] ?? "";
-        const next = value[index + 1] ?? "";
-        if (/\s/.test(next) && !emphasis.size) continue;
-        if (character === "_" && /[\p{L}\p{N}]/u.test(previous) && /[\p{L}\p{N}]/u.test(next)) continue;
-        const count = value[index + 1] === character ? 2 : 1;
-        const marker = character.repeat(count);
-        if (emphasis.has(marker)) emphasis.delete(marker);
-        else emphasis.add(marker);
-        index += count - 1;
-      }
-      if (/\s/.test(character) && !codeTicks && !bracketDepth && !destinationDepth && !angle && !emphasis.size)
-        lastSafe = index + 1;
+    if (token.type !== "text") {
+      append(markdownInline("", issues, references, [token]));
+      continue;
     }
-    let cut = lastSafe > start ? lastSafe : start + 8192;
-    // An even trailing run is already paired; moving one slash changes what
-    // the following chunk escapes.
-    let slashCount = 0;
-    while (value[cut - slashCount - 1] === "\\") slashCount += 1;
-    if (slashCount % 2 && ESCAPABLE_MARKDOWN.test(value[cut] ?? "")) cut -= 1;
-    // An unclosed construct offers no safe boundary. Keep that section's
-    // visible text instead of asking Marked to parse a severed construct.
-    append(
-      lastSafe > start && delimiterCount <= 512
-        ? markdownInline(value.slice(start, cut), issues, references)
-        : inline(unescapeMarkdown(value.slice(start, cut))),
-    );
-    start = cut;
+    let start = 0;
+    while (start < token.raw.length) {
+      let cut = Math.min(start + 8192, token.raw.length);
+      if (cut < token.raw.length) {
+        const whitespace = token.raw.lastIndexOf(" ", cut);
+        if (whitespace > start + 1024) cut = whitespace + 1;
+      }
+      const section = token.raw.slice(start, cut);
+      const dense = (section.match(/[*_`]/g)?.length ?? 0) > 512;
+      append(dense ? inline(unescapeMarkdown(section)) : markdownInline(section, issues, references));
+      start = cut;
+    }
   }
   return output;
 }
 
 function markdownImage(value: string) {
   const trimmed = value.trim();
-  // A full-line image has a short label and a closing destination. Avoid
-  // running Marked's emphasis scanner over arbitrary 64 KiB text lines.
+  // A full-line image has a short label and one complete destination. Reject
+  // a trailing paragraph before running Marked over a large data URL.
   const destination = trimmed.indexOf("](");
   if (
     !trimmed.startsWith("![") ||
@@ -236,10 +199,45 @@ function markdownImage(value: string) {
     destination > 8192
   )
     return null;
+  let end = 2;
+  let brackets = 1;
+  let ticks = 0;
+  while (end < trimmed.length && end <= 8192 && brackets) {
+    const character = trimmed[end]!;
+    if (character === "\\" && end + 1 < trimmed.length) {
+      end += 2;
+      continue;
+    }
+    if (character === "`") {
+      let next = end + 1;
+      while (trimmed[next] === "`") next += 1;
+      const count = next - end;
+      if (!ticks || ticks === count) ticks = ticks ? 0 : count;
+      end = next;
+      continue;
+    }
+    if (!ticks) {
+      if (character === "[") brackets += 1;
+      else if (character === "]") brackets -= 1;
+    }
+    end += 1;
+  }
+  if (brackets || trimmed[end] !== "(") return null;
+  let depth = 1;
+  for (let index = end + 1; index < trimmed.length; index += 1) {
+    if (trimmed[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (trimmed[index] === "(") depth += 1;
+    if (trimmed[index] === ")") depth -= 1;
+    if (depth === 0 && index !== trimmed.length - 1) return null;
+  }
+  if (depth !== 0) return null;
   const tokens = Lexer.lexInline(trimmed, { gfm: false });
   const image = tokens.length === 1 && tokens[0]?.type === "image" ? tokens[0] : null;
   if (!image) return null;
-  return { label: unescapeMarkdown(image.text), href: image.href };
+  return { label: unescapeMarkdown(trimmed.slice(2, end - 1)), href: image.href };
 }
 
 export function markdownToDocument(source: string) {

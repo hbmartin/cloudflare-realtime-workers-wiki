@@ -5905,6 +5905,66 @@ describe("Slack documents and tasks", () => {
     expect(recovered?.status).toBe("queued");
     expect(recovered?.workflow_instance_id).not.toBe(job!.workflow_instance_id);
   });
+  it("leaves an undetermined Workflow running and fails a linked terminal capture", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Status recovery");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    await env.DB.prepare("UPDATE jobs SET status='running',updated_at=? WHERE id=?")
+      .bind(Date.now() - 60_000, captureId)
+      .run();
+    let workflowStatus = "unknown";
+    const productionEnv: Env = {
+      ...runtime(),
+      NOTES_WORKFLOW: {
+        get: vi.fn(async () => ({ status: vi.fn(async () => ({ status: workflowStatus })) })),
+      } as unknown as Env["NOTES_WORKFLOW"],
+    };
+    delete productionEnv.WORKFLOW_INLINE;
+    await recoverQueuedJobs(productionEnv);
+    expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
+      status: "running",
+    });
+    workflowStatus = "errored";
+    await env.DB.prepare("UPDATE jobs SET updated_at=? WHERE id=?")
+      .bind(Date.now() - 60_000, captureId)
+      .run();
+    await recoverQueuedJobs(productionEnv);
+    expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
+      status: "failed",
+    });
+    expect(await env.DB.prepare("SELECT state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      state: "failed",
+    });
+    expect(job?.workflow_instance_id).toBeTruthy();
+  });
+  it("does not fail a replacement run when a stale Workflow status arrives", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Stale status recovery");
+    await prepareSlackCapture(runtime(), captureId);
+    await env.DB.prepare("UPDATE jobs SET status='running',updated_at=? WHERE id=?")
+      .bind(Date.now() - 60_000, captureId)
+      .run();
+    const replacementId = crypto.randomUUID();
+    const productionEnv: Env = {
+      ...runtime(),
+      NOTES_WORKFLOW: {
+        get: vi.fn(async () => ({
+          status: vi.fn(async () => {
+            await env.DB.prepare("UPDATE jobs SET workflow_instance_id=? WHERE id=?")
+              .bind(replacementId, captureId)
+              .run();
+            return { status: "errored" };
+          }),
+        })),
+      } as unknown as Env["NOTES_WORKFLOW"],
+    };
+    delete productionEnv.WORKFLOW_INLINE;
+    await recoverQueuedJobs(productionEnv);
+    expect(
+      await env.DB.prepare("SELECT status,workflow_instance_id FROM jobs WHERE id=?").bind(captureId).first(),
+    ).toEqual({ status: "running", workflow_instance_id: replacementId });
+    expect(await env.DB.prepare("SELECT state FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      state: "running",
+    });
+  });
   it("starts a replacement workflow if the Slack receipt links during requeue", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Link during requeue");
     const job = await prepareSlackCapture(runtime(), captureId);

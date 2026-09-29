@@ -69,6 +69,9 @@ const JOB_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const JOB_CLEANUP_LEASE_MS = 15 * 60_000;
 const JOB_CLEANUP_LEASE_RENEW_MS = 60_000;
 const QUEUED_JOB_RECOVERY_DELAY_MS = 30_000;
+const CAPTURE_LOOKUP_RETRY_DELAY_MS = 5_000;
+const ACTIVE_WORKFLOW_STATUSES = new Set(["queued", "running", "paused", "waiting", "waitingForPause"]);
+const UNDETERMINED_WORKFLOW_STATUS = "unknown";
 
 export type JobWorkflowParams = { jobId: string; attempt?: number; correlationId?: string };
 export type DeliveryQueueMessage =
@@ -822,9 +825,10 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
       error,
     );
     try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
       return await hasUnlinkedCapture(env, job.id);
     } catch {
-      // A later sweep inspects the terminal Workflow if this D1 write also
+      // A later sweep inspects the terminal Workflow if this D1 lookup and write
       // fails, so an outage cannot strand the job in running indefinitely.
     }
     // Defer recovery until D1 can distinguish an unlinked receipt from a real
@@ -850,7 +854,8 @@ async function replaceCaptureWorkflow(
       instanceId,
       deferForLookup ? "Waiting to check Slack receipt" : "Queued",
       deferForLookup ? "capture_lookup_unavailable" : null,
-      Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS,
+      Date.now() -
+        (deferForLookup ? QUEUED_JOB_RECOVERY_DELAY_MS - CAPTURE_LOOKUP_RETRY_DELAY_MS : QUEUED_JOB_RECOVERY_DELAY_MS),
       job.id,
       job.attempt,
       expectedStatus,
@@ -972,7 +977,7 @@ export async function finishPendingJobCleanup(
       try {
         const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
         const status = await instance.status();
-        if (["queued", "running", "paused", "waiting", "waitingForPause"].includes(status.status)) {
+        if (ACTIVE_WORKFLOW_STATUSES.has(status.status)) {
           terminating = true;
           await instance.terminate();
         }
@@ -1044,13 +1049,13 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
       error,
     );
   if (job.type !== "import" && job.type !== "template_clone" && job.type !== "export") {
-    await updateJob(env, job, {
-      status: "failed",
-      label: "Failed",
-      errorCode,
-      errorMessage: message,
-    });
-    await notifyJobs(env, job.workspace_id);
+    const failed = await env.DB.prepare(
+      `UPDATE jobs SET status='failed',progress_label='Failed',error_code=?,error_message=?,updated_at=?
+        WHERE id=? AND attempt=? AND status='running' AND COALESCE(workflow_instance_id,id)=?`,
+    )
+      .bind(errorCode, message, Date.now(), job.id, job.attempt, job.workflow_instance_id ?? job.id)
+      .run();
+    if (failed.meta.changes) await notifyJobs(env, job.workspace_id);
     return;
   }
   const captureId = job.type === "import" ? jsonRecord(job.options_json).captureId : null;
@@ -1059,8 +1064,9 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
     env.DB.prepare(
       `UPDATE jobs SET status = 'failed', cleanup_target = COALESCE(cleanup_target, 'failed'),
          progress_label = 'Failure cleanup pending', error_code = ?, error_message = ?, updated_at = ?
-       WHERE id = ? AND attempt = ? AND status = 'running'`,
-    ).bind(errorCode, message, timestamp, job.id, job.attempt),
+       WHERE id = ? AND attempt = ? AND status = 'running'
+         AND COALESCE(workflow_instance_id,id)=?`,
+    ).bind(errorCode, message, timestamp, job.id, job.attempt, job.workflow_instance_id ?? job.id),
     ...(typeof captureId === "string"
       ? [
           failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, timestamp, null, "failed"),
@@ -1365,37 +1371,60 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
 
 export async function recoverQueuedJobs(env: Env) {
   const cutoff = Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS;
-  // A Workflow may fail while D1 is down, including during its catch handler.
-  // Recover only terminal instances: a live long import must retain its lease.
-  const runningCaptures = await env.DB.prepare(
-    `SELECT * FROM jobs WHERE type='import' AND status='running'
-       AND CASE WHEN json_valid(options_json) THEN json_extract(options_json, '$.captureId')=id ELSE 0 END
-       AND updated_at <= ?
-       ORDER BY updated_at LIMIT 25`,
-  )
-    .bind(cutoff)
-    .all<JobRow>();
-  for (const job of runningCaptures.results) {
-    if (!isCaptureImportJob(job) || !job.workflow_instance_id || env.WORKFLOW_INLINE === "true") continue;
-    try {
+  if (env.WORKFLOW_INLINE !== "true") {
+    const rotateRunningJob = (job: JobRow) =>
+      env.DB.prepare(`UPDATE jobs SET updated_at=? WHERE id=? AND attempt=? AND status='running'
+        AND workflow_instance_id=?`)
+        .bind(Date.now(), job.id, job.attempt, job.workflow_instance_id)
+        .run();
+    // Move live checks to the back of this bounded scan so they cannot starve
+    // terminal jobs while long imports continue to make progress.
+    const running = await env.DB.prepare(
+      `SELECT * FROM jobs WHERE status='running' AND workflow_instance_id IS NOT NULL
+         AND updated_at<=? ORDER BY updated_at LIMIT 25`,
+    )
+      .bind(cutoff)
+      .all<JobRow>();
+    for (const job of running.results) {
       try {
-        const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
-        const status = await instance.status();
-        if (["queued", "running", "paused", "waiting", "waitingForPause"].includes(status.status)) continue;
+        let status: { status: string; error?: unknown } | null = null;
+        try {
+          status = await (await env.NOTES_WORKFLOW.get(job.workflow_instance_id!)).status();
+        } catch (error) {
+          if (!workflowInstanceMissing(error)) throw error;
+        }
+        if (status && (ACTIVE_WORKFLOW_STATUSES.has(status.status) || status.status === UNDETERMINED_WORKFLOW_STATUS)) {
+          await rotateRunningJob(job);
+          continue;
+        }
+        const failure =
+          status && "error" in status && status.error
+            ? status.error
+            : new Error("Workflow ended before the job reached a terminal state.");
+        if (isCaptureImportJob(job)) {
+          const recovery = await shouldRequeueCapture(env, job, failure);
+          if (recovery) {
+            await replaceCaptureWorkflow(env, job, "running", recovery === "lookup_failed");
+            continue;
+          }
+        }
+        await failJobWithCleanup(env, job, failure);
       } catch (error) {
-        if (!workflowInstanceMissing(error)) throw error;
+        logger.error(
+          "workflow.running_recovery.failed",
+          "workflow",
+          "Running job recovery failed.",
+          { jobId: job.id, attempt: job.attempt },
+          error,
+        );
+        // A repeatedly failing status RPC must not keep terminal jobs beyond
+        // this bounded scan from ever being inspected.
+        try {
+          await rotateRunningJob(job);
+        } catch {
+          // The next sweep can retry once D1 recovers.
+        }
       }
-      const recovery = await shouldRequeueCapture(env, job, new Error("Capture workflow ended before job completion."));
-      if (recovery) await replaceCaptureWorkflow(env, job, "running", recovery === "lookup_failed");
-      else await failJobWithCleanup(env, job, new Error("Capture workflow ended before job completion."));
-    } catch (error) {
-      logger.error(
-        "workflow.capture_recovery.failed",
-        "workflow",
-        "Running capture recovery failed.",
-        { jobId: job.id, attempt: job.attempt },
-        error,
-      );
     }
   }
   const queued = await env.DB.prepare(
