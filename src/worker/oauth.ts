@@ -29,6 +29,10 @@ type AccessRow = {
   expires_at: number;
   revoked_at: number | null;
   mcp_enabled: number;
+  security_generation: number;
+  current_security_generation: number;
+  recovery_required: number;
+  codes_saved: number;
   role: MemberContext["role"] | null;
   workspace_name: string;
   location_hint: string | null;
@@ -97,13 +101,15 @@ export async function mcpAccess(request: Request, env: Env, required: readonly M
   const tokenHash = await sha256(match[1]!);
   const row = await env.DB.prepare(
     `SELECT access.grant_id, grant.client_id, grant.user_id, grant.workspace_id,
-            grant.scopes, grant.revoked_at, access.resource, access.expires_at,
+            grant.scopes, grant.revoked_at, grant.security_generation, access.resource, access.expires_at,
             workspace.mcp_enabled, workspace.name workspace_name, workspace.location_hint,
+            security.generation current_security_generation,security.recovery_required,security.codes_saved,
             member.role, user.name user_name, user.email user_email
        FROM oauth_access_tokens access
        JOIN oauth_grants grant ON grant.id=access.grant_id
        JOIN workspaces workspace ON workspace.id=grant.workspace_id
        JOIN user ON user.id=grant.user_id
+       JOIN account_security security ON security.user_id=grant.user_id
        LEFT JOIN workspace_members member ON member.workspace_id=grant.workspace_id AND member.user_id=grant.user_id
       WHERE access.token_hash=?`,
   )
@@ -115,6 +121,9 @@ export async function mcpAccess(request: Request, env: Env, required: readonly M
     row.expires_at <= Date.now() ||
     row.resource !== mcpResource(env) ||
     row.mcp_enabled !== 1 ||
+    row.security_generation !== row.current_security_generation ||
+    row.recovery_required !== 0 ||
+    row.codes_saved !== 1 ||
     !row.role
   )
     return null;
@@ -428,6 +437,7 @@ export async function authorizeOAuthGet(request: Request, env: Env) {
   const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect MCP client</title>
 <main style="max-width:34rem;margin:4rem auto;font:1rem system-ui;line-height:1.5;padding:1rem"><h1>Connect ${escapeHtml(input.client.name)}</h1>
 <p>This client will use your access to <strong>${escapeHtml(member.workspace.name)}</strong> as ${escapeHtml(member.user.email)}.</p>
+<p>Client ID: <code>${escapeHtml(input.client.client_id)}</code><br>Return address: <code>${escapeHtml(input.redirectUri)}</code></p>
 <p>Requested permissions: ${input.scopes.map(escapeHtml).join(", ")}</p>
 <p>You can revoke this connection from workspace settings.</p>
 <form method="post" action="/oauth/authorize">${controls}<button name="decision" value="approve">Allow access</button>
@@ -436,8 +446,10 @@ export async function authorizeOAuthGet(request: Request, env: Env) {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "cache-control": "no-store",
-      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'",
+      "content-security-policy":
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' http: https:; frame-ancestors 'none'; base-uri 'none'",
       "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
     },
   });
 }
@@ -466,9 +478,11 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
   if (singleton(params, "decision") === "deny") return authorizationRedirect(input, { error: "access_denied" });
   if (singleton(params, "decision") !== "approve") throw new HttpError(400, "invalid_request", "Choose Allow or Deny.");
   const code = randomCredential();
-  await env.DB.prepare(
-    `INSERT INTO oauth_authorization_codes(code_hash,client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge,expires_at)
-     VALUES(?,?,?,?,?,?,?,?,?)`,
+  const issued = await env.DB.prepare(
+    `INSERT INTO oauth_authorization_codes
+      (code_hash,client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge,security_generation,expires_at)
+     SELECT ?,?,?,?,?,?,?,?,generation,? FROM account_security
+      WHERE user_id=? AND recovery_required=0 AND codes_saved=1`,
   )
     .bind(
       await sha256(code),
@@ -480,8 +494,10 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
       input.scopes.join(" "),
       input.challenge,
       Date.now() + CODE_TTL,
+      member.user.id,
     )
     .run();
+  if (!issued.meta.changes) throw new HttpError(403, "account_security_required", "Complete account protection again.");
   return authorizationRedirect(input, { code });
 }
 
@@ -535,6 +551,7 @@ type CodeRow = {
   resource: string;
   scopes: string;
   code_challenge: string;
+  security_generation: number;
 };
 
 async function exchangeCode(params: URLSearchParams, env: Env) {
@@ -549,23 +566,25 @@ async function exchangeCode(params: URLSearchParams, env: Env) {
   const row = await env.DB.prepare(
     `UPDATE oauth_authorization_codes SET consumed_at=? WHERE code_hash=? AND client_id=?
       AND redirect_uri=? AND resource=? AND code_challenge=? AND consumed_at IS NULL AND expires_at>?
-      RETURNING client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge`,
+      RETURNING client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge,security_generation`,
   )
     .bind(Date.now(), codeHash, clientId, redirectUri, resource, challenge, Date.now())
     .first<CodeRow>();
   if (!row) return oauthError("invalid_grant", "The authorization code is invalid or already used.");
   const enabled = await env.DB.prepare(
     `SELECT 1 valid FROM workspace_members member JOIN workspaces workspace ON workspace.id=member.workspace_id
-      WHERE member.user_id=? AND member.workspace_id=? AND workspace.mcp_enabled=1`,
+       JOIN account_security security ON security.user_id=member.user_id
+      WHERE member.user_id=? AND member.workspace_id=? AND workspace.mcp_enabled=1
+        AND security.generation=? AND security.recovery_required=0 AND security.codes_saved=1`,
   )
-    .bind(row.user_id, row.workspace_id)
+    .bind(row.user_id, row.workspace_id, row.security_generation)
     .first();
   if (!enabled) return oauthError("access_denied", "Workspace access is no longer available.", 403);
   const grantId = crypto.randomUUID();
   await env.DB.prepare(
-    "INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,created_at) VALUES(?,?,?,?,?,?)",
+    "INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at) VALUES(?,?,?,?,?,?,?)",
   )
-    .bind(grantId, row.client_id, row.user_id, row.workspace_id, row.scopes, Date.now())
+    .bind(grantId, row.client_id, row.user_id, row.workspace_id, row.scopes, row.security_generation, Date.now())
     .run();
   return issueTokens(env, grantId, row.resource, row.scopes);
 }
@@ -580,6 +599,10 @@ type RefreshRow = {
   revoked_at: number | null;
   mcp_enabled: number;
   member_role: string | null;
+  security_generation: number;
+  current_security_generation: number;
+  recovery_required: number;
+  codes_saved: number;
 };
 
 async function refreshGrant(params: URLSearchParams, env: Env) {
@@ -589,9 +612,12 @@ async function refreshGrant(params: URLSearchParams, env: Env) {
   if (resource !== mcpResource(env)) return oauthError("invalid_target", "The MCP resource must match this host.");
   const row = await env.DB.prepare(
     `SELECT refresh.grant_id,refresh.family_id,refresh.expires_at,refresh.consumed_at,
-            grant.client_id,grant.scopes,grant.revoked_at,workspace.mcp_enabled,member.role member_role
+            grant.client_id,grant.scopes,grant.revoked_at,grant.security_generation,
+            workspace.mcp_enabled,member.role member_role,
+            security.generation current_security_generation,security.recovery_required,security.codes_saved
        FROM oauth_refresh_tokens refresh JOIN oauth_grants grant ON grant.id=refresh.grant_id
        JOIN workspaces workspace ON workspace.id=grant.workspace_id
+       JOIN account_security security ON security.user_id=grant.user_id
        LEFT JOIN workspace_members member ON member.workspace_id=grant.workspace_id AND member.user_id=grant.user_id
       WHERE refresh.token_hash=?`,
   )
@@ -603,6 +629,9 @@ async function refreshGrant(params: URLSearchParams, env: Env) {
     row.expires_at <= Date.now() ||
     row.revoked_at !== null ||
     row.mcp_enabled !== 1 ||
+    row.security_generation !== row.current_security_generation ||
+    row.recovery_required !== 0 ||
+    row.codes_saved !== 1 ||
     !row.member_role
   )
     return oauthError("invalid_grant", "The refresh token is invalid.");
@@ -612,18 +641,43 @@ async function refreshGrant(params: URLSearchParams, env: Env) {
       .run();
     return oauthError("invalid_grant", "The refresh token was already used.");
   }
-  const consumed = await env.DB.prepare(
-    "UPDATE oauth_refresh_tokens SET consumed_at=? WHERE token_hash=? AND consumed_at IS NULL RETURNING family_id",
-  )
-    .bind(Date.now(), tokenHash)
-    .first<{ family_id: string }>();
-  if (!consumed) {
+  const rotatedAt = Date.now();
+  const rotationId = crypto.randomUUID();
+  const accessToken = randomCredential();
+  const refreshToken = randomCredential();
+  const issued = await env.DB.batch([
+    env.DB.prepare(
+      `UPDATE oauth_refresh_tokens SET consumed_at=?,rotation_id=? WHERE token_hash=?
+         AND consumed_at IS NULL AND expires_at>?
+         AND EXISTS (SELECT 1 FROM oauth_grants grant JOIN account_security security
+           ON security.user_id=grant.user_id
+           WHERE grant.id=oauth_refresh_tokens.grant_id AND grant.revoked_at IS NULL
+             AND grant.security_generation=security.generation
+             AND security.recovery_required=0 AND security.codes_saved=1)`,
+    ).bind(rotatedAt, rotationId, tokenHash, rotatedAt),
+    env.DB.prepare(
+      `INSERT INTO oauth_access_tokens(token_hash,grant_id,resource,expires_at)
+         SELECT ?,grant_id,?,? FROM oauth_refresh_tokens WHERE token_hash=? AND rotation_id=?`,
+    ).bind(await sha256(accessToken), resource, rotatedAt + ACCESS_TTL, tokenHash, rotationId),
+    env.DB.prepare(
+      `INSERT INTO oauth_refresh_tokens(token_hash,grant_id,family_id,expires_at)
+         SELECT ?,grant_id,family_id,? FROM oauth_refresh_tokens WHERE token_hash=? AND rotation_id=?`,
+    ).bind(await sha256(refreshToken), rotatedAt + REFRESH_TTL, tokenHash, rotationId),
+  ]);
+  if (issued[0]?.meta.changes !== 1 || issued[1]?.meta.changes !== 1 || issued[2]?.meta.changes !== 1) {
     await env.DB.prepare("UPDATE oauth_grants SET revoked_at=? WHERE id=? AND revoked_at IS NULL")
       .bind(Date.now(), row.grant_id)
       .run();
     return oauthError("invalid_grant", "The refresh token was already used.");
   }
-  return issueTokens(env, row.grant_id, resource, row.scopes, row.family_id);
+  return json({
+    access_token: accessToken,
+    token_type: "Bearer",
+    expires_in: ACCESS_TTL / 1000,
+    refresh_token: refreshToken,
+    scope: row.scopes,
+    resource,
+  });
 }
 
 export async function pruneOAuthSecurityRecords(env: Env) {
@@ -645,6 +699,11 @@ export async function pruneOAuthSecurityRecords(env: Env) {
 }
 
 export async function oauthToken(request: Request, env: Env) {
+  const rate = await consumeFixedWindow(env, `oauth-token:${await sourceRateLimitKey(request)}`, {
+    window: 60,
+    max: 60,
+  });
+  if (!rate.allowed) return oauthError("slow_down", "Token requests are temporarily rate limited.", 429);
   const params = await formParams(request);
   const grantType = singleton(params, "grant_type");
   if (grantType === "authorization_code") return exchangeCode(params, env);
@@ -653,6 +712,11 @@ export async function oauthToken(request: Request, env: Env) {
 }
 
 export async function oauthRevoke(request: Request, env: Env) {
+  const rate = await consumeFixedWindow(env, `oauth-revoke:${await sourceRateLimitKey(request)}`, {
+    window: 60,
+    max: 60,
+  });
+  if (!rate.allowed) return oauthError("slow_down", "Revocation requests are temporarily rate limited.", 429);
   const params = await formParams(request);
   const clientId = singleton(params, "client_id");
   const hash = await sha256(singleton(params, "token"));

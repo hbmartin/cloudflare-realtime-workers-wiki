@@ -68,8 +68,17 @@ describe("OAuth MCP foundation", () => {
       .join("");
     await env.DB.batch([
       env.DB.prepare(
-        "INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,created_at) VALUES(?,?,?,?,?,?)",
-      ).bind(grantId, clientId, me.user.id, me.workspace.id, "pages:read pages:write comments:write", Date.now()),
+        `INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at)
+         SELECT ?,?,?,?,?,generation,? FROM account_security WHERE user_id=?`,
+      ).bind(
+        grantId,
+        clientId,
+        me.user.id,
+        me.workspace.id,
+        "pages:read pages:write comments:write",
+        Date.now(),
+        me.user.id,
+      ),
       env.DB.prepare("INSERT INTO oauth_access_tokens(token_hash,grant_id,resource,expires_at) VALUES(?,?,?,?)").bind(
         hash,
         grantId,
@@ -127,6 +136,14 @@ describe("OAuth MCP foundation", () => {
       .bind(commentArgs.page_id)
       .first<{ count: number }>();
     expect(threads?.count).toBe(1);
+    const savedComment = await env.DB.prepare(
+      "SELECT body_json FROM comments WHERE thread_id IN (SELECT id FROM comment_threads WHERE page_id=?)",
+    )
+      .bind(commentArgs.page_id)
+      .first<{ body_json: string }>();
+    expect(JSON.parse(savedComment!.body_json)).toMatchObject([
+      { type: "paragraph", content: [{ type: "text", text: "MCP comment" }] },
+    ]);
     const createArgs = {
       space_id: tree.pages[0]!.spaceId,
       title: "MCP created page",
@@ -144,6 +161,10 @@ describe("OAuth MCP foundation", () => {
       .all<{ id: string }>();
     expect(createdRows.results).toHaveLength(1);
     const createdPageId = createdRows.results[0]!.id;
+    const indexed = await env.DB.prepare("SELECT body FROM page_search WHERE page_id=?")
+      .bind(createdPageId)
+      .first<{ body: string }>();
+    expect(indexed?.body).toContain("created");
     const updateArgs = {
       page_id: createdPageId,
       command: { type: "insert_content", insert_content: { content: "Another line", position: { type: "end" } } },
@@ -332,6 +353,35 @@ describe("OAuth MCP foundation", () => {
       { headers: { cookie } },
     );
     expect(response.status).toBe(400);
+  });
+
+  it("invalidates access after an account security generation change", async () => {
+    const cookie = await bootstrap();
+    const clientId = await register();
+    const me = await (
+      await SELF.fetch(`${ORIGIN}/api/me`, { headers: { cookie, origin: ORIGIN } })
+    ).json<{ user: { id: string }; workspace: { id: string } }>();
+    const grantId = crypto.randomUUID();
+    const token = "g".repeat(64);
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token)))]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at)
+         SELECT ?,?,?,?,?,generation,? FROM account_security WHERE user_id=?`,
+      ).bind(grantId, clientId, me.user.id, me.workspace.id, "pages:read", Date.now(), me.user.id),
+      env.DB.prepare("INSERT INTO oauth_access_tokens(token_hash,grant_id,resource,expires_at) VALUES(?,?,?,?)").bind(
+        hash,
+        grantId,
+        RESOURCE,
+        Date.now() + 60_000,
+      ),
+    ]);
+    const request = new Request(RESOURCE, { headers: { authorization: `Bearer ${token}` } });
+    expect(await mcpAccess(request, env)).not.toBeNull();
+    await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?").bind(me.user.id).run();
+    expect(await mcpAccess(request, env)).toBeNull();
   });
 
   it("bounds registration and token request bodies before parsing", async () => {

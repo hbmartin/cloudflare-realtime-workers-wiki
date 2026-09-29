@@ -20,6 +20,7 @@ CREATE TABLE oauth_authorization_codes (
   resource TEXT NOT NULL,
   scopes TEXT NOT NULL,
   code_challenge TEXT NOT NULL,
+  security_generation INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
   consumed_at INTEGER
 );
@@ -31,6 +32,7 @@ CREATE TABLE oauth_grants (
   user_id TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
   workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
   scopes TEXT NOT NULL,
+  security_generation INTEGER NOT NULL,
   created_at INTEGER NOT NULL,
   revoked_at INTEGER
 );
@@ -49,7 +51,8 @@ CREATE TABLE oauth_refresh_tokens (
   grant_id TEXT NOT NULL REFERENCES oauth_grants(id) ON DELETE CASCADE,
   family_id TEXT NOT NULL,
   expires_at INTEGER NOT NULL,
-  consumed_at INTEGER
+  consumed_at INTEGER,
+  rotation_id TEXT
 );
 CREATE INDEX idx_oauth_refresh_family ON oauth_refresh_tokens(family_id);
 CREATE INDEX idx_oauth_refresh_expiry ON oauth_refresh_tokens(expires_at);

@@ -191,7 +191,7 @@ import {
   setWorkspaceMcpEnabled,
   workspaceMcpSettings,
 } from "./oauth";
-import { mcpRequest } from "./mcp";
+import { mcpRequest, pruneStagedMcpPages } from "./mcp";
 import { parseSearchRequest, searchPages, searchTitles } from "./search";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import {
@@ -1125,11 +1125,23 @@ app.onError((error, c) => errorResponse(c, error));
 app.get("/.well-known/oauth-protected-resource/mcp", (c) => oauthProtectedResourceMetadata(c.env));
 app.get("/.well-known/oauth-protected-resource", (c) => oauthProtectedResourceMetadata(c.env));
 app.get("/.well-known/oauth-authorization-server", (c) => oauthAuthorizationMetadata(c.env));
-app.get("/oauth/authorize", (c) => authorizeOAuthGet(c.req.raw, c.env));
-app.post("/oauth/authorize", (c) => authorizeOAuthPost(c.req.raw, c.env));
-app.post("/oauth/token", (c) => oauthToken(c.req.raw, c.env));
-app.post("/oauth/revoke", (c) => oauthRevoke(c.req.raw, c.env));
-app.post("/oauth/register", (c) => registerOAuthClient(c.req.raw, c.env));
+async function oauthProtocolResponse(action: () => Promise<Response>) {
+  try {
+    return await action();
+  } catch (error) {
+    if (error instanceof HttpError)
+      return Response.json(
+        { error: error.code, error_description: error.message },
+        { status: error.status, headers: { "cache-control": "no-store" } },
+      );
+    throw error;
+  }
+}
+app.get("/oauth/authorize", (c) => oauthProtocolResponse(() => authorizeOAuthGet(c.req.raw, c.env)));
+app.post("/oauth/authorize", (c) => oauthProtocolResponse(() => authorizeOAuthPost(c.req.raw, c.env)));
+app.post("/oauth/token", (c) => oauthProtocolResponse(() => oauthToken(c.req.raw, c.env)));
+app.post("/oauth/revoke", (c) => oauthProtocolResponse(() => oauthRevoke(c.req.raw, c.env)));
+app.post("/oauth/register", (c) => oauthProtocolResponse(() => registerOAuthClient(c.req.raw, c.env)));
 app.get("/api/oauth/connections", (c) => listOAuthConnections(c.req.raw, c.env));
 app.delete("/api/oauth/connections/:id", (c) => revokeOAuthConnection(c.req.raw, c.env, c.req.param("id")));
 app.get("/api/oauth/workspace", (c) => workspaceMcpSettings(c.req.raw, c.env));
@@ -6951,6 +6963,7 @@ export default {
         security_state: async () => {
           await pruneSecurityState(env);
           await pruneOAuthSecurityRecords(env);
+          await pruneStagedMcpPages(env);
         },
         table_search_values: () => backfillTableSearchValues(env),
       };

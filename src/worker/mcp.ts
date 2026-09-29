@@ -16,10 +16,15 @@ import { editableSpaceForMember, pageForMember, requirePageEditor, type PageRow 
 import { pageJson } from "./page-row";
 import { parseSearchRequest, searchPages } from "./search";
 import { broadcastWorkspaceEvent } from "./workspace-events";
+import { sweepOutbox } from "./jobs";
+import { cleanupStagedPage } from "./notion-api";
+import { consumeFixedWindow } from "./rate-limit";
+import { sourceRateLimitKey } from "./source-rate-limit";
 
 const MAX_MCP_BODY = 64 * 1024;
-const OPERATION_ID = /^[A-Za-z0-9._~:-]{1,128}$/;
+const OPERATION_ID = /^[A-Za-z0-9:_-]{1,128}$/;
 const RECEIPT_TTL_MS = 30 * 24 * 60 * 60_000;
+const STAGED_PAGE_TTL_MS = 24 * 60 * 60_000;
 const TOOL_SCOPES: Record<string, readonly McpScope[]> = {
   search_pages: ["pages:read"],
   fetch_page: ["pages:read"],
@@ -30,6 +35,31 @@ const TOOL_SCOPES: Record<string, readonly McpScope[]> = {
 
 function result(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+}
+
+export async function pruneStagedMcpPages(env: Env) {
+  const rows = await env.DB.prepare(
+    `SELECT id,content_epoch,import_job_id FROM pages
+      WHERE import_job_id LIKE 'mcp:create:%' AND created_at<? ORDER BY created_at LIMIT 10`,
+  )
+    .bind(Date.now() - STAGED_PAGE_TTL_MS)
+    .all<{ id: string; content_epoch: number; import_job_id: string }>();
+  for (const row of rows.results) {
+    // Claim the staged row before purging its content. A retry may have
+    // published the page since the SELECT above.
+    const removed = await env.DB.prepare("DELETE FROM pages WHERE id=? AND import_job_id=?")
+      .bind(row.id, row.import_job_id)
+      .run();
+    if (removed.meta.changes !== 1) continue;
+    await cleanupStagedPage(env, row.id, row.content_epoch, row.import_job_id);
+    await env.DB.prepare(
+      `DELETE FROM oauth_operation_receipts
+        WHERE tool_name='create_page' AND json_extract(result_json,'$.status')='staged'
+          AND json_extract(result_json,'$.pageId')=?`,
+    )
+      .bind(row.id)
+      .run();
+  }
 }
 
 function toolError(error: unknown) {
@@ -158,14 +188,14 @@ async function createPageTool(request: Request, env: Env, input: CreatePageInput
   };
   const timestamp = Date.now();
   try {
-    await env.DB.batch([
+    const published = await env.DB.batch([
       env.DB.prepare(
         `INSERT INTO page_search(page_id,workspace_id,title,body)
-         SELECT id,workspace_id,title,'' FROM pages WHERE id=? AND import_job_id=?`,
+         SELECT id,workspace_id,title,plain_text FROM pages WHERE id=? AND import_job_id=?`,
       ).bind(staged.pageId, stageId),
       env.DB.prepare(
         `INSERT INTO page_search_v2(page_id,workspace_id,space_id,title,tags,body,comments,attachments)
-         SELECT id,workspace_id,space_id,title,'','','','' FROM pages WHERE id=? AND import_job_id=?`,
+         SELECT id,workspace_id,space_id,title,'',plain_text,'','' FROM pages WHERE id=? AND import_job_id=?`,
       ).bind(staged.pageId, stageId),
       env.DB.prepare(
         `INSERT INTO subscriptions(id,workspace_id,user_id,resource_type,resource_id,created_by,created_at)
@@ -178,11 +208,15 @@ async function createPageTool(request: Request, env: Env, input: CreatePageInput
         staged.pageId,
         stageId,
       ),
-      env.DB.prepare("UPDATE pages SET import_job_id=NULL WHERE id=? AND import_job_id=?").bind(staged.pageId, stageId),
       env.DB.prepare(
-        "UPDATE oauth_operation_receipts SET result_json=? WHERE grant_id=? AND operation_id=? AND input_hash=?",
-      ).bind(JSON.stringify(value), access.grantId, input.operation_id, inputHash),
+        `UPDATE oauth_operation_receipts SET result_json=?
+         WHERE grant_id=? AND operation_id=? AND input_hash=?
+           AND EXISTS (SELECT 1 FROM pages WHERE id=? AND import_job_id=?)`,
+      ).bind(JSON.stringify(value), access.grantId, input.operation_id, inputHash, staged.pageId, stageId),
+      env.DB.prepare("UPDATE pages SET import_job_id=NULL WHERE id=? AND import_job_id=?").bind(staged.pageId, stageId),
     ]);
+    if (published[3]?.meta.changes !== 1 || published[4]?.meta.changes !== 1)
+      throw new HttpError(409, "page_create_unknown", "The staged page was changed before publication.");
   } catch (error) {
     const committed = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
     if (!committed || (committed as { status?: unknown }).status === "staged") throw error;
@@ -267,16 +301,18 @@ async function updatePageTool(
   });
   const command = parseMarkdownCommand(input.command, projection.markdown);
   const protectedRows = await env.DB.prepare(
-    "SELECT DISTINCT block_id FROM comment_threads WHERE page_id=? AND block_id IS NOT NULL",
+    `SELECT DISTINCT block.internal_id FROM comment_threads thread
+       JOIN api_blocks block ON block.id=thread.block_id AND block.page_id=thread.page_id
+      WHERE thread.page_id=? AND thread.block_id IS NOT NULL`,
   )
     .bind(page.id)
-    .all<{ block_id: string }>();
+    .all<{ internal_id: string }>();
   const operations = markdownMutations(
     envelope.document,
     projection,
     command.edits,
     command.allowDeletingContent,
-    new Set(protectedRows.results.map((row) => row.block_id)),
+    new Set(protectedRows.results.map((row) => row.internal_id)),
   );
   if (!operations.length) return complete(envelope.sequence);
   access = await currentAccess(request, env, ["pages:write"]);
@@ -375,7 +411,9 @@ async function commentTool(
       env,
       access.member,
       scoped,
-      { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: input.body }] }] },
+      page.kind === "diagram"
+        ? { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: input.body }] }] }
+        : [{ type: "paragraph", props: {}, content: [{ type: "text", text: input.body, styles: {} }], children: [] }],
       null,
       input.block_id ?? null,
       {
@@ -394,6 +432,20 @@ async function commentTool(
     pageId: page.id,
   }).catch((error: unknown) => {
     logger.warn("mcp.comment_event.failed", "mcp", "Comment event delivery failed.", { pageId: page.id }, error);
+  });
+  await broadcastWorkspaceEvent(env, access.member.workspace.id, { type: "notifications-invalidated" }).catch(
+    (error: unknown) => {
+      logger.warn(
+        "mcp.notification_event.failed",
+        "mcp",
+        "Notification event delivery failed.",
+        { pageId: page.id },
+        error,
+      );
+    },
+  );
+  await sweepOutbox(env).catch((error: unknown) => {
+    logger.warn("mcp.comment_outbox.failed", "mcp", "Comment outbox delivery failed.", { pageId: page.id }, error);
   });
   return value;
 }
@@ -566,6 +618,8 @@ export async function mcpRequest(request: Request, env: Env) {
   if (requestOrigin && requestOrigin !== site) return Response.json({ error: "Invalid Origin." }, { status: 403 });
   if (new URL(request.url).origin !== site) return Response.json({ error: "Invalid host." }, { status: 403 });
   if (request.method !== "POST") return new Response("Method not allowed.", { status: 405 });
+  const rate = await consumeFixedWindow(env, `mcp:${await sourceRateLimitKey(request)}`, { window: 60, max: 120 });
+  if (!rate.allowed) return new Response("Too many MCP requests.", { status: 429, headers: { "retry-after": "60" } });
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json"))
     return new Response("Expected application/json.", { status: 415 });
   const length = Number(request.headers.get("content-length"));
@@ -602,12 +656,20 @@ export async function mcpRequest(request: Request, env: Env) {
     message?.method === "tools/call" && params && typeof params === "object" && !Array.isArray(params)
       ? (params as { name?: unknown }).name
       : null;
-  const required = typeof name === "string" ? (TOOL_SCOPES[name] ?? []) : [];
-  const access = await mcpAccess(request, env, required);
+  const required = typeof name === "string" && Object.hasOwn(TOOL_SCOPES, name) ? TOOL_SCOPES[name]! : [];
+  const access = await mcpAccess(request, env);
   if (!access)
     return new Response("Unauthorized", {
       status: 401,
       headers: { "www-authenticate": mcpBearerChallenge(env, required[0]), "cache-control": "no-store" },
+    });
+  if (required.some((scope) => !access.scopes.has(scope)))
+    return new Response("Insufficient scope", {
+      status: 403,
+      headers: {
+        "www-authenticate": `${mcpBearerChallenge(env)}, error="insufficient_scope", scope="${required.join(" ")}"`,
+        "cache-control": "no-store",
+      },
     });
   const handler = createMcpHandler(() => serverFor(request, env, access), {
     legacy: "reject",

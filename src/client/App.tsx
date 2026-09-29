@@ -775,7 +775,12 @@ export function App() {
   useEffect(() => {
     if (state.screen !== "workspace") return;
     const authorize = new URLSearchParams(window.location.search).get("oauthAuthorize");
-    if (authorize?.startsWith("/oauth/authorize?")) window.location.assign(authorize);
+    if (authorize?.startsWith("/oauth/authorize?")) {
+      const current = new URL(window.location.href);
+      current.searchParams.delete("oauthAuthorize");
+      window.history.replaceState(window.history.state, "", current);
+      window.location.assign(authorize);
+    }
   }, [state.screen]);
 
   useEffect(() => {
