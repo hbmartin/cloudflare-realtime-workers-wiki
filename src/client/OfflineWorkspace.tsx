@@ -309,9 +309,17 @@ export function OfflineWorkspace({
                         pending.filter((page) => page.pageId === selected.pageId).flatMap(pendingKeysOf),
                       );
                       if (!complete) {
-                        for (const key of pendingKeysOf(selected)) {
-                          if (await hasOfflineDocument(key)) keys.add(key);
-                        }
+                        const fallback = await Promise.all(
+                          pendingKeysOf(selected).map(async (key) => {
+                            try {
+                              return (await hasOfflineDocument(key)) ? key : null;
+                            } catch {
+                              // Best-effort export will count this unreadable copy without hiding other copies.
+                              return key;
+                            }
+                          }),
+                        );
+                        for (const key of fallback) if (key) keys.add(key);
                       }
                       if (!keys.size) {
                         setNotice(

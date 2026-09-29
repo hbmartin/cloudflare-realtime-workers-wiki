@@ -368,6 +368,22 @@ describe("collaboration durability barriers", () => {
     bundle.destroy();
   });
 
+  it("allows a slow IndexedDB copy to become ready after the loading deadline", async () => {
+    const storage = deferred<void>();
+    mocks.whenSynced = storage.promise;
+    const onStatus = vi.fn();
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
+    await Promise.all([
+      expect(bundle.ready).rejects.toThrow("Offline document storage did not finish loading."),
+      vi.advanceTimersByTimeAsync(30_000),
+    ]);
+    expect(mocks.providers[0]?.connect).not.toHaveBeenCalled();
+    storage.resolve();
+    await bundle.lateReady;
+    expect(mocks.providers[0]?.connect).toHaveBeenCalledOnce();
+    bundle.destroy();
+  });
+
   it("disconnects a collaboration connection that completes after destroy", async () => {
     const connection = deferred<void>();
     mocks.whenSynced = Promise.resolve();

@@ -84,6 +84,7 @@ import {
 } from "./offline-catalog";
 import { OfflineWorkspace } from "./OfflineWorkspace";
 import { exportPendingOfflinePages, formatOfflineExportResult } from "./offline-export";
+import { sha256Hex } from "../shared/import-integrity";
 
 const DiagramPage = lazy(() => import("./DiagramPage").then((module) => ({ default: module.DiagramPage })));
 
@@ -106,8 +107,8 @@ type AppState =
 
 const OFFLINE_PURGE_WARNING_PREFIX = "notes:offline-purge-warning:";
 const OFFLINE_PURGE_WARNING =
-  "Known offline copies were removed. This browser could not check for other saved copies, so some may remain on this device.";
-let transientPurgeWarning = false;
+  "Some older offline copies may remain on this device because this browser could not verify an earlier cleanup.";
+const transientPurgeWarnings = new Set<string>();
 
 function offlinePurgeNotice() {
   try {
@@ -116,14 +117,16 @@ function offlinePurgeNotice() {
   } catch {
     // Storage can be disabled, but the current tab still needs the warning.
   }
-  return transientPurgeWarning ? OFFLINE_PURGE_WARNING : undefined;
+  return transientPurgeWarnings.size ? OFFLINE_PURGE_WARNING : undefined;
 }
 
-function rememberOfflinePurgeVerification(accountKey: string, verified: boolean) {
-  transientPurgeWarning = !verified;
+async function rememberOfflinePurgeVerification(accountKey: string, verified: boolean) {
+  if (verified) transientPurgeWarnings.delete(accountKey);
+  else transientPurgeWarnings.add(accountKey);
   try {
-    if (verified) localStorage.removeItem(`${OFFLINE_PURGE_WARNING_PREFIX}${accountKey}`);
-    else localStorage.setItem(`${OFFLINE_PURGE_WARNING_PREFIX}${accountKey}`, "1");
+    const key = `${OFFLINE_PURGE_WARNING_PREFIX}${await sha256Hex(accountKey)}`;
+    if (verified) localStorage.removeItem(key);
+    else localStorage.setItem(key, "1");
   } catch {
     // Continue sign-out even when browser storage is disabled.
   }
@@ -774,7 +777,7 @@ async function resolveAppState(): Promise<AppState> {
   if (locallySignedOut && typeof indexedDB !== "undefined") pendingPurges.add(locallySignedOut);
   for (const accountKey of pendingPurges) {
     try {
-      rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
+      await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
     } catch (error) {
       return {
         screen: "signout-cleanup",
@@ -861,7 +864,7 @@ export function App() {
         });
       try {
         if (typeof indexedDB !== "undefined")
-          rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
+          await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
       } catch (error) {
         showState({
           screen: "signout-cleanup",
@@ -955,9 +958,8 @@ export function App() {
     async (accountKey: string) => {
       showState({ screen: "loading" });
       try {
-        rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
-        if (localStorage.getItem(LOCAL_SIGNOUT_KEY) === accountKey) showState({ screen: "signin" });
-        else await load();
+        await rememberOfflinePurgeVerification(accountKey, await forgetOfflineAccount(accountKey));
+        await load();
       } catch (error) {
         showState({
           screen: "signout-cleanup",
@@ -1319,6 +1321,7 @@ function signInFailure(cause: unknown, fallback: string) {
 function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Promise<void>; initialError?: string }) {
   const [error, setError] = useState(() => consumeSlackAuthError() || initialError);
   const [busy, setBusy] = useState(false);
+  const purgeNotice = offlinePurgeNotice();
   const slackAvailable = useSlackIdentityAvailable();
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1348,7 +1351,7 @@ function SignInScreen({ onComplete, initialError = "" }: { onComplete: () => Pro
     >
       <form className="auth-form" onSubmit={submit}>
         <h2>Sign in</h2>
-        {offlinePurgeNotice() && <output>{offlinePurgeNotice()}</output>}
+        {purgeNotice && <output>{purgeNotice}</output>}
         {slackAvailable && (
           <button
             type="button"

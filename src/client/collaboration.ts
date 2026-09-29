@@ -15,6 +15,7 @@ import {
 } from "./offline-catalog";
 
 export const OFFLINE_COPY_MISSING_MESSAGE = "This offline document copy is no longer on this device.";
+export const OFFLINE_STORAGE_TIMEOUT_MESSAGE = "Offline document storage did not finish loading.";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -26,6 +27,8 @@ export type CollaborationBundle = {
    * active; failures after destroy are suppressed.
    */
   ready: Promise<void>;
+  /** Settles if an initially slow store finishes after the readiness deadline. */
+  lateReady?: Promise<void>;
   readonly hasUnsyncedChanges: boolean;
   stop: () => void;
   destroy: () => void;
@@ -188,19 +191,13 @@ export function createCollaboration(
       connect();
     }
   });
-  let readyTimeout: ReturnType<typeof setTimeout> | undefined;
-  const ready = Promise.race([
-    synced,
-    indexeddb["_db"].then(() => new Promise<never>(() => undefined)),
-    new Promise<never>((_, reject) => {
-      readyTimeout = setTimeout(() => reject(new Error("Offline document storage did not finish loading.")), 30_000);
-    }),
-  ])
-    .finally(() => {
-      if (readyTimeout) clearTimeout(readyTimeout);
-    })
+  void synced.catch(() => undefined);
+  const readyAbort = new AbortController();
+  const ready = waitForOfflinePersistence(indexeddb, readyAbort.signal)
+    .then(() => synced)
     .catch((error) => {
       if (destroyed) return;
+      if (error instanceof Error && error.message === OFFLINE_STORAGE_TIMEOUT_MESSAGE) throw error;
       console.error("Failed to load offline document state", error);
       void reportClientError("client.offline_storage_failed", error);
       onStatus("offline");
@@ -227,6 +224,7 @@ export function createCollaboration(
   const stop = () => {
     if (destroyed) return;
     destroyed = true;
+    readyAbort.abort();
     if (hiddenTimer !== undefined) window.clearTimeout(hiddenTimer);
     barrier.destroy();
     if (connectionTimer !== undefined) window.clearTimeout(connectionTimer);
@@ -243,6 +241,7 @@ export function createCollaboration(
     indexeddb,
     provider,
     ready,
+    lateReady: synced,
     get hasUnsyncedChanges() {
       return durability.hasUnsyncedChanges;
     },
@@ -413,17 +412,29 @@ export async function loadOfflineCopy(key: string) {
   });
 }
 
-export async function waitForOfflinePersistence(persistence: IndexeddbPersistence) {
+export async function waitForOfflinePersistence(persistence: IndexeddbPersistence, signal?: AbortSignal) {
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let rejectAbort: ((reason: unknown) => void) | undefined;
+  const abort = () => rejectAbort?.(new DOMException("Offline storage load canceled.", "AbortError"));
   try {
     await Promise.race([
       persistence["_db"].then(() => persistence.whenSynced),
       new Promise<never>((_, reject) => {
-        timeout = setTimeout(() => reject(new Error("Offline document storage did not finish loading.")), 30_000);
+        timeout = setTimeout(() => reject(new Error(OFFLINE_STORAGE_TIMEOUT_MESSAGE)), 30_000);
       }),
+      ...(signal
+        ? [
+            new Promise<never>((_, reject) => {
+              rejectAbort = reject;
+              signal.addEventListener("abort", abort, { once: true });
+              if (signal.aborted) abort();
+            }),
+          ]
+        : []),
     ]);
   } finally {
     if (timeout) clearTimeout(timeout);
+    signal?.removeEventListener("abort", abort);
   }
 }
 

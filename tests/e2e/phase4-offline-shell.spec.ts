@@ -621,7 +621,7 @@ test("can finish offline sign-out when database enumeration is unavailable", asy
   await expect(page.getByText("Enumeration fallback draft")).toBeVisible();
   await page.getByRole("button", { name: "Sign out and delete local copies" }).click();
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
-  await expect(page.getByRole("status")).toContainText("some may remain on this device");
+  await expect(page.getByRole("status")).toContainText("may remain on this device");
   await context.addInitScript(() => {
     const original = indexedDB.databases.bind(indexedDB);
     (window as Window & { restoreDatabases?: () => void }).restoreDatabases = () =>
@@ -630,11 +630,14 @@ test("can finish offline sign-out when database enumeration is unavailable", asy
   });
   await page.reload();
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
-  await expect(page.getByRole("status")).toContainText("some may remain on this device");
+  await expect(page.getByRole("status")).toContainText("may remain on this device");
+  await context.setOffline(false);
+  await context.clearCookies();
+  await page.evaluate(() => localStorage.removeItem("notes:local-signout"));
   const reopened = await context.newPage();
   await reopened.goto("/");
   await expect(reopened.getByRole("heading", { name: "Sign in" })).toBeVisible();
-  await expect(reopened.getByRole("status")).toContainText("some may remain on this device");
+  await expect(reopened.getByRole("status")).toContainText("may remain on this device");
   await reopened.close();
   expect(
     await page.evaluate(async () => {

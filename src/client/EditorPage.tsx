@@ -29,6 +29,7 @@ import {
   createCollaboration,
   loadOfflineCopy,
   OFFLINE_COPY_MISSING_MESSAGE,
+  OFFLINE_STORAGE_TIMEOUT_MESSAGE,
   type CollaborationBundle,
   userColor,
 } from "./collaboration";
@@ -96,6 +97,9 @@ export function EditorPage({
   const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [preparedRecoveryCopy, setPreparedRecoveryCopy] = useState<{ key: string; markdown: string } | null>(null);
+  const recoveryCopyAttempt = useRef(0);
+  const clipboardItemSupported =
+    typeof ClipboardItem !== "undefined" && Boolean(navigator.clipboard && "write" in navigator.clipboard);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -520,17 +524,22 @@ export function EditorPage({
       try {
         await next.ready;
         if (active) setBundle(next);
-      } catch {
+      } catch (error) {
         if (!active) return;
-        setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+        setStorageError(
+          error instanceof Error && error.message === OFFLINE_STORAGE_TIMEOUT_MESSAGE
+            ? "Offline storage is still loading. Editing will resume when it is ready."
+            : "Offline storage is unavailable, so editing and collaboration are disabled for this page.",
+        );
         void (async () => {
           try {
-            await next.indexeddb.whenSynced;
+            if (!next.lateReady) return;
+            await next.lateReady;
             if (!active) return;
             setStorageError("");
             setBundle(next);
           } catch {
-            // A failed IndexedDB open remains read-only for this page.
+            // A failed store remains read-only for this page.
           }
         })();
       }
@@ -743,10 +752,16 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={async () => {
-                if (typeof ClipboardItem === "undefined" || !navigator.clipboard.write) {
+                const attempt = ++recoveryCopyAttempt.current;
+                if (!clipboardItemSupported) {
                   if (preparedRecoveryCopy?.key !== entry.key) {
                     try {
                       const markdown = await offlineCopyMarkdownFromKey(entry.key, page.title);
+                      if (
+                        attempt !== recoveryCopyAttempt.current ||
+                        !recoveryRef.current.some((current) => current.key === entry.key)
+                      )
+                        return;
                       setPreparedRecoveryCopy({ key: entry.key, markdown });
                       setRecoveryError(null);
                     } catch (error) {
@@ -756,6 +771,7 @@ export function EditorPage({
                     return;
                   }
                   try {
+                    if (!navigator.clipboard?.writeText) throw new Error("Clipboard is unavailable.");
                     await navigator.clipboard.writeText(preparedRecoveryCopy.markdown);
                     setRecoveryError(null);
                   } catch (error) {
@@ -776,7 +792,10 @@ export function EditorPage({
                   console.error("Offline copy clipboard failed", error);
                   setRecoveryError("This offline copy could not be copied.");
                   void content.catch((loadingError) => {
-                    if (recoveryRef.current.some((current) => current.key === entry.key))
+                    if (
+                      attempt === recoveryCopyAttempt.current &&
+                      recoveryRef.current.some((current) => current.key === entry.key)
+                    )
                       setRecoveryError((current) =>
                         current === "This offline copy could not be copied."
                           ? recoveryMessage(loadingError, "This offline copy could not be read.")
@@ -786,16 +805,18 @@ export function EditorPage({
                 }
               }}
             >
-              {typeof ClipboardItem === "undefined" || !navigator.clipboard.write
-                ? preparedRecoveryCopy?.key === entry.key
+              {clipboardItemSupported
+                ? "Copy Markdown"
+                : preparedRecoveryCopy?.key === entry.key
                   ? "Copy prepared Markdown"
-                  : "Prepare Markdown to copy"
-                : "Copy Markdown"}
+                  : "Prepare Markdown to copy"}
             </button>
             {(entry.epoch !== page.contentEpoch || (entry.reason !== "access" && !accessQuarantine)) && (
               <button
                 className="quiet-button"
                 onClick={() => {
+                  recoveryCopyAttempt.current += 1;
+                  setPreparedRecoveryCopy((prepared) => (prepared?.key === entry.key ? null : prepared));
                   dismissedRecovery.current[entry.key] = page.contentEpoch;
                   try {
                     localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
