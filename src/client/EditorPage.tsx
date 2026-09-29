@@ -33,12 +33,7 @@ import {
   type CollaborationBundle,
   userColor,
 } from "./collaboration";
-import {
-  downloadOfflineMarkdown,
-  exportOfflineCopyMarkdown,
-  offlineCopyMarkdown,
-  offlineCopyMarkdownFromKey,
-} from "./offline-export";
+import { downloadOfflineMarkdown, offlineCopyMarkdown, offlineCopyMarkdownFromKey } from "./offline-export";
 import { createDocumentCloseReconciler } from "./document-connection";
 import { reportClientError } from "./telemetry";
 import { editorBlockFactories, EmbedFeatureContext, safeBookmarkUrl } from "./editor-blocks";
@@ -76,6 +71,33 @@ const ACCOUNT_CATALOG_WARNING = "The offline page list could not be updated yet.
 const PENDING_CATALOG_WARNING = "Local changes are saved, but the offline page list could not be updated yet.";
 const SYNCED_CATALOG_WARNING = "Changes are synced, but the offline page list could not be updated yet.";
 const OFFLINE_INIT_ERROR = "Offline storage is unavailable, so editing and collaboration are disabled for this page.";
+type RecoveryEntry = { key: string; epoch: number; reason?: "access" | "storage" | "epoch"; storageFailed?: boolean };
+function recoveryEntries(key: string): RecoveryEntry[] {
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(key) ?? "null");
+    const entries = Array.isArray(saved) ? saved : saved ? [saved] : [];
+    return entries.filter(
+      (entry): entry is RecoveryEntry =>
+        entry !== null && typeof entry === "object" && typeof entry.key === "string" && Number.isInteger(entry.epoch),
+    );
+  } catch {
+    return [];
+  }
+}
+function recoveryRank(reason: RecoveryEntry["reason"]) {
+  return reason === "access" ? 3 : reason === "storage" ? 2 : 1;
+}
+function mergedRecovery(stored: RecoveryEntry | undefined, changed: RecoveryEntry): RecoveryEntry {
+  if (!stored) return changed;
+  const storageFailed = Boolean(
+    stored.storageFailed || stored.reason === "storage" || changed.storageFailed || changed.reason === "storage",
+  );
+  return {
+    ...changed,
+    reason: recoveryRank(stored.reason) > recoveryRank(changed.reason) ? stored.reason : changed.reason,
+    ...(storageFailed ? { storageFailed: true } : {}),
+  };
+}
 const RECOVERY_ACTIONS = ["preview", "export", "copy"] as const;
 type RecoveryAction = (typeof RECOVERY_ACTIONS)[number];
 
@@ -127,6 +149,8 @@ export function EditorPage({
   const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [storageWriteFailed, setStorageWriteFailed] = useState(false);
+  const [liveRecovery, setLiveRecovery] = useState<{ key: string; markdown: string } | null>(null);
+  const [recoveryPersistenceFailed, setRecoveryPersistenceFailed] = useState(false);
   const [storageLoadingSlow, setStorageLoadingSlow] = useState(false);
   const [storageRetry, setStorageRetry] = useState(0);
   const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
@@ -158,44 +182,30 @@ export function EditorPage({
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
   const recoveryKey = `notes:recovery:${member.user.id}:${member.workspace.id}:${page.id}`;
-  type RecoveryEntry = { key: string; epoch: number; reason?: "access" | "storage" | "epoch" };
-  const [recovery, setRecovery] = useState<RecoveryEntry[]>(() => {
-    try {
-      const saved: unknown = JSON.parse(localStorage.getItem(recoveryKey) ?? "null");
-      const entries = Array.isArray(saved) ? saved : saved ? [saved] : [];
-      return entries.filter(
-        (entry): entry is RecoveryEntry =>
-          entry !== null && typeof entry === "object" && typeof entry.key === "string" && Number.isInteger(entry.epoch),
-      );
-    } catch {
-      return [];
-    }
-  });
+  const [recovery, setRecovery] = useState<RecoveryEntry[]>(() => recoveryEntries(recoveryKey));
   const [recoveryPreview, setRecoveryPreview] = useState<{ key: string; text: string } | null>(null);
   const recoveryRef = useRef(recovery);
   const replaceRecovery = useCallback(
     (next: RecoveryEntry[]) => {
       const previous = recoveryRef.current;
-      let merged = next;
+      const previousByKey = new Map(previous.map((entry) => [entry.key, entry]));
+      const nextByKey = new Map(next.map((entry) => [entry.key, entry]));
+      const stored = new Map(recoveryEntries(recoveryKey).map((entry) => [entry.key, entry]));
+      for (const [key, prior] of previousByKey) {
+        const changed = nextByKey.get(key);
+        if (!changed) stored.delete(key);
+        else if (JSON.stringify(changed) !== JSON.stringify(prior))
+          stored.set(key, mergedRecovery(stored.get(key), changed));
+      }
+      for (const [key, changed] of nextByKey)
+        if (!previousByKey.has(key)) stored.set(key, mergedRecovery(stored.get(key), changed));
+      const merged = [...stored.values()].sort((left, right) => left.epoch - right.epoch);
       try {
-        const saved: unknown = JSON.parse(localStorage.getItem(recoveryKey) ?? "null");
-        const previousKeys = new Set(previous.map((entry) => entry.key));
-        if (Array.isArray(saved))
-          merged = [
-            ...saved.filter(
-              (entry): entry is RecoveryEntry =>
-                entry &&
-                typeof entry.key === "string" &&
-                Number.isInteger(entry.epoch) &&
-                !previousKeys.has(entry.key) &&
-                !next.some((item) => item.key === entry.key),
-            ),
-            ...next,
-          ];
         localStorage.setItem(recoveryKey, JSON.stringify(merged));
+        setRecoveryPersistenceFailed(false);
       } catch (error) {
         console.error("Unable to persist offline recovery details", error);
-        setStorageError(OFFLINE_INIT_ERROR);
+        setRecoveryPersistenceFailed(true);
       }
       recoveryRef.current = merged;
       setRecovery(merged);
@@ -215,9 +225,20 @@ export function EditorPage({
       );
       setRecoveryPreview((current) => (current && !retained.has(current.key) ? null : current));
       setPreparedRecoveryCopy((current) => (current && !retained.has(current.key) ? null : current));
+      setLiveRecovery((current) => (current && !retained.has(current.key) ? null : current));
     },
     [recoveryKey],
   );
+  useEffect(() => {
+    const changed = (event: StorageEvent) => {
+      if (event.key !== recoveryKey) return;
+      const entries = recoveryEntries(recoveryKey);
+      recoveryRef.current = entries;
+      setRecovery(entries);
+    };
+    window.addEventListener("storage", changed);
+    return () => window.removeEventListener("storage", changed);
+  }, [recoveryKey]);
   const dismissedRecovery = useRef<Record<string, number>>({});
   useEffect(() => {
     try {
@@ -251,11 +272,14 @@ export function EditorPage({
   const titleDirtyRef = useRef(false);
   const titleSavingRef = useRef(0);
   const currentStorageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
-  const writeRecovery = recovery.some((entry) => entry.key === currentStorageKey && entry.reason === "storage");
+  const writeRecovery = recovery.some(
+    (entry) => entry.key === currentStorageKey && (entry.storageFailed || entry.reason === "storage"),
+  );
   const editable =
     member.role !== "viewer" &&
     !sizeWarning?.readOnly &&
     !storageError &&
+    !recoveryPersistenceFailed &&
     !writeRecovery &&
     !storageWriteFailed &&
     !accessQuarantine;
@@ -300,20 +324,27 @@ export function EditorPage({
 
   useEffect(() => {
     let active = true;
-    if (storageRetry > 0) queueMicrotask(() => active && setStorageWriteFailed(false));
+    queueMicrotask(() => {
+      if (!active) return;
+      setStorageWriteFailed(false);
+      if (storageRetry > 0) setStorageLoadingSlow(false);
+    });
     queueMicrotask(() => active && setStatus("connecting"));
     let pendingWrite = Promise.resolve();
     const quarantine = (key = currentStorageKey, reason: RecoveryEntry["reason"] = "epoch") => {
       if (!active) return;
       const value = {
         key,
-        epoch: storageEpoch(key) || page.contentEpoch,
+        epoch: storageEpoch(key) ?? page.contentEpoch,
         reason,
+        ...(reason === "storage" ? { storageFailed: true } : {}),
       };
       if (dismissedRecovery.current[key] === page.contentEpoch && reason === "epoch") return;
       const current = recoveryRef.current;
-      if (current.some((entry) => entry.key === key && entry.epoch === value.epoch && entry.reason === reason)) return;
-      replaceRecovery([...current.filter((entry) => entry.key !== key), value].sort((a, b) => a.epoch - b.epoch));
+      const prior = current.find((entry) => entry.key === key);
+      const combined = mergedRecovery(prior, value);
+      if (prior && JSON.stringify(prior) === JSON.stringify(combined)) return;
+      replaceRecovery([...current.filter((entry) => entry.key !== key), combined]);
     };
     let next: CollaborationBundle;
     let catalogFailures = 0;
@@ -412,7 +443,7 @@ export function EditorPage({
         if (error instanceof ApiClientError && [401, 403, 404, 410].includes(error.status)) {
           if (error.status === 401) {
             if (hasLocalDraft) quarantine(currentStorageKey, "access");
-            setAccessQuarantine(true);
+            if (hasLocalDraft || olderDrafts.length) setAccessQuarantine(true);
           } else if (hasLocalDraft || olderDrafts.length) {
             if (hasLocalDraft) quarantine(currentStorageKey, "access");
             setAccessQuarantine(true);
@@ -451,7 +482,9 @@ export function EditorPage({
     const clearCurrentRecovery = () => {
       if (!active) return;
       const current = recoveryRef.current;
-      const remaining = current.filter((entry) => entry.key !== currentStorageKey || entry.reason === "storage");
+      const remaining = current.filter(
+        (entry) => entry.key !== currentStorageKey || entry.storageFailed || entry.reason === "storage",
+      );
       if (remaining.length !== current.length) {
         replaceRecovery(remaining);
       }
@@ -532,6 +565,14 @@ export function EditorPage({
       console.error("Unable to persist local document update", error);
       if (active) {
         setStorageWriteFailed(true);
+        try {
+          setLiveRecovery({
+            key: currentStorageKey,
+            markdown: offlineCopyMarkdown(next.doc, offlineMetadata.current.page.title),
+          });
+        } catch (exportError) {
+          console.error("Unable to prepare the current editor for recovery", exportError);
+        }
         quarantine(currentStorageKey, "storage");
       }
     };
@@ -601,10 +642,17 @@ export function EditorPage({
       quarantine,
       onPageChanged,
       onPageUnavailable,
-      onAccessDenied,
+      onAccessDenied: (id, error) => {
+        if (next.hasUnsyncedChanges) {
+          quarantine(currentStorageKey, "access");
+          setAccessQuarantine(true);
+        } else onAccessDenied(id, error);
+      },
       onUnauthorized: () => {
-        if (next.hasUnsyncedChanges) quarantine(currentStorageKey, "access");
-        setAccessQuarantine(true);
+        if (next.hasUnsyncedChanges) {
+          quarantine(currentStorageKey, "access");
+          setAccessQuarantine(true);
+        }
       },
     });
     const connectionClose = (event: CloseEvent) => {
@@ -724,6 +772,7 @@ export function EditorPage({
   }
 
   async function recoveryMarkdown(entry: RecoveryEntry) {
+    if (liveRecovery?.key === entry.key) return liveRecovery.markdown;
     const liveDoc = entry.key === currentStorageKey && storageWriteFailed ? bundle?.doc : null;
     return liveDoc ? offlineCopyMarkdown(liveDoc, page.title) : offlineCopyMarkdownFromKey(entry.key, page.title);
   }
@@ -816,6 +865,11 @@ export function EditorPage({
         </div>
       )}
       {storageError && <div className="notice notice-danger">{storageError}</div>}
+      {recoveryPersistenceFailed && (
+        <div className="notice notice-danger" role="alert">
+          Recovery details could not be saved on this device. Export this copy before leaving this tab.
+        </div>
+      )}
       {storageLoadingSlow && (
         <div className="notice">
           Offline storage is still loading.{" "}
@@ -841,22 +895,33 @@ export function EditorPage({
       {recovery
         .filter(
           (entry) =>
-            entry.epoch !== page.contentEpoch || entry.reason === "storage" || accessQuarantine || storageError,
+            entry.epoch !== page.contentEpoch ||
+            entry.storageFailed ||
+            entry.reason === "storage" ||
+            accessQuarantine ||
+            storageError,
         )
         .map((entry) => (
           <div
-            className={`notice recovery-notice ${entry.reason === "storage" ? "notice-danger" : ""}`}
+            className={`notice recovery-notice ${entry.storageFailed || entry.reason === "storage" ? "notice-danger" : ""}`}
             key={entry.key}
           >
             <div>
               <strong>Offline copy quarantined</strong>
               <span>
-                {entry.reason === "access" || accessQuarantine
+                {entry.reason === "access" || (accessQuarantine && entry.key === currentStorageKey)
                   ? "Current access could not be confirmed for these edits. They were not sent to the server."
-                  : entry.reason === "storage" && entry.epoch === page.contentEpoch
-                    ? "Offline storage could not record some edits. Export the current editor before leaving; the saved copy may be incomplete."
-                    : `Edits from epoch ${entry.epoch} were not merged after this page was restored.`}
+                  : entry.epoch !== page.contentEpoch
+                    ? `Edits from epoch ${entry.epoch} were not merged after this page was restored.`
+                    : "This copy needs recovery."}
               </span>
+              {(entry.storageFailed || entry.reason === "storage") && (
+                <span>
+                  {liveRecovery?.key === entry.key
+                    ? "Offline storage could not record some edits. Export the current editor before leaving."
+                    : "Offline storage missed some edits before this tab closed. The saved copy may be incomplete."}
+                </span>
+              )}
               {Array.from(
                 new Set(
                   RECOVERY_ACTIONS.map((action) => recoveryErrors[`${entry.key}:${action}`]).filter(
@@ -902,33 +967,30 @@ export function EditorPage({
               className="quiet-button"
               onClick={() => {
                 const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "export");
-                const liveDoc = entry.key === currentStorageKey && storageWriteFailed ? bundle?.doc : null;
-                void (
-                  liveDoc
-                    ? Promise.resolve().then(() =>
-                        downloadOfflineMarkdown(
-                          offlineCopyMarkdown(liveDoc, page.title),
-                          `${page.title}-current-editor.md`,
-                        ),
-                      )
-                    : exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`)
-                ).then(
-                  () => {
-                    if (stillCurrent()) recoveryErrorFor(entry.key, "export", null);
-                  },
-                  (error: unknown) => {
-                    console.error("Offline copy export failed", error);
-                    if (stillCurrent())
-                      recoveryErrorFor(
-                        entry.key,
-                        "export",
-                        recoveryMessage(error, "This offline copy could not be exported."),
-                      );
-                  },
-                );
+                void recoveryMarkdown(entry)
+                  .then((markdown) =>
+                    downloadOfflineMarkdown(
+                      markdown,
+                      `${page.title}-${liveRecovery?.key === entry.key ? "current-editor" : `offline-epoch-${entry.epoch}`}.md`,
+                    ),
+                  )
+                  .then(
+                    () => {
+                      if (stillCurrent()) recoveryErrorFor(entry.key, "export", null);
+                    },
+                    (error: unknown) => {
+                      console.error("Offline copy export failed", error);
+                      if (stillCurrent())
+                        recoveryErrorFor(
+                          entry.key,
+                          "export",
+                          recoveryMessage(error, "This offline copy could not be exported."),
+                        );
+                    },
+                  );
               }}
             >
-              {entry.key === currentStorageKey && storageWriteFailed ? "Export current editor" : "Export Markdown"}
+              {liveRecovery?.key === entry.key ? "Export current editor" : "Export Markdown"}
             </button>
             <button
               className="quiet-button"
@@ -995,8 +1057,7 @@ export function EditorPage({
                   ? "Copy prepared Markdown"
                   : "Prepare Markdown to copy"}
             </button>
-            {!accessQuarantine &&
-              !storageWriteFailed &&
+            {!(entry.key === currentStorageKey && (accessQuarantine || storageWriteFailed)) &&
               (entry.epoch !== page.contentEpoch || entry.reason !== "access") && (
                 <button
                   className="quiet-button"
