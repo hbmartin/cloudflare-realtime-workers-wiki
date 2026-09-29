@@ -38,3 +38,22 @@ export function effectiveSpaceRole(
   if (workspaceRole === "viewer" || grant === "viewer") return "viewer";
   return "editor";
 }
+
+export async function sidebarHiddenPageIds(env: Env, workspaceId: string, pageIds: readonly string[]) {
+  if (!pageIds.length) return [];
+  const hidden = await env.DB.prepare(
+    `WITH RECURSIVE hidden(id) AS (
+       SELECT link.page_id FROM table_row_pages link JOIN pages root ON root.id=link.page_id
+        WHERE root.workspace_id=?
+       UNION
+       SELECT source.page_id FROM page_import_sources source JOIN pages root ON root.id=source.page_id
+        WHERE root.workspace_id=? AND source.source_role='table_row_detail'
+       UNION ALL
+       SELECT child.id FROM pages child JOIN hidden parent ON child.parent_id=parent.id
+        WHERE child.workspace_id=?
+     ) SELECT id FROM hidden WHERE id IN (SELECT value FROM json_each(?))`,
+  )
+    .bind(workspaceId, workspaceId, workspaceId, JSON.stringify(pageIds))
+    .all<{ id: string }>();
+  return hidden.results.map((row) => row.id);
+}

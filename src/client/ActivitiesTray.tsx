@@ -41,7 +41,7 @@ function ImportConfirmation({
   job: Job;
   spaces?: Space[];
   pending: boolean;
-  onConfirm: (job: Job, groupSpaceIds: Record<string, string>) => void;
+  onConfirm: (job: Job, groupSpaceIds: Record<string, string>, parentOverride?: null) => void;
 }) {
   const preview = job.result?.preview;
   const [mapping, setMapping] = useState<Record<string, string>>(() =>
@@ -129,6 +129,11 @@ function ImportConfirmation({
       <button className="primary-small" disabled={pending || incomplete} onClick={() => onConfirm(job, mapping)}>
         {pending ? "Starting…" : "Confirm import"}
       </button>
+      {job.importParentId && (
+        <button className="quiet-button" disabled={pending || incomplete} onClick={() => onConfirm(job, mapping, null)}>
+          Confirm at space root
+        </button>
+      )}
     </div>
   );
 }
@@ -156,8 +161,8 @@ export function ActivitiesTray({
   onRefresh: () => void;
   onCancel: (job: Job) => void;
   onCleanup: (job: Job) => void;
-  onRetry: (job: Job) => void;
-  onConfirm: (job: Job, groupSpaceIds: Record<string, string>) => void;
+  onRetry: (job: Job, parentOverride?: null) => void;
+  onConfirm: (job: Job, groupSpaceIds: Record<string, string>, parentOverride?: null) => void;
   onOpenResult: (job: Job) => void;
 }) {
   const closeButton = useRef<HTMLButtonElement>(null);
@@ -292,6 +297,13 @@ export function ActivitiesTray({
                           {pending ? "Retrying…" : "Retry"}
                         </button>
                       )}
+                      {(job.status === "failed" || job.status === "canceled") &&
+                        !job.cleanupPending &&
+                        job.importParentId && (
+                          <button className="quiet-button" disabled={pending} onClick={() => onRetry(job, null)}>
+                            Retry at space root
+                          </button>
+                        )}
                     </span>
                   </div>
                 </li>

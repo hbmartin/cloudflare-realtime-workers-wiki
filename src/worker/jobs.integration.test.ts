@@ -10,6 +10,7 @@ import { NOTION_GROUPING_VERSION } from "../shared/import-space-mapping";
 import { createZip, readZip } from "../shared/zip";
 import type { Env } from "./env";
 import { HttpError } from "./http";
+import { sidebarHiddenPageIds } from "./page-access";
 import { runImport } from "./importer";
 import {
   claimJobWorkflowRun,
@@ -102,10 +103,10 @@ async function bootstrap(): Promise<InstalledWorkspace> {
   return { cookie, pageId: tree.pages[0]!.id, userId: me.user.id, workspaceId: me.workspace.id };
 }
 
-async function confirmedParentImport(installed: InstalledWorkspace) {
+async function confirmedParentImport(installed: InstalledWorkspace, parentId: string | null = installed.pageId) {
   const upload = new FormData();
   upload.set("spaceId", `${installed.workspaceId}-general`);
-  upload.set("parentId", installed.pageId);
+  if (parentId) upload.set("parentId", parentId);
   upload.set("file", new File(["# Child\n\nVerified content."], "child.md", { type: "text/markdown" }));
   const uploadContext = createExecutionContext();
   const uploaded = await worker.fetch(
@@ -2479,6 +2480,29 @@ describe("job execution", () => {
     );
   });
 
+  it("keeps a published child out of the sidebar when its parent is a row-detail page", async () => {
+    const installed = await bootstrap();
+    await env.DB.prepare(
+      `INSERT INTO page_import_sources (page_id, source_path, source_role, created_at)
+       VALUES (?, 'row-detail-parent', 'table_row_detail', ?)`,
+    )
+      .bind(installed.pageId, Date.now())
+      .run();
+    const job = await confirmedParentImport(installed);
+    const step = {
+      async do<T>(_name: string, callback: () => Promise<T>) {
+        return callback();
+      },
+    };
+    await runImport(env, job, step as Parameters<typeof runImport>[2]);
+    const pageId = (await env.DB.prepare(`SELECT id FROM pages WHERE parent_id = ? AND title = 'child'`)
+      .bind(installed.pageId)
+      .first<{ id: string }>())!.id;
+    expect(await sidebarHiddenPageIds(env, installed.workspaceId, [pageId])).toEqual([pageId]);
+    const tree = await worker.fetch(request(installed.cookie, "/api/pages/tree"), env, createExecutionContext());
+    expect((await tree.json<{ pages: Array<{ id: string }> }>()).pages.map((page) => page.id)).not.toContain(pageId);
+  });
+
   it("rejects a parent outside the selected or remapped import space", async () => {
     const installed = await bootstrap();
     const otherSpaceId = crypto.randomUUID();
@@ -2531,11 +2555,65 @@ describe("job execution", () => {
     );
   });
 
-  it.each(["archived parent", "stale stage"] as const)(
-    "does not publish a parented import with %s before the final batch",
+  it("clears an invalid parent on retry and rejects a parent on Notion ZIP retries", async () => {
+    const installed = await bootstrap();
+    const parented = await confirmedParentImport(installed);
+    await env.DB.prepare(`UPDATE jobs SET status = 'failed' WHERE id = ?`).bind(parented.id).run();
+    await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`).bind(Date.now(), installed.pageId).run();
+    const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
+    const context = createExecutionContext();
+    const retry = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${parented.id}/retry`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ parentId: null }),
+      }),
+      bindingsWith({ NOTES_WORKFLOW: { create } }),
+      context,
+    );
+    expect(retry.status).toBe(202);
+    await waitOnExecutionContext(context);
+    const retried = await env.DB.prepare(`SELECT options_json FROM jobs WHERE id = ?`)
+      .bind(parented.id)
+      .first<{ options_json: string }>();
+    expect(JSON.parse(retried!.options_json).parentId).toBeNull();
+
+    const notionId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.prepare(
+      `INSERT INTO jobs (id, workspace_id, space_id, type, status, requested_by, options_json, created_at, updated_at)
+       VALUES (?, ?, ?, 'import', 'failed', ?, ?, ?, ?)`,
+    )
+      .bind(
+        notionId,
+        installed.workspaceId,
+        `${installed.workspaceId}-general`,
+        installed.userId,
+        JSON.stringify({ filename: "notion.zip", format: "notion_zip", confirmed: false }),
+        timestamp,
+        timestamp,
+      )
+      .run();
+    const notionRetry = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${notionId}/retry`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ parentId: installed.pageId }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    expect(notionRetry.status).toBe(422);
+    expect((await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(notionId).first())?.status).toBe(
+      "failed",
+    );
+  });
+
+  it.each(["archived parent", "stale stage", "revoked space", "revoked parent access"] as const)(
+    "does not publish an import with %s before the final batch",
     async (failure) => {
       const installed = await bootstrap();
-      const job = await confirmedParentImport(installed);
+      const job = await confirmedParentImport(installed, failure === "revoked space" ? null : installed.pageId);
       const step = {
         async do<T>(name: string, callback: () => Promise<T>) {
           if (name === "publish import") {
@@ -2543,10 +2621,26 @@ describe("job execution", () => {
               await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`)
                 .bind(Date.now(), installed.pageId)
                 .run();
-            } else {
+            } else if (failure === "stale stage") {
               await env.DB.prepare(`UPDATE pages SET content_epoch = content_epoch + 1 WHERE import_job_id = ?`)
                 .bind(job.id)
                 .run();
+            } else {
+              const backupOwnerId = crypto.randomUUID();
+              const timestamp = Date.now();
+              await env.DB.batch([
+                env.DB.prepare(
+                  `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+                   VALUES (?, 'Backup owner', ?, 1, ?, ?)`,
+                ).bind(backupOwnerId, `backup-${backupOwnerId}@example.test`, timestamp, timestamp),
+                env.DB.prepare(
+                  `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+                   VALUES (?, ?, 'owner', ?)`,
+                ).bind(installed.workspaceId, backupOwnerId, timestamp),
+                env.DB.prepare(
+                  `UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = ? AND user_id = ?`,
+                ).bind(installed.workspaceId, installed.userId),
+              ]);
             }
           }
           return callback();
@@ -2563,6 +2657,13 @@ describe("job execution", () => {
           await env.DB.prepare(
             `SELECT COUNT(*) count FROM pages WHERE import_job_id IS NULL AND title = 'child'`,
           ).first<{ count: number }>()
+        )?.count,
+      ).toBe(0);
+      expect(
+        (
+          await env.DB.prepare(`SELECT COUNT(*) count FROM subscriptions WHERE id LIKE ?`)
+            .bind(`${job.id}:%`)
+            .first<{ count: number }>()
         )?.count,
       ).toBe(0);
     },

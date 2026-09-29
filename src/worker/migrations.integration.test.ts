@@ -485,6 +485,26 @@ describe("D1 migrations", () => {
     });
   });
 
+  it("replays the Slack capture receipt migration with its destination and session link intact", async () => {
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    const captures = await env.DB.prepare("PRAGMA table_info(slack_captures)").all<{ name: string }>();
+    const sessions = await env.DB.prepare("PRAGMA table_info(slack_product_sessions)").all<{ name: string }>();
+    expect(captures.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        "destination_space_id",
+        "destination_parent_id",
+        "target_kind",
+        "title",
+        "request_hash",
+        "attempt",
+        "error_category",
+        "published_at",
+      ]),
+    );
+    expect(sessions.results.map((column) => column.name)).toContain("capture_id");
+  });
+
   it("preserves preloaded account security when a restore inserts the user row later", async () => {
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
     const trigger = await env.DB.prepare(

@@ -8,7 +8,7 @@ export type ImportOptions = {
   filename: string;
   format: ImportPreview["format"];
   confirmed: boolean;
-  parentId?: string;
+  parentId?: string | undefined;
   groupSpaceIds?: Record<string, string>;
   previewGroupKeys?: string[];
   previewGroupingVersion?: number;

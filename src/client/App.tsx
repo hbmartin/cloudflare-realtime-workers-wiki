@@ -2504,7 +2504,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     };
   }, [activitiesOpen, activityPollDelay, loadJobs]);
   const mutateJob = useCallback(
-    async (job: Job, action: "cancel" | "cleanup" | "retry" | "confirm", groupSpaceIds?: Record<string, string>) => {
+    async (
+      job: Job,
+      action: "cancel" | "cleanup" | "retry" | "confirm",
+      groupSpaceIds?: Record<string, string>,
+      parentOverride?: null,
+    ) => {
       setPendingJobId(job.id);
       try {
         const path =
@@ -2514,8 +2519,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         const data = await api<{ job: Job }>(path, {
           method: "POST",
           ...(action === "confirm"
-            ? { body: json({ groupSpaceIds: groupSpaceIds ?? {}, previewId: job.result?.preview?.previewId }) }
-            : {}),
+            ? {
+                body: json({
+                  groupSpaceIds: groupSpaceIds ?? {},
+                  previewId: job.result?.preview?.previewId,
+                  ...(parentOverride === null ? { parentId: null } : {}),
+                }),
+              }
+            : action === "retry" && parentOverride === null
+              ? { body: json({ parentId: null }) }
+              : {}),
         });
         setJobs((current) =>
           current.map((candidate) =>
@@ -3933,8 +3946,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onRefresh={() => void loadJobs()}
           onCancel={(job) => void mutateJob(job, "cancel")}
           onCleanup={(job) => void mutateJob(job, "cleanup")}
-          onRetry={(job) => void mutateJob(job, "retry")}
-          onConfirm={(job, groupSpaceIds) => void mutateJob(job, "confirm", groupSpaceIds)}
+          onRetry={(job, parentOverride) => void mutateJob(job, "retry", undefined, parentOverride)}
+          onConfirm={(job, groupSpaceIds, parentOverride) =>
+            void mutateJob(job, "confirm", groupSpaceIds, parentOverride)
+          }
           onOpenResult={(job) => void openJobResult(job)}
         />
       )}

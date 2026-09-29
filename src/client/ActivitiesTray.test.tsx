@@ -39,6 +39,35 @@ const workspaceSpace: Space = {
 afterEach(cleanup);
 
 describe("ActivitiesTray", () => {
+  it("offers a space-root recovery action for a failed parented import", () => {
+    const retry = vi.fn();
+    const job: Job = {
+      ...runningJob,
+      type: "import",
+      status: "failed",
+      importParentId: "archived-parent",
+      error: { code: "job_failed", message: "Choose a writable space or parent and retry." },
+    };
+    render(
+      <ActivitiesTray
+        jobs={[job]}
+        spaces={[workspaceSpace]}
+        loading={false}
+        error=""
+        pendingJobId={null}
+        onClose={vi.fn()}
+        onRefresh={vi.fn()}
+        onCancel={vi.fn()}
+        onCleanup={vi.fn()}
+        onRetry={retry}
+        onConfirm={vi.fn()}
+        onOpenResult={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry at space root" }));
+    expect(retry).toHaveBeenCalledWith(job, null);
+  });
+
   it("renders progress and exposes the valid action for a running job", () => {
     const cancel = vi.fn();
     render(

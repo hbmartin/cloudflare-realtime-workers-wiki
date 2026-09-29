@@ -288,6 +288,7 @@ export type Job = {
   id: string;
   workspaceId: string;
   spaceId: string | null;
+  importParentId?: string;
   type: JobType;
   status: JobStatus;
   progress: { current: number; total: number; label: string };

@@ -129,6 +129,7 @@ function jsonRecord(value: string) {
 
 export function jobJson(row: JobRow): Job {
   const result = jsonRecord(row.result_json);
+  const options = row.type === "import" ? jsonRecord(row.options_json) : {};
   const warnings = Array.isArray(result.warnings)
     ? result.warnings.filter((warning): warning is string => typeof warning === "string").slice(0, 50)
     : [];
@@ -136,6 +137,7 @@ export function jobJson(row: JobRow): Job {
     id: row.id,
     workspaceId: row.workspace_id,
     spaceId: row.space_id,
+    ...(typeof options.parentId === "string" ? { importParentId: options.parentId } : {}),
     type: row.type,
     status: row.status,
     progress: {
