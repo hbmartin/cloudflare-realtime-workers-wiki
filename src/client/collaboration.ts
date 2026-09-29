@@ -14,6 +14,8 @@ import {
   withOfflineDocumentLock,
 } from "./offline-catalog";
 
+export const OFFLINE_COPY_MISSING_MESSAGE = "This offline document copy is no longer on this device.";
+
 export type CollaborationBundle = {
   doc: Y.Doc;
   indexeddb: IndexeddbPersistence;
@@ -177,15 +179,25 @@ export function createCollaboration(
     durability.markChanged();
     barrier.schedule();
   });
-  const ready = indexeddb.whenSynced
-    .then(() => {
-      if (!destroyed) {
-        // Until the server sync completes, conservatively treat a persisted copy
-        // as recoverable offline work. An epoch rejection happens before sync.
-        if (Y.encodeStateVector(doc).byteLength > 1) durability.markChanged();
-        indexeddbSynced = true;
-        connect();
-      }
+  const synced = indexeddb.whenSynced.then(() => {
+    if (!destroyed) {
+      // Until the server sync completes, conservatively treat a persisted copy
+      // as recoverable offline work. An epoch rejection happens before sync.
+      if (Y.encodeStateVector(doc).byteLength > 1) durability.markChanged();
+      indexeddbSynced = true;
+      connect();
+    }
+  });
+  let readyTimeout: ReturnType<typeof setTimeout> | undefined;
+  const ready = Promise.race([
+    synced,
+    indexeddb["_db"].then(() => new Promise<never>(() => undefined)),
+    new Promise<never>((_, reject) => {
+      readyTimeout = setTimeout(() => reject(new Error("Offline document storage did not finish loading.")), 30_000);
+    }),
+  ])
+    .finally(() => {
+      if (readyTimeout) clearTimeout(readyTimeout);
     })
     .catch((error) => {
       if (destroyed) return;
@@ -385,7 +397,7 @@ export async function loadOfflineCopy(key: string) {
   registerOfflineDocumentKeyFromKey(key);
   return withOfflineDocumentLock(key, async () => {
     registerOfflineDocumentKeyFromKey(key);
-    if (!(await hasOfflineDocument(key))) throw new Error("This offline document copy is no longer on this device.");
+    if (!(await hasOfflineDocument(key))) throw new Error(OFFLINE_COPY_MISSING_MESSAGE);
     const doc = new Y.Doc();
     const persistence = new IndexeddbPersistence(key, doc);
     let loaded = false;

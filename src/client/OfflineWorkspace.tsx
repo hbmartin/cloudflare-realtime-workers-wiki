@@ -11,13 +11,19 @@ import { api, ApiClientError } from "./api";
 import { waitForOfflinePersistence } from "./collaboration";
 import { EmbedFeatureContext } from "./editor-blocks";
 import { notesSchema } from "./mentions";
-import { downloadOfflineMarkdown, exportPendingOfflinePages, offlineCopyMarkdown } from "./offline-export";
+import {
+  downloadOfflineMarkdown,
+  exportPendingOfflinePages,
+  formatOfflineExportResult,
+  offlineCopyMarkdown,
+} from "./offline-export";
 import { useEffectiveColorScheme } from "./ThemeControl";
 import {
   compactDocumentUpdates,
   clearRevokedOfflinePages,
   documentPendingMarker,
   getOfflinePage,
+  hasOfflineDocument,
   listPendingOfflinePages,
   markOfflinePagePending,
   markOfflinePageRevoked,
@@ -303,7 +309,9 @@ export function OfflineWorkspace({
                         pending.filter((page) => page.pageId === selected.pageId).flatMap(pendingKeysOf),
                       );
                       if (!complete) {
-                        for (const key of pendingKeysOf(selected)) keys.add(key);
+                        for (const key of pendingKeysOf(selected)) {
+                          if (await hasOfflineDocument(key)) keys.add(key);
+                        }
                       }
                       if (!keys.size) {
                         setNotice(
@@ -318,11 +326,8 @@ export function OfflineWorkspace({
                         true,
                       );
                       if (!complete || result.failed) {
-                        const failed = result.failed ? ` ${result.failed} could not be read.` : "";
                         const unlisted = !complete ? " Other older copies may remain." : "";
-                        setNotice(
-                          `Exported ${result.exported} readable ${result.exported === 1 ? "copy" : "copies"}.${failed}${unlisted}`,
-                        );
+                        setNotice(`${formatOfflineExportResult(result)}${unlisted}`);
                       }
                     })().catch((error) =>
                       setNotice(error instanceof Error ? error.message : "Unable to export local changes."),

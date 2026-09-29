@@ -683,24 +683,13 @@ export async function forgetOfflineAccount(accountKey: string) {
         }),
     );
   }
-  let verified = !!indexedDB.databases;
-  if (prefix && indexedDB.databases) {
-    let remaining: IDBDatabaseInfo[] | null = null;
-    try {
-      remaining = await indexedDB.databases();
-    } catch (error) {
-      console.error("Offline document enumeration failed during sign-out", error);
-      verified = false;
-    }
-    if (remaining?.some((database) => database.name?.startsWith(prefix)))
-      throw new Error("New local document storage appeared during sign-out. Retry removal.");
-  }
   const newlyRegistered = (completedWithoutEnumeration ? [] : await accountDocumentNames(accountKey, false)).filter(
     (key) => prefix && key.startsWith(prefix) && !keys.has(key),
   );
   if (newlyRegistered.length) throw new Error("New local document storage appeared during sign-out. Retry removal.");
   if (registryEntries().some((name) => !entryNamesAtStart.has(name)))
     throw new Error("New local document storage appeared during sign-out. Retry removal.");
+  let verified = !!indexedDB.databases;
   if (prefix && indexedDB.databases) {
     let remaining: IDBDatabaseInfo[] | null = null;
     try {

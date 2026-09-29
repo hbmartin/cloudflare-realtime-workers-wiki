@@ -57,3 +57,9 @@ export async function exportPendingOfflinePages(pages: OfflinePage[], bestEffort
   );
   return { exported: sections.length, failed };
 }
+
+export function formatOfflineExportResult(result: { exported: number; failed: number }) {
+  const copies = result.exported === 1 ? "copy" : "copies";
+  const unreadable = result.failed ? ` ${result.failed} could not be read.` : "";
+  return `Exported ${result.exported} readable ${copies}.${unreadable}`;
+}

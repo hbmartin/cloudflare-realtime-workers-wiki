@@ -12,6 +12,7 @@ import { LOCAL_SIGNOUT_KEY } from "./offline-catalog";
 
 const mocks = vi.hoisted(() => ({
   whenSynced: new Promise<void>(() => undefined),
+  dbOpen: Promise.resolve({} as IDBDatabase),
   persistenceNames: [] as string[],
   providers: [] as Array<{
     synced: boolean;
@@ -43,7 +44,7 @@ vi.mock("y-indexeddb", () => ({
       mocks.persistenceNames.push(name);
     }
     whenSynced = mocks.whenSynced;
-    _db = Promise.resolve({} as IDBDatabase);
+    _db = mocks.dbOpen;
     destroy = vi.fn(async () => undefined);
   },
 }));
@@ -128,6 +129,7 @@ describe("collaboration durability barriers", () => {
   });
 
   beforeEach(() => {
+    mocks.dbOpen = Promise.resolve({} as IDBDatabase);
     vi.useFakeTimers();
     vi.setSystemTime(0);
     vi.spyOn(Math, "random").mockReturnValue(1);
@@ -349,6 +351,20 @@ describe("collaboration durability barriers", () => {
     expect(logged).toHaveBeenCalledWith("Failed to load offline document state", error);
     expect(onStatus).toHaveBeenCalledWith("offline");
     expect(provider.connect).not.toHaveBeenCalled();
+    bundle.destroy();
+  });
+
+  it("reports an IndexedDB open rejection even when synchronization never settles", async () => {
+    const error = new Error("IndexedDB open failed");
+    mocks.dbOpen = Promise.reject(error);
+    const onStatus = vi.fn();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const bundle = createCollaboration("workspace", "page", 1, onStatus, "user");
+
+    await expect(bundle.ready).rejects.toBe(error);
+    expect(logged).toHaveBeenCalledWith("Failed to load offline document state", error);
+    expect(onStatus).toHaveBeenCalledWith("offline");
+    expect(mocks.providers[0]?.connect).not.toHaveBeenCalled();
     bundle.destroy();
   });
 

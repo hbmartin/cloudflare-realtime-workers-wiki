@@ -25,7 +25,13 @@ import { projectDocument, type ProseMirrorJson } from "../shared/document-projec
 import { diffBlockIds } from "../shared/block-diff";
 import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
-import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
+import {
+  createCollaboration,
+  loadOfflineCopy,
+  OFFLINE_COPY_MISSING_MESSAGE,
+  type CollaborationBundle,
+  userColor,
+} from "./collaboration";
 import { exportOfflineCopyMarkdown, offlineCopyMarkdownFromKey } from "./offline-export";
 import { createDocumentCloseReconciler } from "./document-connection";
 import { editorBlockFactories, EmbedFeatureContext, safeBookmarkUrl } from "./editor-blocks";
@@ -53,9 +59,7 @@ const PENDING_CATALOG_WARNING = "Local changes are saved, but the offline page l
 const SYNCED_CATALOG_WARNING = "Changes are synced, but the offline page list could not be updated yet.";
 
 function recoveryMessage(error: unknown, fallback: string) {
-  return error instanceof Error && error.message === "This offline document copy is no longer on this device."
-    ? error.message
-    : fallback;
+  return error instanceof Error && error.message === OFFLINE_COPY_MISSING_MESSAGE ? error.message : fallback;
 }
 
 export type EditorPageProps = {
@@ -91,6 +95,7 @@ export function EditorPage({
   const [storageError, setStorageError] = useState<string | null>(null);
   const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [preparedRecoveryCopy, setPreparedRecoveryCopy] = useState<{ key: string; markdown: string } | null>(null);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -348,8 +353,11 @@ export function EditorPage({
       if (!active) return;
       const current = recoveryRef.current;
       const remaining = current.filter((entry) => entry.key !== currentStorageKey);
-      if (remaining.length !== current.length) replaceRecovery(remaining);
-      setRecoveryError(null);
+      if (remaining.length !== current.length) {
+        replaceRecovery(remaining);
+        setRecoveryError(null);
+        setPreparedRecoveryCopy((prepared) => (prepared?.key === currentStorageKey ? null : prepared));
+      }
       setStorageError("");
       setCatalogWarning(null);
     };
@@ -515,6 +523,16 @@ export function EditorPage({
       } catch {
         if (!active) return;
         setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+        void (async () => {
+          try {
+            await next.indexeddb.whenSynced;
+            if (!active) return;
+            setStorageError("");
+            setBundle(next);
+          } catch {
+            // A failed IndexedDB open remains read-only for this page.
+          }
+        })();
       }
     })();
     return () => {
@@ -725,28 +743,54 @@ export function EditorPage({
             <button
               className="quiet-button"
               onClick={async () => {
+                if (typeof ClipboardItem === "undefined" || !navigator.clipboard.write) {
+                  if (preparedRecoveryCopy?.key !== entry.key) {
+                    try {
+                      const markdown = await offlineCopyMarkdownFromKey(entry.key, page.title);
+                      setPreparedRecoveryCopy({ key: entry.key, markdown });
+                      setRecoveryError(null);
+                    } catch (error) {
+                      console.error("Offline copy preparation failed", error);
+                      setRecoveryError(recoveryMessage(error, "This offline copy could not be read."));
+                    }
+                    return;
+                  }
+                  try {
+                    await navigator.clipboard.writeText(preparedRecoveryCopy.markdown);
+                    setRecoveryError(null);
+                  } catch (error) {
+                    console.error("Offline copy clipboard failed", error);
+                    setRecoveryError("This offline copy could not be copied.");
+                  }
+                  return;
+                }
                 const content = offlineCopyMarkdownFromKey(entry.key, page.title);
-                void content.catch(() => undefined);
                 try {
-                  if (typeof ClipboardItem !== "undefined" && navigator.clipboard.write)
-                    await navigator.clipboard.write([
-                      new ClipboardItem({
-                        "text/plain": content.then((markdown) => new Blob([markdown], { type: "text/plain" })),
-                      }),
-                    ]);
-                  else await navigator.clipboard.writeText(await content);
+                  await navigator.clipboard.write([
+                    new ClipboardItem({
+                      "text/plain": content.then((markdown) => new Blob([markdown], { type: "text/plain" })),
+                    }),
+                  ]);
                   setRecoveryError(null);
                 } catch (error) {
                   console.error("Offline copy clipboard failed", error);
-                  const source = await content.then(
-                    () => error,
-                    (loadingError) => loadingError as unknown,
-                  );
-                  setRecoveryError(recoveryMessage(source, "This offline copy could not be copied."));
+                  setRecoveryError("This offline copy could not be copied.");
+                  void content.catch((loadingError) => {
+                    if (recoveryRef.current.some((current) => current.key === entry.key))
+                      setRecoveryError((current) =>
+                        current === "This offline copy could not be copied."
+                          ? recoveryMessage(loadingError, "This offline copy could not be read.")
+                          : current,
+                      );
+                  });
                 }
               }}
             >
-              Copy Markdown
+              {typeof ClipboardItem === "undefined" || !navigator.clipboard.write
+                ? preparedRecoveryCopy?.key === entry.key
+                  ? "Copy prepared Markdown"
+                  : "Prepare Markdown to copy"
+                : "Copy Markdown"}
             </button>
             {(entry.epoch !== page.contentEpoch || (entry.reason !== "access" && !accessQuarantine)) && (
               <button

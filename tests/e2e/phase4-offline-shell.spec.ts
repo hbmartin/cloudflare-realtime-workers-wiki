@@ -631,6 +631,11 @@ test("can finish offline sign-out when database enumeration is unavailable", asy
   await page.reload();
   await expect(page.getByRole("heading", { name: "Sign in" })).toBeVisible();
   await expect(page.getByRole("status")).toContainText("some may remain on this device");
+  const reopened = await context.newPage();
+  await reopened.goto("/");
+  await expect(reopened.getByRole("heading", { name: "Sign in" })).toBeVisible();
+  await expect(reopened.getByRole("status")).toContainText("some may remain on this device");
+  await reopened.close();
   expect(
     await page.evaluate(async () => {
       (window as Window & { restoreDatabases?: () => void }).restoreDatabases?.();
