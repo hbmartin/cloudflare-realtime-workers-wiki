@@ -76,7 +76,6 @@ import {
   listOfflinePages,
   listPendingOfflinePages,
   LOCAL_SIGNOUT_KEY,
-  markOfflineAccountPurging,
   offlineAccountKey,
   purgingOfflineAccounts,
   rememberOfflineAccount,
@@ -823,10 +822,6 @@ export function App() {
     async (accountKey: string) => {
       localStorage.setItem(LOCAL_SIGNOUT_KEY, accountKey);
       invalidateUnauthorizedRequests();
-      if (typeof indexedDB !== "undefined")
-        await markOfflineAccountPurging(accountKey).catch((error) =>
-          console.error("Unable to mark local sign-out", error),
-        );
       showState({ screen: "loading" });
       await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
       const serverSignOut = authClient
@@ -934,7 +929,7 @@ export function App() {
     async (accountKey: string) => {
       showState({ screen: "loading" });
       try {
-        await markOfflineAccountPurging(accountKey);
+        await forgetOfflineAccount(accountKey);
         await load();
       } catch (error) {
         showState({

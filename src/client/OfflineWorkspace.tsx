@@ -305,13 +305,7 @@ export function OfflineWorkspace({
                       );
                       if (!complete) {
                         for (const key of pendingKeysOf(selected)) {
-                          if (await hasOfflineDocument(key).catch(() => false)) keys.add(key);
-                        }
-                      }
-                      for (const key of keys) {
-                        if (!(await hasOfflineDocument(key).catch(() => false))) {
-                          keys.delete(key);
-                          complete = false;
+                          if (await hasOfflineDocument(key).catch(() => true)) keys.add(key);
                         }
                       }
                       if (!keys.size) {
@@ -322,10 +316,13 @@ export function OfflineWorkspace({
                         );
                         return;
                       }
-                      await exportPendingOfflinePages([{ ...selected, pendingCopyKeys: [...keys] }]);
-                      if (!complete)
+                      const result = await exportPendingOfflinePages(
+                        [{ ...selected, pendingCopyKeys: [...keys] }],
+                        true,
+                      );
+                      if (!complete || result.failed)
                         setNotice(
-                          "Exported the copies found on this device. Other older copies could not be verified.",
+                          `Exported ${result.exported} readable ${result.exported === 1 ? "copy" : "copies"}. ${result.failed} could not be read; other older copies may remain.`,
                         );
                     })().catch((error) =>
                       setNotice(error instanceof Error ? error.message : "Unable to export local changes."),

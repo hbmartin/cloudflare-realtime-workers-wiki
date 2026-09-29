@@ -20,12 +20,12 @@ import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
 import type { ClientMemberContext, Space } from "../shared/types";
 import type { MentionSuggestion, Page } from "../shared/types";
-import { projectDocument, serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { diffBlockIds } from "../shared/block-diff";
 import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
-import { exportOfflineCopyMarkdown } from "./offline-export";
+import { exportOfflineCopyMarkdown, offlineCopyMarkdownFromKey } from "./offline-export";
 import { createDocumentCloseReconciler } from "./document-connection";
 import { editorBlockFactories, EmbedFeatureContext, safeBookmarkUrl } from "./editor-blocks";
 import { resolveEmbed } from "../shared/embed-providers";
@@ -79,6 +79,7 @@ export function EditorPage({
   const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
   const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
+  const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -252,7 +253,7 @@ export function EditorPage({
         offlineMember.current = currentMember;
         try {
           await rememberOfflineAccount(currentMember);
-          if (active)
+          if (active && !catalogNeedsRepair)
             setCatalogWarning((warning) =>
               warning === "The offline page list could not be updated yet." ? null : warning,
             );
@@ -260,7 +261,7 @@ export function EditorPage({
           console.error("Unable to update offline account metadata", error);
           if (active)
             setCatalogWarning((warning) =>
-              warning?.startsWith("Local changes are saved")
+              warning?.includes("offline page list could not be updated yet")
                 ? warning
                 : "The offline page list could not be updated yet.",
             );
@@ -662,6 +663,7 @@ export function EditorPage({
       )}
       {storageError && <div className="notice notice-danger">{storageError}</div>}
       {catalogWarning && <div className="notice">{catalogWarning}</div>}
+      {recoveryError && <div className="notice notice-danger">{recoveryError}</div>}
       {recovery
         .filter((entry) => entry.epoch !== page.contentEpoch || accessQuarantine || storageError)
         .map((entry) => (
@@ -683,11 +685,13 @@ export function EditorPage({
                   const doc = await loadOfflineCopy(entry.key);
                   try {
                     setRecoveryPreview({ key: entry.key, text: plainYDoc(doc) });
+                    setRecoveryError(null);
                   } finally {
                     doc.destroy();
                   }
                 } catch (error) {
-                  setCatalogWarning(apiErrorMessage(error, "This offline copy could not be read."));
+                  console.error("Offline copy preview failed", error);
+                  setRecoveryError(error instanceof Error ? error.message : "This offline copy could not be read.");
                 }
               }}
             >
@@ -695,29 +699,35 @@ export function EditorPage({
             </button>
             <button
               className="quiet-button"
-              onClick={() =>
-                void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`).catch((error) =>
-                  setCatalogWarning(apiErrorMessage(error, "This offline copy could not be exported.")),
-                )
-              }
+              onClick={() => {
+                void exportOfflineCopyMarkdown(entry.key, page.title, `offline-epoch-${entry.epoch}`).then(
+                  () => setRecoveryError(null),
+                  (error: unknown) => {
+                    console.error("Offline copy export failed", error);
+                    setRecoveryError(
+                      error instanceof Error ? error.message : "This offline copy could not be exported.",
+                    );
+                  },
+                );
+              }}
             >
               Export Markdown
             </button>
             <button
               className="quiet-button"
               onClick={async () => {
+                const content = offlineCopyMarkdownFromKey(entry.key, page.title);
+                void content.catch(() => undefined);
                 try {
-                  const doc = await loadOfflineCopy(entry.key);
-                  try {
-                    const projection = yXmlFragmentToProsemirrorJSON(
-                      doc.getXmlFragment("document-store"),
-                    ) as ProseMirrorJson;
-                    await navigator.clipboard.writeText(serializeDocument(projection).markdown);
-                  } finally {
-                    doc.destroy();
-                  }
+                  await navigator.clipboard.write([
+                    new ClipboardItem({
+                      "text/plain": content.then((markdown) => new Blob([markdown], { type: "text/plain" })),
+                    }),
+                  ]);
+                  setRecoveryError(null);
                 } catch (error) {
-                  setCatalogWarning(apiErrorMessage(error, "This offline copy could not be copied."));
+                  console.error("Offline copy clipboard failed", error);
+                  setRecoveryError(error instanceof Error ? error.message : "This offline copy could not be copied.");
                 }
               }}
             >

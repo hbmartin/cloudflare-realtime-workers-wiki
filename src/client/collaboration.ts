@@ -6,7 +6,12 @@ import { parseWorkspaceEvent } from "../shared/validation";
 import { CollaborationDurability } from "./collaboration-durability";
 import { connectionRetryDelay } from "./retry";
 import { reportClientError } from "./telemetry";
-import { offlineDocumentKey, registerOfflineDocumentKey, registerOfflineDocumentKeyFromKey } from "./offline-catalog";
+import {
+  hasOfflineDocument,
+  offlineDocumentKey,
+  registerOfflineDocumentKey,
+  registerOfflineDocumentKeyFromKey,
+} from "./offline-catalog";
 
 export type CollaborationBundle = {
   doc: Y.Doc;
@@ -171,7 +176,7 @@ export function createCollaboration(
     durability.markChanged();
     barrier.schedule();
   });
-  const ready = indexeddb.whenSynced
+  const ready = waitForOfflinePersistence(indexeddb)
     .then(() => {
       if (!destroyed) {
         // Until the server sync completes, conservatively treat a persisted copy
@@ -377,25 +382,25 @@ export function createNetworkCollaboration(
 
 export async function loadOfflineCopy(key: string) {
   registerOfflineDocumentKeyFromKey(key);
+  if (!(await hasOfflineDocument(key))) throw new Error("This offline document copy is no longer on this device.");
   const doc = new Y.Doc();
   const persistence = new IndexeddbPersistence(key, doc);
+  let loaded = false;
   try {
     await waitForOfflinePersistence(persistence);
+    loaded = true;
     return doc;
-  } catch (error) {
-    doc.destroy();
-    throw error;
   } finally {
     await persistence.destroy().catch(() => undefined);
+    if (!loaded) doc.destroy();
   }
 }
 
 export async function waitForOfflinePersistence(persistence: IndexeddbPersistence) {
-  await persistence["_db"];
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      persistence.whenSynced,
+      persistence["_db"].then(() => persistence.whenSynced),
       new Promise<never>((_, reject) => {
         timeout = setTimeout(() => reject(new Error("Offline document storage did not finish loading.")), 30_000);
       }),

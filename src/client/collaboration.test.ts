@@ -42,6 +42,7 @@ vi.mock("y-indexeddb", () => ({
       mocks.persistenceNames.push(name);
     }
     whenSynced = mocks.whenSynced;
+    _db = Promise.resolve({} as IDBDatabase);
     destroy = vi.fn(async () => undefined);
   },
 }));
@@ -250,8 +251,7 @@ describe("collaboration durability barriers", () => {
     const provider = mocks.providers[0]!;
     provider.connect.mockRejectedValueOnce(error);
 
-    await Promise.resolve();
-    await Promise.resolve();
+    await bundle.ready;
     await Promise.resolve();
 
     expect(onStatus).toHaveBeenCalledWith("offline");
@@ -345,8 +345,7 @@ describe("collaboration durability barriers", () => {
     const provider = mocks.providers[0]!;
     provider.connect.mockReturnValue(connection.promise);
 
-    await Promise.resolve();
-    await Promise.resolve();
+    await bundle.ready;
     expect(provider.connect).toHaveBeenCalledOnce();
 
     bundle.destroy();

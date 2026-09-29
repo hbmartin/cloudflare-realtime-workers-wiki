@@ -113,7 +113,7 @@ function mockShellApi(options: { member?: ClientMemberContext; pages?: Page[]; j
   vi.mocked(api).mockImplementation(async (path) => {
     if (path === "/api/install") return { initialized: true };
     if (path === "/api/security/status")
-      return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      return { state: "ready", userId: currentMember.user.id, totp: true, passkeys: 0, codesSaved: true, fresh: false };
     if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
     if (path === "/api/me") return currentMember;
     if (path === "/api/mentions/unread-count") return { unreadCount: 0 };

@@ -220,11 +220,12 @@ export function registerOfflineDocumentKey(userId: string, workspaceId: string, 
   if (typeof localStorage === "undefined") return;
   const accountKey = offlineAccountKey({ user: { id: userId }, workspace: { id: workspaceId } });
   if (isAccountSigningOut(accountKey)) throw new Error("Local sign-out is removing offline documents.");
-  if (registeredDocumentKeys(accountKey).keys?.includes(key)) return;
+  const entryName = `${documentRegistryEntryPrefix(accountKey)}${key}`;
+  if (localStorage.getItem(entryName) === "1") return;
   try {
-    localStorage.setItem(`${documentRegistryEntryPrefix(accountKey)}${key}`, "1");
+    localStorage.setItem(entryName, "1");
   } catch (error) {
-    if (!indexedDB.databases) throw error;
+    if (!indexedDB.databases && !registeredDocumentKeys(accountKey).keys?.includes(key)) throw error;
     console.error("Offline document registry could not be updated", error);
   }
 }
@@ -617,23 +618,32 @@ export async function markOfflineAccountPurging(accountKey: string) {
   const account = await requestResult(store.get(accountKey) as IDBRequest<OfflineAccount | undefined>);
   if (account) store.put({ ...account, purging: true });
   await transactionDone(transaction);
+  return account;
 }
 
 export async function purgingOfflineAccounts() {
-  const db = await openCatalog();
-  const transaction = db.transaction("accounts", "readonly");
-  const accounts = await requestResult(transaction.objectStore("accounts").getAll() as IDBRequest<OfflineAccount[]>);
-  await transactionDone(transaction);
-  const pending = new Set(accounts.filter((account) => account.purging).map((account) => account.key));
+  const pending = new Set<string>();
   for (let index = 0; index < localStorage.length; index += 1) {
     const key = localStorage.key(index);
     if (key?.startsWith(PURGING_ACCOUNT_PREFIX)) pending.add(key.slice(PURGING_ACCOUNT_PREFIX.length));
   }
+  let accounts: OfflineAccount[];
+  try {
+    const db = await openCatalog();
+    const transaction = db.transaction("accounts", "readonly");
+    accounts = await requestResult(transaction.objectStore("accounts").getAll() as IDBRequest<OfflineAccount[]>);
+    await transactionDone(transaction);
+  } catch (error) {
+    if (!pending.size) throw error;
+    console.error("Offline account catalog could not be checked during purge recovery", error);
+    return [...pending];
+  }
+  for (const account of accounts) if (account.purging) pending.add(account.key);
   return [...pending];
 }
 
 export async function forgetOfflineAccount(accountKey: string) {
-  await markOfflineAccountPurging(accountKey);
+  const account = await markOfflineAccountPurging(accountKey);
   const prefix = accountDocumentPrefix(accountKey);
   const entryPrefix = documentRegistryEntryPrefix(accountKey);
   const registryEntries = () =>
@@ -643,11 +653,6 @@ export async function forgetOfflineAccount(accountKey: string) {
   const entryNamesAtStart = new Set(registryEntries());
   const db = await openCatalog();
   const pages = await readAccountPages(accountKey, false);
-  const accountTransaction = db.transaction("accounts", "readonly");
-  const account = await requestResult(
-    accountTransaction.objectStore("accounts").get(accountKey) as IDBRequest<OfflineAccount | undefined>,
-  );
-  await transactionDone(accountTransaction);
   // A retry after a completed purge has no catalog or registry to inspect.
   const completedWithoutEnumeration =
     !indexedDB.databases && !account && !pages.length && registeredDocumentKeys(accountKey).keys === null;

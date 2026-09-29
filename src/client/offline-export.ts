@@ -19,33 +19,46 @@ export function downloadOfflineMarkdown(markdown: string, filename: string) {
 }
 
 export async function exportOfflineCopyMarkdown(key: string, title: string, suffix: string) {
+  downloadOfflineMarkdown(await offlineCopyMarkdownFromKey(key, title), `${title}-${suffix}.md`);
+}
+
+export async function offlineCopyMarkdownFromKey(key: string, title: string) {
   const doc = await loadOfflineCopy(key);
   try {
-    downloadOfflineMarkdown(offlineCopyMarkdown(doc, title), `${title}-${suffix}.md`);
+    return offlineCopyMarkdown(doc, title);
   } finally {
     doc.destroy();
   }
 }
 
-export async function exportPendingOfflinePages(pages: OfflinePage[]) {
+export async function exportPendingOfflinePages(pages: OfflinePage[], bestEffort = false) {
   const sections: string[] = [];
+  let failed = 0;
   for (const page of pages) {
     const keys = pendingKeysOf(page);
     for (const key of keys) {
       if (!key) throw new Error(`The local copy of ${page.title} is unavailable.`);
-      const doc = await loadOfflineCopy(key);
       try {
-        const epoch = storageEpoch(key);
-        sections.push(
-          `<!-- Offline document ${page.pageId}, epoch ${epoch} -->\n${offlineCopyMarkdown(doc, page.title)}`,
-        );
-      } finally {
-        doc.destroy();
+        const doc = await loadOfflineCopy(key);
+        try {
+          const epoch = storageEpoch(key);
+          sections.push(
+            `<!-- Offline document ${page.pageId}, epoch ${epoch} -->\n${offlineCopyMarkdown(doc, page.title)}`,
+          );
+        } finally {
+          doc.destroy();
+        }
+      } catch (error) {
+        if (!bestEffort) throw error;
+        failed += 1;
+        console.error("Offline copy could not be exported", error);
       }
     }
   }
+  if (!sections.length) throw new Error("No readable offline copy is available to export.");
   downloadOfflineMarkdown(
     sections.join("\n\n---\n\n"),
     `noteflare-offline-copies-${new Date().toISOString().slice(0, 10)}.md`,
   );
+  return { exported: sections.length, failed };
 }
