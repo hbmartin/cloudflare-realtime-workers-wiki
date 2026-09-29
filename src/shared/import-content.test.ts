@@ -72,6 +72,17 @@ describe("import content", () => {
     ]);
   });
 
+  it.each([
+    ["**bold *italic***", "italic"],
+    ["*foo**bar*", "foo"],
+    ["*a***b**", "a"],
+    ["*foo** bar", "foo"],
+    ["*foo**\n", "foo"],
+  ])("keeps italics at delimiter runs: %s", (source, italic) => {
+    const content = markdownToDocument(source).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content.some((node) => node.text === italic && node.marks?.[0]?.type === "italic")).toBe(true);
+  });
+
   it("scans long unclosed emphasis with backslashes without backtracking", () => {
     const source = `**Path ${"\\alpha ".repeat(90)}`;
     const parsed = markdownToDocument(source);

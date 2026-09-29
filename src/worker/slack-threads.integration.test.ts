@@ -70,6 +70,7 @@ import {
   finishPendingJobCleanup,
   jobJson,
   redriveStaleSlackOutbox,
+  recoverQueuedJobs,
   startJobExecution,
   type DeliveryQueueMessage,
   type JobRow,
@@ -5558,6 +5559,35 @@ describe("Slack documents and tasks", () => {
       message: expect.stringContaining("Open the Slack shortcut again"),
     });
   });
+  it("records a fresh capture failure when job retry fails before resume", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Retry access revoked");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    captureSourceAvailable = false;
+    await expect(startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!)).rejects.toThrow(
+      "Slack source is no longer available",
+    );
+    captureSourceAvailable = true;
+    await env.DB.prepare("UPDATE slack_user_links SET migration_state='legacy' WHERE user_id='owner'").run();
+    const retried = await env.DB.prepare(
+      `UPDATE jobs SET status='queued',attempt=attempt+1,workflow_instance_id=?,updated_at=?
+       WHERE id=? AND status='failed' RETURNING *`,
+    )
+      .bind(crypto.randomUUID(), Date.now(), captureId)
+      .first<JobRow>();
+    await expect(startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, retried!)).rejects.toMatchObject({
+      status: 403,
+    });
+    expect(
+      await env.DB.prepare("SELECT state,attempt,error_category FROM slack_captures WHERE id=?")
+        .bind(captureId)
+        .first(),
+    ).toMatchObject({ state: "failed", attempt: 2 });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
+      ).first(),
+    ).toEqual({ count: 2 });
+  });
   it("rebinds a failed capture after Slack reconnection and restages its input", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Reconnected capture");
     const job = await prepareSlackCapture(runtime(), captureId);
@@ -5714,25 +5744,51 @@ describe("Slack documents and tasks", () => {
       .bind(captureId, `jobs/${captureId}/input/slack-0.md`, Date.now(), Date.now())
       .run();
     await expect(resumeSlackCaptureJob(runtime(), captureId, captureId, 1)).rejects.toMatchObject({
-      status: 409,
+      status: 503,
       code: "slack_capture_link_pending",
     });
   });
-  it("fails an orphan job and its unlinked capture together", async () => {
+  it("keeps an orphan job queued until its capture receipt is linked", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Orphan workflow");
     const job = await prepareSlackCapture(runtime(), captureId);
     await env.DB.prepare("UPDATE slack_captures SET state='pending',job_id=NULL WHERE id=?").bind(captureId).run();
-    await expect(startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!)).rejects.toMatchObject({
-      code: "slack_capture_link_pending",
+    await startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!);
+    expect(await env.DB.prepare("SELECT state,job_id FROM slack_captures WHERE id=?").bind(captureId).first()).toEqual({
+      state: "pending",
+      job_id: null,
     });
-    expect(
-      await env.DB.prepare("SELECT state,error_category FROM slack_captures WHERE id=?").bind(captureId).first(),
-    ).toEqual({ state: "failed", error_category: "slack_capture_link_pending" });
+    expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
+      status: "queued",
+    });
     expect(
       await env.DB.prepare(
         "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
       ).first(),
-    ).toEqual({ count: 1 });
+    ).toEqual({ count: 0 });
+    const workflow = vi.fn();
+    await env.DB.prepare("UPDATE jobs SET updated_at=? WHERE id=?")
+      .bind(Date.now() - 60_000, captureId)
+      .run();
+    await recoverQueuedJobs({
+      ...runtime(),
+      NOTES_WORKFLOW: { create: workflow } as unknown as Env["NOTES_WORKFLOW"],
+    });
+    expect(workflow).not.toHaveBeenCalled();
+  });
+  it("links a pending orphan capture when failure cleanup finishes", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Orphan failure cleanup");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    await env.DB.batch([
+      env.DB.prepare("UPDATE slack_captures SET state='pending',job_id=NULL WHERE id=?").bind(captureId),
+      env.DB.prepare(
+        "UPDATE jobs SET status='failed',cleanup_target='failed',error_code='slack_source' WHERE id=?",
+      ).bind(captureId),
+    ]);
+    await finishPendingJobCleanup(runtime(), job!, { terminateWorkflow: false });
+    expect(
+      await env.DB.prepare("SELECT state,job_id,error_category FROM slack_captures WHERE id=?").bind(captureId).first(),
+    ).toEqual({ state: "failed", job_id: captureId, error_category: "slack_source" });
+    await expect(authorizeSlackCaptureJobRetry(runtime(), captureId, captureId)).resolves.toBeUndefined();
   });
   it("does not link a colliding job inserted while the transcript is staged", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Colliding job");
@@ -5761,6 +5817,14 @@ describe("Slack documents and tasks", () => {
         "SELECT count(*) count FROM outbox WHERE topic='slack_capture_feedback' AND payload_json LIKE '%failed%'",
       ).first(),
     ).toEqual({ count: 1 });
+    await expect(retryFailedSlackCapture(runtime(), captureId)).rejects.toMatchObject({
+      status: 409,
+      code: "slack_capture_job_conflict",
+    });
+    await deliverSlackCaptureFeedback(runtime(), captureId, "failed");
+    expect(calls.findLast((call) => call.method === "chat.postEphemeral")?.payload.text).toContain(
+      "Contact a workspace administrator",
+    );
   });
   it("links an orphan failed job to a failed receipt for Activities retry", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Orphan failure");

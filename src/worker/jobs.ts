@@ -1,5 +1,10 @@
 import { deliverSlackProductCopy } from "./slack-product";
-import { captureFeedbackStatement, deliverSlackCaptureFeedback, prepareSlackCapture } from "./slack-capture";
+import {
+  captureFeedbackStatement,
+  deliverSlackCaptureFeedback,
+  failCaptureForJobStatement,
+  prepareSlackCapture,
+} from "./slack-capture";
 import {
   retireUncertainSlackDelivery,
   deliverSlackThread,
@@ -724,6 +729,12 @@ export async function startJobExecution(
   env: Env,
   job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt"> & Partial<Pick<JobRow, "correlation_id">>,
 ) {
+  const pendingCapture = await env.DB.prepare(
+    `SELECT 1 FROM slack_captures WHERE id=? AND state='pending' AND job_id IS NULL`,
+  )
+    .bind(job.id)
+    .first();
+  if (pendingCapture) return;
   if (env.WORKFLOW_INLINE !== "true") return startJobWorkflow(env, job);
   const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(job.id, job.attempt)
@@ -744,6 +755,16 @@ export async function startJobExecution(
     else if (row.type === "export") await runExport(env, row, inlineStep as Parameters<typeof runExport>[2]);
     else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
+    if (safeHttpError(error)?.code === "slack_capture_link_pending") {
+      const returned = await env.DB.prepare(
+        `UPDATE jobs SET status='queued',progress_label='Queued',updated_at=?
+         WHERE id=? AND attempt=? AND status='running'`,
+      )
+        .bind(Date.now() - 30_000, row.id, row.attempt)
+        .run();
+      if (returned.meta.changes) await notifyJobs(env, row.workspace_id);
+      return;
+    }
     const current = await env.DB.prepare(
       `SELECT * FROM jobs WHERE id=? AND attempt>=? AND COALESCE(workflow_instance_id,id)=?`,
     )
@@ -884,14 +905,7 @@ export async function finishPendingJobCleanup(
       ).bind(completedAt, job.id, job.attempt, token),
       ...(typeof captureId === "string"
         ? [
-            env.DB.prepare(
-              `UPDATE slack_captures SET state='failed',
-                 error_category=(SELECT CASE WHEN status='canceled' THEN 'canceled'
-                   ELSE COALESCE(error_code,'job_failed') END FROM jobs WHERE id=?),updated_at=?
-               WHERE id=? AND ((job_id=? AND state='running') OR (job_id IS NULL AND state='pending'))
-                 AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND status IN ('canceled','failed')
-                   AND workspace_id=slack_captures.workspace_id AND requested_by=slack_captures.requested_by)`,
-            ).bind(job.id, completedAt, captureId, job.id, job.id),
+            failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, completedAt),
             captureFeedbackStatement(env.DB, captureId, "failed", completedAt),
           ]
         : []),
@@ -950,12 +964,7 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
     ).bind(errorCode, message, timestamp, job.id, job.attempt),
     ...(typeof captureId === "string"
       ? [
-          env.DB.prepare(
-            `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
-             WHERE id=? AND workspace_id=? AND requested_by=?
-               AND ((job_id=? AND state='running') OR (job_id IS NULL AND state='pending'))
-               AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND attempt=? AND status='failed')`,
-          ).bind(errorCode, timestamp, captureId, job.workspace_id, job.requested_by, job.id, job.id, job.attempt),
+          failCaptureForJobStatement(env.DB, captureId, job.id, job.attempt, timestamp),
           captureFeedbackStatement(env.DB, captureId, "failed", timestamp),
         ]
       : []),
