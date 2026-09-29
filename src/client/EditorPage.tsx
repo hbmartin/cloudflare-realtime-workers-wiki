@@ -683,25 +683,10 @@ function CollaborativeEditor({
       editor.replaceBlocks([block], [{ type: "embed", props: { url, title: "Embedded link" } }] as never);
     } else {
       // Store the URL immediately; the bookmark resolves disposable metadata in the background.
-      const bookmarkId = crypto.randomUUID();
-      editor.replaceBlocks([block], [
-        { id: bookmarkId, type: "bookmark", props: { url, title: url, previewId: "" } },
-      ] as never);
-      void api<{ preview: { id: string } }>("/api/link-previews", {
-        method: "POST",
-        body: json({ url }),
-      })
-        .then(({ preview }) => {
-          const current = editor.getBlock(bookmarkId);
-          if (current?.type === "bookmark" && current.props.url === url) {
-            editor.updateBlock(current, { props: { previewId: preview.id } });
-          }
-        })
-        .catch(() => {
-          // A failed preview leaves the stored URL usable.
-        });
+      editor.replaceBlocks([block], [{ type: "bookmark", props: { url, title: url, previewId: "" } }] as never);
     }
     setPasteChoice(null);
+    editor.focus();
   };
   const colorScheme = useEffectiveColorScheme();
   const getSlashItems = async (query: string) =>
@@ -886,7 +871,13 @@ function CollaborativeEditor({
                 Embed
               </button>
             )}
-            <button type="button" onClick={() => setPasteChoice(null)}>
+            <button
+              type="button"
+              onClick={() => {
+                setPasteChoice(null);
+                editor.focus();
+              }}
+            >
               Cancel
             </button>
           </fieldset>

@@ -93,16 +93,19 @@ export const embedProviders: readonly EmbedProvider[] = [
     expanded: true,
     frame: (url) => {
       if (url.hostname !== "docs.google.com") return null;
-      const published = /^\/(document|spreadsheets|presentation)\/d\/e\/([A-Za-z0-9_-]+)\/(?:pub|pubhtml)\/?$/.exec(
-        url.pathname,
-      );
+      const published =
+        /^\/(document|spreadsheets|presentation)\/d\/e\/([A-Za-z0-9_-]+)\/(?:pub|pubhtml|embed)\/?$/.exec(url.pathname);
       if (published) {
-        const suffix = published[1] === "spreadsheets" ? "pubhtml" : "pub";
+        const suffix = published[1] === "spreadsheets" ? "pubhtml" : published[1] === "presentation" ? "embed" : "pub";
         const frame = new URL(`https://docs.google.com/${published[1]}/d/e/${published[2]}/${suffix}`);
         if (published[1] === "document") frame.searchParams.set("embedded", "true");
         if (published[1] === "spreadsheets") {
           frame.searchParams.set("widget", "true");
           frame.searchParams.set("headers", "false");
+          const gid = url.searchParams.get("gid");
+          const single = url.searchParams.get("single");
+          if (gid && /^\d+$/.test(gid)) frame.searchParams.set("gid", gid);
+          if (single === "true" || single === "false") frame.searchParams.set("single", single);
         }
         return frame.href;
       }

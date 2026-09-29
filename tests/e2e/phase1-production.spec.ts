@@ -149,6 +149,8 @@ test("offers safe paste choices and keeps the link when preview fetch fails", as
   await page.route("**/api/link-previews", (route) => route.fulfill({ status: 503, body: "unavailable" }));
   const paragraph = page.locator('.bn-editor [data-content-type="paragraph"]').last();
   await paragraph.click();
+  await page.locator(".bn-editor").focus();
+  await expect(page.locator(".bn-editor")).toBeFocused();
   await page.evaluate((url) => {
     const clipboardData = new DataTransfer();
     clipboardData.setData("text/plain", url);
@@ -162,6 +164,7 @@ test("offers safe paste choices and keeps the link when preview fetch fails", as
   await expect(choices.getByRole("button", { name: "Embed" })).toBeVisible();
   await choices.getByRole("button", { name: "Preview card" }).click();
   await expect(page.locator(".editor-bookmark a")).toHaveAttribute("href", embedProviders[0]!.fixture);
+  await expect(page.locator(".bn-editor")).toBeFocused();
 });
 
 test("hides expanded paste actions when bootstrap disables them", async ({ page }) => {
@@ -177,6 +180,8 @@ test("hides expanded paste actions when bootstrap disables them", async ({ page 
   await createDocument(page);
   const paragraph = page.locator('.bn-editor [data-content-type="paragraph"]').last();
   await paragraph.click();
+  await page.locator(".bn-editor").focus();
+  await expect(page.locator(".bn-editor")).toBeFocused();
   await page.evaluate((url) => {
     const clipboardData = new DataTransfer();
     clipboardData.setData("text/plain", url);
@@ -188,6 +193,8 @@ test("hides expanded paste actions when bootstrap disables them", async ({ page 
   await expect(choices).toHaveCount(0);
   await createDocument(page);
   await page.locator('.bn-editor [data-content-type="paragraph"]').last().click();
+  await page.locator(".bn-editor").focus();
+  await expect(page.locator(".bn-editor")).toBeFocused();
   await page.evaluate((url) => {
     const clipboardData = new DataTransfer();
     clipboardData.setData("text/plain", url);
@@ -200,6 +207,7 @@ test("hides expanded paste actions when bootstrap disables them", async ({ page 
   await expect(choices.getByRole("button", { name: "Link" })).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(choices).toHaveCount(0);
+  await expect(page.locator(".bn-editor")).toBeFocused();
 });
 
 test("@touch opens the palette and runs a command", async ({ page }) => {

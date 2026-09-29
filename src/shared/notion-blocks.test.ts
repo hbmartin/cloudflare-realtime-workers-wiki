@@ -99,6 +99,11 @@ describe("Notion block adapter", () => {
         embed: { url: `https://www.youtube.com/watch?v=dQw4w9WgXcQ&x=${"a".repeat(2_000)}` },
       }),
     ).toThrow(/2000/);
+    expect(() =>
+      notionInputToBlockContainer({
+        embed: { url: `https://www.youtube.com/watch?v=dQw4w9WgXcQ&x=${"a".repeat(1_500)}${"語".repeat(60)}` },
+      }),
+    ).toThrow(/2000/);
     expect(() => notionRichTextToProseMirror([{ text: { content: "x".repeat(2_001) } }])).toThrow(/2000/);
   });
 

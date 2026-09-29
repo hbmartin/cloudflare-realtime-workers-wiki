@@ -383,7 +383,14 @@ const bookmark = createReactBlockSpec(
       <BookmarkBlock
         url={block.props.url}
         title={block.props.title}
-        update={editor.isEditable ? (url) => editor.updateBlock(block, { props: { url, previewId: "" } }) : undefined}
+        update={
+          editor.isEditable
+            ? (url) =>
+                editor.updateBlock(block, {
+                  props: { url, title: block.props.title === block.props.url ? url : block.props.title, previewId: "" },
+                })
+            : undefined
+        }
       />
     ),
     toExternalHTML: ({ block }) => (

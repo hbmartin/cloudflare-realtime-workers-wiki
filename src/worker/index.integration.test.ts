@@ -43,6 +43,7 @@ import { migrateLegacyColumns } from "./document";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import worker, { backfillTableSearchValues, executeScheduledTasks } from "./index";
+import { linkPreview } from "./link-previews";
 import { SCHEDULED_TASK_NAMES } from "./scheduled-task-names";
 import { broadcastWorkspaceEvent, eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
 
@@ -734,6 +735,36 @@ describe("Worker integration", () => {
     expect(
       (await env.DB.prepare("SELECT COUNT(*) AS count FROM link_preview_cache").first<{ count: number }>())?.count,
     ).toBe(0);
+  });
+  it("serves a cached preview without spending the remote fetch budget", async () => {
+    const installed = await bootstrap();
+    const url = "https://www.public-preview.org/article";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("<title>Cached article</title>", { headers: { "content-type": "text/html" } })),
+    );
+    try {
+      await linkPreview(env, installed.workspaceId, url);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const cachedEnv = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "API_BURST_LIMIT") return { limit: async () => ({ success: false }) };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, "/api/link-previews", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url }),
+      }),
+      cachedEnv,
+      createExecutionContext(),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ preview: { title: "Cached article" } });
   });
   it("keeps preview routes closed when the production feature flag is off", async () => {
     const installed = await bootstrap();

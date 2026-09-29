@@ -60,6 +60,17 @@ describe("embed providers", () => {
     expect(resolveEmbed("https://docs.google.com/spreadsheets/d/e/2PACX-abc123/pubhtml", true)?.frameUrl).toBe(
       "https://docs.google.com/spreadsheets/d/e/2PACX-abc123/pubhtml?widget=true&headers=false",
     );
+    expect(
+      resolveEmbed("https://docs.google.com/spreadsheets/d/e/2PACX-abc123/pubhtml?gid=123&single=true", true)?.frameUrl,
+    ).toBe(
+      "https://docs.google.com/spreadsheets/d/e/2PACX-abc123/pubhtml?widget=true&headers=false&gid=123&single=true",
+    );
+    expect(resolveEmbed("https://docs.google.com/presentation/d/e/2PACX-abc123/pub", true)?.frameUrl).toBe(
+      "https://docs.google.com/presentation/d/e/2PACX-abc123/embed",
+    );
+    expect(resolveEmbed("https://docs.google.com/presentation/d/e/2PACX-abc123/embed", true)?.frameUrl).toBe(
+      "https://docs.google.com/presentation/d/e/2PACX-abc123/embed",
+    );
     expect(resolveEmbed("https://docs.google.com/document/d/e/2PACX-abc123/edit", true)).toBeNull();
   });
 });

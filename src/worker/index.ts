@@ -4581,11 +4581,14 @@ app.post("/api/link-previews", async (c) => {
   const body = await jsonBody(c.req.raw);
   const url = object(body).url;
   if (typeof url !== "string") throw new HttpError(400, "preview_url_invalid", "Use a public HTTPS URL.");
-  const { success } = await c.env.API_BURST_LIMIT.limit({
-    key: `link-preview:${member.workspace.id}:${member.user.id}`,
+  return c.json({
+    preview: await linkPreview(c.env, member.workspace.id, url, async () => {
+      const { success } = await c.env.API_BURST_LIMIT.limit({
+        key: `link-preview:${member.workspace.id}:${member.user.id}`,
+      });
+      if (!success) throw new HttpError(429, "preview_rate_limited", "Link preview rate limit exceeded.");
+    }),
   });
-  if (!success) throw new HttpError(429, "preview_rate_limited", "Link preview rate limit exceeded.");
-  return c.json({ preview: await linkPreview(c.env, member.workspace.id, url) });
 });
 
 app.get("/api/link-previews/:id/image", async (c) => {

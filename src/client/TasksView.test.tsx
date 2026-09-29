@@ -511,16 +511,20 @@ describe("task views", () => {
     await act(async () => (currentPoll as () => void)());
     await waitFor(() => expect(loads).toBe(4));
   });
-  it("clears a superseded refresh when a task save finishes", async () => {
+  it("reloads a superseded refresh when a task save finishes", async () => {
     const original = vi.mocked(api).getMockImplementation()!;
     let pauseRefresh = false;
+    let loads = 0;
     let resolveRefresh: ((value: TaskResponse) => void) | null = null;
     vi.mocked(api).mockImplementation(async (path, init) => {
-      if (pauseRefresh && path.startsWith("/api/tasks?") && !path.includes("rowId=")) {
-        pauseRefresh = false;
-        return new Promise<TaskResponse>((resolve) => {
-          resolveRefresh = resolve;
-        });
+      if (path.startsWith("/api/tasks?") && !path.includes("rowId=")) {
+        loads++;
+        if (pauseRefresh) {
+          pauseRefresh = false;
+          return new Promise<TaskResponse>((resolve) => {
+            resolveRefresh = resolve;
+          });
+        }
       }
       return original(path, init);
     });
@@ -531,9 +535,9 @@ describe("task views", () => {
     await waitFor(() => expect(resolveRefresh).not.toBeNull());
     expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
     fireEvent.change(status, { target: { value: "done" } });
-    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
+    await waitFor(() => expect(loads).toBe(3));
     await act(async () => resolveRefresh!({ tasks: [fixture], hasMore: false, nextCursor: null }));
-    expect(screen.queryByText("Loading tasks…")).toBeNull();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
   });
   it("keeps viewer properties read-only while allowing access to details", async () => {
     render(<TasksView page={page} member={{ ...member, role: "viewer" }} onSelectPage={vi.fn()} />);

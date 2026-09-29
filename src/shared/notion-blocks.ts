@@ -399,21 +399,24 @@ function notionMediaUrl(payload: Record<string, unknown>) {
 
 function validatedExternalUrl(value: string, label: string) {
   if (!value || value.length > 2_000) throw new Error(`${label} URL is required and must be at most 2000 characters.`);
+  let url: URL;
   try {
-    const url = new URL(value);
-    if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error();
-    return url.href;
+    url = new URL(value);
   } catch {
     throw new Error(`${label} URL must be an HTTP or HTTPS URL.`);
   }
+  if (url.protocol !== "https:" && url.protocol !== "http:")
+    throw new Error(`${label} URL must be an HTTP or HTTPS URL.`);
+  if (url.href.length > 2_000) throw new Error(`${label} URL must be at most 2000 characters.`);
+  return url.href;
 }
 
 function validatedEmbedUrl(value: string) {
   // An embed URL is durable content. The feature flag controls framing at render time,
   // so an API client can round-trip an existing URL while expanded embeds are disabled.
-  if (!value || value.length > 2_000) throw new Error("Embed URL is required and must be at most 2000 characters.");
-  if (!resolveEmbed(value, true)) throw new Error("Embeds require a supported HTTPS provider URL.");
-  return new URL(value).href;
+  const canonical = validatedExternalUrl(value, "Embed");
+  if (!resolveEmbed(canonical, true)) throw new Error("Embeds require a supported HTTPS provider URL.");
+  return canonical;
 }
 
 function notionPlainText(value: unknown) {
