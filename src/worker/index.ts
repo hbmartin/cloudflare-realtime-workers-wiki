@@ -2493,10 +2493,7 @@ async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow, p
         "This import's saved space mappings are invalid. Upload the file again to inspect and confirm its destinations.",
       );
     for (const spaceId of destinations) await editableSpaceForMember(env, member, spaceId);
-    const parentId = parentOverride === undefined ? parsed.parentId : parentOverride;
-    if (parentId && parsed.format === "notion_zip")
-      throw new HttpError(422, "import_parent_invalid", "A parent can only be selected for a single-page import.");
-    await validateImportDestinationParent(env, member, job, { ...parsed, parentId: parentId ?? undefined });
+    await validateImportDestinationParent(env, member, job, parsed);
     return;
   }
   if (job.type === "template_clone") {

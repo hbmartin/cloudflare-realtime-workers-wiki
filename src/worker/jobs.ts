@@ -1,4 +1,5 @@
 import { deliverSlackProductCopy } from "./slack-product";
+import { captureFeedbackStatement, deliverSlackCaptureFeedback, prepareSlackCapture } from "./slack-capture";
 import {
   retireUncertainSlackDelivery,
   deliverSlackThread,
@@ -930,6 +931,16 @@ async function failJobWithCleanup(env: Env, job: JobRow, error: unknown) {
     .bind(errorCode, message, Date.now(), job.id, job.attempt)
     .run();
   if (!pending.meta.changes) return;
+  const captureId = job.type === "import" ? jsonRecord(job.options_json).captureId : null;
+  if (typeof captureId === "string") {
+    await env.DB.prepare(
+      `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
+       WHERE id=? AND job_id=? AND state='running'`,
+    )
+      .bind(errorCode, Date.now(), captureId, job.id)
+      .run();
+    await captureFeedbackStatement(env.DB, captureId, "failed", Date.now()).run();
+  }
   await notifyJobs(env, job.workspace_id);
   await finishPendingJobCleanup(env, job, { terminateWorkflow: false }).catch((cleanupError) => {
     logger.error(
@@ -1871,6 +1882,28 @@ export async function consumeDeliveryMessage(
       }
       throw error;
     }
+  } else if (row.topic === "slack_capture") {
+    if (typeof payload.captureId !== "string") return await rejectPayload("Slack capture receipt is invalid.");
+    try {
+      const job = await prepareSlackCapture(env, payload.captureId);
+      if (job) await startJobExecution(env, job);
+    } catch (error) {
+      if (error instanceof HttpError && error.status >= 400 && error.status < 500 && error.status !== 429) {
+        await env.DB.prepare(
+          `UPDATE slack_captures SET state='failed',error_category=?,updated_at=?
+           WHERE id=? AND job_id IS NULL AND state IN ('pending','running')`,
+        )
+          .bind(error.code, Date.now(), payload.captureId)
+          .run();
+        await captureFeedbackStatement(env.DB, payload.captureId, "failed", Date.now()).run();
+        return await rejectPayload(error.code);
+      }
+      throw error;
+    }
+  } else if (row.topic === "slack_capture_feedback") {
+    if (typeof payload.captureId !== "string" || !["queued", "succeeded", "failed"].includes(String(payload.state)))
+      return await rejectPayload("Slack capture feedback is invalid.");
+    await deliverSlackCaptureFeedback(env, payload.captureId, payload.state as "queued" | "succeeded" | "failed");
   } else if (row.topic === "slack_workspace_action") {
     if (typeof payload.receiptId !== "string") return await rejectPayload("Slack workspace receipt is invalid.");
     if ((await deliverSlackWorkspaceAction(env, payload.receiptId)) === "deferred") return await deferSlackView();

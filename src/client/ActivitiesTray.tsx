@@ -131,7 +131,7 @@ function ImportConfirmation({
       </button>
       {job.importParentId && (
         <button className="quiet-button" disabled={pending || incomplete} onClick={() => onConfirm(job, mapping, null)}>
-          Confirm at space root
+          {pending ? "Starting at space root…" : "Confirm at space root"}
         </button>
       )}
     </div>
@@ -301,7 +301,7 @@ export function ActivitiesTray({
                         !job.cleanupPending &&
                         job.importParentId && (
                           <button className="quiet-button" disabled={pending} onClick={() => onRetry(job, null)}>
-                            Retry at space root
+                            {pending ? "Retrying at space root…" : "Retry at space root"}
                           </button>
                         )}
                     </span>

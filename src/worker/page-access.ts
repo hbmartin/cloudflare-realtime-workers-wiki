@@ -42,18 +42,18 @@ export function effectiveSpaceRole(
 export async function sidebarHiddenPageIds(env: Env, workspaceId: string, pageIds: readonly string[]) {
   if (!pageIds.length) return [];
   const hidden = await env.DB.prepare(
-    `WITH RECURSIVE hidden(id) AS (
-       SELECT link.page_id FROM table_row_pages link JOIN pages root ON root.id=link.page_id
-        WHERE root.workspace_id=?
+    `WITH RECURSIVE ancestors(root_id,id,parent_id) AS (
+       SELECT page.id,page.id,page.parent_id FROM pages page
+        WHERE page.workspace_id=? AND page.id IN (SELECT value FROM json_each(?))
        UNION
-       SELECT source.page_id FROM page_import_sources source JOIN pages root ON root.id=source.page_id
-        WHERE root.workspace_id=? AND source.source_role='table_row_detail'
-       UNION ALL
-       SELECT child.id FROM pages child JOIN hidden parent ON child.parent_id=parent.id
-        WHERE child.workspace_id=?
-     ) SELECT id FROM hidden WHERE id IN (SELECT value FROM json_each(?))`,
+       SELECT ancestors.root_id,parent.id,parent.parent_id FROM pages parent
+        JOIN ancestors ON parent.id=ancestors.parent_id WHERE parent.workspace_id=?
+     ) SELECT DISTINCT ancestors.root_id id FROM ancestors
+       LEFT JOIN table_row_pages row_detail ON row_detail.page_id=ancestors.id
+       LEFT JOIN page_import_sources source ON source.page_id=ancestors.id
+      WHERE row_detail.page_id IS NOT NULL OR source.source_role='table_row_detail'`,
   )
-    .bind(workspaceId, workspaceId, workspaceId, JSON.stringify(pageIds))
+    .bind(workspaceId, JSON.stringify(pageIds), workspaceId)
     .all<{ id: string }>();
   return hidden.results.map((row) => row.id);
 }

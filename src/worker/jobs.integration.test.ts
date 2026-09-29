@@ -2609,65 +2609,75 @@ describe("job execution", () => {
     );
   });
 
-  it.each(["archived parent", "stale stage", "revoked space", "revoked parent access"] as const)(
-    "does not publish an import with %s before the final batch",
-    async (failure) => {
-      const installed = await bootstrap();
-      const job = await confirmedParentImport(installed, failure === "revoked space" ? null : installed.pageId);
-      const step = {
-        async do<T>(name: string, callback: () => Promise<T>) {
-          if (name === "publish import") {
-            if (failure === "archived parent") {
-              await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`)
-                .bind(Date.now(), installed.pageId)
-                .run();
-            } else if (failure === "stale stage") {
-              await env.DB.prepare(`UPDATE pages SET content_epoch = content_epoch + 1 WHERE import_job_id = ?`)
-                .bind(job.id)
-                .run();
-            } else {
-              const backupOwnerId = crypto.randomUUID();
-              const timestamp = Date.now();
-              await env.DB.batch([
-                env.DB.prepare(
-                  `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
+  it.each([
+    "archived parent",
+    "stale stage",
+    "revoked space",
+    "revoked parent access",
+    "revoked private grant",
+  ] as const)("does not publish an import with %s before the final batch", async (failure) => {
+    const installed = await bootstrap();
+    const job = await confirmedParentImport(installed, failure === "revoked space" ? null : installed.pageId);
+    const step = {
+      async do<T>(name: string, callback: () => Promise<T>) {
+        if (name === "publish import") {
+          if (failure === "archived parent") {
+            await env.DB.prepare(`UPDATE pages SET archived_at = ? WHERE id = ?`)
+              .bind(Date.now(), installed.pageId)
+              .run();
+          } else if (failure === "stale stage") {
+            await env.DB.prepare(`UPDATE pages SET content_epoch = content_epoch + 1 WHERE import_job_id = ?`)
+              .bind(job.id)
+              .run();
+          } else {
+            const backupOwnerId = crypto.randomUUID();
+            const timestamp = Date.now();
+            await env.DB.batch([
+              env.DB.prepare(
+                `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
                    VALUES (?, 'Backup owner', ?, 1, ?, ?)`,
-                ).bind(backupOwnerId, `backup-${backupOwnerId}@example.test`, timestamp, timestamp),
-                env.DB.prepare(
-                  `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
+              ).bind(backupOwnerId, `backup-${backupOwnerId}@example.test`, timestamp, timestamp),
+              env.DB.prepare(
+                `INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
                    VALUES (?, ?, 'owner', ?)`,
-                ).bind(installed.workspaceId, backupOwnerId, timestamp),
-                env.DB.prepare(
-                  `UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = ? AND user_id = ?`,
-                ).bind(installed.workspaceId, installed.userId),
-              ]);
-            }
+              ).bind(installed.workspaceId, backupOwnerId, timestamp),
+              env.DB.prepare(`UPDATE workspace_members SET role = ? WHERE workspace_id = ? AND user_id = ?`).bind(
+                failure === "revoked private grant" ? "editor" : "viewer",
+                installed.workspaceId,
+                installed.userId,
+              ),
+              ...(failure === "revoked private grant"
+                ? [
+                    env.DB.prepare(`UPDATE spaces SET visibility='private' WHERE id=?`).bind(
+                      `${installed.workspaceId}-general`,
+                    ),
+                  ]
+                : []),
+            ]);
           }
-          return callback();
-        },
-      };
-      await expect(runImport(env, job, step as Parameters<typeof runImport>[2])).rejects.toThrow(
-        "The import destination changed before publication",
-      );
-      expect((await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(job.id).first())?.status).toBe(
-        "running",
-      );
-      expect(
-        (
-          await env.DB.prepare(
-            `SELECT COUNT(*) count FROM pages WHERE import_job_id IS NULL AND title = 'child'`,
-          ).first<{ count: number }>()
-        )?.count,
-      ).toBe(0);
-      expect(
-        (
-          await env.DB.prepare(`SELECT COUNT(*) count FROM subscriptions WHERE id LIKE ?`)
-            .bind(`${job.id}:%`)
-            .first<{ count: number }>()
-        )?.count,
-      ).toBe(0);
-    },
-  );
+        }
+        return callback();
+      },
+    };
+    await expect(runImport(env, job, step as Parameters<typeof runImport>[2])).rejects.toThrow(
+      failure === "stale stage" ? "verified import stage changed" : "import destination is unavailable",
+    );
+    expect((await env.DB.prepare(`SELECT status FROM jobs WHERE id = ?`).bind(job.id).first())?.status).toBe("running");
+    expect(
+      (
+        await env.DB.prepare(`SELECT COUNT(*) count FROM pages WHERE import_job_id IS NULL AND title = 'child'`).first<{
+          count: number;
+        }>()
+      )?.count,
+    ).toBe(0);
+    expect(
+      (
+        await env.DB.prepare(`SELECT COUNT(*) count FROM subscriptions WHERE id LIKE ?`)
+          .bind(`${job.id}:%`)
+          .first<{ count: number }>()
+      )?.count,
+    ).toBe(0);
+  });
 
   it("imports a Notion ZIP hierarchy, database CSV, and bundled image", async () => {
     const installed = await bootstrap();

@@ -46,7 +46,7 @@ describe("ActivitiesTray", () => {
       type: "import",
       status: "failed",
       importParentId: "archived-parent",
-      error: { code: "job_failed", message: "Choose a writable space or parent and retry." },
+      error: { code: "job_failed", message: "The import destination is unavailable." },
     };
     render(
       <ActivitiesTray

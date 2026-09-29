@@ -193,7 +193,15 @@ export type SlackApiContracts = {
     output: { members: string[]; response_metadata?: { next_cursor?: string } };
   };
   "conversations.history": {
-    input: { channel: string; oldest: string; cursor?: string; limit: number; include_all_metadata: boolean };
+    input: {
+      channel: string;
+      oldest: string;
+      latest?: string;
+      inclusive?: boolean;
+      cursor?: string;
+      limit: number;
+      include_all_metadata: boolean;
+    };
     output: { messages: SlackHistoryMessage[]; has_more?: boolean; response_metadata?: { next_cursor?: string } };
   };
   "conversations.replies": {
@@ -256,6 +264,9 @@ export type SlackHistoryMessage = {
   text?: string;
   subtype?: string;
   metadata?: { event_type?: string; event_payload?: { delivery_id?: string } };
+  reactions?: Array<{ name?: string; count?: number }>;
+  files?: Array<{ name?: string; title?: string; permalink?: string; url_private?: string }>;
+  attachments?: Array<{ title?: string; title_link?: string }>;
 };
 
 export type SlackApiMethod = keyof SlackApiContracts;
