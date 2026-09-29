@@ -166,11 +166,26 @@ function markdownInline(
       else if (token.type === "link" || token.type === "image") {
         const rawUrl = token.href;
         const url = safeLink(rawUrl);
-        const labelEnd = token.raw.startsWith("<") ? null : linkLabelEnd(token.raw, 0, 8192);
+        const escapedBracket = !token.raw.startsWith("<") && (token.raw.includes("\\[") || token.raw.includes("\\]"));
+        const labelEnd = token.type === "image" || escapedBracket ? linkLabelEnd(token.raw, 0, 8192) : null;
         const rawLabel = labelEnd === null ? token.text : token.raw.slice(token.type === "image" ? 2 : 1, labelEnd);
-        const escapedBracket = rawLabel.includes("\\[") || rawLabel.includes("\\]");
         const emitLabel = (labelMarks: NonNullable<ProseMirrorJson["marks"]>) => {
-          if (escapedBracket) appendPlain(unescapeMarkdown(rawLabel), labelMarks);
+          if (escapedBracket && labelEnd !== null) {
+            const first = output.length;
+            walk(Lexer.lexInline(rawLabel, { gfm: false }), labelMarks);
+            for (let index = first + 1; index < output.length; index += 1) {
+              const previous = output[index - 1]!;
+              const current = output[index]!;
+              if (
+                previous.type === "text" &&
+                current.type === "text" &&
+                JSON.stringify(previous.marks ?? []) === JSON.stringify(current.marks ?? [])
+              ) {
+                previous.text = (previous.text ?? "") + (current.text ?? "");
+                output.splice(index--, 1);
+              }
+            }
+          } else if (escapedBracket) appendPlain(token.text, labelMarks);
           else if (token.type === "image" && !rawLabel.includes("["))
             output.push(...imageLabelContent({ label: token.text, rawLabel }, labelMarks));
           else walk(children, labelMarks);
@@ -231,6 +246,10 @@ function availableImageMarkers() {
   return markerPool;
 }
 
+function startsAngledDestination(value: string, opener: number, index: number) {
+  return opener >= 0 && index > opener && index - opener <= 8192 && /^\s*$/.test(value.slice(opener + 1, index));
+}
+
 function closingParenWithin(value: string) {
   const candidates = new Map<number, number>();
   const pending: Array<{ index: number; depth: number }> = [];
@@ -247,6 +266,10 @@ function closingParenWithin(value: string) {
     if (firstPending > 8192) {
       pending.splice(0, firstPending);
       firstPending = 0;
+    }
+    if (!candidates.size) {
+      quote = null;
+      angled = false;
     }
     if (value[index] === "\\") {
       index += 1;
@@ -269,7 +292,7 @@ function closingParenWithin(value: string) {
       quote = value[index]!;
       continue;
     }
-    if (candidates.get(depth) === index - 1 && value[index] === "<") {
+    if (value[index] === "<" && startsAngledDestination(value, candidates.get(depth) ?? -1, index)) {
       angled = true;
       continue;
     }
@@ -298,10 +321,14 @@ function lazyClosingParenWithin(value: string) {
 }
 
 const { tokenizer: autolinkTokenizer } = markdownLexer();
-function autolinkEnd(value: string, start: number) {
+function autolinkToken(value: string, start: number) {
   if (value[start] !== "<" || trailingEscape(value, start)) return null;
   const token = autolinkTokenizer.autolink(value.slice(start, start + 8192));
-  return token?.type === "link" ? start + token.raw.length - 1 : null;
+  return token?.type === "link" ? token : null;
+}
+function autolinkEnd(value: string, start: number) {
+  const token = autolinkToken(value, start);
+  return token ? start + token.raw.length - 1 : null;
 }
 
 function inlineSpans(
@@ -327,13 +354,6 @@ function inlineSpans(
       index += 1;
       continue;
     }
-    if (!destinationDepth && value[index] === "<") {
-      const end = autolinkEnd(value, index);
-      if (end !== null) {
-        index = end;
-        continue;
-      }
-    }
     if (destinationQuote) {
       if (value[index] === destinationQuote) destinationQuote = null;
       continue;
@@ -346,7 +366,7 @@ function inlineSpans(
       destinationQuote = value[index]!;
       continue;
     }
-    if (destinationDepth === 1 && index === destinationStart + 1 && value[index] === "<") {
+    if (destinationDepth === 1 && value[index] === "<" && startsAngledDestination(value, destinationStart, index)) {
       destinationAngled = true;
       continue;
     }
@@ -363,7 +383,6 @@ function inlineSpans(
       destinationDepth -= 1;
       if (!destinationDepth) {
         destinations.push({ start: destinationStart, end: index + 1 });
-        if (destinations.length > 100_000) return null;
       }
     }
     if (destinationDepth) continue;
@@ -505,14 +524,6 @@ function safeInlineCut(
       index += 1;
       continue;
     }
-    if (character === "<") {
-      const end = autolinkEnd(value, index);
-      if (end !== null) {
-        if (end >= maximum) return index > start ? index : maximum;
-        index = end;
-        continue;
-      }
-    }
     if (quote) {
       if (character === quote) quote = null;
       continue;
@@ -521,11 +532,22 @@ function safeInlineCut(
       if (character === ">") angled = false;
       continue;
     }
+    if (!parenDepth && character === "<") {
+      const end = autolinkEnd(value, index);
+      if (end !== null) {
+        if (end >= maximum) {
+          const earliest = Math.min(index, enclosingBracket(brackets, value, start, index));
+          return earliest > start ? earliest : maximum;
+        }
+        index = end;
+        continue;
+      }
+    }
     if (parenDepth && /\s/.test(value[index - 1] ?? "") && (character === '"' || character === "'")) {
       quote = character;
       continue;
     }
-    if (parenDepth === 1 && index === destinationStart + 1 && character === "<") {
+    if (parenDepth === 1 && character === "<" && startsAngledDestination(value, destinationStart, index)) {
       angled = true;
       continue;
     }
@@ -586,14 +608,6 @@ function safeDenseBoundary(value: string, boundary: number) {
       index += 1;
       continue;
     }
-    if (character === "<") {
-      const end = autolinkEnd(value, index);
-      if (end !== null) {
-        if (end >= boundary) return index;
-        index = end;
-        continue;
-      }
-    }
     if (quote) {
       if (character === quote) quote = null;
       continue;
@@ -602,11 +616,19 @@ function safeDenseBoundary(value: string, boundary: number) {
       if (character === ">") angled = false;
       continue;
     }
+    if (!parenDepth && character === "<") {
+      const end = autolinkEnd(value, index);
+      if (end !== null) {
+        if (end >= boundary) return Math.min(index, enclosingBracket(brackets, value, -1, index));
+        index = end;
+        continue;
+      }
+    }
     if (parenDepth && /\s/.test(value[index - 1] ?? "") && (character === '"' || character === "'")) {
       quote = character;
       continue;
     }
-    if (parenDepth === 1 && index === destinationStart + 1 && character === "<") {
+    if (parenDepth === 1 && character === "<" && startsAngledDestination(value, destinationStart, index)) {
       angled = true;
       continue;
     }
@@ -652,7 +674,9 @@ function dataImageLabelEnd(value: string, start: number) {
         code &&
         index === start + code.start &&
         (start + code.end <= candidate ||
-          (start + code.end <= limit && !value.slice(candidate + 2, start + code.end).includes("![")))
+          (start + code.end <= limit &&
+            value[start + code.end] !== "`" &&
+            !value.slice(candidate + 2, start + code.end).includes("![")))
       ) {
         index = start + code.end - 1;
         codeIndex += 1;
@@ -853,11 +877,11 @@ function boundedMarkdownInline(
       while (sectionCodes[sectionCodeIndex] && sectionCodes[sectionCodeIndex]!.end <= index) sectionCodeIndex += 1;
       const character = section[index];
       if (character === "<") {
-        const end = autolinkEnd(section, index);
-        if (end !== null) {
+        const token = autolinkToken(section, index);
+        if (token) {
+          const end = index + token.raw.length - 1;
           append(inline(unescapeMarkdown(section.slice(cursor, index))));
-          const token = tokenizer.autolink(section.slice(index, end + 1));
-          if (token) append(markdownInline("", issues, references, [token], imageMarkers));
+          append(markdownInline("", issues, references, [token], imageMarkers));
           cursor = end + 1;
           index = end;
           continue;
@@ -901,13 +925,12 @@ function boundedMarkdownInline(
         const simple = simpleLongLink(section, start, labelEnd);
         if (!simple) continue;
         const href = safeLink(simple.href);
-        const rawLabel = section.slice(start + (section[start] === "!" ? 2 : 1), labelEnd);
         append(inline(unescapeMarkdown(section.slice(cursor, start))));
         if (!href) {
           issues.push({ code: "unsafe_url", detail: simple.href.slice(0, 120) });
-          append(imageLabelContent({ label: simple.label, rawLabel }));
+          append(inline(simple.label));
         } else if (section[start] === "!") {
-          append(imageLabelContent({ label: simple.label, rawLabel }));
+          append(inline(simple.label));
           recordImage({ href });
         } else {
           append(inline(simple.label, [{ type: "link", attrs: { href } }]));

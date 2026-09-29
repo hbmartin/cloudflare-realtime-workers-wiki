@@ -348,6 +348,14 @@ describe("import content", () => {
     const unsafe = markdownToDocument(String.raw`![a \[nested\](wrong.md)](javascript:bad)`);
     expect(unsafe.references).toEqual([]);
     expect(unsafe.issues.some((issue) => issue.code === "unsafe_url")).toBe(true);
+    const rich = markdownToDocument(String.raw`[**bold** \[literal\] ![icon](data:image/png;base64,AAAA)](right.md)`);
+    expect(rich.references).toEqual(["data:image/png;base64,AAAA", "right.md"]);
+    const richText = rich.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(richText).toContainEqual({
+      type: "text",
+      text: "bold",
+      marks: [{ type: "link", attrs: { href: "right.md" } }, { type: "bold" }],
+    });
   });
 
   it("keeps an autolink when a dense split starts at its opening bracket", () => {
