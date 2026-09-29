@@ -60,9 +60,15 @@ describe("Notion block adapter", () => {
       value: "2026-10-01T14:00:00.000Z",
       timezone: "America/Chicago",
     });
-    expect(proseMirrorInlineToNotion([{ type: "dateMention", attrs: { payload } }])).toMatchObject([
-      { type: "text", text: { content: "2026-10-01 09:00 America/Chicago" } },
+    const rich = proseMirrorInlineToNotion([{ type: "dateMention", attrs: { payload } }]);
+    expect(rich).toMatchObject([
+      {
+        type: "mention",
+        mention: { type: "date", date: { start: "2026-10-01T14:00:00.000Z" }, noteFlare: { payload } },
+        plain_text: "2026-10-01 09:00 America/Chicago",
+      },
     ]);
+    expect(notionRichTextToProseMirror(rich)).toEqual([{ type: "dateMention", attrs: { payload } }]);
   });
 
   it("returns unsupported for heading levels outside the API contract", () => {

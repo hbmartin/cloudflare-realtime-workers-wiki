@@ -9,7 +9,7 @@ import { createReactInlineContentSpec } from "@blocknote/react";
 import { useState } from "react";
 import { mentionInlineConfig } from "../shared/mention-spec";
 import { dateMentionInlineConfig } from "../shared/date-mention-spec";
-import { dateMentionFromProps, formatDateMention } from "../shared/date-mentions";
+import { dateMentionFromProps, dateMentionWireProps, formatDateMention } from "../shared/date-mentions";
 import type { PagePreview } from "../shared/types";
 import { api } from "./api";
 import { coreBlockSpecs, inlineMathSpec } from "./editor-blocks";
@@ -115,7 +115,7 @@ const dateMentionInlineSpec = createReactInlineContentSpec(dateMentionInlineConf
       <DateMentionChip
         value={value}
         contentRef={contentRef}
-        update={(next) => updateInlineContent({ type: "dateMention", props: { payload: JSON.stringify(next) } })}
+        update={(next) => updateInlineContent({ type: "dateMention", props: dateMentionWireProps(next) })}
       />
     ) : (
       <span ref={contentRef}>Date</span>

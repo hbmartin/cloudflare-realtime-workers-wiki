@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useRef, useState } from "react"
 import type { DateMention } from "../shared/date-mentions";
 import { formatDateMention } from "../shared/date-mentions";
 import { DateMentionPicker } from "./DateMentionPicker";
+import { DateReminderPicker } from "./DateReminderPicker";
 
 export const DateMentionContext = createContext<{ pageId: string; userId: string; editable: boolean } | null>(null);
 
@@ -18,6 +19,9 @@ export function DateMentionChip({
   const button = useRef<HTMLButtonElement>(null);
   const openedRevision = useRef(value.revision);
   const [open, setOpen] = useState(false);
+  const [reminderOpen, setReminderOpen] = useState(false);
+  const reminderButton = useRef<HTMLButtonElement>(null);
+  const label = formatDateMention(value);
 
   const openPicker = useCallback(() => {
     if (!context?.editable) return;
@@ -32,16 +36,32 @@ export function DateMentionChip({
 
   return (
     <span ref={contentRef} className="date-mention-wrap">
-      <button
-        ref={button}
-        type="button"
-        className="date-mention-chip"
-        disabled={!context?.editable}
-        onClick={openPicker}
-        aria-label={`Date: ${formatDateMention(value)}${context?.editable ? ". Edit date" : ""}`}
-      >
-        <span aria-hidden="true">▦</span> {formatDateMention(value)}
-      </button>
+      {context?.editable ? (
+        <button
+          ref={button}
+          type="button"
+          className="date-mention-chip"
+          onClick={openPicker}
+          aria-label={`Date: ${label}. Edit date`}
+        >
+          <span aria-hidden="true">▦</span> {label}
+        </button>
+      ) : (
+        <span className="date-mention-chip">
+          <span aria-hidden="true">▦</span> {label}
+        </span>
+      )}
+      {context?.userId === value.createdBy && (
+        <button
+          ref={reminderButton}
+          type="button"
+          className="date-mention-reminder"
+          onClick={() => setReminderOpen(true)}
+          aria-label={`Remind me about ${label}`}
+        >
+          Remind me
+        </button>
+      )}
       {open && (
         <DateMentionPicker
           initial={value}
@@ -54,6 +74,16 @@ export function DateMentionChip({
             return null;
           }}
           onClose={closePicker}
+        />
+      )}
+      {reminderOpen && context?.userId === value.createdBy && (
+        <DateReminderPicker
+          pageId={context.pageId}
+          token={value}
+          onClose={() => {
+            setReminderOpen(false);
+            reminderButton.current?.focus();
+          }}
         />
       )}
     </span>

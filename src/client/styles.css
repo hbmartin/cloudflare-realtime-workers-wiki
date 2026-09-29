@@ -1211,12 +1211,26 @@ button.mention-chip:focus-visible {
   font: inherit;
   cursor: pointer;
 }
-.date-mention-chip:hover,
-.date-mention-chip:focus-visible {
+button.date-mention-chip:hover,
+button.date-mention-chip:focus-visible {
   background: var(--surface-hover);
 }
-.date-mention-chip:disabled {
-  cursor: default;
+span.date-mention-chip {
+  cursor: text;
+}
+.date-mention-reminder {
+  margin-left: 4px;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.8em;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.date-mention-reminder:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .date-mention-picker {
   position: fixed;

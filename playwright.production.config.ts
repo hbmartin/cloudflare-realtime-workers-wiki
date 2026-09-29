@@ -4,7 +4,7 @@ process.env.NOTES_E2E_COOKIES = ".wrangler/e2e-production/owner-cookies.json";
 
 export default defineConfig({
   testDir: "tests/e2e",
-  testMatch: "phase1-production.spec.ts",
+  testMatch: ["phase1-production.spec.ts", "phase3-date-mentions.spec.ts"],
   workers: 1,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,

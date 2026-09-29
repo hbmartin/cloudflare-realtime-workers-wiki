@@ -1,5 +1,5 @@
 import type { ProseMirrorJson } from "./types";
-import { dateMentionFromProps, readableDateMention, type DateMention } from "./date-mentions";
+import { dateMentionFromProps, readableDateMention, type DateMention } from "./date-mentions.ts";
 
 export type { ProseMirrorJson } from "./types";
 
@@ -35,6 +35,11 @@ function stringAttr(node: ProseMirrorJson, name: string) {
 export function dateMentionFromNode(node: ProseMirrorJson): DateMention | null {
   if (node.type !== "dateMention") return null;
   return dateMentionFromProps(node.attrs ?? {});
+}
+
+export function dateMentionText(node: ProseMirrorJson) {
+  const mention = dateMentionFromNode(node);
+  return mention ? readableDateMention(mention) : stringAttr(node, "value") || "Date";
 }
 
 export function collectLinkedDiagramIds(
@@ -152,8 +157,7 @@ function nodeText(node: ProseMirrorJson): string {
   if (typeof node.text === "string") return node.text;
   if (node.type === "mention") return stringAttr(node, "label") ?? "";
   if (node.type === "dateMention") {
-    const mention = dateMentionFromNode(node);
-    return mention ? readableDateMention(mention) : stringAttr(node, "value") || "Date";
+    return dateMentionText(node);
   }
   return (node.content ?? []).map(nodeText).join("");
 }

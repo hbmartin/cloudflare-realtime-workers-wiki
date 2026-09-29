@@ -20,6 +20,7 @@ import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
 import { sweepOutbox } from "./jobs";
 import { notificationFanoutStatements } from "./notifications";
+import { reconcileDateRemindersForPage } from "./date-reminders";
 import { MentionTargetTracker } from "./mention-targets";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
@@ -1665,6 +1666,17 @@ export class Document extends YServer {
         }
 
         if (pageProjected && !effectsSuppressed) {
+          this.state.waitUntil(
+            reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
+              logger.error(
+                "document.date_reminder_reconcile.failed",
+                "document",
+                "Date reminder reconciliation failed.",
+                { pageId, epoch },
+                error,
+              ),
+            ),
+          );
           this.state.waitUntil(
             sweepOutbox(this.bindings).catch((error) =>
               logger.error(

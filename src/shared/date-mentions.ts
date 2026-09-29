@@ -9,8 +9,34 @@ export type DateMention = {
 
 export type ReminderChoice = "at_time" | "5m_before" | "1h_before" | "1d_before";
 
+export function dateMentionWireProps(value: DateMention) {
+  return {
+    payload: JSON.stringify(value),
+    tokenId: "",
+    revision: "",
+    createdBy: "",
+    kind: "all-day" as const,
+    value: "",
+    timezone: "",
+  };
+}
+
 const CALENDAR_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const WEEKDAYS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+const MONTHS = [
+  "january",
+  "february",
+  "march",
+  "april",
+  "may",
+  "june",
+  "july",
+  "august",
+  "september",
+  "october",
+  "november",
+  "december",
+];
 const calendarFormatters = new Map<string, Intl.DateTimeFormat>();
 
 function calendarFormatter(timezone: string) {
@@ -108,10 +134,9 @@ export function dateMentionFromProps(props: Record<string, unknown>): DateMentio
 }
 
 export function readableDateMention(mention: DateMention) {
-  if (!validDateMention(mention)) return "Date";
-  if (mention.kind === "all-day") return mention.value;
-  const wall = calendarParts(new Date(mention.value), mention.timezone);
-  return `${calendarDate(wall.year, wall.month, wall.day)} ${String(wall.hour).padStart(2, "0")}:${String(wall.minute).padStart(2, "0")} ${mention.timezone}`;
+  const local = dateMentionLocalFields(mention);
+  if (!local) return "Date";
+  return mention.kind === "all-day" ? local.date : `${local.date} ${local.time} ${mention.timezone}`;
 }
 
 export function parseDatePhrase(query: string, now: Date, timezone: string): string | null {
@@ -120,6 +145,21 @@ export function parseDatePhrase(query: string, now: Date, timezone: string): str
   const base = new Date(Date.UTC(current.year, current.month - 1, current.day));
   const normalized = query.trim().toLowerCase().replace(/\s+/g, " ");
   if (normalized === "today") return calendarDate(current.year, current.month, current.day);
+  const monthDay =
+    /^(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?) (\d{1,2})(?:,? (\d{4}))?$/.exec(
+      normalized,
+    );
+  if (monthDay) {
+    const month = MONTHS.findIndex((name) => name.startsWith(monthDay[1]!)) + 1;
+    const day = Number(monthDay[2]);
+    let year = monthDay[3] ? Number(monthDay[3]) : current.year;
+    let date = calendarDate(year, month, day);
+    if (!monthDay[3] && date < calendarDate(current.year, current.month, current.day)) {
+      year += 1;
+      date = calendarDate(year, month, day);
+    }
+    return validCalendarDate(date) ? date : null;
+  }
   if (normalized === "tomorrow") base.setUTCDate(base.getUTCDate() + 1);
   else if (normalized === "next week") base.setUTCDate(base.getUTCDate() + ((8 - base.getUTCDay()) % 7 || 7));
   else if (normalized === "next month") {
@@ -183,9 +223,6 @@ export function dateMentionDueAt(mention: DateMention, choice: ReminderChoice | 
     const instant = Date.parse(choice.absolute);
     return Number.isFinite(instant) && new Date(instant).toISOString() === choice.absolute ? instant : null;
   }
-  const atTime =
-    mention.kind === "timed" ? Date.parse(mention.value) : resolveLocalDateTime(mention.value, mention.timezone, 9, 0);
-  if (atTime === null) return null;
   if (choice === "1d_before") {
     const local = dateMentionLocalFields(mention);
     if (!local) return null;
@@ -194,6 +231,9 @@ export function dateMentionDueAt(mention: DateMention, choice: ReminderChoice | 
     const [hour, minute] = local.time.split(":").map(Number);
     return resolveLocalDateTime(previous.toISOString().slice(0, 10), mention.timezone, hour!, minute!);
   }
+  const atTime =
+    mention.kind === "timed" ? Date.parse(mention.value) : resolveLocalDateTime(mention.value, mention.timezone, 9, 0);
+  if (atTime === null) return null;
   const offset = { at_time: 0, "5m_before": 300_000, "1h_before": 3_600_000 }[choice];
   return atTime - offset;
 }

@@ -23,6 +23,13 @@ import {
 import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
 import { linkPreview, linkPreviewImage, pruneLinkPreviews } from "./link-previews";
 import {
+  deleteDateReminder,
+  getDateReminder,
+  parseReminderInput,
+  processDueDateReminders,
+  putDateReminder,
+} from "./date-reminders";
+import {
   createIntegration,
   integrationGrants,
   listIntegrations,
@@ -3804,6 +3811,29 @@ app.get("/api/pages/:id/content", async (c) => {
   return new Response(response.body, { status: response.status, headers });
 });
 
+app.get("/api/pages/:pageId/date-reminders/:tokenId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "document") throw new HttpError(404, "page_not_found", "Page not found.");
+  return c.json({ reminder: await getDateReminder(c.env, member, page, c.req.param("tokenId")) });
+});
+
+app.put("/api/pages/:pageId/date-reminders/:tokenId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "document") throw new HttpError(404, "page_not_found", "Page not found.");
+  const input = parseReminderInput(await jsonBody(c.req.raw));
+  return c.json({ reminder: await putDateReminder(c.env, member, page, c.req.param("tokenId"), input) });
+});
+
+app.delete("/api/pages/:pageId/date-reminders/:tokenId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "document") throw new HttpError(404, "page_not_found", "Page not found.");
+  await deleteDateReminder(c.env, member, page, c.req.param("tokenId"));
+  return c.body(null, 204);
+});
+
 app.get("/api/pages/:id/diagram-thumbnail.svg", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
@@ -6947,6 +6977,7 @@ export default {
         slack_redrive: () => redriveStaleSlackOutbox(env),
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
+        date_reminders: () => processDueDateReminders(env),
         slack_digests: () => sendDueSlackChannelDigests(env),
         slack_security_records: () => pruneSlackSecurityRecords(env),
         webhook_history: () => pruneWebhookHistory(env),

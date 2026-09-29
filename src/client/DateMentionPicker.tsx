@@ -1,7 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { DateMention } from "../shared/date-mentions";
-import { dateMentionLocalFields, resolveLocalDateTime, validCalendarDate } from "../shared/date-mentions";
+import {
+  dateMentionLocalFields,
+  parseDatePhrase,
+  resolveLocalDateTime,
+  validCalendarDate,
+} from "../shared/date-mentions";
 
 export function DateMentionPicker({
   initial,
@@ -19,6 +24,7 @@ export function DateMentionPicker({
   const [kind, setKind] = useState(initial.kind);
   const [date, setDate] = useState(local?.date ?? "");
   const [time, setTime] = useState(local?.time ?? "09:00");
+  const [phrase, setPhrase] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -33,7 +39,14 @@ export function DateMentionPicker({
       return;
     }
     const [hour, minute] = time.split(":").map(Number);
-    const instant = kind === "timed" ? resolveLocalDateTime(date, initial.timezone, hour!, minute!) : null;
+    const unchangedTimedValue =
+      kind === "timed" && initial.kind === "timed" && date === local?.date && time === local.time;
+    const instant =
+      kind === "timed"
+        ? unchangedTimedValue
+          ? Date.parse(initial.value)
+          : resolveLocalDateTime(date, initial.timezone, hour!, minute!)
+        : null;
     if (kind === "timed" && instant === null) {
       setError("Choose a valid time.");
       return;
@@ -50,7 +63,29 @@ export function DateMentionPicker({
   return createPortal(
     <dialog ref={dialog} aria-label={label} className="date-mention-picker" onClose={onClose}>
       <label>
-        Date <input type="date" value={date} onChange={(event) => setDate(event.target.value)} />
+        Date phrase
+        <input
+          type="text"
+          value={phrase}
+          placeholder="Tomorrow, next Friday, in 2 weeks"
+          onChange={(event) => {
+            const value = event.target.value;
+            setPhrase(value);
+            const parsed = parseDatePhrase(value, new Date(), initial.timezone);
+            if (parsed) setDate(parsed);
+          }}
+        />
+      </label>
+      <label>
+        Date{" "}
+        <input
+          type="date"
+          value={date}
+          onChange={(event) => {
+            setPhrase("");
+            setDate(event.target.value);
+          }}
+        />
       </label>
       <label>
         Type{" "}

@@ -1,6 +1,7 @@
 import type { ProseMirrorJson } from "./types";
 import { resolveEmbed } from "./embed-providers";
-import { dateMentionFromProps, readableDateMention } from "./date-mentions";
+import { dateMentionFromProps } from "./date-mentions";
+import { dateMentionText } from "./document-projection";
 
 export const NOTION_VERSION = "2026-03-11";
 export const NOTION_PAGE_SIZE_MAX = 100;
@@ -190,10 +191,18 @@ export function proseMirrorInlineToNotion(nodes: ProseMirrorJson[] = []): Notion
     }
     if (node.type === "dateMention") {
       const mention = dateMentionFromProps(node.attrs ?? {});
-      const content = mention ? readableDateMention(mention) : "Date";
+      const content = dateMentionText(node);
       output.push({
-        type: "text",
-        text: { content, link: null },
+        type: mention ? "mention" : "text",
+        ...(mention
+          ? {
+              mention: {
+                type: "date",
+                date: { start: mention.value, time_zone: mention.timezone },
+                noteFlare: { payload: JSON.stringify(mention) },
+              },
+            }
+          : { text: { content, link: null } }),
         annotations: notionAnnotations(node),
         plain_text: content,
         href: null,
@@ -247,6 +256,16 @@ export function notionRichTextToProseMirror(value: unknown): ProseMirrorJson[] {
     }
     if (item.type === "mention" || "mention" in item) {
       const mention = record(item.mention);
+      if (mention.type === "date") {
+        const token = dateMentionFromProps(record(mention.noteFlare));
+        if (token) {
+          output.push({ type: "dateMention", attrs: { payload: JSON.stringify(token) } });
+          continue;
+        }
+        const fallback = string(item.plain_text, string(record(mention.date).start, "Date"));
+        output.push({ type: "text", text: fallback });
+        continue;
+      }
       const entityType = mention.type === "user" ? "user" : "page";
       const entity = record(mention[entityType]);
       const entityId = string(entity.id);

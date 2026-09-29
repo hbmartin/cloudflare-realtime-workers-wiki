@@ -18,6 +18,9 @@ describe("date mentions", () => {
     expect(parseDatePhrase("next month", now, "America/Chicago")).toBe("2026-10-01");
     expect(parseDatePhrase("in 2 weeks", now, "America/Chicago")).toBe("2026-10-12");
     expect(parseDatePhrase("in 400 days", now, "America/Chicago")).toBeNull();
+    expect(parseDatePhrase("Oct 10", now, "America/Chicago")).toBe("2026-10-10");
+    expect(parseDatePhrase("Sep 10", now, "America/Chicago")).toBe("2027-09-10");
+    expect(parseDatePhrase("Feb 29, 2027", now, "America/Chicago")).toBeNull();
   });
 
   it("rejects invalid calendar dates", () => {

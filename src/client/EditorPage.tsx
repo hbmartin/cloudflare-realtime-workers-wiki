@@ -32,7 +32,13 @@ import { notesCommentSchema, notesSchema } from "./mentions";
 import { DateMentionContext } from "./DateMentionChip";
 import { DateMentionPicker } from "./DateMentionPicker";
 import { dateMentionPasteExtension } from "./date-mention-paste";
-import { parseDatePhrase, validTimezone, type DateMention } from "../shared/date-mentions";
+import {
+  dateMentionWireProps,
+  parseDatePhrase,
+  validCalendarDate,
+  validTimezone,
+  type DateMention,
+} from "../shared/date-mentions";
 import type { NotificationPreference } from "../shared/types";
 import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
@@ -598,6 +604,10 @@ function CollaborativeEditor({
   const editorShellRef = useRef<HTMLDivElement>(null);
   const pasteChoiceRef = useRef<HTMLFieldSetElement>(null);
   const dateTimezoneRef = useRef<{ promise: Promise<string>; expiresAt: number } | null>(null);
+  const dateMentionContext = useMemo(
+    () => ({ pageId, userId: member.user.id, editable }),
+    [pageId, member.user.id, editable],
+  );
   const commentsPanel = useRef<HTMLDivElement>(null);
   const threadStore = useMemo(
     () => new ServerThreadStore(pageId, member.user.id, setCommentError),
@@ -826,10 +836,7 @@ function CollaborativeEditor({
           const preferred = data.configured ? data.preferences[0]?.timezone : undefined;
           return preferred && validTimezone(preferred) ? preferred : browserTimezone;
         })
-        .catch(() => {
-          if (dateTimezoneRef.current?.promise === promise) dateTimezoneRef.current = null;
-          return browserTimezone;
-        });
+        .catch(() => browserTimezone);
       dateTimezoneRef.current = { promise, expiresAt: Date.now() + 30_000 };
     }
     const [data, timezone] = await Promise.all([
@@ -849,15 +856,25 @@ function CollaborativeEditor({
         [
           {
             type: "dateMention",
-            props: { payload: JSON.stringify(makeDate(date)) },
+            props: dateMentionWireProps(makeDate(date)),
           },
           " ",
         ],
         { updateSelection: true },
       );
     };
-    const parsed = parseDatePhrase(query, new Date(), timezone);
+    const normalizedQuery = query.trim().toLowerCase();
+    const parsed =
+      parseDatePhrase(query, new Date(), timezone) || (validCalendarDate(normalizedQuery) ? normalizedQuery : null);
     const today = parseDatePhrase("today", new Date(), timezone);
+    const dateQuery =
+      !normalizedQuery ||
+      Boolean(parsed) ||
+      "date".startsWith(normalizedQuery) ||
+      (normalizedQuery.length >= 2 && "calendar".startsWith(normalizedQuery)) ||
+      /^(?:\d{4}-|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|next(?:\s|$)|in(?:\s|$)|tod|tom)/.test(
+        normalizedQuery,
+      );
     const dateItems = [
       ...(parsed
         ? [
@@ -870,14 +887,14 @@ function CollaborativeEditor({
             },
           ]
         : []),
-      ...((!query.trim() || query.trim().toLowerCase() === "date" || parsed) && today
+      ...(dateQuery && today
         ? [
             {
               title: "Choose date…",
               subtext: `Calendar · ${timezone}`,
               group: "Dates",
               icon: <span>▦</span>,
-              onItemClick: () => setDateInsert(makeDate(today)),
+              onItemClick: () => setDateInsert(makeDate(parsed ?? today)),
             },
           ]
         : []),
@@ -906,7 +923,7 @@ function CollaborativeEditor({
     return parsed ? [...dateItems, ...mentions] : [...mentions, ...dateItems];
   };
   return (
-    <DateMentionContext.Provider value={{ pageId, userId: member.user.id, editable }}>
+    <DateMentionContext.Provider value={dateMentionContext}>
       <EmbedFeatureContext.Provider value={member.features?.expandedEmbeds ?? false}>
         <div
           ref={editorShellRef}
@@ -996,7 +1013,7 @@ function CollaborativeEditor({
               label="Insert date mention"
               onSave={(next) => {
                 if (!editable || !editor.isEditable) return "This document is read only.";
-                editor.insertInlineContent([{ type: "dateMention", props: { payload: JSON.stringify(next) } }, " "], {
+                editor.insertInlineContent([{ type: "dateMention", props: dateMentionWireProps(next) }, " "], {
                   updateSelection: true,
                 });
                 return null;
