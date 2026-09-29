@@ -3,7 +3,8 @@ import { tracing } from "cloudflare:workers";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
 import * as Y from "yjs";
-import { collectTransclusions, projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { collectTransclusions, dateTokens, projectDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { dateMentionFromProps } from "../shared/date-mentions";
 import {
   diagramFromYDoc,
   DIAGRAM_NODES_ROOT,
@@ -250,6 +251,28 @@ function yNode(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {
   }
   element.insert(0, (node.content ?? []).map(yNode));
   return element;
+}
+
+function repairDuplicateDateTokens(document: Y.Doc) {
+  const seen = new Set<string>();
+  const visit = (parent: Y.XmlFragment | Y.XmlElement) => {
+    for (const child of parent.toArray()) {
+      if (!(child instanceof Y.XmlElement)) continue;
+      if (child.nodeName === "dateMention") {
+        const token = dateMentionFromProps(child.getAttributes());
+        if (token) {
+          if (seen.has(token.tokenId)) {
+            child.setAttribute(
+              "payload",
+              JSON.stringify({ ...token, tokenId: crypto.randomUUID(), revision: crypto.randomUUID() }),
+            );
+          } else seen.add(token.tokenId);
+        }
+      }
+      visit(child);
+    }
+  };
+  document.transact(() => visit(document.getXmlFragment("document-store")), "date-token-normalize");
 }
 
 type YBlockParent = Y.XmlFragment | Y.XmlElement;
@@ -864,6 +887,19 @@ export class Document extends YServer {
         return Response.json({ error: code }, { status: code === "block_not_found" ? 404 : 422 });
       }
       const document = yXmlFragmentToProsemirrorJSON(clone.getXmlFragment("document-store")) as ProseMirrorJson;
+      const incomingDateIds = new Set<string>();
+      for (const operation of body.operations as ApiBlockMutation[]) {
+        if (operation.type === "update_block") {
+          for (const id of dateTokens(operation.node).keys()) incomingDateIds.add(id);
+        } else if (operation.type === "append_children") {
+          for (const child of operation.children) for (const id of dateTokens(child).keys()) incomingDateIds.add(id);
+        }
+      }
+      const resultingDates = dateTokens(document);
+      if (Array.from(incomingDateIds).some((id) => resultingDates.get(id) === null)) {
+        clone.destroy();
+        return Response.json({ error: "duplicate_date_token" }, { status: 409 });
+      }
       const blockCount = flattenDocumentBlocks(document).length;
       if (blockCount > 10_000) {
         clone.destroy();
@@ -1223,7 +1259,10 @@ export class Document extends YServer {
   }
 
   private async compactOnce(forceVersion = false, suppressExternalEffects = false) {
-    if (this.metadata.content_kind === "document") migrateLegacyColumns(this.document);
+    if (this.metadata.content_kind === "document") {
+      migrateLegacyColumns(this.document);
+      repairDuplicateDateTokens(this.document);
+    }
     this.flushPendingUpdates();
     const { pageId, epoch } = this.ids;
     const maximum = this.state.storage.sql

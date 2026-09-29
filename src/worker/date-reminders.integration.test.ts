@@ -3,6 +3,7 @@ import { abortAllDurableObjects, applyD1Migrations, env, reset, runInDurableObje
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import type { DateMention } from "../shared/date-mentions";
+import { dateTokens } from "../shared/document-projection";
 import type { Env } from "./env";
 import { processDueDateReminders } from "./date-reminders";
 
@@ -376,6 +377,40 @@ describe("date reminders", () => {
         .bind(token.tokenId)
         .first(),
     ).toEqual({ state: "active", missing_since: null, generation: 1 });
+  });
+
+  it("gives a concurrent duplicate a new identity before reconciling reminders", async () => {
+    const installed = await bootstrap();
+    const token: DateMention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: installed.userId,
+      kind: "timed",
+      value: new Date(Date.now() + 3_600_000).toISOString(),
+      timezone: "UTC",
+    };
+    await addToken(installed.page.id, token);
+    const path = `/api/pages/${installed.page.id}/date-reminders/${token.tokenId}`;
+    const saved = await SELF.fetch(
+      request(installed.cookie, path, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ revision: token.revision, choice: "at_time" }),
+      }),
+    );
+    expect(saved.status).toBe(200);
+    await addToken(installed.page.id, token);
+    const response = await env.DOCUMENT.getByName(`${installed.page.id}~1`).fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    );
+    const content = await response.json<{ document: Parameters<typeof dateTokens>[0] }>();
+    const tokens = dateTokens(content.document);
+    expect(tokens.size).toBe(2);
+    expect(tokens.get(token.tokenId)).toBeTruthy();
+    expect(Array.from(tokens.values()).every(Boolean)).toBe(true);
+    expect((await SELF.fetch(request(installed.cookie, path))).status).toBe(200);
   });
 
   it("does not deliver when the author loses workspace access before the due scan", async () => {

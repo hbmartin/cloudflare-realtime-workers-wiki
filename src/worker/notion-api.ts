@@ -35,7 +35,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { dateTokens } from "../shared/document-projection";
 import { dateMentionFromProps } from "../shared/date-mentions";
-import { reconcileDateRemindersForPage } from "./date-reminders";
+import { MISSING_GRACE_MS } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -1197,36 +1197,47 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   const located = await locatedBlock(c.env, principal, c.req.param("blockId"));
   const input = await body(c.req.raw);
   if (input.in_trash === true) {
-    const mutated = await mutateDocument(c.env, located.page, principal, [
-      { type: "delete_block", internalId: located.internalId },
-    ]);
-    await reconcileDateRemindersForPage(c.env, located.page.id, located.page.content_epoch, mutated.document);
+    await mutateDocument(c.env, located.page, principal, [{ type: "delete_block", internalId: located.internalId }]);
     return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
   }
   const blockDates = dateTokens(located.block!.node);
-  const liveDates = dateTokens((await liveDocument(c.env, located.page)).document);
+  const suppliedDates = new Map<string, NonNullable<ReturnType<typeof dateMentionFromProps>>>();
   for (const payload of Object.values(input)) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
-    const richText = (payload as { rich_text?: unknown }).rich_text;
-    if (!Array.isArray(richText)) continue;
-    for (const item of richText) {
-      const supplied = dateMentionFromProps(item?.mention?.noteFlare ?? {});
-      if (!supplied || blockDates.has(supplied.tokenId)) continue;
-      if (liveDates.has(supplied.tokenId))
-        throw new NotionError(409, "conflict_error", "Move the original date token before reusing its ID.");
-      const reminder = await c.env.DB.prepare(
-        `SELECT user_id,token_revision,timezone FROM date_reminders
-         WHERE page_id=? AND content_epoch=? AND token_id=?
-           AND state IN ('active','claimed','delivered') AND missing_since>=? LIMIT 1`,
+    const content = payload as { rich_text?: unknown; cells?: unknown };
+    const groups = [content.rich_text, ...(Array.isArray(content.cells) ? content.cells : [])];
+    for (const group of groups) {
+      if (!Array.isArray(group)) continue;
+      for (const item of group) {
+        const supplied = dateMentionFromProps(item?.mention?.noteFlare ?? {});
+        if (supplied && !blockDates.has(supplied.tokenId)) suppliedDates.set(supplied.tokenId, supplied);
+      }
+    }
+  }
+  if (suppliedDates.size) {
+    const liveDates = dateTokens((await liveDocument(c.env, located.page)).document);
+    const rows = await c.env.DB.prepare(
+      `SELECT token_id,user_id,token_revision,timezone FROM date_reminders
+       WHERE page_id=? AND content_epoch=? AND token_id IN (SELECT value FROM json_each(?))
+         AND state IN ('active','claimed','delivered') AND missing_since>=?`,
+    )
+      .bind(
+        located.page.id,
+        located.page.content_epoch,
+        JSON.stringify(Array.from(suppliedDates.keys())),
+        Date.now() - MISSING_GRACE_MS,
       )
-        .bind(located.page.id, located.page.content_epoch, supplied.tokenId, Date.now() - 2 * 60_000)
-        .first<{ user_id: string; token_revision: string; timezone: string }>();
+      .all<{ token_id: string; user_id: string; token_revision: string; timezone: string }>();
+    for (const reminder of rows.results) {
+      const supplied = suppliedDates.get(reminder.token_id);
       if (
-        reminder?.user_id === supplied.createdBy &&
+        supplied &&
+        !liveDates.has(supplied.tokenId) &&
+        reminder.user_id === supplied.createdBy &&
         reminder.token_revision === supplied.revision &&
         reminder.timezone === supplied.timezone
       )
-        blockDates.set(supplied.tokenId, supplied);
+        blockDates.set(supplied.tokenId, { ...supplied, revision: crypto.randomUUID() });
     }
   }
   let container;
@@ -1242,7 +1253,6 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   const mutated = await mutateDocument(c.env, located.page, principal, [
     { type: "update_block", internalId: located.internalId, node },
   ]);
-  await reconcileDateRemindersForPage(c.env, located.page.id, located.page.content_epoch, mutated.document);
   const updated = findDocumentBlock(mutated.document, located.internalId)!;
   return c.json(await blockObject(c.env, located.page, updated, await metadataForPage(c.env, located.page.id)));
 });
@@ -1251,10 +1261,7 @@ notionApi.delete("/blocks/:blockId", async (c) => {
   const principal = c.get("principal");
   capability(principal, "updateContent");
   const located = await locatedBlock(c.env, principal, c.req.param("blockId"));
-  const mutated = await mutateDocument(c.env, located.page, principal, [
-    { type: "delete_block", internalId: located.internalId },
-  ]);
-  await reconcileDateRemindersForPage(c.env, located.page.id, located.page.content_epoch, mutated.document);
+  await mutateDocument(c.env, located.page, principal, [{ type: "delete_block", internalId: located.internalId }]);
   return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
 });
 

@@ -146,6 +146,30 @@ describe("Notion-compatible API", () => {
       }),
     );
     expect(inserted.status).toBe(200);
+    const duplicate = await env.DOCUMENT.getByName(`${installed.pageId}~1`).fetch(
+      new Request("https://document.internal/api-mutate", {
+        method: "POST",
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "content-type": "application/json" },
+        body: JSON.stringify({
+          actorId: me.user.id,
+          operations: [
+            {
+              type: "append_children",
+              children: [
+                {
+                  type: "blockContainer",
+                  attrs: { id: crypto.randomUUID() },
+                  content: [
+                    { type: "paragraph", content: [{ type: "dateMention", attrs: dateMentionWireProps(mention) }] },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+    );
+    expect(duplicate.status).toBe(409);
     const read = await SELF.fetch(notionRequest(createdIntegration.token, `/blocks/${installed.pageId}/children`));
     const blocks = await read.json<{
       results: Array<{ id: string; paragraph: { rich_text: Array<Record<string, unknown>> } }>;
@@ -259,6 +283,9 @@ describe("Notion-compatible API", () => {
       tokenId: mention.tokenId,
       createdBy: mention.createdBy,
     });
+    expect(JSON.parse(movedBlock.paragraph.rich_text[0]!.mention.noteFlare.payload).revision).not.toBe(
+      movedMention.revision,
+    );
     const afterMove = await (
       await SELF.fetch(authenticated(installed.cookie, reminderPath))
     ).json<{

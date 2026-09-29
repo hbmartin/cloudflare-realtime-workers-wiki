@@ -29,7 +29,7 @@ type ReminderRow = {
 
 const ACTIVE_SWEEP_INTERVAL = 14 * 60_000;
 const DELIVERED_SWEEP_INTERVAL = 24 * 60 * 60_000;
-const MISSING_GRACE_MS = 2 * 60_000;
+export const MISSING_GRACE_MS = 2 * 60_000;
 
 export type ReminderInput = { revision: string; choice: ReminderChoice | { absolute: string } };
 
@@ -108,6 +108,9 @@ export async function putDateReminder(
   if (dueAt === null || dueAt <= Date.now())
     throw new HttpError(422, "reminder_in_past", "Choose a future reminder time.");
   const timestamp = Date.now();
+  const previous = await env.DB.prepare(`SELECT * FROM date_reminders WHERE page_id=? AND token_id=? AND user_id=?`)
+    .bind(page.id, tokenId, member.user.id)
+    .first<ReminderRow>();
   const row = await env.DB.prepare(
     `INSERT INTO date_reminders
       (id,workspace_id,page_id,content_epoch,token_id,user_id,token_revision,timezone,choice_json,
@@ -123,6 +126,7 @@ export async function putDateReminder(
         OR date_reminders.choice_json!=excluded.choice_json
         OR date_reminders.due_at!=excluded.due_at
         OR date_reminders.state!='active'
+        OR date_reminders.missing_since IS NOT NULL
      RETURNING *`,
   )
     .bind(
@@ -150,6 +154,37 @@ export async function putDateReminder(
   const latestDocument = await roomDocument(env, page.id, page.content_epoch);
   const latestToken = dateTokens(latestDocument).get(tokenId);
   if (!latestToken || latestToken.revision !== token.revision || latestToken.createdBy !== member.user.id) {
+    if (row) {
+      if (previous) {
+        await env.DB.prepare(
+          `UPDATE date_reminders SET content_epoch=?,token_revision=?,timezone=?,choice_json=?,due_at=?,
+             generation=?,state=?,claim_id=?,claimed_at=?,delivery_receipt_id=?,missing_since=?,checked_at=?,updated_at=?
+           WHERE id=? AND generation=?`,
+        )
+          .bind(
+            previous.content_epoch,
+            previous.token_revision,
+            previous.timezone,
+            previous.choice_json,
+            previous.due_at,
+            previous.generation,
+            previous.state,
+            previous.claim_id,
+            previous.claimed_at,
+            previous.delivery_receipt_id,
+            previous.missing_since,
+            previous.checked_at,
+            Date.now(),
+            row.id,
+            row.generation,
+          )
+          .run();
+      } else {
+        await env.DB.prepare(`DELETE FROM date_reminders WHERE id=? AND generation=?`)
+          .bind(row.id, row.generation)
+          .run();
+      }
+    }
     await reconcileDateRemindersForPage(env, page.id, page.content_epoch, latestDocument);
     const effective = await env.DB.prepare(`SELECT * FROM date_reminders WHERE id=?`)
       .bind(savedRow.id)
@@ -204,7 +239,8 @@ export async function reconcileDateRemindersForPage(
           `UPDATE date_reminders SET missing_since=?,checked_at=?,
              state=CASE WHEN state='claimed' THEN 'active' ELSE state END,
              claim_id=NULL,claimed_at=NULL,updated_at=?
-           WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
+           WHERE id=? AND generation=? AND missing_since IS NULL
+             AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
         )
           .bind(timestamp, timestamp, timestamp, row.id, row.generation, ...sequenceBind)
           .run();
@@ -242,8 +278,7 @@ export async function reconcileDateRemindersForPage(
     } else if (!unchanged && dueAt === row.due_at) {
       await env.DB.prepare(
         `UPDATE date_reminders SET token_revision=?,timezone=?,missing_since=NULL,
-           state=CASE WHEN state='claimed' THEN 'active' ELSE state END,
-           claim_id=NULL,claimed_at=NULL,checked_at=?,updated_at=?
+           checked_at=?,updated_at=?
          WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
       )
         .bind(token.revision, token.timezone, timestamp, timestamp, row.id, row.generation, ...sequenceBind)
@@ -259,9 +294,7 @@ export async function reconcileDateRemindersForPage(
         .run();
     } else if (row.missing_since !== null) {
       await env.DB.prepare(
-        `UPDATE date_reminders SET missing_since=NULL,
-           state=CASE WHEN state='claimed' THEN 'active' ELSE state END,
-           claim_id=NULL,claimed_at=NULL,checked_at=?,updated_at=?
+        `UPDATE date_reminders SET missing_since=NULL,checked_at=?,updated_at=?
          WHERE id=? AND generation=? AND state IN ('active','claimed','delivered') ${sequenceGuard}`,
       )
         .bind(timestamp, timestamp, row.id, row.generation, ...sequenceBind)
@@ -286,14 +319,14 @@ async function sweepDateReminders(env: Env) {
     env.DB.prepare(
       `SELECT page_id,content_epoch,MIN(checked_at) next_check FROM date_reminders
        WHERE state IN ('active','claimed') AND checked_at<?
-       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 4`,
+       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 20`,
     )
       .bind(cutoffs.active)
       .all<{ page_id: string; content_epoch: number }>(),
     env.DB.prepare(
       `SELECT page_id,content_epoch,MIN(checked_at) next_check FROM date_reminders
        WHERE state='delivered' AND checked_at<?
-       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 1`,
+       GROUP BY page_id,content_epoch ORDER BY next_check LIMIT 5`,
     )
       .bind(cutoffs.delivered)
       .all<{ page_id: string; content_epoch: number }>(),
@@ -415,7 +448,7 @@ async function deliverDueDateReminders(env: Env) {
       const results = await env.DB.batch([
         env.DB.prepare(
           `UPDATE date_reminders SET state='delivered',delivery_receipt_id=?,token_revision=?,claim_id=NULL,
-             claimed_at=NULL,checked_at=?,updated_at=?
+             claimed_at=NULL,missing_since=NULL,checked_at=?,updated_at=?
            WHERE id=? AND generation=? AND state='claimed' AND claim_id=?`,
         ).bind(receiptId, token.revision, timestamp, timestamp, row.id, row.generation, claimId),
         ...notificationFanoutStatements(env.DB, {
