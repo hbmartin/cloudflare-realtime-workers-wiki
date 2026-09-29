@@ -73,8 +73,12 @@ function escapeMarkdownInline(value: string) {
 
 // Block-level constructs are only meaningful at the start of a line.
 function escapeMarkdownText(value: string) {
-  return escapeMarkdownInline(value).replace(
-    /(^|\n)([ \t]*)(#{1,6}(?=\s|$)|>|[-+](?=\s|$)|\d{1,9}[.)](?=\s|$)|={2,}$|-{2,}$|_{3,}$|~{3,})/g,
+  return escapeMarkdownBlockStart(escapeMarkdownInline(value.replaceAll(/\r\n?/g, "\n")));
+}
+
+function escapeMarkdownBlockStart(value: string) {
+  return value.replace(
+    /(^|\n)([ \t]*)(#{1,6}(?=[ \t]|$)|>|[-+](?=[ \t]|$)|\d{1,9}[.)](?=[ \t]|$)|={1,}[ \t]*$|(?:[-*_][ \t]*){3,}$|~{3,})/gm,
     (_match, lineStart: string, indent: string, token: string) => `${lineStart}${indent}\\${token}`,
   );
 }
@@ -108,7 +112,7 @@ function safeUrl(value: unknown) {
 }
 
 function markdownCodeSpan(value: string) {
-  value = value.replaceAll(/\r?\n/g, " ");
+  value = value.replaceAll(/\r\n?|\n/g, " ");
   let longestRun = 0;
   for (const match of value.matchAll(/`+/g)) longestRun = Math.max(longestRun, match[0].length);
   const delimiter = "`".repeat(longestRun + 1);
@@ -140,7 +144,7 @@ function markedText(node: ProseMirrorJson, format: "markdown" | "html") {
             : `[${value}](${markdownDestination(href)})`;
     }
   }
-  return value;
+  return format === "markdown" ? escapeMarkdownBlockStart(value) : value;
 }
 
 function nodeText(node: ProseMirrorJson): string {
@@ -358,9 +362,10 @@ function serializeNode(
   }
   if (type === "math") {
     const formula = stringAttr(node, "formula") ?? nodeText(node);
+    const fence = markdownFence(formula, "$");
     return format === "html"
       ? `<div class="math" data-formula="${escapeHtml(formula)}"><pre>${escapeHtml(formula)}</pre></div>`
-      : `$$\n${formula.replaceAll("$$", "\\$\\$")}\n$$\n\n`;
+      : `${fence}\n${formula}\n${fence}\n\n`;
   }
   if (type === "mermaid") {
     const source = stringAttr(node, "source") ?? nodeText(node);

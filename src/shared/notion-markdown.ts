@@ -56,8 +56,15 @@ function container(block: NotionBlock): ProseMirrorJson {
 function representable(block: NotionBlock, options: DocumentSerializationOptions): boolean {
   if (!DIRECT_MARKDOWN_TYPES.has(block.type)) return false;
   if ((block.type === "linkToPage" || block.type === "linkedDiagram") && !options.pageHref) return false;
+  if (block.type === "math" && typeof block.node.attrs?.formula === "string" && block.node.attrs.formula.includes("$$"))
+    return false;
   if (MEDIA_TYPES.has(block.type)) {
     const url = block.node.attrs?.url;
+    if (
+      typeof url === "string" &&
+      Array.from(url).some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)
+    )
+      return false;
     if (typeof url === "string" && options.mediaHref?.(url) === null) return false;
     if (typeof url === "string" && url.startsWith("/api/attachments/") && !options.mediaHref) return false;
   }
@@ -83,7 +90,7 @@ export function projectNotionMarkdown(
   const encoder = new TextEncoder();
   const appendOmitted = (block: NotionBlock, id: string, marker: string) => {
     if (unknownBlockIds.length >= MAX_UNKNOWN_BLOCK_IDS) return;
-    const text = `${marker}\n\n`;
+    const text = `${parts.at(-1)?.endsWith("\n\n") || !parts.length ? "" : "\n"}${marker}\n\n`;
     const markerBytes = encoder.encode(text).length;
     if (bytes + markerBytes > MAX_MARKDOWN_BYTES) return;
     const from = length;
@@ -96,7 +103,9 @@ export function projectNotionMarkdown(
   for (let index = 0; index < blocks.length; index += 1) {
     const block = blocks[index]!;
     const id = publicBlockIds.get(block.internalId) ?? block.id;
-    const notionType = notionBlockRegistry[block.type as keyof typeof notionBlockRegistry]?.notionType ?? block.type;
+    const notionType = additionalBlocks.includes(block)
+      ? "child_page"
+      : (notionBlockRegistry[block.type as keyof typeof notionBlockRegistry]?.notionType ?? block.type);
     const marker = `<unknown url="notion://blocks/${attribute(id)}" alt="${attribute(notionType)}"/>`;
     if (truncated || spans.length >= MAX_MARKDOWN_BLOCKS) {
       truncated = true;
@@ -106,7 +115,8 @@ export function projectNotionMarkdown(
     const supported = representable(block, options);
     const content = supported ? serializeMarkdownNode(container(block), options).trimEnd() : marker;
     const next = blocks[index + 1];
-    const suffix = LIST_ITEM_TYPES.has(block.type) && next?.type === block.type ? "\n" : "\n\n";
+    const suffix =
+      LIST_ITEM_TYPES.has(block.type) && next?.type === block.type && representable(next, options) ? "\n" : "\n\n";
     const text = content ? `${content}${suffix}` : "";
     const nextBytes = encoder.encode(text).length;
     if (bytes + nextBytes > CONTENT_BUDGET_BYTES) {

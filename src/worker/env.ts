@@ -34,6 +34,7 @@ export interface AppBindings {
   DO_LOCATION_HINT?: DurableObjectLocationHint;
   WORKFLOW_INLINE?: "true";
   EXPANDED_EMBEDS_ENABLED?: "true" | "false";
+  NOTION_MARKDOWN_WRITES_ENABLED?: "true" | "false";
   OBSERVABILITY_PROBE_TOKEN?: string;
 }
 

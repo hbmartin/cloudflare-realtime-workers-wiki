@@ -226,6 +226,7 @@ type ApiBlockMutation =
       position?: { type: "start" | "end" | "after_block"; afterInternalId?: string };
     }
   | { type: "update_block"; internalId: string; node: ProseMirrorJson }
+  | { type: "replace_block"; internalId: string; container: ProseMirrorJson }
   | { type: "delete_block"; internalId: string };
 
 function yNode(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {
@@ -309,6 +310,13 @@ function applyApiMutation(document: Y.Doc, operation: ApiBlockMutation) {
   if (!found) throw new Error("block_not_found");
   if (operation.type === "delete_block") {
     found.group.delete(found.index, 1);
+    return;
+  }
+  if (operation.type === "replace_block") {
+    if (operation.container.type !== "blockContainer" || operation.container.attrs?.id !== operation.internalId)
+      throw new Error("invalid_block_replacement");
+    found.group.delete(found.index, 1);
+    found.group.insert(found.index, [yNode(operation.container)]);
     return;
   }
   const children = found.container.toArray();
@@ -815,7 +823,13 @@ export class Document extends YServer {
       if (this.metadata.content_kind !== "document") {
         return Response.json({ error: "Block mutations are only available for document pages." }, { status: 422 });
       }
-      let body: { actorId?: unknown; operations?: unknown; suppressExternalEffects?: unknown; operationId?: unknown };
+      let body: {
+        actorId?: unknown;
+        operations?: unknown;
+        suppressExternalEffects?: unknown;
+        operationId?: unknown;
+        expectedSequence?: unknown;
+      };
       try {
         body = await request.json();
       } catch {
@@ -850,6 +864,13 @@ export class Document extends YServer {
           sequence: this.metadata.snapshot_seq,
         });
       }
+      if (
+        body.expectedSequence !== undefined &&
+        (!Number.isInteger(body.expectedSequence) ||
+          this.metadata.dirty ||
+          this.metadata.snapshot_seq !== body.expectedSequence)
+      )
+        return Response.json({ error: "revision_changed" }, { status: 409 });
       const clone = new Y.Doc();
       Y.applyUpdate(clone, Y.encodeStateAsUpdate(this.document));
       try {

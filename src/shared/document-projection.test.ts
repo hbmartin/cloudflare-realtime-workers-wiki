@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { Lexer } from "marked";
 import {
   collectLinkedDiagramIds,
   containsLinkedDiagramId,
@@ -163,6 +164,22 @@ describe("structured document projection", () => {
     expect(serialized.markdown).toContain("````\nx\n```\n# inside\n````");
     expect(serialized.markdown).toContain("````mermaid\ngraph TD\n```\n# inside\n````");
     expect(serialized.markdown).not.toContain("# forged");
+  });
+
+  it("keeps marked punctuation and carriage returns inside their paragraph", () => {
+    const serialized = serializeDocument(
+      document(
+        { type: "paragraph", content: [{ type: "text", text: "~x", marks: [{ type: "strike" }] }] },
+        { type: "paragraph", content: [{ type: "text", text: "x\r# forged", marks: [{ type: "code" }] }] },
+        { type: "paragraph", content: [{ type: "text", text: "a\n___\nb\n===\nc" }] },
+        { type: "paragraph", content: [{ type: "text", text: "After" }] },
+      ),
+    );
+    const tokens = Lexer.lex(serialized.markdown);
+    expect(tokens.filter((token) => token.type === "heading" || token.type === "hr" || token.type === "code")).toEqual(
+      [],
+    );
+    expect(serialized.markdown).toContain("After");
   });
 
   it("keeps paragraph delimiters and multiline inline code from creating new blocks", () => {

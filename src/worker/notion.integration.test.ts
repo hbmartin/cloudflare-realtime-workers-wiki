@@ -105,6 +105,102 @@ beforeEach(async () => {
 });
 
 describe("Notion-compatible API", () => {
+  it("updates one Markdown block without replacing its neighboring block ID", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    const inserted = await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [
+        { paragraph: { rich_text: [{ text: { content: "First paragraph" } }] } },
+        { paragraph: { rich_text: [{ text: { content: "Second paragraph" } }] } },
+      ] as never,
+    });
+    expect(inserted.results).toHaveLength(2);
+    const before = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(before.markdown).toContain("First paragraph\n\nSecond paragraph");
+    const patched = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          type: "update_content",
+          update_content: { content_updates: [{ old_str: "First", new_str: "Changed" }] },
+        }),
+      }),
+    );
+    expect(patched.status).toBe(200);
+    expect((await patched.json<{ markdown: string }>()).markdown).toContain("Changed paragraph\n\nSecond paragraph");
+    const after = await client.blocks.children.list({ block_id: installed.pageId });
+    expect(after.results.map((item) => item.id)).toEqual(inserted.results.map((item) => item.id));
+  });
+
+  it("runs all four Markdown commands through the Notion SDK", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [
+        { paragraph: { rich_text: [{ text: { content: "First paragraph" } }] } },
+        { paragraph: { rich_text: [{ text: { content: "Second paragraph" } }] } },
+      ] as never,
+    });
+    const inserted = await client.pages.updateMarkdown({
+      page_id: installed.pageId,
+      type: "insert_content",
+      insert_content: { content: "Intro\n\n", position: { type: "start" } },
+    });
+    expect(inserted.markdown).toContain("Intro\n\nFirst paragraph");
+    const updated = await client.pages.updateMarkdown({
+      page_id: installed.pageId,
+      type: "update_content",
+      update_content: { content_updates: [{ old_str: "First", new_str: "Changed" }] },
+    });
+    expect(updated.markdown).toContain("Changed paragraph");
+    const ranged = await client.pages.updateMarkdown({
+      page_id: installed.pageId,
+      type: "replace_content_range",
+      replace_content_range: { content_range: "Second...paragraph", content: "Last" },
+    });
+    expect(ranged.markdown).toContain("Last");
+    const replaced = await client.pages.updateMarkdown({
+      page_id: installed.pageId,
+      type: "replace_content",
+      replace_content: { new_str: "## Replaced\n\nNew body" },
+    });
+    expect(replaced.markdown).toBe("## Replaced\n\nNew body\n");
+  });
+
+  it("rejects ambiguous and unsafe Markdown without changing the page", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [
+        { paragraph: { rich_text: [{ text: { content: "First paragraph" } }] } },
+        { paragraph: { rich_text: [{ text: { content: "Second paragraph" } }] } },
+      ] as never,
+    });
+    const before = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    for (const input of [
+      { type: "update_content", update_content: { content_updates: [{ old_str: "paragraph", new_str: "text" }] } },
+      { type: "replace_content", replace_content: { new_str: "<script>alert(1)</script>" } },
+    ]) {
+      const response = await SELF.fetch(
+        notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(input),
+        }),
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ object: "error", code: "validation_error" });
+      expect((await client.pages.retrieveMarkdown({ page_id: installed.pageId })).markdown).toBe(before.markdown);
+    }
+  });
+
   it("retrieves Markdown only with a valid read grant", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);

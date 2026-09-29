@@ -13,6 +13,9 @@ import {
 } from "../shared/notion-blocks";
 import { constantTimeEqual, hmacSha256Hex } from "../shared/security";
 import { MAX_MARKDOWN_BLOCKS, MAX_UNKNOWN_BLOCK_IDS, projectNotionMarkdown } from "../shared/notion-markdown";
+import { parseMarkdownCommand } from "../shared/notion-markdown-commands";
+import { markdownEditTargets, markdownMutations } from "../shared/notion-markdown-mutations";
+import { MarkdownWriteError } from "../shared/notion-markdown-write";
 import type { Comment, CommentThread, DocumentContentEnvelope, WorkspaceEvent } from "../shared/types";
 import { PAGE_TITLE_MAX } from "../shared/validation";
 import { processArchiveDisconnectTargets } from "./archive";
@@ -486,7 +489,6 @@ async function metadataForPage(env: Env, pageId: string) {
 function localAttachmentId(rawUrl: string, baseUrl: string) {
   try {
     const url = new URL(rawUrl, baseUrl);
-    if (url.origin !== new URL(baseUrl).origin) return null;
     return /^\/api\/attachments\/([A-Za-z0-9_-]+)\/?$/.exec(url.pathname)?.[1] ?? null;
   } catch {
     return null;
@@ -562,6 +564,7 @@ async function mutateDocument(
   principal: IntegrationPrincipal,
   operations: unknown[],
   suppressExternalEffects = false,
+  options: { expectedSequence?: number; operationId?: string } = {},
 ) {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/api-mutate", {
@@ -571,14 +574,14 @@ async function mutateDocument(
         "x-notes-internal": env.BETTER_AUTH_SECRET,
         ...correlationHeaders(),
       },
-      body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects }),
+      body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects, ...options }),
     }),
   );
   if (response.status === 404) throw new NotionError(404, "object_not_found", "Block not found.");
   if (response.status === 409) throw new NotionError(409, "conflict_error", "The document could not be changed.");
   if (response.status === 413) throw new NotionError(413, "validation_error", "The mutation exceeds document limits.");
   if (!response.ok) throw new NotionError(400, "validation_error", "The block mutation is invalid.");
-  return response.json<{ document: DocumentContentEnvelope["document"] }>();
+  return response.json<{ document: DocumentContentEnvelope["document"]; sequence: number }>();
 }
 
 async function cleanupStagedPage(env: Env, pageId: string, contentEpoch: number, stageId: string) {
@@ -658,25 +661,28 @@ notionApi.get("/pages/:pageId", async (c) => {
   );
 });
 
-notionApi.get("/pages/:pageId/markdown", async (c) => {
+async function pageMarkdownProjection(
+  c: Context<ApiContext>,
+  page: IntegrationPage,
+  suppliedSnapshot?: DocumentContentEnvelope,
+) {
   const principal = c.get("principal");
-  capability(principal, "readContent");
-  const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
-  const snapshot = await liveDocument(c.env, page);
-  const referencedAttachments = new Set<string>();
-  const linkedPages = new Set<string>();
-  const visit = (node: DocumentContentEnvelope["document"]) => {
-    if (node.type === "linkToPage" && typeof node.attrs?.pageId === "string") linkedPages.add(node.attrs.pageId);
-    if (["image", "video", "audio", "file", "pdf"].includes(node.type ?? "") && typeof node.attrs?.url === "string") {
-      const id = localAttachmentId(node.attrs.url, c.req.url);
-      if (id && referencedAttachments.size < MAX_MARKDOWN_BLOCKS) referencedAttachments.add(id);
-    }
-    for (const child of node.content ?? []) visit(child);
-  };
-  visit(snapshot.document);
-  const [metadata, id, attachments, childPages] = await Promise.all([
+  const [snapshot, metadata, id] = await Promise.all([
+    suppliedSnapshot ?? liveDocument(c.env, page),
     metadataForPage(c.env, page.id),
     publicPageId(c.env, page.id),
+  ]);
+  const referencedAttachments = new Set<string>();
+  const linkedPages = new Set<string>();
+  for (const block of documentBlocks(snapshot.document)) {
+    if (block.type === "linkToPage" && typeof block.node.attrs?.pageId === "string")
+      linkedPages.add(block.node.attrs.pageId);
+    if (["image", "video", "audio", "file", "pdf"].includes(block.type) && typeof block.node.attrs?.url === "string") {
+      const attachmentId = localAttachmentId(block.node.attrs.url, c.env.BETTER_AUTH_URL);
+      if (attachmentId && referencedAttachments.size < MAX_MARKDOWN_BLOCKS) referencedAttachments.add(attachmentId);
+    }
+  }
+  const [attachments, childPages] = await Promise.all([
     referencedAttachments.size
       ? c.env.DB.prepare(`SELECT id FROM attachments WHERE page_id = ? AND id IN (SELECT value FROM json_each(?))`)
           .bind(page.id, JSON.stringify([...referencedAttachments]))
@@ -717,26 +723,44 @@ notionApi.get("/pages/:pageId/markdown", async (c) => {
     node: { type: "linkToPage", attrs: { pageId: child.id, title: child.title } },
     children: [],
   }));
+  const mediaCache = new Map<string, string | null>();
+  const mediaHref = (url: string) => {
+    if (mediaCache.has(url)) return mediaCache.get(url)!;
+    const attachmentId = localAttachmentId(url, c.env.BETTER_AUTH_URL);
+    if (attachmentId) {
+      const signed = signedMedia.get(attachmentId) ?? null;
+      mediaCache.set(url, signed);
+      return signed;
+    }
+    try {
+      if (new URL(url, c.env.BETTER_AUTH_URL).pathname.startsWith("/api/attachments/")) {
+        mediaCache.set(url, null);
+        return null;
+      }
+    } catch {
+      mediaCache.set(url, null);
+      return null;
+    }
+    mediaCache.set(url, url);
+    return url;
+  };
   const projection = projectNotionMarkdown(
     snapshot.document,
     ids,
     {
       pageHref: (pageId) => new URL(`/?page=${encodeURIComponent(pageId)}`, c.req.url).toString(),
-      mediaHref: (url) => {
-        const attachmentId = localAttachmentId(url, c.req.url);
-        if (attachmentId) return signedMedia.get(attachmentId) ?? null;
-        try {
-          const parsed = new URL(url, c.req.url);
-          if (parsed.origin === new URL(c.req.url).origin && parsed.pathname.startsWith("/api/attachments/"))
-            return null;
-        } catch {
-          return null;
-        }
-        return url;
-      },
+      mediaHref,
     },
     childBlocks,
   );
+  return { snapshot, id, projection };
+}
+
+notionApi.get("/pages/:pageId/markdown", async (c) => {
+  const principal = c.get("principal");
+  capability(principal, "readContent");
+  const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
+  const { id, projection } = await pageMarkdownProjection(c, page);
   return c.json({
     object: "page_markdown",
     id,
@@ -744,6 +768,72 @@ notionApi.get("/pages/:pageId/markdown", async (c) => {
     truncated: projection.truncated,
     unknown_block_ids: projection.unknownBlockIds,
   });
+});
+
+notionApi.patch("/pages/:pageId/markdown", async (c) => {
+  if (c.env.NOTION_MARKDOWN_WRITES_ENABLED !== "true")
+    throw new NotionError(404, "object_not_found", "Markdown updates are unavailable.");
+  const principal = c.get("principal");
+  capability(principal, "updateContent");
+  const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
+  const input = await body(c.req.raw);
+  if (input.allow_async !== undefined && typeof input.allow_async !== "boolean")
+    throw new NotionError(400, "validation_error", "allow_async must be a boolean.");
+  if (input.allow_async === true)
+    throw new NotionError(400, "validation_error", "Background Markdown updates are not enabled yet.");
+  let current = await pageMarkdownProjection(c, page);
+  let originalTargets: string | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let operations;
+    try {
+      const command = parseMarkdownCommand(input, current.projection.markdown);
+      const targets = JSON.stringify(markdownEditTargets(current.projection, command.edits));
+      if (originalTargets !== null && originalTargets !== targets)
+        throw new MarkdownWriteError("The selected content changed while applying the Markdown edit.");
+      originalTargets = targets;
+      operations = markdownMutations(
+        current.snapshot.document,
+        current.projection,
+        command.edits,
+        command.allowDeletingContent,
+      );
+    } catch (error) {
+      if (error instanceof MarkdownWriteError)
+        throw new NotionError(attempt ? 409 : 400, attempt ? "conflict_error" : "validation_error", error.message);
+      throw error;
+    }
+    if (!operations.length) {
+      return c.json({
+        object: "page_markdown",
+        id: current.id,
+        markdown: current.projection.markdown,
+        truncated: current.projection.truncated,
+        unknown_block_ids: current.projection.unknownBlockIds,
+      });
+    }
+    try {
+      const committed = await mutateDocument(c.env, page, principal, operations, false, {
+        expectedSequence: current.snapshot.sequence,
+        operationId: crypto.randomUUID(),
+      });
+      current = await pageMarkdownProjection(c, page, {
+        ...current.snapshot,
+        document: committed.document,
+        sequence: committed.sequence,
+      });
+      return c.json({
+        object: "page_markdown",
+        id: current.id,
+        markdown: current.projection.markdown,
+        truncated: current.projection.truncated,
+        unknown_block_ids: current.projection.unknownBlockIds,
+      });
+    } catch (error) {
+      if (!(error instanceof NotionError) || error.status !== 409 || attempt === 1) throw error;
+      current = await pageMarkdownProjection(c, page);
+    }
+  }
+  throw new NotionError(409, "conflict_error", "The document changed while applying the Markdown edit.");
 });
 
 notionApi.get("/pages/:pageId/properties/:propertyId", async (c) => {
@@ -1219,6 +1309,7 @@ notionApi.get("/blocks/:blockId/children", async (c) => {
   if (page) {
     const childPages = await c.env.DB.prepare(
       `SELECT * FROM pages WHERE parent_id = ? AND workspace_id = ? AND archived_at IS NULL AND kind = 'document'
+        AND import_job_id IS NULL AND is_template=0
         ORDER BY position, id LIMIT ? OFFSET ?`,
     )
       .bind(page.id, principal.workspaceId, size + 1, Math.max(0, offset - blocks.length))

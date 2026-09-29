@@ -63,6 +63,22 @@ describe("Notion Markdown projection", () => {
     expect(projectNotionMarkdown(page(first, second)).markdown).toBe("- One\n- Two\n");
   });
 
+  it("separates a tight list from an unknown or truncated following item", () => {
+    const first = notionInputToBlockContainer({ bulleted_list_item: { rich_text: [{ text: { content: "One" } }] } });
+    const unsupported = notionInputToBlockContainer({
+      bulleted_list_item: {
+        rich_text: [{ text: { content: "Two" } }],
+        children: [{ paragraph: { rich_text: [{ text: { content: "Nested" } }] } }],
+      },
+    });
+    expect(projectNotionMarkdown(page(first, unsupported)).markdown).toContain("- One\n\n<unknown");
+    const preceding = Array.from({ length: 999 }, () =>
+      notionInputToBlockContainer({ paragraph: { rich_text: [{ text: { content: "Before" } }] } }),
+    );
+    const later = notionInputToBlockContainer({ bulleted_list_item: { rich_text: [{ text: { content: "Later" } }] } });
+    expect(projectNotionMarkdown(page(...preceding, first, later)).markdown).toContain("- One\n\n<unknown");
+  });
+
   it("uses an inert marker for unsupported content, including nested content", () => {
     const bookmark = notionInputToBlockContainer({ bookmark: { url: "https://example.test" } });
     const nested = notionInputToBlockContainer({
