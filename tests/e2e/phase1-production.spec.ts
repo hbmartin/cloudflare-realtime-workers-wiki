@@ -185,10 +185,7 @@ test("hides expanded paste actions when bootstrap disables them", async ({ page 
     );
   }, "https://www.loom.com/share/be3f4b20127d47be9f884c3fab71d030");
   const choices = page.locator(".paste-url-choice");
-  await expect(choices.getByRole("button", { name: "Link" })).toBeVisible();
-  await expect(choices.getByRole("button", { name: "Preview card" })).toHaveCount(0);
-  await expect(choices.getByRole("button", { name: "Embed" })).toHaveCount(0);
-  await choices.getByRole("button", { name: "Link" }).click();
+  await expect(choices).toHaveCount(0);
   await createDocument(page);
   await page.locator('.bn-editor [data-content-type="paragraph"]').last().click();
   await page.evaluate((url) => {
@@ -200,6 +197,9 @@ test("hides expanded paste actions when bootstrap disables them", async ({ page 
   }, embedProviders[0]!.fixture);
   await expect(choices.getByRole("button", { name: "Embed" })).toBeVisible();
   await expect(choices.getByRole("button", { name: "Preview card" })).toHaveCount(0);
+  await expect(choices.getByRole("button", { name: "Link" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(choices).toHaveCount(0);
 });
 
 test("@touch opens the palette and runs a command", async ({ page }) => {

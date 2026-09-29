@@ -62,10 +62,9 @@ describe("core editor blocks", () => {
     expect(safePdfUrl("/api/attachments/file-id")).toBe("/api/attachments/file-id");
   });
 
-  it("stores a preview ID while keeping its URL usable if the preview fails", async () => {
+  it("debounces preview fetches, keeps a saved title, and leaves failed URLs usable", async () => {
     const url = "https://example.com/article";
     const update = vi.fn();
-    const updatePreviewId = vi.fn();
     mocks.api.mockResolvedValueOnce({
       preview: {
         id: "preview-id",
@@ -77,22 +76,23 @@ describe("core editor blocks", () => {
         expiresAt: Date.now() + 1000,
       },
     });
-    const block = (value: string, id = "") =>
+    const block = (value: string) =>
       createElement(
         EmbedFeatureContext.Provider,
         { value: true },
-        createElement(BookmarkBlock, { url: value, title: "Saved title", previewId: id, update, updatePreviewId }),
+        createElement(BookmarkBlock, { url: value, title: "Saved title", update }),
       );
-    const view = render(block(url));
-    await waitFor(() => expect(updatePreviewId).toHaveBeenCalledWith("preview-id"));
+    const view = render(block("https://example.com/arti"));
+    view.rerender(block(url));
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledTimes(1), { timeout: 3_000 });
+    expect(JSON.parse(String(mocks.api.mock.calls[0]?.[1]?.body))).toEqual({ url });
     expect(screen.getByRole("link")).toHaveAttribute("href", url);
-    view.rerender(block(url, "preview-id"));
-    expect(updatePreviewId).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("link")).toHaveTextContent("Saved title");
     fireEvent.change(screen.getByLabelText("Bookmark URL"), { target: { value: "https://example.com/other" } });
     expect(update).toHaveBeenCalledWith("https://example.com/other");
     mocks.api.mockRejectedValueOnce(new Error("proxy unavailable"));
     view.rerender(block("https://example.com/other"));
-    await waitFor(() => expect(mocks.api).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledTimes(2), { timeout: 3_000 });
     expect(screen.getByRole("link")).toHaveAttribute("href", "https://example.com/other");
   });
 

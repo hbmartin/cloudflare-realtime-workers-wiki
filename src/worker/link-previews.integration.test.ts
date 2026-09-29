@@ -56,6 +56,99 @@ describe("link previews", () => {
     expect(await env.DB.prepare("SELECT id FROM link_preview_cache WHERE id = ?").bind(first.id).first()).toBeNull();
   });
 
+  it("decodes numeric titles and escaped image query strings", async () => {
+    const encodedImage = `${imageUrl}?w=1200&amp;h=630`;
+    const decodedImage = `${imageUrl}?w=1200&h=630`;
+    const fetcher = vi.fn(async (url: string) =>
+      url === pageUrl
+        ? new Response(
+            `<meta property="og:title" content="It&#8217;s useful"><meta property="og:image" content="${encodedImage}">`,
+            {
+              headers: { "content-type": "text/html" },
+            },
+          )
+        : url === decodedImage
+          ? new Response(png, { headers: { "content-type": "image/png" } })
+          : new Response("missing", { status: 404 }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    const preview = await linkPreview(env, "workspace", pageUrl);
+    expect(preview.title).toBe("It’s useful");
+    expect(preview.imageUrl).toBe(`/api/link-previews/${preview.id}/image`);
+    expect(fetcher).toHaveBeenCalledWith(decodedImage, expect.anything());
+  });
+
+  it("keeps the card image-free when R2 rejects the image", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) =>
+        url === pageUrl
+          ? new Response(`<meta property="og:image" content="${imageUrl}">`, {
+              headers: { "content-type": "text/html" },
+            })
+          : new Response(png, { headers: { "content-type": "image/png" } }),
+      ),
+    );
+    const bucket = new Proxy(env.BUCKET, {
+      get(target, property) {
+        if (property === "put")
+          return async () => {
+            throw new Error("R2 unavailable");
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const preview = await linkPreview({ ...env, BUCKET: bucket }, "workspace", pageUrl);
+    expect(preview.imageUrl).toBeNull();
+    expect(
+      (
+        await env.DB.prepare("SELECT image_key FROM link_preview_cache WHERE id = ?")
+          .bind(preview.id)
+          .first<{ image_key: string | null }>()
+      )?.image_key,
+    ).toBeNull();
+  });
+
+  it("returns one in-progress card for concurrent requests", async () => {
+    let release!: (response: Response) => void;
+    const fetcher = vi.fn(
+      () =>
+        new Promise<Response>((resolve) => {
+          release = resolve;
+        }),
+    );
+    vi.stubGlobal("fetch", fetcher);
+    const first = linkPreview(env, "workspace", pageUrl);
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    const pending = await linkPreview(env, "workspace", pageUrl);
+    expect(pending.title).toBe("www.public-preview.org");
+    expect(fetcher).toHaveBeenCalledOnce();
+    release(new Response("<title>Finished</title>", { headers: { "content-type": "text/html" } }));
+    expect((await first).title).toBe("Finished");
+  });
+
+  it("caps cache rows before fetching a new URL", async () => {
+    const fetcher = vi.fn();
+    vi.stubGlobal("fetch", fetcher);
+    const db = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) =>
+            sql.startsWith("SELECT COUNT(*) AS count FROM link_preview_cache")
+              ? { bind: () => ({ first: async () => ({ count: 1_000 }) }) }
+              : target.prepare(sql);
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(linkPreview({ ...env, DB: db }, "workspace", pageUrl)).rejects.toMatchObject({
+      status: 429,
+      code: "preview_cache_full",
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("rejects internal targets before fetch and never follows a private redirect", async () => {
     const fetcher = vi.fn(
       async () => new Response(null, { status: 302, headers: { location: "https://127.0.0.1/admin" } }),

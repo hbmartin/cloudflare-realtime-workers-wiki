@@ -7,6 +7,8 @@ const MAX_HTML = 512 * 1024;
 const MAX_IMAGE = 2 * 1024 * 1024;
 const MAX_REDIRECTS = 3;
 const FETCH_TIMEOUT = 10_000;
+const REFRESH_LEASE = 30_000;
+const MAX_WORKSPACE_PREVIEWS = 1_000;
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
 
 function rasterSignature(mime: string, bytes: Uint8Array) {
@@ -108,16 +110,21 @@ async function boundedBytes(response: Response, max: number): Promise<Uint8Array
   return output;
 }
 
+function decodeEntities(value: string) {
+  return value.replace(/&(?:amp|lt|gt|quot|apos|#(?:x[0-9a-f]+|[0-9]+));/gi, (entity) => {
+    const named: Record<string, string> = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&apos;": "'" };
+    const replacement = named[entity.toLowerCase()];
+    if (replacement) return replacement;
+    const numeric = entity.slice(2, -1);
+    const point = numeric[0]?.toLowerCase() === "x" ? Number.parseInt(numeric.slice(1), 16) : Number(numeric);
+    return Number.isInteger(point) && point > 0 && point <= 0x10ffff && (point < 0xd800 || point > 0xdfff)
+      ? String.fromCodePoint(point)
+      : " ";
+  });
+}
+
 function decodeText(value: string) {
-  return value
-    .replace(/<[^>]*>/g, " ")
-    .replace(
-      /&(?:amp|lt|gt|quot|apos|#39);/gi,
-      (entity) =>
-        ({ "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&apos;": "'", "&#39;": "'" })[
-          entity.toLowerCase() as "&amp;"
-        ] ?? " ",
-    )
+  return decodeEntities(value.replace(/<[^>]*>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -138,7 +145,7 @@ function metadata(html: string) {
     title: field(properties.get("og:title") || properties.get("twitter:title") || documentTitle, 200),
     description: field(properties.get("og:description") || properties.get("description"), 500),
     siteName: field(properties.get("og:site_name"), 100),
-    image: properties.get("og:image") || properties.get("twitter:image") || null,
+    image: decodeEntities(properties.get("og:image") || properties.get("twitter:image") || "") || null,
   };
 }
 
@@ -160,7 +167,40 @@ export async function linkPreview(env: Env, workspaceId: string, value: string) 
   const existing = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
     .bind(id, workspaceId)
     .first<CacheRow>();
-  if (existing && existing.expires_at > Date.now()) return responsePreview(existing);
+  const now = Date.now();
+  if (existing && existing.expires_at > now) return responsePreview(existing);
+  if (existing) {
+    const claimed = await env.DB.prepare(
+      "UPDATE link_preview_cache SET expires_at = ? WHERE id = ? AND workspace_id = ? AND expires_at <= ?",
+    )
+      .bind(now + REFRESH_LEASE, id, workspaceId, now)
+      .run();
+    if (!claimed.meta.changes) {
+      const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
+        .bind(id, workspaceId)
+        .first<CacheRow>();
+      if (current) return responsePreview(current);
+    }
+  } else {
+    const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM link_preview_cache WHERE workspace_id = ?")
+      .bind(workspaceId)
+      .first<{ count: number }>();
+    if ((count?.count ?? 0) >= MAX_WORKSPACE_PREVIEWS)
+      throw new HttpError(429, "preview_cache_full", "This workspace has too many cached previews.");
+    const claimed = await env.DB.prepare(
+      `INSERT OR IGNORE INTO link_preview_cache
+        (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    )
+      .bind(id, workspaceId, url.href, url.hostname, "", url.hostname, null, null, now + REFRESH_LEASE, now)
+      .run();
+    if (!claimed.meta.changes) {
+      const current = await env.DB.prepare("SELECT * FROM link_preview_cache WHERE id = ? AND workspace_id = ?")
+        .bind(id, workspaceId)
+        .first<CacheRow>();
+      if (current) return responsePreview(current);
+    }
+  }
 
   let title = url.hostname;
   let description = "";
@@ -186,9 +226,10 @@ export async function linkPreview(env: Env, workspaceId: string, value: string) 
         if (image.response.ok && IMAGE_MIMES.has(mime)) {
           const bytes = await boundedBytes(image.response, MAX_IMAGE);
           if (rasterSignature(mime, bytes)) {
-            imageKey = `link-previews/${workspaceId}/${id}`;
+            const key = `link-previews/${workspaceId}/${id}/${crypto.randomUUID()}`;
+            await env.BUCKET.put(key, bytes, { httpMetadata: { contentType: mime } });
+            imageKey = key;
             imageMime = mime;
-            await env.BUCKET.put(imageKey, bytes, { httpMetadata: { contentType: mime } });
           }
         }
       } catch {
@@ -247,14 +288,16 @@ export async function linkPreviewImage(env: Env, workspaceId: string, id: string
 
 export async function pruneLinkPreviews(env: Env) {
   const rows = await env.DB.prepare(
-    "SELECT id,image_key FROM link_preview_cache WHERE expires_at <= ? ORDER BY expires_at LIMIT 100",
+    "SELECT id FROM link_preview_cache WHERE expires_at <= ? ORDER BY expires_at LIMIT 100",
   )
     .bind(Date.now())
-    .all<{ id: string; image_key: string | null }>();
+    .all<{ id: string }>();
   for (const row of rows.results) {
-    if (row.image_key) await env.BUCKET.delete(row.image_key);
-    await env.DB.prepare("DELETE FROM link_preview_cache WHERE id = ? AND expires_at <= ?")
+    const removed = await env.DB.prepare(
+      "DELETE FROM link_preview_cache WHERE id = ? AND expires_at <= ? RETURNING image_key",
+    )
       .bind(row.id, Date.now())
-      .run();
+      .first<{ image_key: string | null }>();
+    if (removed?.image_key) await env.BUCKET.delete(removed.image_key);
   }
 }

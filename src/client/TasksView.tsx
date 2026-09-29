@@ -438,6 +438,7 @@ export function TasksView({
       }
       // A list load that started before this mutation can contain stale rows.
       generation.current++;
+      setLoading(false);
       setRevision(result.revision);
       revisionRef.current = result.revision;
       const revised = {

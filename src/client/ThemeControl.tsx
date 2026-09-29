@@ -39,6 +39,7 @@ export function ThemeControl({ compact = false }: { compact?: boolean }) {
     }
   });
   const colorScheme = context?.colorScheme ?? fallbackScheme;
+  const effectiveScheme = useEffectiveColorScheme();
   const setColorScheme = useCallback(
     (value: MantineColorScheme) => {
       if (context) {
@@ -56,10 +57,11 @@ export function ThemeControl({ compact = false }: { compact?: boolean }) {
   );
   useEffect(() => {
     if (!compact) return undefined;
-    const toggle = () => setColorScheme(colorScheme === "dark" ? "light" : "dark");
+    const toggle = () =>
+      setColorScheme((colorScheme === "auto" ? effectiveScheme : colorScheme) === "dark" ? "light" : "dark");
     window.addEventListener("notes:toggle-theme", toggle);
     return () => window.removeEventListener("notes:toggle-theme", toggle);
-  }, [colorScheme, compact, setColorScheme]);
+  }, [colorScheme, compact, effectiveScheme, setColorScheme]);
   if (compact) {
     const current = OPTIONS.find((option) => option.value === colorScheme) ?? OPTIONS[2]!;
     const next = colorScheme === "auto" ? "light" : colorScheme === "light" ? "dark" : "auto";

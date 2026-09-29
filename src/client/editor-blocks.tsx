@@ -274,7 +274,7 @@ function EmbedBlock({ url, title, update }: { url: string; title: string; update
           src={embedded.frameUrl}
           sandbox={embedded.provider.sandbox}
           allow={embedded.provider.allow}
-          referrerPolicy="no-referrer"
+          referrerPolicy="strict-origin-when-cross-origin"
           allowFullScreen
         />
       ) : (
@@ -326,19 +326,7 @@ type LinkPreview = {
   expiresAt: number;
 };
 
-export function BookmarkBlock({
-  url,
-  title,
-  previewId = "",
-  update,
-  updatePreviewId,
-}: {
-  url: string;
-  title: string;
-  previewId?: string;
-  update?: (url: string) => void;
-  updatePreviewId?: (id: string) => void;
-}) {
+export function BookmarkBlock({ url, title, update }: { url: string; title: string; update?: (url: string) => void }) {
   const expanded = useContext(EmbedFeatureContext);
   const [loaded, setLoaded] = useState<{ url: string; preview: LinkPreview } | null>(null);
   const [failedImage, setFailedImage] = useState<string | null>(null);
@@ -346,25 +334,28 @@ export function BookmarkBlock({
   useEffect(() => {
     if (!expanded || !url.startsWith("https://")) return undefined;
     const controller = new AbortController();
-    void api<{ preview: LinkPreview }>("/api/link-previews", {
-      method: "POST",
-      body: json({ url }),
-      signal: controller.signal,
-    })
-      .then((result) => setLoaded({ url, preview: result.preview }))
-      .catch(() => setLoaded(null));
-    return () => controller.abort();
+    const timer = window.setTimeout(() => {
+      void api<{ preview: LinkPreview }>("/api/link-previews", {
+        method: "POST",
+        body: json({ url }),
+        signal: controller.signal,
+      })
+        .then((result) => setLoaded({ url, preview: result.preview }))
+        .catch(() => setLoaded(null));
+    }, 500);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [expanded, url]);
-  useEffect(() => {
-    if (preview && preview.id !== previewId) updatePreviewId?.(preview.id);
-  }, [preview, previewId, updatePreviewId]);
+  const displayTitle = title && title !== "Bookmark" && title !== url ? title : preview?.title || title || "Bookmark";
   return (
     <div className="editor-bookmark">
       <a href={safeBookmarkUrl(url) ?? undefined} target="_blank" rel="noreferrer">
         {preview?.imageUrl && preview.imageUrl !== failedImage && (
           <img src={preview.imageUrl} alt="" loading="lazy" onError={() => setFailedImage(preview.imageUrl)} />
         )}
-        <strong>{preview?.title || title || "Bookmark"}</strong>
+        <strong>{displayTitle}</strong>
         {preview?.description && <span>{preview.description}</span>}
         <span>{preview?.siteName || url || "Add an HTTP, HTTPS, or mail link"}</span>
       </a>
@@ -392,11 +383,7 @@ const bookmark = createReactBlockSpec(
       <BookmarkBlock
         url={block.props.url}
         title={block.props.title}
-        previewId={block.props.previewId}
         update={editor.isEditable ? (url) => editor.updateBlock(block, { props: { url, previewId: "" } }) : undefined}
-        updatePreviewId={
-          editor.isEditable ? (id) => editor.updateBlock(block, { props: { previewId: id } }) : undefined
-        }
       />
     ),
     toExternalHTML: ({ block }) => (

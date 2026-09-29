@@ -15,7 +15,7 @@ describe("embed providers", () => {
       expect(frameSrc).toContain(provider.origin);
       expect(provider.sandbox).not.toContain("allow-top-navigation");
       expect(provider.sandbox).not.toContain("allow-popups");
-      expect(provider.sandbox).not.toContain("allow-same-origin");
+      expect(provider.sandbox).toContain("allow-same-origin");
       expect(resolveEmbed(provider.fixture) === null).toBe(provider.expanded);
     }
     expect(frameSrc.filter((origin) => origin !== "'self'").sort()).toEqual(
@@ -51,5 +51,15 @@ describe("embed providers", () => {
       ["https://codepen.io/chriscoyier/embed/gfdDu", "https://codepen.io/chriscoyier/embed/gfdDu?default-tab=result"],
     ] as const;
     for (const [source, expected] of examples) expect(resolveEmbed(source, true)?.frameUrl).toBe(expected);
+  });
+
+  it("keeps Google publish-to-web IDs and uses published frame paths", () => {
+    expect(resolveEmbed("https://docs.google.com/document/d/e/2PACX-abc123/pub", true)?.frameUrl).toBe(
+      "https://docs.google.com/document/d/e/2PACX-abc123/pub?embedded=true",
+    );
+    expect(resolveEmbed("https://docs.google.com/spreadsheets/d/e/2PACX-abc123/pubhtml", true)?.frameUrl).toBe(
+      "https://docs.google.com/spreadsheets/d/e/2PACX-abc123/pubhtml?widget=true&headers=false",
+    );
+    expect(resolveEmbed("https://docs.google.com/document/d/e/2PACX-abc123/edit", true)).toBeNull();
   });
 });

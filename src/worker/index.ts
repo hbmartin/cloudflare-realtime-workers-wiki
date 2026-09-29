@@ -4578,9 +4578,13 @@ app.post("/api/link-previews", async (c) => {
   assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
   if (c.env.EXPANDED_EMBEDS_ENABLED !== "true")
     throw new HttpError(404, "preview_disabled", "Link previews are unavailable.");
-  const body = await c.req.json<unknown>();
+  const body = await jsonBody(c.req.raw);
   const url = object(body).url;
   if (typeof url !== "string") throw new HttpError(400, "preview_url_invalid", "Use a public HTTPS URL.");
+  const { success } = await c.env.API_BURST_LIMIT.limit({
+    key: `link-preview:${member.workspace.id}:${member.user.id}`,
+  });
+  if (!success) throw new HttpError(429, "preview_rate_limited", "Link preview rate limit exceeded.");
   return c.json({ preview: await linkPreview(c.env, member.workspace.id, url) });
 });
 

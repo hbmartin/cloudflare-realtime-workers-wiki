@@ -588,6 +588,7 @@ function CollaborativeEditor({
   const [commentError, setCommentError] = useState("");
   const [pasteChoice, setPasteChoice] = useState<{ url: string; blockId: string } | null>(null);
   const editorShellRef = useRef<HTMLDivElement>(null);
+  const pasteChoiceRef = useRef<HTMLFieldSetElement>(null);
   const commentsPanel = useRef<HTMLDivElement>(null);
   const threadStore = useMemo(
     () => new ServerThreadStore(pageId, member.user.id, setCommentError),
@@ -617,6 +618,20 @@ function CollaborativeEditor({
     [bundle, editable, member, pageId, threadStore],
   );
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
+  useEffect(() => {
+    if (!pasteChoice) return undefined;
+    const choice = pasteChoiceRef.current;
+    choice?.querySelector("button")?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      setPasteChoice(null);
+      editor.focus();
+    };
+    choice?.addEventListener("keydown", onKeyDown);
+    return () => choice?.removeEventListener("keydown", onKeyDown);
+  }, [editor, pasteChoice]);
   useEffect(() => {
     const root = editorShellRef.current;
     if (!root) return undefined;
@@ -668,7 +683,23 @@ function CollaborativeEditor({
       editor.replaceBlocks([block], [{ type: "embed", props: { url, title: "Embedded link" } }] as never);
     } else {
       // Store the URL immediately; the bookmark resolves disposable metadata in the background.
-      editor.replaceBlocks([block], [{ type: "bookmark", props: { url, title: url, previewId: "" } }] as never);
+      const bookmarkId = crypto.randomUUID();
+      editor.replaceBlocks([block], [
+        { id: bookmarkId, type: "bookmark", props: { url, title: url, previewId: "" } },
+      ] as never);
+      void api<{ preview: { id: string } }>("/api/link-previews", {
+        method: "POST",
+        body: json({ url }),
+      })
+        .then(({ preview }) => {
+          const current = editor.getBlock(bookmarkId);
+          if (current?.type === "bookmark" && current.props.url === url) {
+            editor.updateBlock(current, { props: { previewId: preview.id } });
+          }
+        })
+        .catch(() => {
+          // A failed preview leaves the stored URL usable.
+        });
     }
     setPasteChoice(null);
   };
@@ -792,9 +823,21 @@ function CollaborativeEditor({
         ref={editorShellRef}
         onPasteCapture={(event) => {
           if (!editable || event.clipboardData.files.length || event.isDefaultPrevented()) return;
-          if (!(event.target instanceof Element) || !event.target.closest('.bn-editor[contenteditable="true"]')) return;
+          if (
+            !(event.target instanceof Element) ||
+            !editorShellRef.current?.contains(event.target) ||
+            !event.target.closest('.bn-editor[contenteditable="true"]')
+          )
+            return;
           const value = event.clipboardData.getData("text/plain").trim();
           if (!safeBookmarkUrl(value) || /\s/.test(value)) return;
+          if (
+            !(
+              (member.features?.expandedEmbeds && value.startsWith("https://")) ||
+              resolveEmbed(value, member.features?.expandedEmbeds)
+            )
+          )
+            return;
           const block = editor.getTextCursorPosition().block;
           if (block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) return;
           event.preventDefault();
@@ -828,7 +871,7 @@ function CollaborativeEditor({
             )}
         </BlockNoteView>
         {pasteChoice && (
-          <fieldset className="paste-url-choice">
+          <fieldset ref={pasteChoiceRef} className="paste-url-choice">
             <legend>Paste as</legend>
             <button type="button" onClick={() => choosePaste("link")}>
               Link

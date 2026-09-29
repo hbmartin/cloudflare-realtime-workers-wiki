@@ -698,6 +698,43 @@ afterEach(async () => {
 });
 
 describe("Worker integration", () => {
+  it("rejects malformed preview JSON without an internal error", async () => {
+    const installed = await bootstrap();
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, "/api/link-previews", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{bad",
+      }),
+      env,
+      createExecutionContext(),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: { code: "invalid_json" } });
+  });
+  it("limits preview requests before fetching remote pages", async () => {
+    const installed = await bootstrap();
+    const limitedEnv = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "API_BURST_LIMIT") return { limit: async () => ({ success: false }) };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const response = await worker.fetch(
+      authenticatedRequest(installed.cookie, "/api/link-previews", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ url: "https://example.org/article" }),
+      }),
+      limitedEnv,
+      createExecutionContext(),
+    );
+    expect(response.status).toBe(429);
+    expect(await response.json()).toMatchObject({ error: { code: "preview_rate_limited" } });
+    expect(
+      (await env.DB.prepare("SELECT COUNT(*) AS count FROM link_preview_cache").first<{ count: number }>())?.count,
+    ).toBe(0);
+  });
   it("keeps preview routes closed when the production feature flag is off", async () => {
     const installed = await bootstrap();
     const disabledEnv = new Proxy(env, {

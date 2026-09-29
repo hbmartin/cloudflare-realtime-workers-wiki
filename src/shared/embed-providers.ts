@@ -14,7 +14,7 @@ export const embedProviders: readonly EmbedProvider[] = [
   {
     id: "youtube",
     origin: "https://www.youtube-nocookie.com",
-    sandbox: "allow-scripts allow-presentation",
+    sandbox: "allow-scripts allow-same-origin allow-presentation",
     allow: "autoplay; encrypted-media; picture-in-picture",
     fixture: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     expanded: false,
@@ -38,7 +38,7 @@ export const embedProviders: readonly EmbedProvider[] = [
   {
     id: "vimeo",
     origin: "https://player.vimeo.com",
-    sandbox: "allow-scripts allow-presentation",
+    sandbox: "allow-scripts allow-same-origin allow-presentation",
     allow: "autoplay; fullscreen; picture-in-picture",
     fixture: "https://vimeo.com/76979871",
     expanded: false,
@@ -56,7 +56,7 @@ export const embedProviders: readonly EmbedProvider[] = [
   {
     id: "figma",
     origin: "https://embed.figma.com",
-    sandbox: "allow-scripts allow-presentation",
+    sandbox: "allow-scripts allow-same-origin allow-presentation",
     fixture: "https://www.figma.com/design/nrPSsILSYjesyc5UHjYYa4",
     expanded: false,
     frame: (url) => {
@@ -74,7 +74,7 @@ export const embedProviders: readonly EmbedProvider[] = [
   {
     id: "loom",
     origin: "https://www.loom.com",
-    sandbox: "allow-scripts allow-presentation",
+    sandbox: "allow-scripts allow-same-origin allow-presentation",
     allow: "autoplay; picture-in-picture",
     fixture: "https://www.loom.com/share/be3f4b20127d47be9f884c3fab71d030",
     expanded: true,
@@ -88,13 +88,26 @@ export const embedProviders: readonly EmbedProvider[] = [
   {
     id: "google-docs",
     origin: "https://docs.google.com",
-    sandbox: "allow-scripts allow-forms",
+    sandbox: "allow-scripts allow-same-origin allow-forms",
     fixture: "https://docs.google.com/document/d/example/edit",
     expanded: true,
     frame: (url) => {
       if (url.hostname !== "docs.google.com") return null;
+      const published = /^\/(document|spreadsheets|presentation)\/d\/e\/([A-Za-z0-9_-]+)\/(?:pub|pubhtml)\/?$/.exec(
+        url.pathname,
+      );
+      if (published) {
+        const suffix = published[1] === "spreadsheets" ? "pubhtml" : "pub";
+        const frame = new URL(`https://docs.google.com/${published[1]}/d/e/${published[2]}/${suffix}`);
+        if (published[1] === "document") frame.searchParams.set("embedded", "true");
+        if (published[1] === "spreadsheets") {
+          frame.searchParams.set("widget", "true");
+          frame.searchParams.set("headers", "false");
+        }
+        return frame.href;
+      }
       const match = /^\/(document|spreadsheets|presentation)\/d\/([A-Za-z0-9_-]+)(?:\/|$)/.exec(url.pathname);
-      if (!match) return null;
+      if (!match || match[2] === "e") return null;
       const suffix = match[1] === "presentation" ? "embed" : "preview";
       return `https://docs.google.com/${match[1]}/d/${match[2]}/${suffix}`;
     },
@@ -102,7 +115,7 @@ export const embedProviders: readonly EmbedProvider[] = [
   {
     id: "google-drive",
     origin: "https://drive.google.com",
-    sandbox: "allow-scripts allow-forms",
+    sandbox: "allow-scripts allow-same-origin allow-forms",
     fixture: "https://drive.google.com/file/d/example/view",
     expanded: true,
     frame: (url) => {
@@ -114,7 +127,7 @@ export const embedProviders: readonly EmbedProvider[] = [
   {
     id: "miro",
     origin: "https://miro.com",
-    sandbox: "allow-scripts allow-forms",
+    sandbox: "allow-scripts allow-same-origin allow-forms",
     fixture: "https://miro.com/app/board/o9J_kkQxX78=/",
     expanded: true,
     frame: (url) => {
@@ -126,7 +139,7 @@ export const embedProviders: readonly EmbedProvider[] = [
   {
     id: "spotify",
     origin: "https://open.spotify.com",
-    sandbox: "allow-scripts allow-presentation",
+    sandbox: "allow-scripts allow-same-origin allow-presentation",
     allow: "encrypted-media",
     fixture: "https://open.spotify.com/track/0Lr4kGOYn9l83EjuK6cZFQ",
     expanded: true,
@@ -141,7 +154,7 @@ export const embedProviders: readonly EmbedProvider[] = [
   {
     id: "codepen",
     origin: "https://codepen.io",
-    sandbox: "allow-scripts allow-forms",
+    sandbox: "allow-scripts allow-same-origin allow-forms",
     fixture: "https://codepen.io/chriscoyier/pen/gfdDu",
     expanded: true,
     frame: (url) => {

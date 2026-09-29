@@ -94,6 +94,11 @@ describe("Notion block adapter", () => {
     expect(() => notionInputToBlockContainer({ embed: { url: "https://untrusted.example/embed" } })).toThrow(
       /supported HTTPS provider/,
     );
+    expect(() =>
+      notionInputToBlockContainer({
+        embed: { url: `https://www.youtube.com/watch?v=dQw4w9WgXcQ&x=${"a".repeat(2_000)}` },
+      }),
+    ).toThrow(/2000/);
     expect(() => notionRichTextToProseMirror([{ text: { content: "x".repeat(2_001) } }])).toThrow(/2000/);
   });
 
