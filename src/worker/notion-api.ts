@@ -933,7 +933,7 @@ function keepMarkdownTaskLease(env: Env, task: MarkdownTaskRow) {
 }
 
 /** A D1 lease and a document-room receipt make crashes after commit safe to retry. */
-export async function runNotionMarkdownTask(env: Env, id: string) {
+async function runNotionMarkdownTask(env: Env, id: string) {
   if (env.NOTION_MARKDOWN_WRITES_ENABLED !== "true") return;
   const task = await claimMarkdownTask(env, id);
   if (!task) return;

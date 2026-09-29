@@ -43,6 +43,9 @@ export interface Env extends AppBindings {}
 
 declare global {
   namespace Cloudflare {
-    interface Env extends Omit<AppBindings, "BROWSER" | "EXPANDED_EMBEDS_ENABLED" | "OFFLINE_EDITING_ENABLED"> {}
+    interface Env extends Omit<
+      AppBindings,
+      "BROWSER" | "EXPANDED_EMBEDS_ENABLED" | "NOTION_MARKDOWN_WRITES_ENABLED" | "OFFLINE_EDITING_ENABLED"
+    > {}
   }
 }

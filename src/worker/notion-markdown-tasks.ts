@@ -2,7 +2,7 @@ import type { Env } from "./env";
 
 export const RESULT_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const LEASE_MS = 60_000;
-export const MAX_MARKDOWN_TASK_ATTEMPTS = 10;
+const MAX_MARKDOWN_TASK_ATTEMPTS = 10;
 
 export type MarkdownTaskRow = {
   id: string;
