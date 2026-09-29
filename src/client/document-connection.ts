@@ -10,7 +10,6 @@ export type ProviderControl = {
 export type DocumentCloseReconcilerOptions = {
   page: Pick<Page, "id" | "contentEpoch">;
   provider: ProviderControl;
-  canQuarantine: boolean;
   hasUnsyncedChanges: () => boolean;
   quarantine: () => void;
   onPageChanged: (page: Page) => void;
@@ -25,7 +24,6 @@ const RECONCILED_CLOSE_CODES = new Set([4410, 4412, 1006]);
 export function createDocumentCloseReconciler({
   page,
   provider,
-  canQuarantine,
   hasUnsyncedChanges,
   quarantine,
   onPageChanged,
@@ -72,7 +70,7 @@ export function createDocumentCloseReconciler({
     try {
       const result = await api<{ page: Page }>(`/api/pages/${page.id}`);
       if (!active || check !== closeCheck) return;
-      if (result.page.contentEpoch !== page.contentEpoch && canQuarantine && hasUnsyncedChanges()) {
+      if (result.page.contentEpoch !== page.contentEpoch && hasUnsyncedChanges()) {
         quarantine();
       }
       if (result.page.archivedAt !== null) {
@@ -128,7 +126,7 @@ export function createDocumentCloseReconciler({
       }
       if (!RECONCILED_CLOSE_CODES.has(event.code)) return;
       const check = invalidate();
-      if (event.code === 4410 && canQuarantine && hasUnsyncedChanges()) quarantine();
+      if (event.code === 4410 && hasUnsyncedChanges()) quarantine();
       void reconcileClose(event.code, check);
     },
     handleSync(synced: boolean) {

@@ -38,7 +38,6 @@ function setup(hasUnsyncedChanges = false) {
   const reconciler = createDocumentCloseReconciler({
     page,
     provider,
-    canQuarantine: true,
     hasUnsyncedChanges: () => hasUnsyncedChanges,
     quarantine,
     onPageChanged,
