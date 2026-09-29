@@ -851,17 +851,29 @@ export class Document extends YServer {
       return new Response("Forbidden", { status: 403 });
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
-      // A compaction may capture one sequence while new websocket edits arrive.
-      // Keep the response tied to a committed sequence, or ask the caller to retry.
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        this.flushPendingUpdates();
-        if (!this.metadata.dirty && !this.compaction) break;
-        await this.compact();
-      }
+      // A single compaction captures one coherent envelope. New websocket edits
+      // can arrive while it persists; readers can still use the committed copy.
       this.flushPendingUpdates();
-      if (this.metadata.dirty || this.compaction)
-        return Response.json({ error: "Document content is still changing." }, { status: 503 });
+      if (this.compaction) await this.compaction;
+      else if (this.metadata.dirty) await this.compact();
+      this.flushPendingUpdates();
       const { pageId, epoch } = this.ids;
+      if (this.metadata.dirty || this.compaction) {
+        const table = this.metadata.content_kind === "diagram" ? "diagram_projections" : "document_projections";
+        const row = await this.bindings.DB.prepare(
+          `SELECT sequence,r2_key,content_hash FROM ${table} WHERE page_id=? AND content_epoch=?`,
+        )
+          .bind(pageId, epoch)
+          .first<{ sequence: number; r2_key: string; content_hash: string }>();
+        const stored = row ? await this.bindings.BUCKET.get(row.r2_key) : null;
+        if (!stored) return Response.json({ error: "Committed document content is unavailable." }, { status: 503 });
+        const envelope = await stored.json<{ pageId: string; contentEpoch: number; sequence: number }>();
+        if (envelope.pageId !== pageId || envelope.contentEpoch !== epoch || envelope.sequence !== row!.sequence)
+          return Response.json({ error: "Committed document content is invalid." }, { status: 503 });
+        return Response.json(envelope, {
+          headers: { etag: `"${row!.content_hash}"`, "x-notes-content-current": "0" },
+        });
+      }
       if (this.metadata.content_kind === "diagram") {
         const envelope = diagramFromYDoc(this.document, {
           pageId,
@@ -869,7 +881,7 @@ export class Document extends YServer {
           sequence: this.metadata.snapshot_seq,
         });
         return Response.json(envelope, {
-          headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
+          headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"`, "x-notes-content-current": "1" },
         });
       }
       const document = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
@@ -881,7 +893,7 @@ export class Document extends YServer {
         document,
       };
       return Response.json(envelope, {
-        headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"` },
+        headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"`, "x-notes-content-current": "1" },
       });
     }
     if (request.method === "POST" && url.pathname.endsWith("/api-mutate")) {

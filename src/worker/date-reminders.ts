@@ -62,7 +62,8 @@ async function roomEnvelope(env: Env, pageId: string, epoch: number) {
       headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
     }),
   );
-  if (!response.ok) throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
+  if (!response.ok || response.headers.get("x-notes-content-current") !== "1")
+    throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
   const envelope = await response.json<DocumentContentEnvelope>();
   if (envelope.pageId !== pageId || envelope.contentEpoch !== epoch || envelope.document.type !== "doc")
     throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
@@ -353,18 +354,21 @@ async function sweepDateReminders(env: Env) {
       );
       if (!applied) retryDelay = 0;
     } catch (error) {
-      retryDelay = 2 * 60_000;
-      failures.push(error);
-      logger.error(
-        "date_reminder.sweep.failed",
-        "scheduler",
-        "Date reminder reconciliation failed.",
-        { pageId: row.page_id, epoch: row.content_epoch },
-        error,
-      );
+      if (error instanceof HttpError && error.code === "content_unavailable") retryDelay = 0;
+      else {
+        retryDelay = 2 * 60_000;
+        failures.push(error);
+        logger.error(
+          "date_reminder.sweep.failed",
+          "scheduler",
+          "Date reminder reconciliation failed.",
+          { pageId: row.page_id, epoch: row.content_epoch },
+          error,
+        );
+      }
     }
     if (retryDelay !== null) {
-      // Failed rooms skip the next sweep tick; stale sequence races retry next tick.
+      // A stale or changing room retries next tick; other failures skip one tick.
       await rotateSweepRows(env, row.page_id, row.content_epoch, cutoffs, retryDelay).catch((rotateError) => {
         failures.push(rotateError);
         logger.error(
@@ -393,13 +397,14 @@ async function rotateSweepRows(
   cutoffs: { active: number; delivered: number },
   retryDelay: number,
 ) {
-  const nextAttempt = Date.now() + retryDelay;
+  const offset = retryDelay === 0 ? 2 * 60_000 : 17 * 60_000;
   await env.DB.prepare(
-    `UPDATE date_reminders SET checked_at=?
+    `UPDATE date_reminders SET checked_at=CASE
+       WHEN state='delivered' THEN ? ELSE ? END
      WHERE page_id=? AND content_epoch=?
        AND ((state IN ('active','claimed') AND checked_at<?) OR (state='delivered' AND checked_at<?))`,
   )
-    .bind(nextAttempt, pageId, epoch, cutoffs.active, cutoffs.delivered)
+    .bind(cutoffs.delivered + offset, cutoffs.active + offset, pageId, epoch, cutoffs.active, cutoffs.delivered)
     .run();
 }
 
@@ -528,7 +533,8 @@ async function deliverDueDateReminders(env: Env) {
         });
       }
     } catch (error) {
-      logger.error("date_reminder.delivery.failed", "scheduler", "Date reminder delivery failed.", { id }, error);
+      if (!(error instanceof HttpError && error.code === "content_unavailable"))
+        logger.error("date_reminder.delivery.failed", "scheduler", "Date reminder delivery failed.", { id }, error);
       await releaseReminderClaim(env, row, claimId);
     }
   }

@@ -135,6 +135,37 @@ afterEach(async () => {
 });
 
 describe("date reminders", () => {
+  it("returns a committed content sequence when edits arrive during compaction", async () => {
+    const installed = await bootstrap();
+    const stub = env.DOCUMENT.getByName(`${installed.page.id}~1`);
+    const content = () =>
+      stub.fetch(
+        new Request("https://document.internal/content", {
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        }),
+      );
+    await content();
+    await runInDurableObject(stub, async (instance) => {
+      const document = (instance as unknown as { document: Y.Doc }).document;
+      document.transact(() => document.getXmlFragment("document-store").insert(0, [new Y.XmlElement("paragraph")]));
+    });
+    const before = await content();
+    expect(before.status).toBe(200);
+    expect(before.headers.get("x-notes-content-current")).toBe("1");
+    const committed = await before.json<{ sequence: number; document: unknown }>();
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as { document: Y.Doc; compaction: Promise<void> | null };
+      room.compaction = Promise.resolve();
+      room.document.transact(() => {
+        room.document.getXmlFragment("document-store").insert(0, [new Y.XmlElement("paragraph")]);
+      });
+    });
+    const during = await content();
+    expect(during.status).toBe(200);
+    expect(during.headers.get("x-notes-content-current")).toBe("0");
+    expect(await during.json()).toEqual(committed);
+  });
+
   it("validates expected document sequences before block mutation", async () => {
     const installed = await bootstrap();
     const token: DateMention = {
