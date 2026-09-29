@@ -10,13 +10,7 @@
     <link rel="icon" type="image/png" href="/favicon-32x32.png" sizes="32x32" />
     <link rel="icon" type="image/png" href="/favicon-16x16.png" sizes="16x16" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" sizes="180x180" />
-    <script>
-      try {
-        const saved = localStorage.getItem("notes:color-scheme") || "auto";
-        const dark = saved === "dark" || (saved === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
-        document.documentElement.dataset.mantineColorScheme = dark ? "dark" : "light";
-      } catch {}
-    </script>
+    <script src="/theme-init.js"></script>
     <title>NoteFlare</title>
   </head>
   <body>

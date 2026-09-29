@@ -92,7 +92,11 @@ vi.mock("@blocknote/react", () => ({
 }));
 
 vi.mock("./BacklinksPanel", () => ({ BacklinksPanel: () => null }));
-vi.mock("./editor-blocks", () => ({ editorBlockFactories: [] }));
+vi.mock("./editor-blocks", async () => ({
+  editorBlockFactories: [],
+  EmbedFeatureContext: (await import("react")).createContext(false),
+  safeBookmarkUrl: (value: string) => value,
+}));
 vi.mock("./mentions", () => ({ notesSchema: {}, notesCommentSchema: {} }));
 
 const page: Page = {

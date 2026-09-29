@@ -20,7 +20,11 @@ export default defineConfig(({ command }) => {
     plugins: [
       react(),
       cloudflare({
-        persistState: isE2E ? { path: ".wrangler/e2e" } : true,
+        persistState: process.env.NOTES_E2E_STATE
+          ? { path: process.env.NOTES_E2E_STATE }
+          : isE2E
+            ? { path: ".wrangler/e2e" }
+            : true,
         ...(isE2E
           ? {
               inspectorPort: false,

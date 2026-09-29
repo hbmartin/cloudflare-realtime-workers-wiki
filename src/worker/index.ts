@@ -20,6 +20,7 @@ import {
   UPLOAD_SESSION_TTL_MS,
 } from "./attachments";
 import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
+import { linkPreview, linkPreviewImage, pruneLinkPreviews } from "./link-previews";
 import {
   createIntegration,
   integrationGrants,
@@ -1518,6 +1519,7 @@ app.get("/api/me", async (c) => {
     user: member.user,
     workspace: member.workspace,
     role: member.role,
+    features: { expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true" },
   };
   return c.json(context);
 });
@@ -4571,6 +4573,24 @@ app.get("/api/search/titles", async (c) => {
   return c.json(await searchTitles(c.env.DB, member, c.req.url));
 });
 
+app.post("/api/link-previews", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  assertSameOrigin(c.req.raw, c.env.BETTER_AUTH_URL);
+  if (c.env.EXPANDED_EMBEDS_ENABLED !== "true")
+    throw new HttpError(404, "preview_disabled", "Link previews are unavailable.");
+  const body = await c.req.json<unknown>();
+  const url = object(body).url;
+  if (typeof url !== "string") throw new HttpError(400, "preview_url_invalid", "Use a public HTTPS URL.");
+  return c.json({ preview: await linkPreview(c.env, member.workspace.id, url) });
+});
+
+app.get("/api/link-previews/:id/image", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  if (c.env.EXPANDED_EMBEDS_ENABLED !== "true")
+    throw new HttpError(404, "preview_disabled", "Link previews are unavailable.");
+  return linkPreviewImage(c.env, member.workspace.id, c.req.param("id"));
+});
+
 app.get("/api/mentions/suggestions", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const query = (c.req.query("q") ?? "").trim().slice(0, 100);
@@ -6869,6 +6889,7 @@ export default {
         outbox: async () => {
           await sweepOutbox(env);
           await purgeExpiredSlackSearchSessions(env);
+          await pruneLinkPreviews(env);
         },
         slack_redrive: () => redriveStaleSlackOutbox(env),
         job_artifacts: () => expireJobArtifacts(env),

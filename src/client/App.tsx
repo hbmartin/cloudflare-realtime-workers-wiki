@@ -1,5 +1,6 @@
 import { TasksView } from "./TasksView";
-import { ActionMenu, Icon, QuickSwitcher, RecentPages, readPreference, savePreference } from "./WorkspaceUI";
+import { ActionMenu, Icon, RecentPages, readPreference, savePreference } from "./WorkspaceUI";
+import { CommandPalette, type AppCommand, type PaletteMode } from "./CommandPalette";
 import { CreationMenu, WorkspaceTree } from "./WorkspaceTree";
 import {
   lazy,
@@ -1098,7 +1099,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     Math.max(220, Math.min(420, readPreference(`${preferencesKey}:width`, 260))),
   );
   const [recentIds, setRecentIds] = useState<string[]>(() => readPreference(`${preferencesKey}:recent`, []));
-  const [quickSwitcherOpen, setQuickSwitcherOpen] = useState(false);
+  const [paletteMode, setPaletteMode] = useState<PaletteMode | null>(null);
+  const [moveDialogOpen, setMoveDialogOpen] = useState(false);
   useEffect(() => {
     savePreference(`${preferencesKey}:collapsed`, sidebarCollapsed);
     savePreference(`${preferencesKey}:width`, sidebarWidth);
@@ -1111,10 +1113,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       const target = event.target instanceof Element ? event.target : null;
       const editableTarget = target?.closest("input, textarea, select, [contenteditable='true']");
       const shortcutModifier = /Mac|iPhone|iPad/.test(navigator.platform) ? event.metaKey : event.ctrlKey;
-      if (!event.defaultPrevented && !editableTarget && shortcutModifier && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        setQuickSwitcherOpen((open) => !open);
+      if (event.defaultPrevented || event.isComposing || event.key === "Process") return;
+      if (document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]')) return;
+      let mode: PaletteMode | null = null;
+      if (shortcutModifier && !event.altKey) {
+        if (event.key.toLowerCase() === "k" && !event.shiftKey) mode = "all";
+        if (event.key.toLowerCase() === "p") mode = event.shiftKey ? "commands" : "pages";
+      } else if (!editableTarget && !event.metaKey && !event.ctrlKey && !event.altKey && event.key === "?") {
+        mode = "help";
       }
+      if (!mode) return;
+      event.preventDefault();
+      setPaletteMode(mode);
     };
     window.addEventListener("keydown", handle);
     return () => window.removeEventListener("keydown", handle);
@@ -2579,6 +2589,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     () => (activeSpace ? { ...member, role: activeSpace.effectiveRole } : member),
     [activeSpace, member],
   );
+  useEffect(() => {
+    if (!pagesLoaded) return;
+    const accessible = new Set(pages.filter((page) => !page.archivedAt && !page.isTemplate).map((page) => page.id));
+    // Access can change after local recents have already been persisted.
+    // eslint-disable-next-line react/set-state-in-effect
+    setRecentIds((current) => {
+      const filtered = current.filter((id) => accessible.has(id));
+      return filtered.length === current.length ? current : filtered;
+    });
+  }, [pages, pagesLoaded]);
   const rememberSelected = Boolean(activeSelected && !activeSelected.isTemplate && activeSelected.archivedAt === null);
   useEffect(() => {
     if (resolvedSelectedId && rememberSelected && view !== "home") {
@@ -3294,6 +3314,60 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const initialPageLoadFailed = !pagesLoaded && workspaceErrors.some((error) => error.source === "page-tree");
   const pendingPageError = workspaceErrors.find((error) => error.source === "page-access")?.message;
 
+  const commands: AppCommand[] = [
+    {
+      id: "create-document",
+      label: "Create document",
+      shortcut: "",
+      isAvailable: () => canCreatePage,
+      run: () => void createPage("document"),
+    },
+    {
+      id: "create-table",
+      label: "Create table",
+      shortcut: "",
+      isAvailable: () => canCreatePage,
+      run: () => void createPage("table"),
+    },
+    {
+      id: "create-diagram",
+      label: "Create diagram",
+      shortcut: "",
+      isAvailable: () => canCreatePage,
+      run: () => void createPage("diagram"),
+    },
+    {
+      id: "create-task-list",
+      label: "Create task list",
+      shortcut: "",
+      isAvailable: () => canCreatePage,
+      run: () => void createPage("tasks"),
+    },
+    { id: "search", label: "Search workspace", shortcut: "", isAvailable: () => true, run: () => showView("search") },
+    { id: "inbox", label: "Open inbox", shortcut: "", isAvailable: () => true, run: openNotifications },
+    {
+      id: "theme",
+      label: "Toggle theme",
+      shortcut: "",
+      isAvailable: () => true,
+      run: () => window.dispatchEvent(new Event("notes:toggle-theme")),
+    },
+    {
+      id: "export",
+      label: "Export current page",
+      shortcut: "",
+      isAvailable: () => Boolean(activeSelected && !activeSelected.isTemplate),
+      run: () => setExportOpen(true),
+    },
+    {
+      id: "move",
+      label: "Move current page",
+      shortcut: "",
+      isAvailable: () => Boolean(activeSelected && !activeSelected.isTemplate && canEditActiveSpace),
+      run: () => setMoveDialogOpen(true),
+    },
+  ];
+
   const metadata = activeSelected ? (
     <PageTags
       assigned={pageTags.pageId === activeSelected.id ? pageTags.tags : []}
@@ -3607,9 +3681,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <div className="topbar-actions">
             <button
               className="icon-button"
-              aria-label="Find a page (⌘K / Ctrl+K)"
-              title="Find a page (⌘K / Ctrl+K)"
-              onClick={() => setQuickSwitcherOpen(true)}
+              aria-label="Find a page or command (⌘K / Ctrl+K)"
+              title="Find a page or command (⌘K / Ctrl+K)"
+              onClick={() => setPaletteMode("all")}
             >
               <Icon name="search" />
             </button>
@@ -3904,16 +3978,95 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           }}
         />
       )}
-      {quickSwitcherOpen && (
-        <QuickSwitcher
+      {paletteMode && (
+        <CommandPalette
+          mode={paletteMode}
           pages={pages.filter((page) => !page.isTemplate && !page.archivedAt)}
           recentIds={recentIds}
-          onSelect={navigateToPage}
-          onClose={() => setQuickSwitcherOpen(false)}
+          commands={commands}
+          onSelectPage={navigateToPage}
+          onClose={() => setPaletteMode(null)}
+        />
+      )}
+      {moveDialogOpen && activeSelected && (
+        <MovePageDialog
+          page={activeSelected}
+          pages={pages}
+          onMove={(parentId) => void move(activeSelected.id, parentId)}
+          onClose={() => setMoveDialogOpen(false)}
         />
       )}
       {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
     </div>
+  );
+}
+
+function MovePageDialog({
+  page,
+  pages,
+  onMove,
+  onClose,
+}: {
+  page: Page;
+  pages: Page[];
+  onMove: (parentId: string | null) => void;
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDialogElement>(null);
+  const [parentId, setParentId] = useState(page.parentId ?? "");
+  useEffect(() => {
+    const dialog = ref.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+  const byId = new Map(pages.map((item) => [item.id, item]));
+  const eligible = pages.filter((candidate) => {
+    if (candidate.id === page.id || candidate.spaceId !== page.spaceId || candidate.archivedAt || candidate.isTemplate)
+      return false;
+    let parent: Page | undefined = candidate;
+    while (parent) {
+      if (parent.id === page.id) return false;
+      parent = parent.parentId ? byId.get(parent.parentId) : undefined;
+    }
+    return true;
+  });
+  return (
+    <dialog
+      ref={ref}
+      className="move-page-dialog"
+      aria-label={`Move ${page.title}`}
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+    >
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          onMove(parentId || null);
+          onClose();
+        }}
+      >
+        <h2>Move “{page.title}”</h2>
+        <label>
+          Destination
+          <select value={parentId} onChange={(event) => setParentId(event.target.value)}>
+            <option value="">Top level of this space</option>
+            {eligible.map((candidate) => (
+              <option key={candidate.id} value={candidate.id}>
+                {candidate.title}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="dialog-actions">
+          <button type="button" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit">Move page</button>
+        </div>
+      </form>
+    </dialog>
   );
 }
 

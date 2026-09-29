@@ -51,7 +51,9 @@ export type MemberContext = {
   role: Role;
 };
 
-export type ClientMemberContext = Omit<MemberContext, "session">;
+export type ClientMemberContext = Omit<MemberContext, "session"> & {
+  features?: { expandedEmbeds: boolean };
+};
 
 export type Page = {
   id: string;

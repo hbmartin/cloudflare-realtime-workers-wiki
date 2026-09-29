@@ -2630,8 +2630,48 @@ button.mention-chip:focus-visible {
 }
 .editor-bookmark a {
   display: grid;
+  gap: 4px;
   color: var(--ink);
   text-decoration: none;
+}
+.editor-bookmark img {
+  width: 100%;
+  max-height: 180px;
+  object-fit: cover;
+  border-radius: 6px;
+}
+.notes-editor [data-content-type="codeBlock"] {
+  position: relative;
+}
+.code-copy-button {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-elevated);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 12px;
+}
+.paste-url-choice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-elevated);
+}
+.paste-url-choice button {
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface-muted);
+  color: var(--ink);
+  cursor: pointer;
 }
 .editor-bookmark span,
 .editor-synced-placeholder,
@@ -3757,6 +3797,36 @@ button.mention-chip:focus-visible {
 .quick-switcher-results button:hover,
 .recent-pages button:hover {
   background: var(--surface-hover);
+}
+.quick-switcher-results button small {
+  margin-left: auto;
+  color: var(--muted);
+}
+.move-page-dialog {
+  width: min(460px, calc(100vw - 32px));
+  margin: 16vh auto auto;
+  padding: 24px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-elevated);
+  color: var(--ink);
+}
+.move-page-dialog::backdrop {
+  background: #0005;
+}
+.move-page-dialog form,
+.move-page-dialog label {
+  display: grid;
+  gap: 12px;
+}
+.move-page-dialog select {
+  width: 100%;
+  padding: 8px;
+}
+.move-page-dialog .dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 .quick-switcher footer {
   padding-top: 12px;

@@ -91,7 +91,9 @@ describe("Notion block adapter", () => {
   });
 
   it("rejects disallowed embeds and oversized rich text", () => {
-    expect(() => notionInputToBlockContainer({ embed: { url: "https://untrusted.example/embed" } })).toThrow(/YouTube/);
+    expect(() => notionInputToBlockContainer({ embed: { url: "https://untrusted.example/embed" } })).toThrow(
+      /supported HTTPS provider/,
+    );
     expect(() => notionRichTextToProseMirror([{ text: { content: "x".repeat(2_001) } }])).toThrow(/2000/);
   });
 

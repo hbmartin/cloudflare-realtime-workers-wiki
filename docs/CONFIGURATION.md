@@ -8,9 +8,10 @@ be confirmed rather than trusted.
 Set in the environment's `vars` block of `wrangler.jsonc`. Plaintext; visible in the dashboard and in
 the repository.
 
-| Name              | Default                 | Notes                                                                                                                                                                                                                                                                                                                                                                  |
-| ----------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BETTER_AUTH_URL` | `http://localhost:5173` | The exact origin the installation is served from. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **The production environment must use its deployed HTTPS origin.** |
+| Name                      | Default                 | Notes                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------- | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BETTER_AUTH_URL`         | `http://localhost:5173` | The exact origin the installation is served from. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **The production environment must use its deployed HTTPS origin.** |
+| `EXPANDED_EMBEDS_ENABLED` | unset (off)             | Set to `true` to enable Loom, Google, Miro, Spotify, and CodePen frames and the link-preview action. The Worker exposes the flag in `/api/me`; disabling it preserves stored links and the original YouTube, Vimeo, and Figma frames.                                                                                                                                  |
 
 ## Secrets
 
@@ -104,6 +105,7 @@ The Worker exports two Durable Object classes, so per-version preview URLs are u
 | `diagrams/{pageId}/epochs/{epoch}/thumbnails/`  | Generated private SVG thumbnails                 |
 | `diagrams/{pageId}/versions/{versionId}.bin`    | Immutable diagram version snapshots              |
 | `assets/{workspaceId}/{uuid}`                   | Attachment bodies, server-generated private keys |
+| `link-previews/{workspaceId}/{hash}`            | Disposable raster images for cached link cards   |
 
 ## Tunable constants
 

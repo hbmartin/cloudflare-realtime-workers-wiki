@@ -6,6 +6,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Page } from "../shared/types";
 import {
   allowedEmbedUrl,
+  BookmarkBlock,
+  EmbedFeatureContext,
   editorBlockFactories,
   LinkedDiagramView,
   MermaidBlock,
@@ -52,12 +54,46 @@ describe("core editor blocks", () => {
     expect(safeBookmarkUrl("javascript:alert(1)")).toBeNull();
   });
 
-  it("accepts only canonical HTTP and HTTPS URLs for PDF frames", () => {
-    expect(safePdfUrl(" https://example.com/manual.pdf ")).toBe("https://example.com/manual.pdf");
-    expect(safePdfUrl("http://localhost/manual.pdf")).toBe("http://localhost/manual.pdf");
+  it("frames only same-origin attachments and links remote PDFs", () => {
+    expect(safePdfUrl(" https://example.com/manual.pdf ")).toBeNull();
+    expect(safePdfUrl("http://localhost/manual.pdf")).toBeNull();
     expect(safePdfUrl("mailto:owner@example.test")).toBeNull();
     expect(safePdfUrl("javascript:alert(1)")).toBeNull();
-    expect(safePdfUrl("/api/attachments/file-id")).toBeNull();
+    expect(safePdfUrl("/api/attachments/file-id")).toBe("/api/attachments/file-id");
+  });
+
+  it("stores a preview ID while keeping its URL usable if the preview fails", async () => {
+    const url = "https://example.com/article";
+    const update = vi.fn();
+    const updatePreviewId = vi.fn();
+    mocks.api.mockResolvedValueOnce({
+      preview: {
+        id: "preview-id",
+        url,
+        title: "Article",
+        description: "Summary",
+        siteName: "Example",
+        imageUrl: null,
+        expiresAt: Date.now() + 1000,
+      },
+    });
+    const block = (value: string, id = "") =>
+      createElement(
+        EmbedFeatureContext.Provider,
+        { value: true },
+        createElement(BookmarkBlock, { url: value, title: "Saved title", previewId: id, update, updatePreviewId }),
+      );
+    const view = render(block(url));
+    await waitFor(() => expect(updatePreviewId).toHaveBeenCalledWith("preview-id"));
+    expect(screen.getByRole("link")).toHaveAttribute("href", url);
+    view.rerender(block(url, "preview-id"));
+    expect(updatePreviewId).toHaveBeenCalledTimes(1);
+    fireEvent.change(screen.getByLabelText("Bookmark URL"), { target: { value: "https://example.com/other" } });
+    expect(update).toHaveBeenCalledWith("https://example.com/other");
+    mocks.api.mockRejectedValueOnce(new Error("proxy unavailable"));
+    view.rerender(block("https://example.com/other"));
+    await waitFor(() => expect(mocks.api).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("link")).toHaveAttribute("href", "https://example.com/other");
   });
 
   it("uses a fresh Mermaid DOM id for every render invocation", async () => {

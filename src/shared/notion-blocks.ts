@@ -1,4 +1,5 @@
 import type { ProseMirrorJson } from "./types";
+import { resolveEmbed } from "./embed-providers";
 
 export const NOTION_VERSION = "2026-03-11";
 export const NOTION_PAGE_SIZE_MAX = 100;
@@ -408,22 +409,8 @@ function validatedExternalUrl(value: string, label: string) {
 }
 
 function validatedEmbedUrl(value: string) {
-  const href = validatedExternalUrl(value, "Embed");
-  const hostname = new URL(href).hostname.toLowerCase();
-  if (
-    ![
-      "youtu.be",
-      "youtube.com",
-      "www.youtube.com",
-      "vimeo.com",
-      "www.vimeo.com",
-      "figma.com",
-      "www.figma.com",
-    ].includes(hostname)
-  ) {
-    throw new Error("Embeds are limited to YouTube, Vimeo, and Figma URLs.");
-  }
-  return href;
+  if (!resolveEmbed(value, true)) throw new Error("Embeds require a supported HTTPS provider URL.");
+  return new URL(value).href;
 }
 
 function notionPlainText(value: unknown) {

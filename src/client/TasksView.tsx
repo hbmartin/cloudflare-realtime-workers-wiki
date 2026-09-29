@@ -411,7 +411,6 @@ export function TasksView({
     const listId = task?.listId ?? page?.id;
     if (!listId) return false;
     const startedViewEpoch = viewEpoch.current;
-    const startedGeneration = generation.current;
     const current = task ? (dataRef.current.tasks.find((item) => item.id === task.id) ?? task) : null;
     const readVersion = task ? (taskReadVersion.current.get(task.id) ?? 0) + 1 : 1;
     if (task) taskReadVersion.current.set(task.id, readVersion);
@@ -433,10 +432,12 @@ export function TasksView({
           }),
         },
       );
-      if (!active.current || viewEpoch.current !== startedViewEpoch || generation.current !== startedGeneration) {
+      if (!active.current || viewEpoch.current !== startedViewEpoch) {
         onTaskOperationSettled?.(operationId, false);
         return true;
       }
+      // A list load that started before this mutation can contain stale rows.
+      generation.current++;
       setRevision(result.revision);
       revisionRef.current = result.revision;
       const revised = {
@@ -462,13 +463,20 @@ export function TasksView({
       if (!task) taskReadVersion.current.set(rowId, readVersion);
       const reconcile = async () => {
         const response = await taskApi<TaskResponse>(`/api/tasks?rowId=${encodeURIComponent(rowId)}`);
+        const assignees =
+          listId in membersRef.current
+            ? null
+            : await taskApi<{ members: Person[] }>(`/api/task-lists/${listId}/assignees`);
         if (
           !active.current ||
           viewEpoch.current !== startedViewEpoch ||
-          generation.current !== startedGeneration ||
           taskReadVersion.current.get(rowId) !== readVersion
         )
           return false;
+        if (assignees) {
+          membersRef.current = { ...membersRef.current, [listId]: assignees.members };
+          setMembers(membersRef.current);
+        }
         const found = response.tasks.find((item) => item.id === rowId);
         const currentListRevision = Math.max(
           result.revision,
@@ -505,7 +513,7 @@ export function TasksView({
       return true;
     } catch (cause) {
       onTaskOperationSettled?.(operationId, false);
-      if (active.current && viewEpoch.current === startedViewEpoch && generation.current === startedGeneration) {
+      if (active.current && viewEpoch.current === startedViewEpoch) {
         setError({
           owner: "save",
           message: apiErrorMessage(cause, "The task could not be saved. Your change is ready to retry."),

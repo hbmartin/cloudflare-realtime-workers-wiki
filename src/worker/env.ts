@@ -33,6 +33,7 @@ export interface AppBindings {
   BOOTSTRAP_TOKEN: string;
   DO_LOCATION_HINT?: DurableObjectLocationHint;
   WORKFLOW_INLINE?: "true";
+  EXPANDED_EMBEDS_ENABLED?: "true" | "false";
   OBSERVABILITY_PROBE_TOKEN?: string;
 }
 
@@ -40,6 +41,6 @@ export interface Env extends AppBindings {}
 
 declare global {
   namespace Cloudflare {
-    interface Env extends Omit<AppBindings, "BROWSER"> {}
+    interface Env extends Omit<AppBindings, "BROWSER" | "EXPANDED_EMBEDS_ENABLED"> {}
   }
 }
