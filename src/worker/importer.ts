@@ -770,7 +770,7 @@ async function singlePageBundle(job: JobRow, options: ImportOptions, bytes: Uint
   const page: ImportPage = {
     source: options.filename,
     id: await stableId(job.id, "page", options.filename),
-    parentId: null,
+    parentId: options.parentId ?? null,
     parentSource: null,
     spaceId: destinationSpaceId(job, options, "Imported"),
     groupKey: "Imported",
@@ -1372,7 +1372,12 @@ async function runImportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
   const refreshing = options.confirmed && !hasCurrentImportConfirmation(options);
   if (refreshing) {
     const obsoleteJob = job;
-    options = { filename: options.filename, format: options.format, confirmed: false };
+    options = {
+      filename: options.filename,
+      format: options.format,
+      confirmed: false,
+      ...(options.parentId ? { parentId: options.parentId } : {}),
+    };
     const refreshedOptionsJson = JSON.stringify(options);
     const recoverCommittedRefresh = () =>
       env.DB.prepare(

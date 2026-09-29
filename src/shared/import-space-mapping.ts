@@ -7,6 +7,7 @@ export type ImportOptions = {
   filename: string;
   format: ImportPreview["format"];
   confirmed: boolean;
+  parentId?: string;
   groupSpaceIds?: Record<string, string>;
   previewGroupKeys?: string[];
   previewGroupingVersion?: number;
@@ -23,6 +24,15 @@ export function requireImportOptions(options: Record<string, unknown>): ImportOp
     throw new Error("Import options are invalid.");
   const groupSpaceIds = normalizeGroupSpaceIds(options.groupSpaceIds);
   const keys = options.previewGroupKeys;
+  if (
+    options.parentId !== undefined &&
+    (typeof options.parentId !== "string" ||
+      options.parentId.length === 0 ||
+      options.parentId.length > 100 ||
+      options.format === "notion_zip")
+  ) {
+    throw new Error("Import parent is invalid.");
+  }
   if (groupSpaceIds === null || (groupSpaceIds && Object.keys(groupSpaceIds).length === 0)) {
     throw new Error("Import space mappings are invalid.");
   }

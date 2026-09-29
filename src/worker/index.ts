@@ -2185,7 +2185,12 @@ async function refreshImportPreview(c: Context<{ Bindings: Env }>, member: Membe
   requireEditor(member);
   if (job.space_id) await editableSpaceForMember(c.env, member, job.space_id);
   const saved = storedJobOptions(job);
-  const options = parseImportOptions({ filename: saved.filename, format: saved.format, confirmed: false });
+  const options = parseImportOptions({
+    filename: saved.filename,
+    format: saved.format,
+    confirmed: false,
+    parentId: saved.parentId,
+  });
   if (!options) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
   if (!job.input_key?.startsWith(`jobs/${job.id}/input/`)) {
     throw new HttpError(
@@ -2241,6 +2246,7 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
     filename: options.filename,
     format: options.format,
     confirmed: false,
+    parentId: options.parentId,
   });
   if (!inspectionOptions) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
   if (!isCurrentImportPreview(preview, inspectionOptions.format)) return refreshImportPreview(c, member, job);
