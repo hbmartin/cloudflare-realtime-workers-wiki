@@ -194,6 +194,14 @@ export async function reconcileDateRemindersForPage(
     .bind(pageId, epoch, ...(sweepCutoff === undefined ? [] : [sweepCutoff.active, sweepCutoff.delivered]))
     .all<ReminderRow>();
   if (!rows.results.length) return;
+  const projectionMatches = async () =>
+    (
+      await env.DB.prepare(`SELECT sequence FROM document_projections WHERE page_id=? AND content_epoch=?`)
+        .bind(pageId, epoch)
+        .first<{ sequence: number }>()
+    )?.sequence === sequence;
+  if (sequence !== undefined && !(await projectionMatches()))
+    throw new Error("Date reminder projection changed during reconciliation.");
   const tokens = dateTokens(document);
   const timestamp = Date.now();
   const unchangedIds: string[] = [];
@@ -282,6 +290,8 @@ export async function reconcileDateRemindersForPage(
       .bind(timestamp, JSON.stringify(unchangedIds), ...sequenceBind)
       .run();
   }
+  if (sequence !== undefined && !(await projectionMatches()))
+    throw new Error("Date reminder projection changed during reconciliation.");
 }
 
 async function sweepDateReminders(env: Env) {
@@ -378,6 +388,7 @@ async function deliverDueDateReminders(env: Env) {
   )
     .bind(timestamp, timestamp - 2 * 60_000)
     .all<{ id: string }>();
+  const retried = new Set<string>();
   for (const { id } of due.results) {
     const claimId = crypto.randomUUID();
     const row = await env.DB.prepare(
@@ -454,6 +465,19 @@ async function deliverDueDateReminders(env: Env) {
           createdAt: timestamp,
         }),
       ]);
+      if (!results[0]?.meta.changes && !results[1]?.meta.changes) {
+        await env.DB.prepare(
+          `UPDATE date_reminders SET state='active',claim_id=NULL,claimed_at=NULL,updated_at=?
+           WHERE id=? AND generation=? AND state='claimed' AND claim_id=?`,
+        )
+          .bind(Date.now(), row.id, row.generation, claimId)
+          .run();
+        if (!retried.has(id)) {
+          retried.add(id);
+          due.results.push({ id });
+        }
+        continue;
+      }
       if (results[0]?.meta.changes && !results[1]?.meta.changes) {
         await env.DB.prepare(
           `UPDATE date_reminders SET state='canceled',generation=generation+1,
@@ -497,13 +521,6 @@ async function deliverDueDateReminders(env: Env) {
 }
 
 export async function processDueDateReminders(env: Env) {
-  await env.DB.prepare(
-    `UPDATE date_reminders SET state='canceled',generation=generation+1,
-       claim_id=NULL,claimed_at=NULL,delivery_receipt_id=NULL,updated_at=?
-     WHERE id IN (SELECT id FROM date_reminders WHERE state='missing' LIMIT 100)`,
-  )
-    .bind(Date.now())
-    .run();
   let deliveryFailed = false;
   let deliveryFailure: unknown;
   try {

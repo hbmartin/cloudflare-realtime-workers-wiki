@@ -6,7 +6,7 @@ import type { DateMention } from "../shared/date-mentions";
 import { dateTokens } from "../shared/document-projection";
 import { flattenDocumentBlocks } from "../shared/notion-blocks";
 import type { Env } from "./env";
-import { processDueDateReminders } from "./date-reminders";
+import { processDueDateReminders, reconcileDateRemindersForPage } from "./date-reminders";
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -517,6 +517,40 @@ describe("date reminders", () => {
           .first<{ choice_json: string }>()
       )?.choice_json,
     ).toBe('"5m_before"');
+  });
+
+  it("reports a stale reconciliation snapshot so the sweep can advance", async () => {
+    const installed = await bootstrap();
+    const token: DateMention = {
+      tokenId: crypto.randomUUID(),
+      revision: crypto.randomUUID(),
+      createdBy: installed.userId,
+      kind: "timed",
+      value: new Date(Date.now() + 3_600_000).toISOString(),
+      timezone: "UTC",
+    };
+    await addToken(installed.page.id, token);
+    const reminder = await SELF.fetch(
+      request(installed.cookie, `/api/pages/${installed.page.id}/date-reminders/${token.tokenId}`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ revision: token.revision, choice: "5m_before" }),
+      }),
+    );
+    expect(reminder.status).toBe(200);
+    const envelope = await (
+      await env.DOCUMENT.getByName(`${installed.page.id}~1`).fetch(
+        new Request("https://document.internal/content", {
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        }),
+      )
+    ).json<{ document: Parameters<typeof dateTokens>[0]; sequence: number }>();
+    await env.DB.prepare(`UPDATE document_projections SET sequence=sequence+1 WHERE page_id=?`)
+      .bind(installed.page.id)
+      .run();
+    await expect(
+      reconcileDateRemindersForPage(env, installed.page.id, 1, envelope.document, envelope.sequence),
+    ).rejects.toThrow("projection changed");
   });
 
   it("does not deliver when the author loses workspace access before the due scan", async () => {

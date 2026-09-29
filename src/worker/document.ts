@@ -852,6 +852,8 @@ export class Document extends YServer {
     }
     if (request.method === "GET" && url.pathname.endsWith("/content")) {
       this.flushPendingUpdates();
+      if (this.compaction) await this.compaction;
+      this.flushPendingUpdates();
       if (this.metadata.dirty) await this.compact();
       const { pageId, epoch } = this.ids;
       if (this.metadata.content_kind === "diagram") {
@@ -1306,14 +1308,13 @@ export class Document extends YServer {
       if (duplicates.length) {
         const { pageId, epoch } = this.ids;
         let preferredBlocks = this.priorDateBlocks ?? new Map<string, string>();
+        const fetchedPrevious = !this.priorDateBlocks;
         try {
-          if (!this.priorDateBlocks) {
+          if (fetchedPrevious) {
             preferredBlocks = await priorDateTokenBlocks(this.bindings, pageId, epoch);
             this.priorDateBlocks = preferredBlocks;
-            duplicates = duplicateDateTokens(this.document);
           }
         } catch (error) {
-          duplicates = duplicateDateTokens(this.document);
           logger.warn(
             "document.date_token_origin.unavailable",
             "document",
@@ -1322,6 +1323,7 @@ export class Document extends YServer {
             error,
           );
         }
+        if (fetchedPrevious) duplicates = duplicateDateTokens(this.document);
         // The previous projection fetch can yield to incoming websocket edits.
         // Repair the live tree after it returns, then capture the compaction.
         if (duplicates.length) repairDuplicateDateTokens(this.document, duplicates, preferredBlocks);
@@ -1748,7 +1750,7 @@ export class Document extends YServer {
 
         const results = await this.bindings.DB.batch(statements);
         pageProjected = Boolean(results[0]?.meta.changes);
-        if (pageProjected && this.priorDateBlocks) this.priorDateBlocks = dateTokenBlocks(json);
+        if (pageProjected) this.priorDateBlocks = dateTokenBlocks(json);
         const superseded = supersededProjection?.r2_key;
         if (pageProjected && superseded && superseded !== structuredKey) {
           this.state.waitUntil(
@@ -1844,15 +1846,13 @@ export class Document extends YServer {
       this.metadata.last_version_at = versionAt;
 
       if (pageProjected && !effectsSuppressed)
-        this.state.waitUntil(
-          reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
-            logger.error(
-              "document.date_reminder_reconcile.failed",
-              "document",
-              "Date reminder reconciliation failed.",
-              { pageId, epoch },
-              error,
-            ),
+        await reconcileDateRemindersForPage(this.bindings, pageId, epoch, json, maximum).catch((error: unknown) =>
+          logger.error(
+            "document.date_reminder_reconcile.failed",
+            "document",
+            "Date reminder reconciliation failed.",
+            { pageId, epoch },
+            error,
           ),
         );
 

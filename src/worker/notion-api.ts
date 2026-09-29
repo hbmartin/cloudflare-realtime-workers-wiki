@@ -35,7 +35,7 @@ import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { dateTokens } from "../shared/document-projection";
 import { dateMentionFromProps } from "../shared/date-mentions";
-import { MISSING_GRACE_MS, reconcileDateRemindersForPage } from "./date-reminders";
+import { MISSING_GRACE_MS } from "./date-reminders";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -1217,6 +1217,7 @@ notionApi.patch("/blocks/:blockId", async (c) => {
     return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
   }
   const blockDates = dateTokens(located.block!.node);
+  const pendingMissing: Array<{ id: string; generation: number }> = [];
   const suppliedDates = new Map<string, NonNullable<ReturnType<typeof dateMentionFromProps>>>();
   for (const payload of Object.values(input)) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
@@ -1233,22 +1234,16 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   if (suppliedDates.size) {
     const liveDates = dateTokens(located.document);
     const possibleMoves = [...suppliedDates.keys()].filter((id) => !liveDates.has(id));
-    if (possibleMoves.length)
-      await reconcileDateRemindersForPage(
-        c.env,
-        located.page.id,
-        located.page.content_epoch,
-        located.document,
-        located.sequence,
-      );
     const rows = possibleMoves.length
       ? await c.env.DB.prepare(
-          `SELECT token_id,user_id,token_revision,timezone,missing_since FROM date_reminders
+          `SELECT id,generation,token_id,user_id,token_revision,timezone,missing_since FROM date_reminders
        WHERE page_id=? AND content_epoch=? AND token_id IN (SELECT value FROM json_each(?))
          AND state IN ('active','claimed','delivered')`,
         )
           .bind(located.page.id, located.page.content_epoch, JSON.stringify(possibleMoves))
           .all<{
+            id: string;
+            generation: number;
             token_id: string;
             user_id: string;
             token_revision: string;
@@ -1258,15 +1253,17 @@ notionApi.patch("/blocks/:blockId", async (c) => {
       : { results: [] };
     for (const reminder of rows.results) {
       const supplied = suppliedDates.get(reminder.token_id);
-      if (!supplied || liveDates.has(supplied.tokenId)) continue;
+      if (!supplied) continue;
       if (
         reminder.user_id !== supplied.createdBy ||
         reminder.token_revision !== supplied.revision ||
         reminder.timezone !== supplied.timezone
       )
         continue;
-      if (reminder.missing_since === null)
-        throw new NotionError(409, "conflict_error", "This date token is not ready to move. Retry shortly.");
+      if (reminder.missing_since === null) {
+        reminder.missing_since = Date.now();
+        pendingMissing.push({ id: reminder.id, generation: reminder.generation });
+      }
       if (reminder.missing_since >= Date.now() - MISSING_GRACE_MS)
         blockDates.set(supplied.tokenId, { ...supplied, revision: crypto.randomUUID() });
     }
@@ -1281,6 +1278,29 @@ notionApi.patch("/blocks/:blockId", async (c) => {
   if (!node) throw new NotionError(400, "validation_error", "Block content is required.");
   if ([...dateTokens(container).values()].some((token) => token === null))
     throw new NotionError(400, "validation_error", "Date tokens must be unique within a block.");
+  for (const reminder of pendingMissing) {
+    const missingAt = Date.now();
+    const marked = await c.env.DB.prepare(
+      `UPDATE date_reminders SET missing_since=?,checked_at=?,updated_at=?
+       WHERE id=? AND generation=? AND missing_since IS NULL
+         AND state IN ('active','claimed','delivered')
+         AND EXISTS (SELECT 1 FROM document_projections
+           WHERE page_id=? AND content_epoch=? AND sequence=?)`,
+    )
+      .bind(
+        missingAt,
+        missingAt,
+        missingAt,
+        reminder.id,
+        reminder.generation,
+        located.page.id,
+        located.page.content_epoch,
+        located.sequence,
+      )
+      .run();
+    if (!marked.meta.changes)
+      throw new NotionError(409, "conflict_error", "This date token changed while moving it. Retry.");
+  }
   const mutated = await mutateDocument(c.env, located.page, principal, [
     { type: "update_block", internalId: located.internalId, node },
   ]);
