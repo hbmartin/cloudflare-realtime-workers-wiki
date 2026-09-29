@@ -39,8 +39,7 @@ function decodeHtml(value: string) {
 }
 
 function safeLink(value: string) {
-  const decoded = decodeHtml(value.trim());
-  const trimmed = /^[a-z][a-z\d+.-]*:/i.test(decoded) ? decoded.replaceAll("\\", "%5C") : decoded.replaceAll("\\", "/");
+  const trimmed = decodeHtml(value.trim()).replaceAll("\\", "%5C");
   if (!trimmed) return null;
   for (let index = 0; index < trimmed.length; index += 1) {
     const code = trimmed.charCodeAt(index);
@@ -166,9 +165,11 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
     let angle = false;
     let codeTicks = 0;
     const emphasis = new Set<string>();
+    let delimiterCount = 0;
     let lastSafe = -1;
     for (let index = start; index < start + 8192; index += 1) {
       const character = value[index]!;
+      if (INLINE_MARKUP_CHAR.test(character)) delimiterCount += 1;
       if (character === "\\" && ESCAPABLE_MARKDOWN.test(value[index + 1] ?? "")) {
         index += 1;
         continue;
@@ -182,15 +183,19 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
         continue;
       }
       if (codeTicks) continue;
-      if (character === "<" && !angle) angle = true;
+      if (character === "<" && !angle && /[!/?a-z]/i.test(value[index + 1] ?? "")) angle = true;
       else if (character === ">") angle = false;
       else if (character === "[") bracketDepth += 1;
       else if (character === "]" && bracketDepth) {
         bracketDepth -= 1;
-        if (!bracketDepth && value[index + 1] === "(") destinationDepth = 1;
-      } else if (character === "(" && destinationDepth) destinationDepth += 1;
+      } else if (character === "(" && (destinationDepth || (!bracketDepth && value[index - 1] === "]")))
+        destinationDepth += 1;
       else if (character === ")" && destinationDepth) destinationDepth -= 1;
       else if ((character === "*" || character === "_") && !bracketDepth && !destinationDepth) {
+        const previous = value[index - 1] ?? "";
+        const next = value[index + 1] ?? "";
+        if (/\s/.test(next) && !emphasis.size) continue;
+        if (character === "_" && /[\p{L}\p{N}]/u.test(previous) && /[\p{L}\p{N}]/u.test(next)) continue;
         const count = value[index + 1] === character ? 2 : 1;
         const marker = character.repeat(count);
         if (emphasis.has(marker)) emphasis.delete(marker);
@@ -200,9 +205,19 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
       if (/\s/.test(character) && !codeTicks && !bracketDepth && !destinationDepth && !angle && !emphasis.size)
         lastSafe = index + 1;
     }
-    let cut = lastSafe > start + 4096 ? lastSafe : start + 8192;
-    if (value[cut - 1] === "\\" && ESCAPABLE_MARKDOWN.test(value[cut] ?? "")) cut -= 1;
-    append(markdownInline(value.slice(start, cut), issues, references));
+    let cut = lastSafe > start ? lastSafe : start + 8192;
+    // An even trailing run is already paired; moving one slash changes what
+    // the following chunk escapes.
+    let slashCount = 0;
+    while (value[cut - slashCount - 1] === "\\") slashCount += 1;
+    if (slashCount % 2 && ESCAPABLE_MARKDOWN.test(value[cut] ?? "")) cut -= 1;
+    // An unclosed construct offers no safe boundary. Keep that section's
+    // visible text instead of asking Marked to parse a severed construct.
+    append(
+      lastSafe > start && delimiterCount <= 512
+        ? markdownInline(value.slice(start, cut), issues, references)
+        : inline(unescapeMarkdown(value.slice(start, cut))),
+    );
     start = cut;
   }
   return output;
@@ -210,21 +225,21 @@ function boundedMarkdownInline(value: string, issues: ImportIssue[], references:
 
 function markdownImage(value: string) {
   const trimmed = value.trim();
-  if (!trimmed.startsWith("![") || trimmed.length > 64_000) return null;
+  // A full-line image has a short label and a closing destination. Avoid
+  // running Marked's emphasis scanner over arbitrary 64 KiB text lines.
+  const destination = trimmed.indexOf("](");
+  if (
+    !trimmed.startsWith("![") ||
+    !trimmed.endsWith(")") ||
+    trimmed.length > 64_000 ||
+    destination < 0 ||
+    destination > 8192
+  )
+    return null;
   const tokens = Lexer.lexInline(trimmed, { gfm: false });
   const image = tokens.length === 1 && tokens[0]?.type === "image" ? tokens[0] : null;
   if (!image) return null;
-  let end = 2;
-  let depth = 1;
-  while (end < trimmed.length && depth) {
-    if (trimmed[end] === "\\" && end + 1 < trimmed.length) end += 2;
-    else {
-      if (trimmed[end] === "[") depth += 1;
-      else if (trimmed[end] === "]") depth -= 1;
-      end += 1;
-    }
-  }
-  return { label: unescapeMarkdown(trimmed.slice(2, end - 1)), href: image.href };
+  return { label: unescapeMarkdown(image.text), href: image.href };
 }
 
 export function markdownToDocument(source: string) {

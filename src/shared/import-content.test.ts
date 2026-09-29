@@ -208,9 +208,9 @@ describe("import content", () => {
 
   it("keeps escaped backslashes in link and block image destinations", () => {
     const link = markdownToDocument(String.raw`[doc](folder\\_name/file.md)`);
-    expect(link.references).toEqual(["folder/_name/file.md"]);
+    expect(link.references).toEqual(["folder%5C_name/file.md"]);
     const image = markdownToDocument(String.raw`![diagram](folder\\_name/file.png)`);
-    expect(image.references).toEqual(["folder/_name/file.png"]);
+    expect(image.references).toEqual(["folder%5C_name/file.png"]);
   });
 
   it("preserves Slack and nested-path links when a long paragraph is simplified", () => {
@@ -259,6 +259,31 @@ describe("import content", () => {
     const parsed = markdownToDocument(`![logo](${data})`);
     expect(parsed.document.content![0]!.content![0]!.content![0]!.type).toBe("image");
     expect(parsed.references).toEqual([data]);
+  });
+
+  it("keeps links that follow earlier link destinations near a long-content boundary", () => {
+    const parsed = markdownToDocument(
+      `[first](first.md) ${"word ".repeat(1634)}[second](https://example.com/second) ${"word ".repeat(1000)}`,
+    );
+    expect(parsed.references).toEqual(["first.md", "https://example.com/second"]);
+    expect(JSON.stringify(parsed.document)).toContain("https://example.com/second");
+  });
+
+  it("keeps formatting after ordinary punctuation in a long paragraph", () => {
+    const parsed = markdownToDocument(
+      `2 * 3 = 6 and x < y in file_name ${"word ".repeat(1630)}**important** [source](source.md)`,
+    );
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toContainEqual({ type: "text", text: "important", marks: [{ type: "bold" }] });
+    expect(parsed.references).toEqual(["source.md"]);
+  });
+
+  it("keeps code-span brackets in a block image caption", () => {
+    const parsed = markdownToDocument("![a `]` b](image.png)");
+    expect(parsed.document.content![0]!.content![0]!.content![0]).toMatchObject({
+      type: "image",
+      attrs: { caption: "a `]` b", name: "a `]` b" },
+    });
   });
 
   it("uses Marked link and code rules in long content", () => {

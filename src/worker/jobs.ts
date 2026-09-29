@@ -780,8 +780,8 @@ export async function startJobExecution(
         await replaceCaptureWorkflow(env, current, "running", recovery === "lookup_failed");
         return;
       }
+      await failJobWithCleanup(env, current, error);
     }
-    if (current?.status === "running") await failJobWithCleanup(env, current, error);
     throw error;
   }
 }
@@ -804,7 +804,9 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
   if (!isCaptureImportJob(job)) return false;
   // Older Workflow step results can surface a wrapped error without the
   // original HttpError code. The receipt state is authoritative in that case.
-  return hasUnlinkedCapture(env, job.id).catch((lookupError: unknown) => {
+  try {
+    return await hasUnlinkedCapture(env, job.id);
+  } catch (lookupError) {
     logger.error(
       "workflow.capture_lookup.failed",
       "workflow",
@@ -812,10 +814,23 @@ async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
       { jobId: job.id },
       lookupError,
     );
+    logger.error(
+      "workflow.capture_import.failed",
+      "workflow",
+      "Capture import failed before receipt lookup.",
+      { jobId: job.id, attempt: job.attempt },
+      error,
+    );
+    try {
+      return await hasUnlinkedCapture(env, job.id);
+    } catch {
+      // A later sweep inspects the terminal Workflow if this D1 write also
+      // fails, so an outage cannot strand the job in running indefinitely.
+    }
     // Defer recovery until D1 can distinguish an unlinked receipt from a real
     // import failure. Neither outcome is safe to assume during an outage.
     return "lookup_failed" as const;
-  });
+  }
 }
 
 async function replaceCaptureWorkflow(
@@ -835,7 +850,7 @@ async function replaceCaptureWorkflow(
       instanceId,
       deferForLookup ? "Waiting to check Slack receipt" : "Queued",
       deferForLookup ? "capture_lookup_unavailable" : null,
-      Date.now() - (deferForLookup ? 0 : QUEUED_JOB_RECOVERY_DELAY_MS),
+      Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS,
       job.id,
       job.attempt,
       expectedStatus,
@@ -1350,6 +1365,39 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
 
 export async function recoverQueuedJobs(env: Env) {
   const cutoff = Date.now() - QUEUED_JOB_RECOVERY_DELAY_MS;
+  // A Workflow may fail while D1 is down, including during its catch handler.
+  // Recover only terminal instances: a live long import must retain its lease.
+  const runningCaptures = await env.DB.prepare(
+    `SELECT * FROM jobs WHERE type='import' AND status='running'
+       AND CASE WHEN json_valid(options_json) THEN json_extract(options_json, '$.captureId')=id ELSE 0 END
+       AND updated_at <= ?
+       ORDER BY updated_at LIMIT 25`,
+  )
+    .bind(cutoff)
+    .all<JobRow>();
+  for (const job of runningCaptures.results) {
+    if (!isCaptureImportJob(job) || !job.workflow_instance_id || env.WORKFLOW_INLINE === "true") continue;
+    try {
+      try {
+        const instance = await env.NOTES_WORKFLOW.get(job.workflow_instance_id);
+        const status = await instance.status();
+        if (["queued", "running", "paused", "waiting", "waitingForPause"].includes(status.status)) continue;
+      } catch (error) {
+        if (!workflowInstanceMissing(error)) throw error;
+      }
+      const recovery = await shouldRequeueCapture(env, job, new Error("Capture workflow ended before job completion."));
+      if (recovery) await replaceCaptureWorkflow(env, job, "running", recovery === "lookup_failed");
+      else await failJobWithCleanup(env, job, new Error("Capture workflow ended before job completion."));
+    } catch (error) {
+      logger.error(
+        "workflow.capture_recovery.failed",
+        "workflow",
+        "Running capture recovery failed.",
+        { jobId: job.id, attempt: job.attempt },
+        error,
+      );
+    }
+  }
   const queued = await env.DB.prepare(
     `SELECT id, workflow_instance_id, attempt, correlation_id FROM jobs
       WHERE status = 'queued' AND updated_at <= ?

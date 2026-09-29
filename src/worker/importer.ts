@@ -310,7 +310,9 @@ function normalizedRelativePath(sourcePath: string, href: string) {
   if (!raw || /^[a-z][a-z\d+.-]*:/i.test(raw) || raw.startsWith("//")) return null;
   try {
     const base = new URL(`https://import.invalid/${sourcePath.split("/").map(encodeURIComponent).join("/")}`);
-    const url = new URL(raw, base);
+    // Archive paths commonly use backslashes as separators, while stored
+    // document hrefs retain an encoded literal backslash for browser safety.
+    const url = new URL(raw.replace(/%5c/gi, "/"), base);
     if (url.origin !== base.origin) return null;
     return url.pathname
       .slice(1)
