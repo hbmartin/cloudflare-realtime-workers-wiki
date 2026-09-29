@@ -42,14 +42,16 @@ describe("import content", () => {
     ]);
   });
 
-  it.each(["*foo\\*", "_bar\\_", "**baz\\**", "__qux\\__"])(
-    "does not turn an escaped closing delimiter into formatting: %s",
-    (source) => {
-      const parsed = markdownToDocument(source);
-      const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
-      expect(content).toEqual([{ type: "text", text: source.replaceAll("\\", "") }]);
-    },
-  );
+  it.each(["*foo\\*", "_bar\\_"])("does not turn an escaped closing delimiter into formatting: %s", (source) => {
+    const parsed = markdownToDocument(source);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([{ type: "text", text: source.replaceAll("\\", "") }]);
+  });
+
+  it.each(["**baz\\**", "__qux\\__"])("retains the visible text of ambiguous escaped runs: %s", (source) => {
+    const content = markdownToDocument(source).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content.map((node) => node.text).join("")).toBe(source.replaceAll("\\", "").slice(1, -1));
+  });
 
   it.each([
     ["\\**foo*", "*", "foo", ""],
@@ -74,7 +76,7 @@ describe("import content", () => {
 
   it.each([
     ["**bold *italic***", "italic"],
-    ["*foo**bar*", "foo"],
+    ["*foo**bar*", "foo**bar"],
     ["*a***b**", "a"],
     ["*foo** bar", "foo"],
     ["*foo**\n", "foo"],
@@ -83,11 +85,11 @@ describe("import content", () => {
     expect(content.some((node) => node.text === italic && node.marks?.[0]?.type === "italic")).toBe(true);
   });
 
-  it("keeps a strong span after an unmatched star", () => {
+  it("parses ambiguous delimiter runs according to CommonMark", () => {
     const content = markdownToDocument("*a**b**").document.content![0]!.content![0]!.content![0]!.content!;
     expect(content).toEqual([
-      { type: "text", text: "*a" },
-      { type: "text", text: "b", marks: [{ type: "bold" }] },
+      { type: "text", text: "a*", marks: [{ type: "italic" }] },
+      { type: "text", text: "b", marks: [{ type: "italic" }, { type: "italic" }] },
     ]);
   });
 
@@ -97,6 +99,55 @@ describe("import content", () => {
       { type: "text", text: "foo", marks: [{ type: "italic" }] },
       { type: "text", text: "bar", marks: [{ type: "italic" }, { type: "bold" }] },
       { type: "text", text: "baz", marks: [{ type: "italic" }] },
+    ]);
+  });
+
+  it("keeps two strong spans and the surrounding italic text", () => {
+    const content = markdownToDocument("*Note: **foo** and **bar** are required*").document.content![0]!.content![0]!
+      .content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "Note: ", marks: [{ type: "italic" }] },
+      { type: "text", text: "foo", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: " and ", marks: [{ type: "italic" }] },
+      { type: "text", text: "bar", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: " are required", marks: [{ type: "italic" }] },
+    ]);
+  });
+
+  it("keeps links and code inside nested emphasis", () => {
+    const linked = markdownToDocument("*see [docs](https://example.com) and **this** too*");
+    const content = linked.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toContainEqual({
+      type: "text",
+      text: "docs",
+      marks: [{ type: "italic" }, { type: "link", attrs: { href: "https://example.com" } }],
+    });
+    expect(linked.references).toEqual(["https://example.com"]);
+    const code = markdownToDocument("*run `npm i` then **now** ok*").document.content![0]!.content![0]!.content![0]!
+      .content!;
+    expect(code).toContainEqual({ type: "text", text: "npm i", marks: [{ type: "italic" }, { type: "code" }] });
+    expect(code).toContainEqual({ type: "text", text: "now", marks: [{ type: "italic" }, { type: "bold" }] });
+  });
+
+  it("rejects unsafe links inside emphasis and leaves spaced asterisks literal", () => {
+    const unsafe = markdownToDocument("*see [bad](javascript:alert(1)) and **this** too*");
+    expect(unsafe.issues).toEqual([{ code: "unsafe_url", detail: "javascript:alert(1)" }]);
+    expect(unsafe.references).toEqual([]);
+    const spaced = markdownToDocument("a * b **c** d * e").document.content![0]!.content![0]!.content![0]!.content!;
+    expect(spaced).toEqual([
+      { type: "text", text: "a * b " },
+      { type: "text", text: "c", marks: [{ type: "bold" }] },
+      { type: "text", text: " d * e" },
+    ]);
+  });
+
+  it("recognizes a real opener after an escaped backslash", () => {
+    const content = markdownToDocument("\\\\*a**b**c*").document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([
+      { type: "text", text: "\\" },
+      { type: "text", text: "a", marks: [{ type: "italic" }] },
+      { type: "text", text: "b", marks: [{ type: "italic" }, { type: "bold" }] },
+      { type: "text", text: "c", marks: [{ type: "italic" }] },
     ]);
   });
 

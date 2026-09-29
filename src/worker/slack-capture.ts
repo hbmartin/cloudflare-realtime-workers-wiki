@@ -10,6 +10,8 @@ import { taskAssignees } from "./tasks";
 import { logger } from "./observability";
 import type { TaskStatus } from "../shared/tasks";
 
+export const SLACK_CAPTURE_PAGE_GONE_MESSAGE = "Saved to NoteFlare, but the page is no longer available.";
+
 export type SlackCaptureSource = {
   channelId: string;
   ts: string;
@@ -89,6 +91,12 @@ export function failCaptureForJobStatement(
   generation: number | null = null,
   status: "failed" | "final" | "any" = "any",
 ) {
+  const retryFailedCapture = status === "final" ? "" : "OR (state='failed' AND last_failed_job_attempt<?)";
+  const jobStatusGuard = {
+    any: "",
+    failed: "AND status='failed'",
+    final: "AND status IN ('failed','canceled') AND cleanup_target IS NULL AND cleanup_token IS NULL AND updated_at=?",
+  }[status];
   return db
     .prepare(
       `UPDATE slack_captures SET job_id=?,state='failed',
@@ -98,13 +106,10 @@ export function failCaptureForJobStatement(
        last_failed_job_attempt=?,updated_at=?
      WHERE id=? AND (? IS NULL OR installation_generation=?)
        AND ((job_id IS NULL AND state='pending') OR
-         (job_id=? AND (state='running' OR
-           (state='failed' AND ?<>'final' AND last_failed_job_attempt<?))))
+         (job_id=? AND (state='running' ${retryFailedCapture})))
        AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND attempt=?
          AND workspace_id=slack_captures.workspace_id AND requested_by=slack_captures.requested_by
-         AND (?='any' OR (?='failed' AND status='failed') OR
-           (?='final' AND status IN ('failed','canceled') AND cleanup_target IS NULL
-             AND cleanup_token IS NULL AND updated_at=?)))`,
+         ${jobStatusGuard})`,
     )
     .bind(
       jobId,
@@ -115,14 +120,10 @@ export function failCaptureForJobStatement(
       generation,
       generation,
       jobId,
-      status,
-      jobAttempt,
+      ...(status === "final" ? [] : [jobAttempt]),
       jobId,
       jobAttempt,
-      status,
-      status,
-      status,
-      timestamp,
+      ...(status === "final" ? [timestamp] : []),
     );
 }
 
@@ -588,7 +589,7 @@ export async function deliverSlackCaptureFeedback(
       : state === "succeeded" && capture.page_id
         ? `Saved to NoteFlare: ${origin}/?page=${encodeURIComponent(capture.page_id)}`
         : state === "succeeded"
-          ? "Saved to NoteFlare, but the page is no longer available."
+          ? SLACK_CAPTURE_PAGE_GONE_MESSAGE
           : capture.error_category === "slack_capture_job_conflict"
             ? `Your Slack capture could not be saved because its job receipt conflicts with another request. Contact a workspace administrator, then use Retry capture.`
             : capture.job_id

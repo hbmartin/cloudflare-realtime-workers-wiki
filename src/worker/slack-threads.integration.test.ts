@@ -66,6 +66,7 @@ import {
 } from "./slack-workspace";
 import {
   beginJobCancellation,
+  claimJobWorkflowRun,
   NotesJobWorkflow,
   consumeDeliveryMessage,
   finishPendingJobCleanup,
@@ -5784,6 +5785,8 @@ describe("Slack documents and tasks", () => {
     const captureId = await startCapture("document", "space:workspace-general", "Workflow link race");
     const job = await prepareSlackCapture(runtime(), captureId);
     await env.DB.prepare("UPDATE slack_captures SET state='pending',job_id=NULL WHERE id=?").bind(captureId).run();
+    // The old workflow had already claimed the job before the receipt became pending.
+    await env.DB.prepare("UPDATE jobs SET status='running' WHERE id=?").bind(captureId).run();
     // Workerd owns the WorkflowEntrypoint constructor. Exercise its observed
     // path directly with the same bindings and step callback.
     const workflow = Object.assign(Object.create(NotesJobWorkflow.prototype) as object, {
@@ -5833,6 +5836,13 @@ describe("Slack documents and tasks", () => {
     delete productionEnv.WORKFLOW_INLINE;
     await startJobExecution(productionEnv, job!);
     expect(create).not.toHaveBeenCalled();
+    expect(
+      await claimJobWorkflowRun(
+        runtime(),
+        { payload: { jobId: captureId, attempt: 1 }, instanceId: job!.workflow_instance_id! },
+        1,
+      ),
+    ).toBeNull();
     expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
       status: "queued",
     });
@@ -5841,6 +5851,7 @@ describe("Slack documents and tasks", () => {
     const captureId = await startCapture("document", "space:workspace-general", "Wrapped Workflow error");
     const job = await prepareSlackCapture(runtime(), captureId);
     await env.DB.prepare("UPDATE slack_captures SET state='pending',job_id=NULL WHERE id=?").bind(captureId).run();
+    await env.DB.prepare("UPDATE jobs SET status='running' WHERE id=?").bind(captureId).run();
     const workflow = Object.assign(Object.create(NotesJobWorkflow.prototype) as object, {
       env: runtime(),
     }) as unknown as { runObserved: (event: unknown, step: unknown) => Promise<void> };
@@ -5870,6 +5881,7 @@ describe("Slack documents and tasks", () => {
     const captureId = await startCapture("document", "space:workspace-general", "Link during requeue");
     const job = await prepareSlackCapture(runtime(), captureId);
     await env.DB.prepare("UPDATE slack_captures SET state='pending',job_id=NULL WHERE id=?").bind(captureId).run();
+    await env.DB.prepare("UPDATE jobs SET status='running' WHERE id=?").bind(captureId).run();
     const create = vi.fn(async () => undefined);
     const workflowEnv: Env = { ...runtime(), NOTES_WORKFLOW: { create } as unknown as Env["NOTES_WORKFLOW"] };
     delete workflowEnv.WORKFLOW_INLINE;

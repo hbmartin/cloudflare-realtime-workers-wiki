@@ -730,19 +730,8 @@ export async function startJobExecution(
   env: Env,
   job: Pick<JobRow, "id" | "workflow_instance_id" | "attempt"> & Partial<Pick<JobRow, "correlation_id">>,
 ) {
-  // Slack capture ids are SHA-256 prefixes; other job ids are UUIDs. An
-  // unlinked capture must be re-staged before any workflow claims its job.
-  if (/^[0-9a-f]{32}$/.test(job.id)) {
-    const pending = await env.DB.prepare(
-      `SELECT 1 FROM slack_captures WHERE id=? AND state='pending' AND job_id IS NULL
-         AND EXISTS (SELECT 1 FROM jobs WHERE jobs.id=slack_captures.id
-           AND jobs.workspace_id=slack_captures.workspace_id
-           AND jobs.requested_by=slack_captures.requested_by)`,
-    )
-      .bind(job.id)
-      .first();
-    if (pending) return;
-  }
+  // An unlinked receipt must be re-staged before creating a Workflow instance.
+  if (await hasUnlinkedCapture(env, job.id)) return;
   if (env.WORKFLOW_INLINE !== "true") return startJobWorkflow(env, job);
   const row = await env.DB.prepare(`SELECT * FROM jobs WHERE id = ? AND attempt = ?`)
     .bind(job.id, job.attempt)
@@ -763,33 +752,47 @@ export async function startJobExecution(
     else if (row.type === "export") await runExport(env, row, inlineStep as Parameters<typeof runExport>[2]);
     else await runImport(env, row, inlineStep as Parameters<typeof runImport>[2]);
   } catch (error) {
-    if (await shouldRequeueCapture(env, row, error)) {
-      await requeueUnlinkedCapture(env, row);
-      return;
-    }
     const current = await env.DB.prepare(
       `SELECT * FROM jobs WHERE id=? AND attempt>=? AND COALESCE(workflow_instance_id,id)=?`,
     )
       .bind(row.id, row.attempt, row.workflow_instance_id ?? row.id)
       .first<JobRow>();
+    if (current?.status === "running" && (await shouldRequeueCapture(env, current, error))) {
+      if (await requeueUnlinkedCapture(env, current)) return;
+    }
     if (current?.status === "running") await failJobWithCleanup(env, current, error);
     throw error;
   }
+}
+
+const UNLINKED_CAPTURE_SQL = `EXISTS (SELECT 1 FROM slack_captures capture
+  WHERE capture.id=jobs.id AND capture.workspace_id=jobs.workspace_id
+    AND capture.requested_by=jobs.requested_by
+    AND capture.state='pending' AND capture.job_id IS NULL)`;
+
+async function hasUnlinkedCapture(env: Env, jobId: string) {
+  return Boolean(await env.DB.prepare(`SELECT 1 FROM jobs WHERE id=? AND ${UNLINKED_CAPTURE_SQL}`).bind(jobId).first());
 }
 
 async function shouldRequeueCapture(env: Env, job: JobRow, error: unknown) {
   if (safeHttpError(error)?.code === "slack_capture_link_pending") return true;
   if (job.type !== "import") return false;
   const captureId = jsonRecord(job.options_json).captureId;
-  if (typeof captureId !== "string") return false;
+  if (captureId !== job.id) return false;
   // Older Workflow step results can surface a wrapped error without the
   // original HttpError code. The receipt state is authoritative in that case.
-  return Boolean(
-    await env.DB.prepare(`SELECT 1 FROM slack_captures WHERE id=? AND state='pending' AND job_id IS NULL
-      AND workspace_id=? AND requested_by=?`)
-      .bind(captureId, job.workspace_id, job.requested_by)
-      .first(),
-  );
+  try {
+    return await hasUnlinkedCapture(env, job.id);
+  } catch (lookupError) {
+    logger.error(
+      "workflow.capture_lookup.failed",
+      "workflow",
+      "Capture lookup failed during job recovery.",
+      { jobId: job.id },
+      lookupError,
+    );
+    return false;
+  }
 }
 
 async function requeueUnlinkedCapture(env: Env, job: JobRow) {
@@ -808,7 +811,7 @@ async function requeueUnlinkedCapture(env: Env, job: JobRow) {
       job.workflow_instance_id ?? job.id,
     )
     .run();
-  if (!returned.meta.changes) return;
+  if (!returned.meta.changes) return false;
   await notifyJobs(env, job.workspace_id);
   // prepareSlackCapture may have linked the receipt using the old workflow id
   // while this catch was running. Start the replacement immediately in that case.
@@ -821,6 +824,7 @@ async function requeueUnlinkedCapture(env: Env, job: JobRow) {
     .bind(job.id, instanceId)
     .first<Pick<JobRow, "id" | "workflow_instance_id" | "attempt" | "correlation_id">>();
   if (linked) await startJobExecution(env, linked);
+  return true;
 }
 
 async function notifyJobs(env: Env, workspaceId: string) {
@@ -1053,7 +1057,8 @@ async function updateJob(
        progress_label = COALESCE(?, progress_label),
        error_code = ?, error_message = ?,
        result_json = COALESCE(?, result_json), updated_at = ?
-     WHERE id = ? AND attempt = ? AND status = ?`,
+     WHERE id = ? AND attempt = ? AND status = ?
+       ${fields.status === "running" ? `AND NOT ${UNLINKED_CAPTURE_SQL}` : ""}`,
   )
     .bind(
       fields.status ?? null,
@@ -1290,10 +1295,8 @@ export class NotesJobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams>
         return;
       }
       if (current.status !== "running") return;
-      if (await shouldRequeueCapture(this.env, current, error)) {
-        await requeueUnlinkedCapture(this.env, current);
+      if ((await shouldRequeueCapture(this.env, current, error)) && (await requeueUnlinkedCapture(this.env, current)))
         return;
-      }
       await failJobWithCleanup(this.env, current, error);
       throw error;
     }
@@ -1305,10 +1308,7 @@ export async function recoverQueuedJobs(env: Env) {
   const queued = await env.DB.prepare(
     `SELECT id, workflow_instance_id, attempt, correlation_id FROM jobs
       WHERE status = 'queued' AND updated_at <= ?
-        AND NOT EXISTS (SELECT 1 FROM slack_captures
-          WHERE slack_captures.id=jobs.id AND slack_captures.state='pending' AND slack_captures.job_id IS NULL
-            AND slack_captures.workspace_id=jobs.workspace_id
-            AND slack_captures.requested_by=jobs.requested_by)
+        AND NOT ${UNLINKED_CAPTURE_SQL}
       ORDER BY updated_at LIMIT 25`,
   )
     .bind(cutoff)

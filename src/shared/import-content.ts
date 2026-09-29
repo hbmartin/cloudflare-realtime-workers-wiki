@@ -1,4 +1,5 @@
 import * as Y from "yjs";
+import { Lexer, type Token } from "marked";
 import type { ColumnType, ProseMirrorJson } from "./types";
 
 export type ImportedTable = {
@@ -124,10 +125,6 @@ function markdownDestination(value: string, start: number) {
   return value[cursor] === ")" ? { href, end: cursor + 1 } : null;
 }
 
-function unescapeMarkdownPunctuation(text: string) {
-  return text.replace(/\\([\\`*_{}[\]()#+\-.!|>~])/g, "$1");
-}
-
 function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
   const output: ProseMirrorJson[] = [];
   const append = (text: string, marks: ProseMirrorJson["marks"] = []) => {
@@ -139,89 +136,34 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
     }
     output.push(...inline(text, marks));
   };
-  // Escapes are a scanner alternative, so delimiters inside code spans stay
-  // literal while escaped punctuation outside them cannot open formatting.
-  const pattern =
-    /\\([\\`*_{}[\]()#+\-.!|>~])|(!?)\[((?:\\.|[^\]\\])*)\]\(|\*\*((?:\\.|[^\\*])+)\*\*|__((?:\\.|[^\\_])+)__|`([^`]+)`|\*(?!\*)((?:\\.|[^\\*])+)(?<=\S)\*|_(?!_)((?:\\.|[^\\_])+)_(?!\w)/g;
-  const nestedPattern = /\*((?:\\.|[^\\*])+?)\*\*((?:\\.|[^\\*])+?)\*\*((?:\\.|[^\\*])+?)\*/g;
-  let offset = 0;
-  let nested = nestedPattern.exec(value);
-  let match: RegExpExecArray | null;
-  while ((match = pattern.exec(value))) {
-    // A single emphasis span can contain a strong span using the same marker.
-    // Consume the full delimiter sequence before the flat alternatives split it.
-    while (nested && nested.index < offset) nested = nestedPattern.exec(value);
-    if (
-      nested &&
-      nested.index <= match.index &&
-      value[nested.index - 1] !== "*" &&
-      value[nested.index - 1] !== "\\" &&
-      (nested.index < match.index || match[7] !== undefined)
-    ) {
-      append(value.slice(offset, nested.index));
-      append(unescapeMarkdownPunctuation(nested[1]!), [{ type: "italic" }]);
-      append(unescapeMarkdownPunctuation(nested[2]!), [{ type: "italic" }, { type: "bold" }]);
-      append(unescapeMarkdownPunctuation(nested[3]!), [{ type: "italic" }]);
-      offset = nested.index + nested[0].length;
-      pattern.lastIndex = offset;
-      nested = nestedPattern.exec(value);
-      continue;
+  // Keep block conversion local, but use a CommonMark inline lexer for nested
+  // delimiters. The resulting tokens still pass through our URL policy.
+  const walk = (tokens: Token[], marks: ProseMirrorJson["marks"] = []) => {
+    for (const token of tokens) {
+      const children: Token[] = "tokens" in token && Array.isArray(token.tokens) ? token.tokens : [];
+      if (token.type === "text" || token.type === "escape") append(token.text, marks);
+      else if (token.type === "em") walk(children, [{ type: "italic" }, ...marks]);
+      else if (token.type === "strong") walk(children, [...marks, { type: "bold" }]);
+      else if (token.type === "codespan") append(token.text, [...marks, { type: "code" }]);
+      else if (token.type === "link" || token.type === "image") {
+        const rawUrl = token.href;
+        const url = safeLink(rawUrl);
+        if (!url) {
+          issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
+          walk(children, marks);
+        } else if (token.type === "image") {
+          references.push(url);
+          issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
+          walk(children, marks);
+        } else {
+          references.push(url);
+          walk(children, [...marks, { type: "link", attrs: { href: url } }]);
+        }
+      } else if (children.length) walk(children, marks);
+      else append(token.raw, marks);
     }
-    // A delimiter consumed by an escape or bold span can precede a new
-    // italic span. Only reject a second delimiter still in the plain text.
-    const isItalic = match[7] !== undefined || match[8] !== undefined;
-    const delimiter = match[7] !== undefined ? "*" : "_";
-    const closer = match.index + match[0].length - 1;
-    // Let a complete strong span starting at this delimiter take precedence.
-    // Otherwise closing an italic here consumes half its opening pair.
-    if (match[7] !== undefined && /^\*\*(?:\\.|[^\\*])+\*\*/.test(value.slice(closer))) {
-      pattern.lastIndex = match.index + 1;
-      continue;
-    }
-    if (isItalic && match.index > offset && value[match.index - 1] === delimiter) {
-      pattern.lastIndex = match.index + 1;
-      continue;
-    }
-    append(value.slice(offset, match.index));
-    const [whole, escaped, image, label, boldA, boldB, code, italicA, italicB] = match;
-    if (escaped !== undefined) {
-      append(escaped);
-      offset = pattern.lastIndex;
-      continue;
-    }
-    if (label !== undefined) {
-      const destination = markdownDestination(value, pattern.lastIndex);
-      if (!destination) {
-        append(unescapeMarkdownPunctuation(whole));
-        offset = pattern.lastIndex;
-        continue;
-      }
-      pattern.lastIndex = destination.end;
-      const rawUrl = destination.href;
-      const url = safeLink(rawUrl);
-      if (!url) {
-        issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
-        append(unescapeMarkdownPunctuation(label ?? ""));
-      } else if (image) {
-        references.push(url);
-        // Images are not inline nodes in this schema, so both branches degrade to the
-        // label; the issue keeps that downgrade visible in the import warnings.
-        issues.push({ code: "image_not_imported", detail: url.slice(0, 120) });
-        append(unescapeMarkdownPunctuation(label ?? ""));
-      } else {
-        references.push(url);
-        append(unescapeMarkdownPunctuation(label ?? ""), [{ type: "link", attrs: { href: url } }]);
-      }
-    } else if (boldA !== undefined || boldB !== undefined) {
-      append(unescapeMarkdownPunctuation(boldA ?? boldB ?? ""), [{ type: "bold" }]);
-    } else if (code !== undefined) {
-      append(code, [{ type: "code" }]);
-    } else {
-      append(unescapeMarkdownPunctuation(italicA ?? italicB ?? ""), [{ type: "italic" }]);
-    }
-    offset = pattern.lastIndex;
-  }
-  append(value.slice(offset));
+  };
+  walk(Lexer.lexInline(value, { gfm: false }));
   return output;
 }
 
