@@ -16,7 +16,7 @@ type SavedReminder = {
   choice: ReminderChoice | { absolute: string };
   dueAt: number;
   generation: number;
-  state: "active" | "claimed" | "delivered" | "missing";
+  state: "active" | "claimed" | "delivered";
 };
 
 const OPTIONS: Array<{ value: ReminderChoice | "custom"; label: string }> = [
@@ -174,7 +174,6 @@ export function DateReminderPicker({
         </p>
       )}
       {saved?.state === "delivered" && <p>This reminder was delivered.</p>}
-      {saved?.state === "missing" && <p>This reminder is paused until the date reappears in the document.</p>}
       {error && <p role="alert">{error}</p>}
       <div className="date-mention-actions">
         <button type="button" onClick={() => void save()} disabled={busy}>

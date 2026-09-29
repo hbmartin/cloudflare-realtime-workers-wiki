@@ -234,6 +234,30 @@ function pmMark(type: string, markAttrs?: Record<string, unknown>) {
   return { type, ...(markAttrs ? { attrs: markAttrs } : {}) };
 }
 
+function notionDateStart(start: string, timezone: string): Pick<DateMention, "kind" | "value"> {
+  if (validCalendarDate(start)) return { kind: "all-day", value: start };
+  const local = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?$/.exec(start);
+  const absolute = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(?:Z|[+-]\d{2}:\d{2})$/.exec(
+    start,
+  );
+  const parts = local ?? absolute;
+  if (
+    !parts ||
+    !validCalendarDate(parts[1]!) ||
+    Number(parts[2]) > 23 ||
+    Number(parts[3]) > 59 ||
+    Number(parts[4] ?? 0) > 59
+  )
+    throw new Error("Date mention is invalid.");
+  const minute = local
+    ? resolveLocalDateTime(parts[1]!, timezone, Number(parts[2]), Number(parts[3]))
+    : Date.parse(start);
+  if (minute === null || !Number.isFinite(minute)) throw new Error("Date mention is invalid.");
+  const fractionalMs = Number((parts[5] ?? "").padEnd(3, "0").slice(0, 3));
+  const instant = local ? minute + Number(parts[4] ?? 0) * 1000 + fractionalMs : minute;
+  return { kind: "timed", value: new Date(instant).toISOString() };
+}
+
 export function notionRichTextToProseMirror(
   value: unknown,
   existingDates?: ReadonlyMap<string, DateMention | null>,
@@ -273,22 +297,7 @@ export function notionRichTextToProseMirror(
           const date = record(mention.date);
           const dateValue = string(date.start);
           const timezone = string(date.time_zone, existing.timezone);
-          const local = /^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(dateValue);
-          const instant = local
-            ? Number(local[4] ?? 0) < 60
-              ? resolveLocalDateTime(local[1]!, timezone, Number(local[2]), Number(local[3]))
-              : null
-            : /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,3})?)?(?:Z|[+-]\d{2}:\d{2})$/.test(dateValue)
-              ? Date.parse(dateValue)
-              : null;
-          const kind = validCalendarDate(dateValue) ? "all-day" : "timed";
-          const normalizedValue =
-            kind === "all-day"
-              ? dateValue
-              : instant !== null && Number.isFinite(instant)
-                ? new Date(instant + (local ? Number(local[4] ?? 0) * 1000 : 0)).toISOString()
-                : dateValue;
-          const updated: DateMention = { ...existing, kind, value: normalizedValue, timezone };
+          const updated: DateMention = { ...existing, ...notionDateStart(dateValue, timezone), timezone };
           if (!validDateMention(updated)) throw new Error("Date mention is invalid.");
           const unchanged =
             updated.kind === existing.kind &&

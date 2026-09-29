@@ -34,7 +34,6 @@ import { sweepOutbox } from "./jobs";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { deleteR2Prefix } from "./r2";
 import { dateTokens } from "../shared/document-projection";
-import { dateMentionFromProps } from "../shared/date-mentions";
 import { correlationHeaders, currentObservabilityContext, logger } from "./observability";
 import { registerMetricMiddleware } from "./metric-route";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
@@ -543,13 +542,7 @@ async function locatedBlock(env: Env, principal: IntegrationPrincipal, id: strin
   if (!block && !includeTrash) {
     throw new NotionError(404, "object_not_found", "Could not find page or block with the requested ID.");
   }
-  return {
-    page,
-    block,
-    document: envelope.document,
-    internalId: row.internal_id,
-    metadata: await metadataForPage(env, page.id),
-  };
+  return { page, block, internalId: row.internal_id, metadata: await metadataForPage(env, page.id) };
 }
 
 async function mutateDocument(
@@ -1205,39 +1198,9 @@ notionApi.patch("/blocks/:blockId", async (c) => {
     await mutateDocument(c.env, located.page, principal, [{ type: "delete_block", internalId: located.internalId }]);
     return c.json({ ...(await blockObject(c.env, located.page, located.block!, located.metadata)), in_trash: true });
   }
-  const blockDates = dateTokens(located.block!.node);
-  const liveDates = dateTokens(located.document);
-  for (const payload of Object.values(input)) {
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) continue;
-    const richText = (payload as { rich_text?: unknown }).rich_text;
-    if (!Array.isArray(richText)) continue;
-    for (const item of richText) {
-      const supplied = dateMentionFromProps(item?.mention?.noteFlare ?? {});
-      if (!supplied || blockDates.has(supplied.tokenId)) continue;
-      if (liveDates.has(supplied.tokenId)) {
-        throw new NotionError(
-          409,
-          "conflict_error",
-          "Move the original date token before reusing its ID in another block.",
-        );
-      }
-      const reminder = await c.env.DB.prepare(
-        `SELECT user_id,token_revision,timezone FROM date_reminders
-            WHERE page_id=? AND content_epoch=? AND token_id=? AND state!='canceled' LIMIT 1`,
-      )
-        .bind(located.page.id, located.page.content_epoch, supplied.tokenId)
-        .first<{ user_id: string; token_revision: string; timezone: string }>();
-      if (
-        reminder?.user_id === supplied.createdBy &&
-        reminder.token_revision === supplied.revision &&
-        reminder.timezone === supplied.timezone
-      )
-        blockDates.set(supplied.tokenId, supplied);
-    }
-  }
   let container;
   try {
-    container = notionInputToBlockContainer({ ...input, id: located.internalId }, 0, blockDates);
+    container = notionInputToBlockContainer({ ...input, id: located.internalId }, 0, dateTokens(located.block!.node));
   } catch (error) {
     throw new NotionError(400, "validation_error", error instanceof Error ? error.message : "Invalid block.");
   }

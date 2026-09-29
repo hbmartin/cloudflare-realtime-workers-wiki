@@ -165,7 +165,7 @@ describe("Notion-compatible API", () => {
       paragraph: { rich_text: Array<{ mention: { noteFlare: { payload: string } } }> };
     }>();
     expect(JSON.parse(preserved.paragraph.rich_text[0]!.mention.noteFlare.payload)).toMatchObject(mention);
-    for (const start of ["2026-10-01T09:00:00-05:00", "2026-10-01T09:00:00"]) {
+    for (const start of ["2026-10-01T09:00:00-05:00", "2026-10-01T09:00:00", "2026-10-01T14:00:00.000000Z"]) {
       const roundTrip = structuredClone(originalRichText);
       (roundTrip[0]!.mention as { date: { start: string } }).date.start = start;
       const response = await SELF.fetch(
@@ -181,6 +181,19 @@ describe("Notion-compatible API", () => {
       }>();
       expect(JSON.parse(normalized.paragraph.rich_text[0]!.mention.noteFlare.payload)).toMatchObject(mention);
     }
+    const invalidRichText = structuredClone(originalRichText);
+    (invalidRichText[0]!.mention as { date: { start: string } }).date.start = "2026-02-30T09:00:00Z";
+    expect(
+      (
+        await SELF.fetch(
+          notionRequest(createdIntegration.token, `/blocks/${block!.id}`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ paragraph: { rich_text: invalidRichText } }),
+          }),
+        )
+      ).status,
+    ).toBe(400);
     const editedRichText = structuredClone(originalRichText);
     const editedMention = editedRichText[0]!.mention as { date: { start: string } };
     editedMention.date.start = "2026-10-05T14:00:00.000Z";
@@ -199,48 +212,6 @@ describe("Notion-compatible API", () => {
       tokenId: mention.tokenId,
       createdBy: mention.createdBy,
       value: "2026-10-05T14:00:00.000Z",
-    });
-    const movedMention = JSON.parse(updated.paragraph.rich_text[0]!.mention.noteFlare.payload) as {
-      tokenId: string;
-      revision: string;
-    };
-    const reminder = await SELF.fetch(
-      authenticated(installed.cookie, `/api/pages/${installed.pageId}/date-reminders/${mention.tokenId}`, {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          revision: movedMention.revision,
-          choice: { absolute: new Date(Date.now() + 24 * 60 * 60_000).toISOString() },
-        }),
-      }),
-    );
-    expect(reminder.status).toBe(200);
-    const appended = await SELF.fetch(
-      notionRequest(createdIntegration.token, `/blocks/${installed.pageId}/children`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ children: [{ paragraph: { rich_text: [] } }] }),
-      }),
-    );
-    expect(appended.status).toBe(200);
-    const target = await appended.json<{ results: Array<{ id: string }> }>();
-    expect(
-      (await SELF.fetch(notionRequest(createdIntegration.token, `/blocks/${block!.id}`, { method: "DELETE" }))).status,
-    ).toBe(200);
-    const moved = await SELF.fetch(
-      notionRequest(createdIntegration.token, `/blocks/${target.results[0]!.id}`, {
-        method: "PATCH",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ paragraph: { rich_text: updated.paragraph.rich_text } }),
-      }),
-    );
-    expect(moved.status).toBe(200);
-    const movedBlock = await moved.json<{
-      paragraph: { rich_text: Array<{ mention: { noteFlare: { payload: string } } }> };
-    }>();
-    expect(JSON.parse(movedBlock.paragraph.rich_text[0]!.mention.noteFlare.payload)).toMatchObject({
-      tokenId: mention.tokenId,
-      createdBy: mention.createdBy,
     });
   });
   it("round-trips expanded embed URLs through /v1 while framing is disabled", async () => {

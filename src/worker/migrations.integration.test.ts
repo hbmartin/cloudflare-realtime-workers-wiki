@@ -6,41 +6,6 @@ import { createAuth } from "./auth";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
-  it("accepts temporarily missing reminders after an existing 0057 database upgrades", async () => {
-    await applyD1Migrations(
-      env.DB,
-      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0058"),
-    );
-    const before = await env.DB.prepare(`SELECT sql FROM sqlite_master WHERE name='date_reminders'`).first<{
-      sql: string;
-    }>();
-    expect(before?.sql).not.toContain("'missing'");
-    await env.DB.batch([
-      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
-        VALUES ('owner','Owner','owner@example.test',1,1)`),
-      env.DB.prepare(`INSERT INTO workspaces(id,name,created_at) VALUES ('workspace','Notes',1)`),
-      env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
-        VALUES ('page','workspace','workspace-general','document','a0','Page','owner',1,1)`),
-      env.DB.prepare(`INSERT INTO date_reminders
-        (id,workspace_id,page_id,content_epoch,token_id,user_id,token_revision,timezone,choice_json,
-         due_at,state,checked_at,created_at,updated_at)
-        VALUES ('reminder','workspace','page',1,'token','owner','revision','UTC','"at_time"',
-                12345,'active',1,1,1)`),
-    ]);
-    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
-    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
-    const after = await env.DB.prepare(`SELECT sql FROM sqlite_master WHERE name='date_reminders'`).first<{
-      sql: string;
-    }>();
-    expect(after?.sql).toContain("'missing'");
-    expect(await env.DB.prepare(`SELECT id,state,due_at FROM date_reminders WHERE id='reminder'`).first()).toEqual({
-      id: "reminder",
-      state: "active",
-      due_at: 12345,
-    });
-    await env.DB.prepare(`UPDATE date_reminders SET state='missing' WHERE id='reminder'`).run();
-  });
-
   it("repairs a stale recovery claim after its pending key was pruned", async () => {
     await applyD1Migrations(
       env.DB,
