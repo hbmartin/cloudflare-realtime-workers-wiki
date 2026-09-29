@@ -394,6 +394,7 @@ async function hydrateDocumentAssets(
 ) {
   if (!page.document) return;
   const bySource = new Map<string, ImportAsset>();
+  const visitedLinks = new Set<object>();
   walkDocument(page.document, (node) => {
     const url = typeof node.attrs?.url === "string" ? node.attrs.url : null;
     if (url) {
@@ -407,6 +408,9 @@ async function hydrateDocumentAssets(
     }
     for (const mark of node.marks ?? []) {
       if (mark.type !== "link" || typeof mark.attrs?.href !== "string") continue;
+      // Formatted link labels contain several text nodes with the same mark.
+      if (visitedLinks.has(mark)) continue;
+      visitedLinks.add(mark);
       const path = normalizedRelativePath(page.source, mark.attrs.href);
       const targetId = path ? pageIds.get(path) : null;
       if (targetId) {

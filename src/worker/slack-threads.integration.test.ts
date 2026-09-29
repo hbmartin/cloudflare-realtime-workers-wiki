@@ -5846,6 +5846,13 @@ describe("Slack documents and tasks", () => {
     expect(await env.DB.prepare("SELECT status FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
       status: "queued",
     });
+    const replacement = await env.DB.prepare("SELECT workflow_instance_id FROM jobs WHERE id=?")
+      .bind(captureId)
+      .first<{ workflow_instance_id: string }>();
+    expect(replacement?.workflow_instance_id).not.toBe(job!.workflow_instance_id);
+    const linked = await prepareSlackCapture(runtime(), captureId);
+    await startJobExecution(productionEnv, linked!);
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ id: replacement?.workflow_instance_id }));
   });
   it("requeues a wrapped Workflow step error while the Slack receipt is unlinked", async () => {
     const captureId = await startCapture("document", "space:workspace-general", "Wrapped Workflow error");

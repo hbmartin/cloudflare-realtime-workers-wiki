@@ -80,52 +80,39 @@ function blockDocument(blocks: ProseMirrorJson[]) {
   } satisfies ProseMirrorJson;
 }
 
-// Scan destinations instead of stopping at the first closing parenthesis.
-function markdownDestination(value: string, start: number) {
-  let cursor = start;
-  while (/\s/.test(value[cursor] ?? "") && cursor < value.length) cursor += 1;
-  const angled = value[cursor] === "<";
-  if (angled) cursor += 1;
-  let href = "";
-  let depth = 0;
-  for (; cursor < value.length; cursor += 1) {
-    const character = value[cursor]!;
-    if (character === "\\" && /[!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~]/.test(value[cursor + 1] ?? "")) {
-      href += value[++cursor];
-    } else if (angled && character === ">") {
-      cursor += 1;
-      break;
-    } else if (!angled && character === "(") {
-      depth += 1;
-      href += character;
-    } else if (!angled && character === ")") {
-      if (depth === 0) break;
-      depth -= 1;
-      href += character;
-    } else if (!angled && /\s/.test(character)) {
-      break;
+const ESCAPABLE_MARKDOWN = /[!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~]/;
+
+function unescapeMarkdown(value: string) {
+  let output = "";
+  for (let index = 0; index < value.length; index += 1) {
+    if (value[index] === "\\" && ESCAPABLE_MARKDOWN.test(value[index + 1] ?? "")) index += 1;
+    output += value[index];
+  }
+  return output;
+}
+
+function plainEscapedMarkdown(value: string) {
+  let output = "";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index]!;
+    if (character === "\\" && ESCAPABLE_MARKDOWN.test(value[index + 1] ?? "")) {
+      output += value[++index];
+    } else if (/[!*_[\]`<&]/.test(character)) {
+      return null;
     } else {
-      href += character;
+      output += character;
     }
   }
-  if (depth !== 0) return null;
-  const destinationEnd = cursor;
-  while (cursor < value.length && /\s/.test(value[cursor]!)) cursor += 1;
-  if (cursor > destinationEnd && ['"', "'", "("].includes(value[cursor] ?? "")) {
-    const closer = value[cursor] === "(" ? ")" : value[cursor];
-    cursor += 1;
-    while (cursor < value.length && value[cursor] !== closer) {
-      if (value[cursor] === "\\") cursor += 1;
-      cursor += 1;
-    }
-    if (value[cursor] !== closer) return null;
-    cursor += 1;
-    while (cursor < value.length && /\s/.test(value[cursor]!)) cursor += 1;
-  }
-  return value[cursor] === ")" ? { href, end: cursor + 1 } : null;
+  return output;
 }
 
 function markdownInline(value: string, issues: ImportIssue[], references: string[]) {
+  const plain = plainEscapedMarkdown(value);
+  if (plain !== null) return inline(plain);
+  if (value.length > 64_000) {
+    issues.push({ code: "inline_markup_simplified", detail: "A long paragraph was imported as plain text." });
+    return inline(unescapeMarkdown(value));
+  }
   const output: ProseMirrorJson[] = [];
   const append = (text: string, marks: ProseMirrorJson["marks"] = []) => {
     if (!text) return;
@@ -136,17 +123,19 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
     }
     output.push(...inline(text, marks));
   };
-  // Keep block conversion local, but use a CommonMark inline lexer for nested
+  // Keep block conversion local, but use an inline lexer for nested
   // delimiters. The resulting tokens still pass through our URL policy.
   const walk = (tokens: Token[], marks: ProseMirrorJson["marks"] = []) => {
     for (const token of tokens) {
       const children: Token[] = "tokens" in token && Array.isArray(token.tokens) ? token.tokens : [];
-      if (token.type === "text" || token.type === "escape") append(token.text, marks);
-      else if (token.type === "em") walk(children, [{ type: "italic" }, ...marks]);
+      if (token.type === "text") append(unescapeMarkdown(token.text), marks);
+      else if (token.type === "escape") append(token.text, marks);
+      else if (token.type === "em")
+        walk(children, marks.some((mark) => mark.type === "italic") ? marks : [{ type: "italic" }, ...marks]);
       else if (token.type === "strong") walk(children, [...marks, { type: "bold" }]);
       else if (token.type === "codespan") append(token.text, [...marks, { type: "code" }]);
       else if (token.type === "link" || token.type === "image") {
-        const rawUrl = token.href;
+        const rawUrl = unescapeMarkdown(token.href);
         const url = safeLink(rawUrl);
         if (!url) {
           issues.push({ code: "unsafe_url", detail: rawUrl.slice(0, 120) });
@@ -160,7 +149,7 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
           walk(children, [...marks, { type: "link", attrs: { href: url } }]);
         }
       } else if (children.length) walk(children, marks);
-      else append(token.raw, marks);
+      else append(unescapeMarkdown(token.raw), marks);
     }
   };
   walk(Lexer.lexInline(value, { gfm: false }));
@@ -168,11 +157,9 @@ function markdownInline(value: string, issues: ImportIssue[], references: string
 }
 
 function markdownImage(value: string) {
-  const opener = /^!\[([^\]]*)\]\(/.exec(value);
-  if (!opener) return null;
-  const destination = markdownDestination(value, opener[0].length);
-  if (!destination || value.slice(destination.end).trim()) return null;
-  return { label: opener[1] ?? "", href: destination.href };
+  const tokens = Lexer.lexInline(value.trim(), { gfm: false });
+  const image = tokens.length === 1 && tokens[0]?.type === "image" ? tokens[0] : null;
+  return image ? { label: unescapeMarkdown(image.text), href: unescapeMarkdown(image.href) } : null;
 }
 
 export function markdownToDocument(source: string) {

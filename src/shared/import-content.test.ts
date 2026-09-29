@@ -85,11 +85,11 @@ describe("import content", () => {
     expect(content.some((node) => node.text === italic && node.marks?.[0]?.type === "italic")).toBe(true);
   });
 
-  it("parses ambiguous delimiter runs according to CommonMark", () => {
+  it("keeps ambiguous delimiter runs readable without duplicate marks", () => {
     const content = markdownToDocument("*a**b**").document.content![0]!.content![0]!.content![0]!.content!;
     expect(content).toEqual([
       { type: "text", text: "a*", marks: [{ type: "italic" }] },
-      { type: "text", text: "b", marks: [{ type: "italic" }, { type: "italic" }] },
+      { type: "text", text: "b", marks: [{ type: "italic" }] },
     ]);
   });
 
@@ -156,6 +156,37 @@ describe("import content", () => {
     const parsed = markdownToDocument(source);
     const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
     expect(content).toEqual([{ type: "text", text: source.trim() }]);
+  });
+
+  it("unescapes punctuation inside HTML-like text and autolinks", () => {
+    const html = markdownToDocument('<div class="foo\\-bar">');
+    expect(html.document.content![0]!.content![0]!.content![0]!.content).toEqual([
+      { type: "text", text: '<div class="foo-bar">' },
+    ]);
+    const link = markdownToDocument("<https://example.com/a\\.b>");
+    expect(link.references).toEqual(["https://example.com/a.b"]);
+    expect(link.document.content![0]!.content![0]!.content![0]!.content).toEqual([
+      {
+        type: "text",
+        text: "https://example.com/a.b",
+        marks: [{ type: "link", attrs: { href: "https://example.com/a.b" } }],
+      },
+    ]);
+  });
+
+  it("bounds formatting work for an exceptionally long paragraph without dropping text", () => {
+    const source = `**${"\\.".repeat(40_000)}`;
+    const parsed = markdownToDocument(source);
+    const content = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(content).toEqual([{ type: "text", text: `**${".".repeat(40_000)}` }]);
+    expect(parsed.issues).toEqual([
+      { code: "inline_markup_simplified", detail: "A long paragraph was imported as plain text." },
+    ]);
+    const plain = markdownToDocument("\\.".repeat(40_000));
+    expect(plain.issues).toEqual([]);
+    expect(plain.document.content![0]!.content![0]!.content![0]!.content).toEqual([
+      { type: "text", text: ".".repeat(40_000) },
+    ]);
   });
 
   it.each([

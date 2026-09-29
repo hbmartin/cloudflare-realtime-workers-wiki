@@ -2,7 +2,8 @@
 -- whose next attempt is queued or running; that attempt has not failed yet.
 UPDATE slack_captures
    SET last_failed_job_attempt = (
-     SELECT CASE WHEN jobs.status IN ('failed', 'canceled') THEN jobs.attempt
+     SELECT CASE WHEN jobs.status IN ('failed', 'canceled')
+                     OR slack_captures.updated_at >= jobs.updated_at THEN jobs.attempt
                  ELSE MAX(0, jobs.attempt - 1) END
        FROM jobs WHERE jobs.id = slack_captures.job_id
    )
