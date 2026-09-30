@@ -66,7 +66,7 @@ import { SearchView } from "./SearchView";
 import { ExportDialog } from "./ExportDialog";
 import { ImportDialog } from "./ImportDialog";
 import { SlackSettings } from "./SlackSettings";
-import { ThemeControl } from "./ThemeControl";
+import { ThemeControl, useThemeCommand } from "./ThemeControl";
 import { ShareControl } from "./ShareControl";
 import { IntegrationsSettings } from "./IntegrationsSettings";
 
@@ -1093,6 +1093,7 @@ export function useCommittedRef<T>(value: T) {
 }
 
 function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
+  useThemeCommand();
   const preferencesKey = `notes:ui:${member.workspace.id}:${member.user.id}`;
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readPreference(`${preferencesKey}:collapsed`, false));
   const [sidebarWidth, setSidebarWidth] = useState(() =>
@@ -4016,7 +4017,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         <MovePageDialog
           page={activeSelected}
           pages={pages}
-          onMove={(parentId) => void move(activeSelected.id, parentId)}
+          onMove={(parentId) => {
+            if (parentId !== activeSelected.parentId) void move(activeSelected.id, parentId);
+          }}
           onClose={() => setMoveDialogOpen(false)}
         />
       )}

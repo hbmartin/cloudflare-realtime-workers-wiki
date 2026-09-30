@@ -279,12 +279,21 @@ export async function mutateTask(
   if (replay) {
     if (replay.request_hash !== hash)
       throw new HttpError(409, "idempotency_key_reused", "That operation ID describes a different change.");
+    const subtree =
+      body.archived === true
+        ? await env.DB.prepare(
+            `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id)
+             SELECT id FROM subtree`,
+          )
+            .bind(replay.detail_page_id)
+            .all<{ id: string }>()
+        : undefined;
     return {
       rowId: replay.row_id,
       detailPageId: replay.detail_page_id,
       revision: replay.revision,
       replayed: true,
-      pageIds: body.archived === true ? [replay.detail_page_id] : undefined,
+      pageIds: subtree?.results.map((row) => row.id),
     };
   }
   const previous = rowId

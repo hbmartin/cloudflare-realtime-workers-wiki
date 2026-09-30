@@ -92,17 +92,17 @@ export function captureMarkdown(input: {
     lines.push(messageText(message.text ?? ""));
     for (const reaction of message.reactions ?? []) {
       if (typeof reaction.name === "string" && Number.isSafeInteger(reaction.count) && reaction.count! > 0)
-        lines.push(`Reaction: ${escapeMarkdown(reaction.name)} × ${reaction.count}`);
+        lines.push("", `Reaction: ${escapeMarkdown(reaction.name)} × ${reaction.count}`);
     }
     for (const file of message.files ?? []) {
       const name = file.title ?? file.name ?? "Slack attachment";
       const href = safeHttpsLink(file.permalink ?? "", true);
-      lines.push(href ? `Attachment: ${link(name, href)}` : `Attachment: ${escapeMarkdown(name)}`);
+      lines.push("", href ? `Attachment: ${link(name, href)}` : `Attachment: ${escapeMarkdown(name)}`);
     }
     for (const attachment of message.attachments ?? []) {
       const name = attachment.title ?? "Slack attachment";
       const href = safeHttpsLink(attachment.title_link ?? "");
-      lines.push(href ? `Attachment: ${link(name, href)}` : `Attachment: ${escapeMarkdown(name)}`);
+      lines.push("", href ? `Attachment: ${link(name, href)}` : `Attachment: ${escapeMarkdown(name)}`);
     }
   }
   const markdown = lines.join("\n").trimEnd() + "\n";
