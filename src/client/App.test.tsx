@@ -1987,7 +1987,7 @@ describe("App error handling", () => {
 
     const openSidebar = await screen.findByRole("button", { name: "Open navigation" });
     fireEvent.click(openSidebar);
-    fireEvent.click(getArchive("Archive Roadmap"));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(await screen.findByText("Archive was rejected.")).toBeInTheDocument();
     expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
