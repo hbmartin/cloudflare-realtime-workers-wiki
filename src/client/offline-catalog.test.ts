@@ -1,10 +1,16 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { latestOfflineAccount } from "./offline-catalog";
+let latestOfflineAccount: typeof import("./offline-catalog").latestOfflineAccount;
 
 function database() {
+  const stores = new Set<string>();
   return {
+    objectStoreNames: { contains: (name: string) => stores.has(name) },
+    createObjectStore: vi.fn((name: string) => {
+      stores.add(name);
+      return { createIndex: vi.fn() };
+    }),
     close: vi.fn(),
     onversionchange: null as (() => void) | null,
     transaction: vi.fn(() => {
@@ -29,7 +35,9 @@ const databases: ReturnType<typeof database>[] = [];
 let requests: Array<EventTarget & { result: ReturnType<typeof database>; error: Error | null }>;
 let open: ReturnType<typeof vi.fn>;
 
-beforeEach(() => {
+beforeEach(async () => {
+  vi.resetModules();
+  ({ latestOfflineAccount } = await import("./offline-catalog"));
   vi.useFakeTimers();
   requests = [];
   open = vi.fn(() => {
@@ -87,6 +95,25 @@ it("closes a late success without disturbing a successful retry", async () => {
   expect(current.result.close).not.toHaveBeenCalled();
   await expect(latestOfflineAccount()).resolves.toBeNull();
   expect(open).toHaveBeenCalledTimes(2);
+});
+
+it("closes a slow initial catalog creation after its deadline", async () => {
+  const failed = latestOfflineAccount().catch((error: unknown) => error);
+  const request = requests[0]!;
+  request.dispatchEvent(new Event("upgradeneeded"));
+  expect(request.result.createObjectStore.mock.calls).toEqual([
+    ["accounts", { keyPath: "key" }],
+    ["pages", { keyPath: "key" }],
+  ]);
+  expect(request.result.createObjectStore.mock.results[1]!.value.createIndex).toHaveBeenCalledWith(
+    "byAccount",
+    "accountKey",
+  );
+  await vi.advanceTimersByTimeAsync(5_000);
+  await expect(failed).resolves.toEqual(new Error("Offline catalog open timed out."));
+  request.dispatchEvent(new Event("success"));
+  expect(request.result.close).toHaveBeenCalledOnce();
+  expect(request.result.transaction).not.toHaveBeenCalled();
 });
 
 it("clears the deadline after a successful open and reuses the connection", async () => {
