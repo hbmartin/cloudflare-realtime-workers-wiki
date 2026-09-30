@@ -106,7 +106,8 @@ function markdownInline(
   if (!prepared) {
     const plain = unescapeMarkdown(value, true);
     if (plain !== null) return inline(plain);
-    if (value.length > 8192) return boundedMarkdownInline(value, issues, references);
+    if (value.length > 8192 || (value.match(/[<\\]/g)?.length ?? 0) > 128 || (value.match(/[*_`]/g)?.length ?? 0) > 512)
+      return boundedMarkdownInline(value, issues, references);
     if (value.includes("data:image/"))
       return markdownInline(value, issues, references, Lexer.lexInline(value, { gfm: false }), undefined, true);
   }

@@ -295,11 +295,13 @@ export function TasksView({
   );
   const refreshLease = useCallback(async () => {
     if (!pageId) return;
+    const startedLease = leaseRef.current;
     try {
       const response = await taskApi<{ lease: TableData["lease"] }>(`/api/task-lists/${pageId}/lease`);
       if (active.current && filtersRef.current.pageId === pageId) {
         setHolder(response.lease.holderName);
-        if (leaseRef.current && !response.lease.heldByMe) {
+        if (startedLease && leaseRef.current === startedLease && !response.lease.heldByMe) {
+          release(startedLease);
           leaseRef.current = null;
           leaseExpiresAtRef.current = 0;
           setLease(null);
@@ -315,7 +317,7 @@ export function TasksView({
       )
         setHolder(null);
     }
-  }, [pageId]);
+  }, [pageId, release]);
   useEffect(() => {
     if (!pageId) return undefined;
     const timer = setInterval(() => {
