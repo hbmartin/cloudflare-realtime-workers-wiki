@@ -95,12 +95,12 @@ export function captureMarkdown(input: {
         lines.push("", `Reaction: ${escapeMarkdown(reaction.name)} × ${reaction.count}`);
     }
     for (const file of message.files ?? []) {
-      const name = file.title ?? file.name ?? "Slack attachment";
+      const name = file.title?.trim() || file.name?.trim() || "Slack attachment";
       const href = safeHttpsLink(file.permalink ?? "", true);
       lines.push("", href ? `Attachment: ${link(name, href)}` : `Attachment: ${escapeMarkdown(name)}`);
     }
     for (const attachment of message.attachments ?? []) {
-      const name = attachment.title ?? "Slack attachment";
+      const name = attachment.title?.trim() || "Slack attachment";
       const href = safeHttpsLink(attachment.title_link ?? "");
       lines.push("", href ? `Attachment: ${link(name, href)}` : `Attachment: ${escapeMarkdown(name)}`);
     }
