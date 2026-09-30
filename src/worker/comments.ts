@@ -13,10 +13,18 @@ const COMMENT_BODY_MAX_BYTES = 32 * 1024;
 const COMMENT_BODY_MAX_NODES = 2_000;
 const COMMENT_BODY_MAX_DEPTH = 30;
 
+export function commentBlockInternalId(
+  pageId: string,
+  blockId: string,
+  indexed: { page_id: string | null; internal_id: string | null } | null,
+) {
+  return indexed ? (indexed.page_id === pageId ? indexed.internal_id : null) : blockId;
+}
+
 export async function protectedCommentBlockIds(env: Env, pageId: string, document: ProseMirrorJson) {
   const liveIds = new Set(flattenDocumentBlocks(document).map((block) => block.internalId));
   const rows = await env.DB.prepare(
-    `SELECT DISTINCT thread.block_id,block.id public_id,block.internal_id,block.page_id,block.deleted_at
+    `SELECT DISTINCT thread.block_id,block.id public_id,block.internal_id,block.page_id
        FROM comment_threads thread LEFT JOIN api_blocks block ON block.id=thread.block_id
       WHERE thread.page_id=? AND thread.block_id IS NOT NULL`,
   )
@@ -26,17 +34,13 @@ export async function protectedCommentBlockIds(env: Env, pageId: string, documen
       public_id: string | null;
       internal_id: string | null;
       page_id: string | null;
-      deleted_at: number | null;
     }>();
   const protectedIds = new Set<string>();
   for (const row of rows.results) {
     // Public IDs are global; native IDs are scoped to the live document. A
-    // known foreign or deleted public ID must never fall back to a native ID.
-    const internalId = row.public_id
-      ? row.page_id === pageId && row.deleted_at === null
-        ? row.internal_id
-        : null
-      : row.block_id;
+    // known foreign public ID must never fall back to a native ID. Existence
+    // comes from the live document because deletion metadata can be stale.
+    const internalId = commentBlockInternalId(pageId, row.block_id, row.public_id ? row : null);
     if (internalId && liveIds.has(internalId)) protectedIds.add(internalId);
   }
   return protectedIds;

@@ -591,6 +591,19 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
   const input = await authorizationRequest(params, env);
   if (input instanceof Response) return input;
   if (!member) return authorizationRedirect(input, { error: "access_denied" }, env);
+  try {
+    const current = await consentMember(request, env);
+    if (
+      current.session.id !== member.session.id ||
+      current.workspace.id !== member.workspace.id ||
+      current.mcpGeneration !== member.mcpGeneration
+    )
+      return authorizationRedirect(input, { error: "access_denied" }, env);
+    member = current;
+  } catch (error) {
+    if (!(error instanceof HttpError) || ![401, 403].includes(error.status)) throw error;
+    return authorizationRedirect(input, { error: "access_denied" }, env);
+  }
   let decision: string;
   try {
     decision = singleton(params, "decision");
@@ -814,7 +827,7 @@ async function refreshGrant(params: URLSearchParams, env: Env) {
     await env.DB.prepare("UPDATE oauth_grants SET revoked_at=? WHERE id=? AND revoked_at IS NULL")
       .bind(Date.now(), row.grant_id)
       .run();
-    return oauthError("invalid_grant", "The refresh token was already used.");
+    return oauthError("invalid_grant", "The refresh token is no longer valid.");
   }
   return json({
     access_token: accessToken,

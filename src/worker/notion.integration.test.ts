@@ -195,7 +195,7 @@ describe("Notion-compatible API", () => {
     ).toBe("Once\n");
   });
 
-  it.each(["native", "public", "foreign"])(
+  it.each(["native", "public", "stale", "foreign"])(
     "verifies %s comment targets before protecting Markdown content",
     async (target) => {
       const installed = await bootstrap();
@@ -222,8 +222,10 @@ describe("Notion-compatible API", () => {
       }
       await env.DB.prepare(`INSERT INTO comment_threads(id,workspace_id,space_id,page_id,created_by,block_id,created_at,updated_at)
       SELECT 'thread',workspace_id,space_id,id,created_by,?,1,1 FROM pages WHERE id=?`)
-        .bind(target === "public" ? metadata.id : metadata.internal_id, installed.pageId)
+        .bind(target === "public" || target === "stale" ? metadata.id : metadata.internal_id, installed.pageId)
         .run();
+      if (target === "stale")
+        await env.DB.prepare("UPDATE api_blocks SET deleted_at=1 WHERE id=?").bind(metadata.id).run();
       const response = await SELF.fetch(
         notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
           method: "PATCH",

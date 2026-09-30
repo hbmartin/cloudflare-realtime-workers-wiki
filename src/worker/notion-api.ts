@@ -755,7 +755,7 @@ async function pageMarkdownProjection(
       if (attachmentId && referencedAttachments.size < MAX_MARKDOWN_BLOCKS) referencedAttachments.add(attachmentId);
     }
   }
-  const [attachments, childPages] = await Promise.all([
+  const [attachments, childPages, protectedBlockIds] = await Promise.all([
     referencedAttachments.size
       ? env.DB.prepare(`SELECT id FROM attachments WHERE page_id = ? AND id IN (SELECT value FROM json_each(?))`)
           .bind(page.id, JSON.stringify([...referencedAttachments]))
@@ -774,6 +774,7 @@ async function pageMarkdownProjection(
         MAX_MARKDOWN_BLOCKS + MAX_UNKNOWN_BLOCK_IDS + 1,
       )
       .all<{ id: string; title: string }>(),
+    protectedCommentBlockIds(env, page.id, snapshot.document),
   ]);
   const signedMedia = new Map(
     await Promise.all(
@@ -792,7 +793,6 @@ async function pageMarkdownProjection(
     if (signed) canonicalMediaUrls.set(signed, url);
   }
   const ids = new Map([...metadata].map(([internalId, value]) => [internalId, value.id]));
-  const protectedBlockIds = await protectedCommentBlockIds(env, page.id, snapshot.document);
   const childIds = await publicPageIds(
     env,
     childPages.results.map((child) => child.id),

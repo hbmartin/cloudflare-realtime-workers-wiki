@@ -1,7 +1,7 @@
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { z } from "zod";
-import { createCommentThread, protectedCommentBlockIds, type CommentPage } from "./comments";
+import { commentBlockInternalId, createCommentThread, protectedCommentBlockIds, type CommentPage } from "./comments";
 import { findDocumentBlock } from "../shared/notion-blocks";
 import { projectNotionMarkdown } from "../shared/notion-markdown";
 import { MarkdownWriteError, parseWritableMarkdown } from "../shared/notion-markdown-write";
@@ -528,14 +528,10 @@ async function commentTool(
   if (input.block_id !== undefined) {
     if (page.kind !== "document") throw new HttpError(404, "block_not_found", "The comment block was not found.");
     const envelope = await roomContent(env, access, page);
-    const block = await env.DB.prepare("SELECT page_id,internal_id,deleted_at FROM api_blocks WHERE id=?")
+    const block = await env.DB.prepare("SELECT page_id,internal_id FROM api_blocks WHERE id=?")
       .bind(input.block_id)
-      .first<{ page_id: string; internal_id: string; deleted_at: number | null }>();
-    const internalId = block
-      ? block.page_id === page.id && block.deleted_at === null
-        ? block.internal_id
-        : null
-      : input.block_id;
+      .first<{ page_id: string; internal_id: string }>();
+    const internalId = commentBlockInternalId(page.id, input.block_id, block);
     if (!internalId || !findDocumentBlock(envelope.document, internalId))
       throw new HttpError(404, "block_not_found", "The comment block was not found.");
     access = await currentAccess(request, env, scopes);

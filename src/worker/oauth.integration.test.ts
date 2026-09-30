@@ -468,7 +468,7 @@ describe("OAuth MCP foundation", () => {
     );
     await env.DB.prepare("UPDATE api_blocks SET deleted_at=1 WHERE id=?").bind(blocks.alias).run();
     expect(await protectedCommentBlockIds(env, connection.page.id, blocks.snapshot.document)).toEqual(
-      new Set([blocks.nestedId]),
+      new Set([blocks.nativeId, blocks.nestedId]),
     );
     await env.DB.prepare("DELETE FROM comment_threads WHERE page_id=?").bind(connection.page.id).run();
     await env.DB.prepare(`INSERT INTO comment_threads(id,workspace_id,space_id,page_id,created_by,block_id,created_at,updated_at)
@@ -481,6 +481,54 @@ describe("OAuth MCP foundation", () => {
       command: { type: "replace_content", replace_content: { new_str: "Replacement", allow_deleting_content: true } },
     });
     expect(edited.result.isError).not.toBe(true);
+  });
+
+  it("keeps live public comment targets usable and protected when their derived index is stale", async () => {
+    const connection = await connect(await bootstrap());
+    const blocks = await seedCommentBlocks(connection);
+    await env.DB.prepare("UPDATE api_blocks SET deleted_at=1 WHERE id=?").bind(blocks.alias).run();
+    const commented = await toolCall(connection.token, "create_comment", {
+      page_id: connection.page.id,
+      block_id: blocks.alias,
+      body: "Live target",
+      operation_id: "stale-index-comment",
+    });
+    expect(commented.result.isError).not.toBe(true);
+    expect(await protectedCommentBlockIds(env, connection.page.id, blocks.snapshot.document)).toEqual(
+      new Set([blocks.nativeId]),
+    );
+    const edited = await toolCall(connection.token, "update_page", {
+      page_id: connection.page.id,
+      operation_id: "stale-index-edit",
+      command: { type: "replace_content", replace_content: { new_str: "Replacement", allow_deleting_content: true } },
+    });
+    expect(edited.result.isError).toBe(true);
+    expect(JSON.stringify(edited)).toContain("comments or comment anchors");
+  });
+
+  it("rejects consent when its browser session is signed out during client resolution", async () => {
+    const cookie = await bootstrap();
+    const clientId = await register();
+    const bindings = afterDatabaseRead(
+      "SELECT client_id,name,redirect_uris_json,metadata_url,updated_at FROM oauth_clients WHERE client_id=?",
+      async () => {
+        const signout = await SELF.fetch(`${ORIGIN}/api/auth/sign-out`, {
+          method: "POST",
+          headers: { cookie, origin: ORIGIN },
+        });
+        expect(signout.status).toBe(200);
+      },
+    );
+    const response = await authorizeOAuthPost(
+      new Request(`${ORIGIN}/oauth/authorize`, {
+        method: "POST",
+        headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
+        body: `${authorizationParams(clientId)}&decision=approve`,
+      }),
+      bindings,
+    );
+    expect(new URL(response.headers.get("location")!).searchParams.get("error")).toBe("access_denied");
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM oauth_authorization_codes").first()).toEqual({ count: 0 });
   });
 
   it("lets only one concurrent exchange consume a code and leaves the winning grant usable", async () => {
@@ -547,6 +595,12 @@ describe("OAuth MCP foundation", () => {
         bindings,
       );
       expect(response.status).toBe(400);
+      expect((await response.json<{ error_description: string }>()).error_description).toBe(
+        grantType === "refresh_token"
+          ? "The refresh token is no longer valid."
+          : "The authorization code is invalid or already used.",
+      );
+
       expect(await env.DB.prepare("SELECT COUNT(*) count FROM oauth_grants WHERE revoked_at IS NULL").first()).toEqual({
         count: 0,
       });
