@@ -20,7 +20,14 @@ import { sha256Hex } from "../shared/import-integrity";
 import type { Comment, CommentThread, DocumentContentEnvelope, WorkspaceEvent } from "../shared/types";
 import { PAGE_TITLE_MAX } from "../shared/validation";
 import { processArchiveDisconnectTargets } from "./archive";
-import { createCommentThread, softDeleteComment, updateComment, type CommentActor, type CommentPage } from "./comments";
+import {
+  createCommentThread,
+  protectedCommentBlockIds,
+  softDeleteComment,
+  updateComment,
+  type CommentActor,
+  type CommentPage,
+} from "./comments";
 import {
   activeIntegrationPrincipal,
   authenticateIntegration,
@@ -733,13 +740,10 @@ async function pageMarkdownProjection(
   requestUrl: string,
   suppliedSnapshot?: DocumentContentEnvelope,
 ) {
-  const [snapshot, metadata, id, commentBlocks] = await Promise.all([
+  const [snapshot, metadata, id] = await Promise.all([
     suppliedSnapshot ?? liveDocument(env, page),
     metadataForPage(env, page.id),
     publicPageId(env, page.id),
-    env.DB.prepare(`SELECT DISTINCT block_id FROM comment_threads WHERE page_id=? AND block_id IS NOT NULL`)
-      .bind(page.id)
-      .all<{ block_id: string }>(),
   ]);
   const referencedAttachments = new Set<string>();
   const linkedPages = new Set<string>();
@@ -751,7 +755,7 @@ async function pageMarkdownProjection(
       if (attachmentId && referencedAttachments.size < MAX_MARKDOWN_BLOCKS) referencedAttachments.add(attachmentId);
     }
   }
-  const [attachments, childPages] = await Promise.all([
+  const [attachments, childPages, protectedBlockIds] = await Promise.all([
     referencedAttachments.size
       ? env.DB.prepare(`SELECT id FROM attachments WHERE page_id = ? AND id IN (SELECT value FROM json_each(?))`)
           .bind(page.id, JSON.stringify([...referencedAttachments]))
@@ -770,6 +774,7 @@ async function pageMarkdownProjection(
         MAX_MARKDOWN_BLOCKS + MAX_UNKNOWN_BLOCK_IDS + 1,
       )
       .all<{ id: string; title: string }>(),
+    protectedCommentBlockIds(env, page.id, snapshot.document),
   ]);
   const signedMedia = new Map(
     await Promise.all(
@@ -788,13 +793,6 @@ async function pageMarkdownProjection(
     if (signed) canonicalMediaUrls.set(signed, url);
   }
   const ids = new Map([...metadata].map(([internalId, value]) => [internalId, value.id]));
-  const commentedPublicIds = new Set(commentBlocks.results.map((row) => row.block_id));
-  const protectedBlockIds = new Set([
-    ...commentedPublicIds,
-    ...[...metadata]
-      .filter(([internalId, value]) => commentedPublicIds.has(internalId) || commentedPublicIds.has(value.id))
-      .map(([internalId]) => internalId),
-  ]);
   const childIds = await publicPageIds(
     env,
     childPages.results.map((child) => child.id),

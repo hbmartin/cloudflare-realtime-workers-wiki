@@ -1136,11 +1136,19 @@ async function oauthProtocolResponse(action: () => Promise<Response>) {
   try {
     return await action();
   } catch (error) {
-    if (error instanceof HttpError)
+    if (error instanceof HttpError) {
+      const retryAfter = (error.details as { retryAfter?: number } | undefined)?.retryAfter;
       return Response.json(
         { error: error.code, error_description: error.message },
-        { status: error.status, headers: { "cache-control": "no-store" } },
+        {
+          status: error.status,
+          headers: {
+            "cache-control": "no-store",
+            ...(error.status === 429 ? { "retry-after": String(retryAfter ?? 60) } : {}),
+          },
+        },
       );
+    }
     throw error;
   }
 }
@@ -7017,11 +7025,9 @@ export default {
         slack_digests: () => sendDueSlackChannelDigests(env),
         slack_security_records: () => pruneSlackSecurityRecords(env),
         webhook_history: () => pruneWebhookHistory(env),
-        security_state: async () => {
-          await pruneSecurityState(env);
-          await pruneOAuthSecurityRecords(env);
-          await pruneStagedMcpPages(env);
-        },
+        security_state: () => pruneSecurityState(env),
+        oauth_security_records: () => pruneOAuthSecurityRecords(env),
+        mcp_staged_pages: () => pruneStagedMcpPages(env),
         table_search_values: () => backfillTableSearchValues(env),
       };
       const tasks: ScheduledTask[] = SCHEDULED_TASK_NAMES.map((name) => ({ name, run: runners[name] }));

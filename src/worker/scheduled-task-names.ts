@@ -15,6 +15,8 @@ export const SCHEDULED_TASK_NAMES = [
   "slack_security_records",
   "webhook_history",
   "security_state",
+  "oauth_security_records",
+  "mcp_staged_pages",
   "table_search_values",
 ] as const;
 

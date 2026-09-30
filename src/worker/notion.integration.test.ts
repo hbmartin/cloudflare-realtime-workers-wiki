@@ -195,6 +195,57 @@ describe("Notion-compatible API", () => {
     ).toBe("Once\n");
   });
 
+  it.each(["native", "public", "stale", "foreign"])(
+    "verifies %s comment targets before protecting Markdown content",
+    async (target) => {
+      const installed = await bootstrap();
+      const createdIntegration = await integration(installed.cookie, installed.pageId);
+      const client = notion(createdIntegration.token);
+      await client.blocks.children.append({
+        block_id: installed.pageId,
+        children: [{ paragraph: { rich_text: [{ text: { content: "Original body" } }] } }] as never,
+      });
+      const metadata = (await env.DB.prepare(
+        "SELECT id,internal_id FROM api_blocks WHERE page_id=? AND deleted_at IS NULL",
+      )
+        .bind(installed.pageId)
+        .first<{ id: string; internal_id: string }>())!;
+      if (target === "foreign") {
+        await env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+        SELECT 'foreign-page',workspace_id,space_id,kind,'z9','Other page',created_by,created_at,updated_at FROM pages WHERE id=?`)
+          .bind(installed.pageId)
+          .run();
+        await env.DB.prepare(`INSERT INTO api_blocks(id,page_id,internal_id,content_hash,created_at,updated_at)
+        VALUES (?,'foreign-page','foreign-native','hash',1,1)`)
+          .bind(metadata.internal_id)
+          .run();
+      }
+      await env.DB.prepare(`INSERT INTO comment_threads(id,workspace_id,space_id,page_id,created_by,block_id,created_at,updated_at)
+      SELECT 'thread',workspace_id,space_id,id,created_by,?,1,1 FROM pages WHERE id=?`)
+        .bind(target === "public" || target === "stale" ? metadata.id : metadata.internal_id, installed.pageId)
+        .run();
+      if (target === "stale")
+        await env.DB.prepare("UPDATE api_blocks SET deleted_at=1 WHERE id=?").bind(metadata.id).run();
+      const response = await SELF.fetch(
+        notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            type: "replace_content",
+            replace_content: { new_str: "Replacement", allow_deleting_content: true },
+          }),
+        }),
+      );
+      expect(response.status).toBe(target === "foreign" ? 200 : 400);
+      expect(await response.json()).toMatchObject(
+        target === "foreign" ? { markdown: "Replacement\n" } : { code: "validation_error" },
+      );
+      expect((await client.pages.retrieveMarkdown({ page_id: installed.pageId })).markdown).toBe(
+        target === "foreign" ? "Replacement\n" : "Original body\n",
+      );
+    },
+  );
+
   it("runs all four Markdown commands through the Notion SDK", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);

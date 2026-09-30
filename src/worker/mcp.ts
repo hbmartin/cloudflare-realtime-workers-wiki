@@ -1,7 +1,8 @@
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { z } from "zod";
-import { createCommentThread, type CommentPage } from "./comments";
+import { commentBlockInternalId, createCommentThread, protectedCommentBlockIds, type CommentPage } from "./comments";
+import { findDocumentBlock } from "../shared/notion-blocks";
 import { projectNotionMarkdown } from "../shared/notion-markdown";
 import { MarkdownWriteError, parseWritableMarkdown } from "../shared/notion-markdown-write";
 import { markdownMutations } from "../shared/notion-markdown-mutations";
@@ -71,7 +72,10 @@ export async function pruneStagedMcpPages(env: Env) {
       await deleteR2Prefix(env.BUCKET, `documents/${row.id}/`);
       await env.DB.batch([
         env.DB.prepare(
-          `DELETE FROM oauth_operation_receipts
+          `UPDATE oauth_operation_receipts
+            SET result_json=json_set(json_remove(result_json,'$.children'),'$.status','failed',
+              '$.error',json_object('status',409,'code','page_creation_expired',
+                'message','Staged page creation expired. Start a new operation.'))
             WHERE tool_name='create_page' AND json_extract(result_json,'$.status')='staged'
               AND json_extract(result_json,'$.pageId')=?
               AND EXISTS (SELECT 1 FROM pages WHERE id=? AND import_job_id=? AND updated_at=?)`,
@@ -106,7 +110,59 @@ function toolError(error: unknown) {
     error instanceof HttpError || error instanceof MarkdownWriteError
       ? error.message
       : "The tool could not complete this request.";
-  return { isError: true, content: [{ type: "text" as const, text: message }] };
+  return {
+    isError: true,
+    content: [{ type: "text" as const, text: message }],
+    structuredContent: {
+      error: {
+        code:
+          error instanceof HttpError
+            ? error.code
+            : error instanceof MarkdownWriteError
+              ? "invalid_markdown"
+              : "tool_unavailable",
+        retryable:
+          error instanceof HttpError
+            ? error.status >= 500 || error.status === 429
+            : !(error instanceof MarkdownWriteError),
+      },
+    },
+  };
+}
+
+function creationResult(receipt: unknown) {
+  const value = receipt as { status?: unknown; error?: { status: HttpError["status"]; code: string; message: string } };
+  if (value?.status === "failed" && value.error)
+    throw new HttpError(value.error.status, value.error.code, value.error.message);
+  return receipt;
+}
+
+async function mutationFailure(response: Response) {
+  if (response.status === 409) {
+    const conflict = await response.json<{ error?: string }>().catch((): { error?: string } => ({}));
+    if (conflict.error === "revision_changed")
+      return new HttpError(409, "page_changed", "The document changed. Read it again and update the request.");
+    if (conflict.error === "This document is read-only.")
+      return new HttpError(409, "document_read_only", "This document is read-only.");
+    if (conflict.error === "duplicate_date_token")
+      return new HttpError(409, "duplicate_date_token", "Move the original date token before reusing its ID.");
+    if (conflict.error === "idempotency_key_reused")
+      return new HttpError(409, "idempotency_key_reused", "Use a new operation ID for a different mutation.");
+    return new HttpError(409, "mutation_conflict", "The document could not be changed.");
+  }
+  if (response.status === 404)
+    return new HttpError(404, "block_not_found", "The block is no longer available. Read the document again.");
+  if (response.status === 410) return new HttpError(404, "page_not_found", "This document is no longer available.");
+  if (response.status === 413) return new HttpError(413, "document_limit", "The mutation exceeds document limits.");
+  if ([400, 415, 422].includes(response.status))
+    return new HttpError(422, "invalid_mutation", "The block mutation is invalid.");
+  if (response.status === 429)
+    return new HttpError(429, "document_busy", "The document is busy. Retry with the same operation ID.");
+  return new HttpError(
+    503,
+    "document_unavailable",
+    "The document is temporarily unavailable. Retry with the same operation ID.",
+  );
 }
 
 async function writableDestination(env: Env, access: McpAccess, spaceId: string, parentId: string | null) {
@@ -133,7 +189,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
   const inputHash = await sha256(JSON.stringify({ ...input, parent_id: parentId }));
   type Staged = { status: "staged"; pageId: string; children: ReturnType<typeof parseWritableMarkdown> };
   let receipt = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
-  if (receipt && (receipt as { status?: unknown }).status !== "staged") return receipt;
+  if (receipt && (receipt as { status?: unknown }).status !== "staged") return creationResult(receipt);
   if (!receipt) {
     const children = parseWritableMarkdown(input.markdown);
     if (children.length > 100)
@@ -179,7 +235,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
       if (!receipt) throw error;
     }
   }
-  if ((receipt as { status?: unknown }).status !== "staged") return receipt;
+  if ((receipt as { status?: unknown }).status !== "staged") return creationResult(receipt);
   const staged = receipt as Staged;
   const stageId = `mcp:create:${staged.pageId}`;
   const stage = await env.DB.prepare("SELECT content_epoch,import_job_id FROM pages WHERE id=? AND workspace_id=?")
@@ -215,12 +271,26 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
         }),
       }),
     );
-    if (!response.ok)
-      throw new HttpError(
-        response.status === 409 ? 409 : 503,
-        "page_content_failed",
-        "The page content could not be saved.",
-      );
+    if (!response.ok) {
+      const error = await mutationFailure(response);
+      if (error.status < 500 && error.status !== 429) {
+        await env.DB.prepare(
+          "UPDATE oauth_operation_receipts SET result_json=? WHERE grant_id=? AND operation_id=? AND input_hash=? AND json_extract(result_json,'$.status')='staged'",
+        )
+          .bind(
+            JSON.stringify({
+              status: "failed",
+              pageId: staged.pageId,
+              error: { status: error.status, code: error.code, message: error.message },
+            }),
+            access.grantId,
+            input.operation_id,
+            inputHash,
+          )
+          .run();
+      }
+      throw error;
+    }
     sequence = (await response.json<{ sequence: number }>()).sequence;
   }
   access = await currentAccess(request, env, ["pages:write"]);
@@ -278,7 +348,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
   } catch (error) {
     const committed = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
     if (!committed || (committed as { status?: unknown }).status === "staged") throw error;
-    return committed;
+    return creationResult(committed);
   }
   const page = await pageForMember(env, access.member, staged.pageId);
   await broadcastWorkspaceEvent(env, access.member.workspace.id, {
@@ -369,20 +439,13 @@ async function updatePageTool(
     pageHref: (id) => new URL(`/?page=${encodeURIComponent(id)}`, env.BETTER_AUTH_URL).href,
   });
   const command = parseMarkdownCommand(input.command, projection.markdown);
-  const protectedRows = await env.DB.prepare(
-    `SELECT DISTINCT COALESCE(block.internal_id,thread.block_id) internal_id FROM comment_threads thread
-       LEFT JOIN api_blocks block ON (block.id=thread.block_id OR block.internal_id=thread.block_id)
-         AND block.page_id=thread.page_id
-      WHERE thread.page_id=? AND thread.block_id IS NOT NULL`,
-  )
-    .bind(page.id)
-    .all<{ internal_id: string }>();
+  const protectedIds = await protectedCommentBlockIds(env, page.id, envelope.document);
   const operations = markdownMutations(
     envelope.document,
     projection,
     command.edits,
     command.allowDeletingContent,
-    new Set(protectedRows.results.map((row) => row.internal_id)),
+    protectedIds,
   );
   if (!operations.length) return complete(envelope.sequence);
   access = await currentAccess(request, env, ["pages:write"]);
@@ -409,11 +472,7 @@ async function updatePageTool(
   if (!response.ok) {
     const committed = await roomMutationReceipt(env, page, operationId);
     if (committed) return complete(committed.sequence);
-    throw new HttpError(
-      response.status === 409 ? 409 : 503,
-      "page_update_failed",
-      "The document edit was not applied.",
-    );
+    throw await mutationFailure(response);
   }
   return complete((await response.json<{ sequence: number }>()).sequence);
 }
@@ -465,7 +524,21 @@ async function commentTool(
   const cached = await receiptFor(env, access.grantId, input.operation_id, "create_comment", inputHash);
   if (cached) return cached;
   access = await currentAccess(request, env, scopes);
-  const page = await pageForMember(env, access.member, input.page_id);
+  let page = await pageForMember(env, access.member, input.page_id);
+  if (input.block_id !== undefined) {
+    if (page.kind !== "document") throw new HttpError(404, "block_not_found", "The comment block was not found.");
+    const envelope = await roomContent(env, access, page);
+    const block = await env.DB.prepare("SELECT page_id,internal_id FROM api_blocks WHERE id=?")
+      .bind(input.block_id)
+      .first<{ page_id: string; internal_id: string }>();
+    const internalId = commentBlockInternalId(page.id, input.block_id, block);
+    if (!internalId || !findDocumentBlock(envelope.document, internalId))
+      throw new HttpError(404, "block_not_found", "The comment block was not found.");
+    access = await currentAccess(request, env, scopes);
+    page = await pageForMember(env, access.member, input.page_id);
+    if (page.content_epoch !== envelope.contentEpoch)
+      throw new HttpError(409, "page_changed", "The page content version changed.");
+  }
   const scoped: CommentPage = {
     id: page.id,
     workspace_id: page.workspace_id,
@@ -738,7 +811,10 @@ export async function mcpRequest(request: Request, env: Env, context: Background
   if (!access) {
     return new Response("Unauthorized", {
       status: 401,
-      headers: { "www-authenticate": mcpBearerChallenge(env, required.join(" ")), "cache-control": "no-store" },
+      headers: {
+        "www-authenticate": `${mcpBearerChallenge(env, required.join(" "))}${/^Bearer(?:\s|$)/i.test(request.headers.get("authorization") ?? "") ? ', error="invalid_token"' : ""}`,
+        "cache-control": "no-store",
+      },
     });
   }
   const rate = await consumeFixedWindow(env, `mcp-grant:${access.grantId}`, { window: 60, max: 120 });

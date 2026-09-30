@@ -11,6 +11,25 @@ const CODE_TTL = 5 * 60_000;
 const ACCESS_TTL = 15 * 60_000;
 const REFRESH_TTL = 30 * 24 * 60 * 60_000;
 const MAX_CLIENT_DOCUMENT = 32 * 1024;
+const CLIENT_CACHE_TTL = 5 * 60_000;
+const ABANDONED_CLIENT_TTL = 7 * 24 * 60 * 60_000;
+const CLIENT_ACTIVITY_INTERVAL = 60 * 60_000;
+const MAX_CLIENTS = 1_000;
+
+function clientRegistrationRate(env: Env) {
+  return consumeFixedWindow(env, "oauth-client-registrations", { window: 60, max: 100 });
+}
+
+async function limitAuthorization(request: Request, env: Env) {
+  const rate = await consumeFixedWindow(env, `oauth-authorize:${await sourceRateLimitKey(request)}`, {
+    window: 60,
+    max: 30,
+  });
+  if (!rate.allowed)
+    throw new HttpError(429, "slow_down", "Authorization requests are temporarily rate limited.", {
+      retryAfter: rate.retryAfter,
+    });
+}
 
 type OAuthClient = {
   client_id: string;
@@ -59,10 +78,13 @@ function json(value: unknown, status = 200) {
   return Response.json(value, { status, headers: { "cache-control": "no-store" } });
 }
 
-function oauthError(code: string, description: string, status = 400) {
+function oauthError(code: string, description: string, status = 400, retryAfter: number | null = 60) {
   return Response.json(
     { error: code, error_description: description },
-    { status, headers: { "cache-control": "no-store", ...(status === 429 ? { "retry-after": "60" } : {}) } },
+    {
+      status,
+      headers: { "cache-control": "no-store", ...(status === 429 ? { "retry-after": String(retryAfter ?? 60) } : {}) },
+    },
   );
 }
 
@@ -267,6 +289,17 @@ async function boundedRequestText(request: Request, max: number) {
 
 async function metadataClient(env: Env, clientId: string) {
   let current = publicClientUrl(clientId);
+  const rate = await clientRegistrationRate(env);
+  if (!rate.allowed)
+    throw new HttpError(429, "slow_down", "Client metadata requests are temporarily rate limited.", {
+      retryAfter: rate.retryAfter,
+    });
+  const capacity = await env.DB.prepare(
+    "SELECT 1 available WHERE EXISTS (SELECT 1 FROM oauth_clients WHERE client_id=?) OR (SELECT COUNT(*) FROM oauth_clients)<?",
+  )
+    .bind(clientId, MAX_CLIENTS)
+    .first();
+  if (!capacity) throw new HttpError(503, "temporarily_unavailable", "OAuth client registration is at capacity.");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   try {
@@ -294,14 +327,18 @@ async function metadataClient(env: Env, clientId: string) {
       const uris = redirectUris(document.redirect_uris);
       const name = typeof document.client_name === "string" ? document.client_name.trim().slice(0, 100) : "MCP client";
       const now = Date.now();
-      await env.DB.prepare(
+      const saved = await env.DB.prepare(
         `INSERT INTO oauth_clients(client_id,name,redirect_uris_json,metadata_url,created_at,updated_at)
-         VALUES(?,?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET name=excluded.name,
+         SELECT ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM oauth_clients WHERE client_id=?)
+           OR (SELECT COUNT(*) FROM oauth_clients)<?
+         ON CONFLICT(client_id) DO UPDATE SET name=excluded.name,
          redirect_uris_json=excluded.redirect_uris_json, metadata_url=excluded.metadata_url,
          updated_at=excluded.updated_at`,
       )
-        .bind(clientId, name, JSON.stringify(uris), clientId, now, now)
+        .bind(clientId, name, JSON.stringify(uris), clientId, now, now, clientId, MAX_CLIENTS)
         .run();
+      if (!saved.meta.changes)
+        throw new HttpError(503, "temporarily_unavailable", "OAuth client registration is at capacity.");
       return {
         client_id: clientId,
         name,
@@ -316,12 +353,26 @@ async function metadataClient(env: Env, clientId: string) {
 }
 
 async function resolveClient(env: Env, clientId: string) {
-  if (clientId.startsWith("https://")) return metadataClient(env, clientId);
-  const client = await env.DB.prepare(
-    "SELECT client_id,name,redirect_uris_json,metadata_url FROM oauth_clients WHERE client_id=?",
+  if (clientId.startsWith("https://")) {
+    const cached = await env.DB.prepare(
+      "SELECT client_id,name,redirect_uris_json,metadata_url FROM oauth_clients WHERE client_id=? AND metadata_url=? AND updated_at>?",
+    )
+      .bind(clientId, clientId, Date.now() - CLIENT_CACHE_TTL)
+      .first<OAuthClient>();
+    return cached ?? metadataClient(env, clientId);
+  }
+  let client = await env.DB.prepare(
+    "SELECT client_id,name,redirect_uris_json,metadata_url,updated_at FROM oauth_clients WHERE client_id=?",
   )
     .bind(clientId)
-    .first<OAuthClient>();
+    .first<OAuthClient & { updated_at: number }>();
+  const timestamp = Date.now();
+  if (client && client.updated_at <= timestamp - CLIENT_ACTIVITY_INTERVAL)
+    client = await env.DB.prepare(
+      "UPDATE oauth_clients SET updated_at=MAX(updated_at,?) WHERE client_id=? RETURNING client_id,name,redirect_uris_json,metadata_url,updated_at",
+    )
+      .bind(timestamp, clientId)
+      .first<OAuthClient & { updated_at: number }>();
   if (!client) throw new HttpError(400, "invalid_client", "This client is not registered.");
   return client;
 }
@@ -331,7 +382,8 @@ export async function registerOAuthClient(request: Request, env: Env) {
     window: 60,
     max: 10,
   });
-  if (!rate.allowed) return oauthError("slow_down", "Client registration is temporarily rate limited.", 429);
+  if (!rate.allowed)
+    return oauthError("slow_down", "Client registration is temporarily rate limited.", 429, rate.retryAfter);
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json"))
     return oauthError("invalid_client_metadata", "Send JSON client metadata.", 415);
   const source = await boundedRequestText(request, MAX_CLIENT_DOCUMENT);
@@ -345,14 +397,24 @@ export async function registerOAuthClient(request: Request, env: Env) {
     return oauthError("invalid_client_metadata", "Client metadata is invalid.");
   const document = value as Record<string, unknown>;
   const redirects = redirectUris(document.redirect_uris);
+  const registrationRate = await clientRegistrationRate(env);
+  if (!registrationRate.allowed)
+    return oauthError(
+      "slow_down",
+      "Client registration is temporarily rate limited.",
+      429,
+      registrationRate.retryAfter,
+    );
   const clientId = `urn:noteflare:oauth-client:${crypto.randomUUID()}`;
   const name = typeof document.client_name === "string" ? document.client_name.trim().slice(0, 100) : "MCP client";
   const now = Date.now();
-  await env.DB.prepare(
-    "INSERT INTO oauth_clients(client_id,name,redirect_uris_json,metadata_url,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+  const saved = await env.DB.prepare(
+    "INSERT INTO oauth_clients(client_id,name,redirect_uris_json,metadata_url,created_at,updated_at) SELECT ?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM oauth_clients)<?",
   )
-    .bind(clientId, name, JSON.stringify(redirects), null, now, now)
+    .bind(clientId, name, JSON.stringify(redirects), null, now, now, MAX_CLIENTS)
     .run();
+  if (!saved.meta.changes)
+    return oauthError("temporarily_unavailable", "OAuth client registration is at capacity.", 503);
   return json(
     { client_id: clientId, client_name: name, redirect_uris: redirects, token_endpoint_auth_method: "none" },
     201,
@@ -393,12 +455,27 @@ type AuthorizationRequest = {
   resource: string;
 };
 
+function registeredRedirect(registered: string[], requested: string) {
+  if (registered.includes(requested)) return true;
+  try {
+    if (new URL(requested).protocol !== "http:") return false;
+  } catch {
+    return false;
+  }
+  // RFC 8252 permits an ephemeral port on HTTP loopback IP redirects only.
+  // Keep every other character, including the path and query, exact.
+  const loopback = /^(http:\/\/(?:127\.0\.0\.1|\[::1\]))(?::[0-9]+)?(?=[/?]|$)/;
+  if (!loopback.test(requested)) return false;
+  const withoutPort = requested.replace(loopback, "$1");
+  return registered.some((uri) => loopback.test(uri) && uri.replace(loopback, "$1") === withoutPort);
+}
+
 async function authorizationRequest(params: URLSearchParams, env: Env): Promise<AuthorizationRequest | Response> {
   const clientId = singleton(params, "client_id");
   if (clientId.length > 2048) throw new HttpError(400, "invalid_client", "Client ID is too long.");
   const client = await resolveClient(env, clientId);
   const redirectUri = singleton(params, "redirect_uri");
-  if (!(JSON.parse(client.redirect_uris_json) as string[]).includes(redirectUri))
+  if (!registeredRedirect(JSON.parse(client.redirect_uris_json) as string[], redirectUri))
     throw new HttpError(400, "invalid_request", "The redirect URI is not registered for this client.");
   const providedState = params.getAll("state");
   try {
@@ -424,11 +501,11 @@ async function authorizationRequest(params: URLSearchParams, env: Env): Promise<
 
 async function consentMember(request: Request, env: Env) {
   const member = await requireMember(request, env);
-  const row = await env.DB.prepare("SELECT mcp_enabled FROM workspaces WHERE id=?")
+  const row = await env.DB.prepare("SELECT mcp_enabled,mcp_generation FROM workspaces WHERE id=?")
     .bind(member.workspace.id)
-    .first<{ mcp_enabled: number }>();
+    .first<{ mcp_enabled: number; mcp_generation: number }>();
   if (row?.mcp_enabled !== 1) throw new HttpError(403, "mcp_disabled", "MCP is not enabled for this workspace.");
-  return member;
+  return { ...member, mcpGeneration: row.mcp_generation };
 }
 
 function authorizationRedirect(
@@ -444,6 +521,7 @@ function authorizationRedirect(
 }
 
 export async function authorizeOAuthGet(request: Request, env: Env) {
+  await limitAuthorization(request, env);
   const source = new URL(request.url).searchParams;
   const input = await authorizationRequest(source, env);
   if (input instanceof Response) return input;
@@ -500,12 +578,28 @@ function randomCredential() {
 
 export async function authorizeOAuthPost(request: Request, env: Env) {
   checkBrowserOrigin(request, env);
+  await limitAuthorization(request, env);
   const params = await formParams(request);
-  const input = await authorizationRequest(params, env);
-  if (input instanceof Response) return input;
-  let member: MemberContext;
+  // Capture consent before resolving remote client metadata, which may stall
+  // while an owner disables and re-enables MCP.
+  let member: Awaited<ReturnType<typeof consentMember>> | null = null;
   try {
     member = await consentMember(request, env);
+  } catch (error) {
+    if (!(error instanceof HttpError) || ![401, 403].includes(error.status)) throw error;
+  }
+  const input = await authorizationRequest(params, env);
+  if (input instanceof Response) return input;
+  if (!member) return authorizationRedirect(input, { error: "access_denied" }, env);
+  try {
+    const current = await consentMember(request, env);
+    if (
+      current.session.id !== member.session.id ||
+      current.workspace.id !== member.workspace.id ||
+      current.mcpGeneration !== member.mcpGeneration
+    )
+      return authorizationRedirect(input, { error: "access_denied" }, env);
+    member = current;
   } catch (error) {
     if (!(error instanceof HttpError) || ![401, 403].includes(error.status)) throw error;
     return authorizationRedirect(input, { error: "access_denied" }, env);
@@ -524,8 +618,11 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
   const issued = await env.DB.prepare(
     `INSERT INTO oauth_authorization_codes
       (code_hash,client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge,security_generation,expires_at)
-     SELECT ?,?,?,?,?,?,?,?,generation,? FROM account_security
-      WHERE user_id=? AND recovery_required=0 AND codes_saved=1`,
+     SELECT ?,?,?,?,?,?,?,?,security.generation,? FROM account_security security
+       JOIN workspace_members member ON member.user_id=security.user_id
+       JOIN workspaces workspace ON workspace.id=member.workspace_id
+      WHERE security.user_id=? AND security.recovery_required=0 AND security.codes_saved=1
+        AND workspace.id=? AND workspace.mcp_enabled=1 AND workspace.mcp_generation=?`,
   )
     .bind(
       await sha256(code),
@@ -538,12 +635,14 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
       input.challenge,
       Date.now() + CODE_TTL,
       member.user.id,
+      member.workspace.id,
+      member.mcpGeneration,
     )
     .run();
   if (!issued.meta.changes)
     return authorizationRedirect(
       input,
-      { error: "access_denied", error_description: "Account protection is required." },
+      { error: "access_denied", error_description: "Workspace access or account protection changed. Try again." },
       env,
     );
   return authorizationRedirect(input, { code }, env);
@@ -557,37 +656,49 @@ async function pkceChallenge(verifier: string) {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
-async function issueTokens(
-  env: Env,
-  grantId: string,
-  resource: string,
-  scope: string,
-  familyId: string = crypto.randomUUID(),
-) {
+async function issueTokens(env: Env, codeHash: string, code: CodeRow) {
+  const grantId = crypto.randomUUID();
+  const familyId = crypto.randomUUID();
   const accessToken = randomCredential();
   const refreshToken = randomCredential();
   const now = Date.now();
-  await env.DB.batch([
-    env.DB.prepare("INSERT INTO oauth_access_tokens(token_hash,grant_id,resource,expires_at) VALUES(?,?,?,?)").bind(
-      await sha256(accessToken),
-      grantId,
-      resource,
-      now + ACCESS_TTL,
-    ),
-    env.DB.prepare("INSERT INTO oauth_refresh_tokens(token_hash,grant_id,family_id,expires_at) VALUES(?,?,?,?)").bind(
-      await sha256(refreshToken),
-      grantId,
-      familyId,
-      now + REFRESH_TTL,
-    ),
+  const issued = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at)
+       SELECT ?,code.client_id,code.user_id,code.workspace_id,code.scopes,code.security_generation,?
+         FROM oauth_authorization_codes code
+         JOIN workspaces workspace ON workspace.id=code.workspace_id
+         JOIN workspace_members member ON member.workspace_id=code.workspace_id AND member.user_id=code.user_id
+         JOIN account_security security ON security.user_id=code.user_id
+        WHERE code.code_hash=? AND code.client_id=? AND code.redirect_uri=? AND code.resource=?
+          AND code.code_challenge=? AND code.consumed_at IS NULL AND code.expires_at>?
+          AND workspace.mcp_enabled=1 AND security.generation=code.security_generation
+          AND security.recovery_required=0 AND security.codes_saved=1`,
+    ).bind(grantId, now, codeHash, code.client_id, code.redirect_uri, code.resource, code.code_challenge, now),
+    // The unique grant identifies this transaction's winning exchange. A failed
+    // token insert rolls back both this consumption and the grant creation.
+    env.DB.prepare(
+      `UPDATE oauth_authorization_codes SET consumed_at=? WHERE code_hash=? AND consumed_at IS NULL
+        AND EXISTS (SELECT 1 FROM oauth_grants WHERE id=?)`,
+    ).bind(now, codeHash, grantId),
+    env.DB.prepare(
+      `INSERT INTO oauth_access_tokens(token_hash,grant_id,resource,expires_at)
+       SELECT ?,id,?,? FROM oauth_grants WHERE id=?`,
+    ).bind(await sha256(accessToken), code.resource, now + ACCESS_TTL, grantId),
+    env.DB.prepare(
+      `INSERT INTO oauth_refresh_tokens(token_hash,grant_id,family_id,expires_at)
+       SELECT ?,id,?,? FROM oauth_grants WHERE id=?`,
+    ).bind(await sha256(refreshToken), familyId, now + REFRESH_TTL, grantId),
   ]);
+  if (issued.some((result) => result.meta.changes !== 1))
+    return oauthError("invalid_grant", "The authorization code is invalid or already used.");
   return json({
     access_token: accessToken,
     token_type: "Bearer",
     expires_in: ACCESS_TTL / 1000,
     refresh_token: refreshToken,
-    scope,
-    resource,
+    scope: code.scopes,
+    resource: code.resource,
   });
 }
 
@@ -614,11 +725,12 @@ async function exchangeCode(params: URLSearchParams, env: Env) {
   const credentialRate = await consumeFixedWindow(env, `oauth-code:${codeHash}`, { window: 60, max: 60 });
   if (!credentialRate.allowed) return oauthError("slow_down", "Authorization code requests are rate limited.", 429);
   const row = await env.DB.prepare(
-    `UPDATE oauth_authorization_codes SET consumed_at=? WHERE code_hash=? AND client_id=?
+    `SELECT client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge,security_generation
+      FROM oauth_authorization_codes WHERE code_hash=? AND client_id=?
       AND redirect_uri=? AND resource=? AND code_challenge=? AND consumed_at IS NULL AND expires_at>?
-      RETURNING client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge,security_generation`,
+    `,
   )
-    .bind(Date.now(), codeHash, clientId, redirectUri, resource, challenge, Date.now())
+    .bind(codeHash, clientId, redirectUri, resource, challenge, Date.now())
     .first<CodeRow>();
   if (!row) return oauthError("invalid_grant", "The authorization code is invalid or already used.");
   const enabled = await env.DB.prepare(
@@ -630,13 +742,7 @@ async function exchangeCode(params: URLSearchParams, env: Env) {
     .bind(row.user_id, row.workspace_id, row.security_generation)
     .first();
   if (!enabled) return oauthError("access_denied", "Workspace access is no longer available.", 403);
-  const grantId = crypto.randomUUID();
-  await env.DB.prepare(
-    "INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at) VALUES(?,?,?,?,?,?,?)",
-  )
-    .bind(grantId, row.client_id, row.user_id, row.workspace_id, row.scopes, row.security_generation, Date.now())
-    .run();
-  return issueTokens(env, grantId, row.resource, row.scopes);
+  return issueTokens(env, codeHash, row);
 }
 
 type RefreshRow = {
@@ -701,7 +807,10 @@ async function refreshGrant(params: URLSearchParams, env: Env) {
          AND consumed_at IS NULL AND expires_at>?
          AND EXISTS (SELECT 1 FROM oauth_grants grant JOIN account_security security
            ON security.user_id=grant.user_id
+           JOIN workspaces workspace ON workspace.id=grant.workspace_id
+           JOIN workspace_members member ON member.workspace_id=grant.workspace_id AND member.user_id=grant.user_id
            WHERE grant.id=oauth_refresh_tokens.grant_id AND grant.revoked_at IS NULL
+             AND workspace.mcp_enabled=1
              AND grant.security_generation=security.generation
              AND security.recovery_required=0 AND security.codes_saved=1)`,
     ).bind(rotatedAt, rotationId, tokenHash, rotatedAt),
@@ -718,7 +827,7 @@ async function refreshGrant(params: URLSearchParams, env: Env) {
     await env.DB.prepare("UPDATE oauth_grants SET revoked_at=? WHERE id=? AND revoked_at IS NULL")
       .bind(Date.now(), row.grant_id)
       .run();
-    return oauthError("invalid_grant", "The refresh token was already used.");
+    return oauthError("invalid_grant", "The refresh token is no longer valid.");
   }
   return json({
     access_token: accessToken,
@@ -745,6 +854,22 @@ export async function pruneOAuthSecurityRecords(env: Env) {
     env.DB.prepare(
       "DELETE FROM oauth_operation_receipts WHERE (grant_id,operation_id) IN (SELECT grant_id,operation_id FROM oauth_operation_receipts WHERE expires_at<=? ORDER BY expires_at LIMIT 100)",
     ).bind(timestamp),
+    env.DB.prepare(
+      `DELETE FROM oauth_grants WHERE id IN (
+        SELECT grant.id FROM oauth_grants grant WHERE grant.created_at<?
+          AND (grant.revoked_at IS NULL OR grant.revoked_at<?)
+          AND NOT EXISTS (SELECT 1 FROM oauth_access_tokens WHERE grant_id=grant.id)
+          AND NOT EXISTS (SELECT 1 FROM oauth_refresh_tokens WHERE grant_id=grant.id)
+          AND NOT EXISTS (SELECT 1 FROM oauth_operation_receipts WHERE grant_id=grant.id)
+        ORDER BY grant.created_at LIMIT 100)`,
+    ).bind(timestamp - REFRESH_TTL, timestamp - REFRESH_TTL),
+    env.DB.prepare(
+      `DELETE FROM oauth_clients WHERE client_id IN (
+        SELECT client.client_id FROM oauth_clients client WHERE client.updated_at<?
+          AND NOT EXISTS (SELECT 1 FROM oauth_grants WHERE client_id=client.client_id)
+          AND NOT EXISTS (SELECT 1 FROM oauth_authorization_codes WHERE client_id=client.client_id AND expires_at>?)
+        ORDER BY client.updated_at LIMIT 100)`,
+    ).bind(timestamp - ABANDONED_CLIENT_TTL, timestamp),
   ]);
 }
 
@@ -785,12 +910,34 @@ export async function oauthRevoke(request: Request, env: Env) {
 
 export async function listOAuthConnections(request: Request, env: Env) {
   const member = await requireMember(request, env);
+  const cursor = new URL(request.url).searchParams.get("cursor");
+  let after: { active: boolean; createdAt: number; id: string } | null = null;
+  if (cursor) {
+    try {
+      if (cursor.length > 512) throw new Error("Invalid cursor");
+      const parsed = JSON.parse(atob(cursor.replaceAll("-", "+").replaceAll("_", "/"))) as Record<string, unknown>;
+      if (
+        !parsed ||
+        typeof parsed.active !== "boolean" ||
+        !Number.isSafeInteger(parsed.createdAt) ||
+        Number(parsed.createdAt) < 0 ||
+        typeof parsed.id !== "string" ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(parsed.id)
+      )
+        throw new Error("Invalid cursor");
+      after = { active: parsed.active, createdAt: Number(parsed.createdAt), id: parsed.id };
+    } catch {
+      throw new HttpError(400, "invalid_cursor", "The connections cursor is invalid.");
+    }
+  }
   const rows = await env.DB.prepare(
     `SELECT grant.id,grant.scopes,grant.created_at,grant.revoked_at,client.client_id,client.name
        FROM oauth_grants grant JOIN oauth_clients client ON client.client_id=grant.client_id
-      WHERE grant.user_id=? AND grant.workspace_id=? ORDER BY grant.created_at DESC,grant.id DESC LIMIT 100`,
+      WHERE grant.user_id=? AND grant.workspace_id=?
+        ${after ? "AND (grant.revoked_at IS NULL,grant.created_at,grant.id)<(?,?,?)" : ""}
+      ORDER BY (grant.revoked_at IS NULL) DESC,grant.created_at DESC,grant.id DESC LIMIT 101`,
   )
-    .bind(member.user.id, member.workspace.id)
+    .bind(member.user.id, member.workspace.id, ...(after ? [after.active ? 1 : 0, after.createdAt, after.id] : []))
     .all<{
       id: string;
       scopes: string;
@@ -799,8 +946,17 @@ export async function listOAuthConnections(request: Request, env: Env) {
       client_id: string;
       name: string;
     }>();
+  const connections = rows.results.slice(0, 100);
+  const last = connections.at(-1);
   return json({
-    connections: rows.results.map((row) => ({
+    nextCursor:
+      rows.results.length > 100 && last
+        ? btoa(JSON.stringify({ active: last.revoked_at === null, createdAt: last.created_at, id: last.id }))
+            .replaceAll("+", "-")
+            .replaceAll("/", "_")
+            .replace(/=+$/, "")
+        : null,
+    connections: connections.map((row) => ({
       id: row.id,
       clientId: row.client_id,
       name: row.name,
@@ -836,9 +992,25 @@ export async function setWorkspaceMcpEnabled(request: Request, env: Env) {
   )
     throw new HttpError(400, "invalid_input", "enabled must be a boolean.");
   const enabled = (source as { enabled: boolean }).enabled;
-  await env.DB.prepare("UPDATE workspaces SET mcp_enabled=? WHERE id=?")
-    .bind(enabled ? 1 : 0, member.workspace.id)
-    .run();
+  const statements = [
+    env.DB.prepare("UPDATE workspaces SET mcp_enabled=?,mcp_generation=mcp_generation+? WHERE id=?").bind(
+      enabled ? 1 : 0,
+      enabled ? 0 : 1,
+      member.workspace.id,
+    ),
+  ];
+  if (!enabled) {
+    statements.push(
+      env.DB.prepare("UPDATE oauth_grants SET revoked_at=? WHERE workspace_id=? AND revoked_at IS NULL").bind(
+        Date.now(),
+        member.workspace.id,
+      ),
+      env.DB.prepare("DELETE FROM oauth_authorization_codes WHERE workspace_id=? AND consumed_at IS NULL").bind(
+        member.workspace.id,
+      ),
+    );
+  }
+  await env.DB.batch(statements);
   return json({ enabled });
 }
 
