@@ -812,6 +812,27 @@ describe("import content", () => {
     expect(parsed.references).toContain("after.md");
     expect(JSON.stringify(parsed.document)).toContain('"href":"after.md"');
   });
+  it("keeps emphasis after many ordinary escaped version numbers", () => {
+    const parsed = markdownToDocument(`${"Version 1\\.2\\.3 ".repeat(70)}and **bold** text`);
+    expect(JSON.stringify(parsed.document)).toContain('"text":"bold","marks":[{"type":"bold"}]');
+    expect(parsed.issues).toContainEqual(expect.objectContaining({ code: "inline_markup_simplified" }));
+  });
+  it("keeps every valid link after dense escaped text", () => {
+    const source = `${"\\.".repeat(150)} ${Array.from({ length: 200 }, (_, index) => `[doc](file${index}.md)`).join(" ")}`;
+    expect(source.length).toBeLessThan(8192);
+    const parsed = markdownToDocument(source);
+    expect(parsed.references).toEqual(Array.from({ length: 200 }, (_, index) => `file${index}.md`));
+  });
+  it("keeps a long label across the short paragraph's density boundary", () => {
+    const parsed = markdownToDocument(`[${"word ".repeat(250)}${"<? ".repeat(200)}](wide.md)`);
+    expect(parsed.references).toContain("wide.md");
+  });
+  it("does not let delimiters in a URL disable nearby emphasis", () => {
+    const href = `https://example.com/${"_".repeat(600)}`;
+    const parsed = markdownToDocument(`[doc](${href}) and **bold** text`);
+    expect(parsed.references).toContain(href);
+    expect(JSON.stringify(parsed.document)).toContain('"text":"bold","marks":[{"type":"bold"}]');
+  });
   it("keeps a dense long link label without invoking recursive Marked label parsing", () => {
     const parsed = markdownToDocument(`[${"<? ".repeat(2_000)}](dense.md) ${"\\.".repeat(5_000)}`);
     expect(parsed.references).toContain("dense.md");

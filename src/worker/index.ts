@@ -4319,7 +4319,10 @@ app.delete("/api/pages/:id", async (c) => {
       now(),
       "task_detail_delete",
     );
-    return c.json({ ok: true, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
+    return c.json(
+      { ok: true, pageIds, ...(result.replayed ? { replayed: true } : {}), ...cleanup },
+      cleanup.cleanupPending ? 202 : 200,
+    );
   }
   const requestedOperationId = c.req.header("x-notes-operation-id");
   const operationId = requestedOperationId && ID_PATTERN.test(requestedOperationId) ? requestedOperationId : undefined;

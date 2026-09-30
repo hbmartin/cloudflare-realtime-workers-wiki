@@ -8462,7 +8462,26 @@ describe("calm workspace task lists", () => {
       permanently: false,
       pageIds: replayBody.pageIds.filter((id) => id !== grandchild.id),
     });
-  });
+    const currentReplay = await change(installed, list.id, body, result.rowId);
+    expect(currentReplay.status).toBe(200);
+    expect((await currentReplay.json<{ pageIds: string[] }>()).pageIds.toSorted()).toEqual(
+      [result.detailPageId, child.id].toSorted(),
+    );
+    await env.DB.prepare("UPDATE pages SET archived_at=NULL,archive_operation_id=NULL WHERE id IN (?,?)")
+      .bind(result.detailPageId, child.id)
+      .run();
+    const restoredReplay = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}`, {
+        method: "DELETE",
+        headers: { "x-notes-operation-id": body.operationId },
+      }),
+    );
+    expect(restoredReplay.status).toBe(200);
+    expect(await restoredReplay.json()).toMatchObject({ ok: true, replayed: true, pageIds: [], cleanupPending: false });
+    expect(await env.DB.prepare("SELECT archived_at FROM pages WHERE id=?").bind(result.detailPageId).first()).toEqual({
+      archived_at: null,
+    });
+  }, 40_000);
 
   it("archives and restores task details without detaching their row", async () => {
     const installed = await bootstrap();
