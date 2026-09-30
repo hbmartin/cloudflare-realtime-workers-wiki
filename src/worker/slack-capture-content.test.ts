@@ -63,6 +63,8 @@ describe("Slack capture Markdown", () => {
           reactions: [
             { name: "thumbsup", count: 3 },
             { name: "ignored", count: 0 },
+            { name: "", count: 3 },
+            { name: " \t ", count: 2 },
             { name: "heart", count: 1 },
           ],
           files: [{ name: "Plan.pdf", permalink: "https://workspace.slack.com/files/UOWNER/F123" }],

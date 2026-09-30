@@ -91,7 +91,12 @@ export function captureMarkdown(input: {
     lines.push("", `### ${escapeMarkdown(message.user ?? message.bot_id ?? "Slack member")} · ${message.ts}`, "");
     lines.push(messageText(message.text ?? ""));
     for (const reaction of message.reactions ?? []) {
-      if (typeof reaction.name === "string" && Number.isSafeInteger(reaction.count) && reaction.count! > 0)
+      if (
+        typeof reaction.name === "string" &&
+        reaction.name.trim() &&
+        Number.isSafeInteger(reaction.count) &&
+        reaction.count! > 0
+      )
         lines.push("", `Reaction: ${escapeMarkdown(reaction.name)} × ${reaction.count}`);
     }
     for (const file of message.files ?? []) {

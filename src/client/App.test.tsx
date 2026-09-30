@@ -271,10 +271,10 @@ describe("App error handling", () => {
     });
   });
 
-  it.each(["unchanged", "changed", "remote"])(
+  it.each(["unchanged", "changed", "remote", "remote-top-level", "draft-remote", "draft-remote-same"])(
     "only moves a page when the dialog destination changes (%s)",
     async (scenario) => {
-      const changed = scenario === "changed";
+      const changed = ["changed", "remote-top-level", "draft-remote"].includes(scenario);
       for (const method of ["showModal", "close"] as const) {
         const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
         Object.defineProperty(HTMLDialogElement.prototype, method, {
@@ -289,10 +289,12 @@ describe("App error handling", () => {
         });
       }
       const destination = { ...page, id: "destination", title: "Destination", position: "b0" };
-      mockShellApi({ pages: [page, destination] });
+      const otherDestination = { ...destination, id: "other-destination", title: "Other destination", position: "b1" };
+      mockShellApi({ pages: [page, destination, otherDestination] });
       const shellApi = vi.mocked(api).getMockImplementation()!;
       vi.mocked(api).mockImplementation(async (path, init) => {
-        if (path === `/api/pages/${page.id}/move`) return { page: { ...page, parentId: destination.id, revision: 2 } };
+        if (path === `/api/pages/${page.id}/move`)
+          return { page: { ...page, parentId: JSON.parse(String(init?.body)).parentId, revision: 3 } };
         return shellApi(path, init);
       });
       render(<App />);
@@ -300,21 +302,29 @@ describe("App error handling", () => {
       fireEvent.click(screen.getByRole("button", { name: /Find a page or command/ }));
       fireEvent.click(await screen.findByRole("option", { name: /Move current page/ }));
       const dialog = screen.getByRole("dialog", { name: "Move Roadmap" });
-      if (scenario === "remote")
+      const select = within(dialog).getByLabelText("Destination");
+      if (scenario === "changed" || scenario.startsWith("draft-"))
+        fireEvent.change(select, { target: { value: destination.id } });
+      if (scenario.startsWith("remote") || scenario.startsWith("draft-")) {
         act(() =>
           dispatchWorkspaceEvent({
             type: "pages-upserted",
-            pages: [{ ...page, parentId: destination.id, revision: 2 }],
+            pages: [
+              { ...page, parentId: scenario === "draft-remote" ? otherDestination.id : destination.id, revision: 2 },
+            ],
           }),
         );
-      if (changed)
-        fireEvent.change(within(dialog).getByLabelText("Destination"), { target: { value: destination.id } });
+      }
+      expect(select).toHaveValue(scenario === "unchanged" ? "" : destination.id);
+      if (scenario === "remote-top-level") fireEvent.change(select, { target: { value: "" } });
       fireEvent.click(within(dialog).getByRole("button", { name: "Move page" }));
       expect(screen.queryByRole("dialog", { name: "Move Roadmap" })).toBeNull();
       const requests = vi.mocked(api).mock.calls.filter(([path]) => path === `/api/pages/${page.id}/move`);
       expect(requests).toHaveLength(changed ? 1 : 0);
       expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual(
-        changed ? [{ parentId: destination.id, beforeId: null, afterId: null }] : [],
+        changed
+          ? [{ parentId: scenario === "remote-top-level" ? null : destination.id, beforeId: null, afterId: null }]
+          : [],
       );
     },
   );

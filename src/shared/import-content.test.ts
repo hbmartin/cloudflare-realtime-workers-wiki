@@ -817,6 +817,21 @@ describe("import content", () => {
     expect(JSON.stringify(parsed.document)).toContain('"text":"bold","marks":[{"type":"bold"}]');
     expect(parsed.issues).toContainEqual(expect.objectContaining({ code: "inline_markup_simplified" }));
   });
+  it("keeps plain escaped text on the fast path without a simplification warning", () => {
+    const source = "Version 1\\.2\\.3 ".repeat(70);
+    const parsed = markdownToDocument(source);
+    expect(parsed.issues).toEqual([]);
+    expect(JSON.stringify(parsed.document)).toContain("Version 1.2.3");
+  });
+  it.each([
+    `${"_".repeat(511)} **bold** text`,
+    `${"*".repeat(511)} __bold__ text`,
+    `${"*".repeat(513)} **bold** text`,
+    `\\${"_".repeat(513)} **bold** text`,
+  ])("keeps delimiter runs intact at the inline density limit", (source) => {
+    const parsed = markdownToDocument(source);
+    expect(JSON.stringify(parsed.document)).toContain('"text":"bold","marks":[{"type":"bold"}]');
+  });
   it("keeps every valid link after dense escaped text", () => {
     const source = `${"\\.".repeat(150)} ${Array.from({ length: 200 }, (_, index) => `[doc](file${index}.md)`).join(" ")}`;
     expect(source.length).toBeLessThan(8192);

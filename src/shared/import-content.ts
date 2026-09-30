@@ -86,15 +86,20 @@ const INLINE_SECTION_LIMIT = 8192;
 const INLINE_SCAN_LIMIT = 128;
 const INLINE_DELIMITER_LIMIT = 512;
 
-function hasDenseInlineMarkup(value: string) {
+function inlineMarkupOverflow(value: string, start = 0, end = value.length): number | null {
   let scans = 0;
   let delimiters = 0;
-  for (const character of value) {
-    if ((character === "<" || character === "\\") && ++scans > INLINE_SCAN_LIMIT) return true;
+  for (let index = start; index < end; index += 1) {
+    const character = value[index];
+    if ((character === "<" || character === "\\") && ++scans > INLINE_SCAN_LIMIT) return index;
     if ((character === "*" || character === "_" || character === "`") && ++delimiters > INLINE_DELIMITER_LIMIT)
-      return true;
+      return index;
   }
-  return false;
+  return null;
+}
+
+function hasDenseInlineMarkup(value: string) {
+  return inlineMarkupOverflow(value) !== null;
 }
 
 function unescapeMarkdown(value: string): string;
@@ -852,16 +857,21 @@ function boundedMarkdownInline(
     if (plain !== null) return append(inline(plain));
     for (let start = 0; start < text.length;) {
       let cut = Math.min(start + INLINE_SECTION_LIMIT, text.length);
-      let scans = 0;
-      let delimiters = 0;
-      for (let index = start; index < cut; index += 1) {
-        const character = text[index];
-        if (
-          ((character === "<" || character === "\\") && ++scans > INLINE_SCAN_LIMIT) ||
-          ((character === "*" || character === "_" || character === "`") && ++delimiters > INLINE_DELIMITER_LIMIT)
-        ) {
-          cut = index;
-          break;
+      cut = inlineMarkupOverflow(text, start, cut) ?? cut;
+      const delimiter = text[cut];
+      if (delimiter && "*_`".includes(delimiter) && text[cut - 1] === delimiter) {
+        let boundary = cut;
+        while (boundary > start && text[boundary - 1] === delimiter) boundary -= 1;
+        if (trailingEscape(text, boundary, start)) boundary -= 1;
+        if (boundary > start) cut = boundary;
+        else {
+          // An oversized leading run stays literal so the parser remains bounded
+          // and the next section starts after the complete delimiter run.
+          let end = cut + 1;
+          while (text[end] === delimiter) end += 1;
+          append(inline(unescapeMarkdown(text.slice(start, end))));
+          start = end;
+          continue;
         }
       }
       if (trailingEscape(text, cut, start) && cut < text.length) cut -= 1;

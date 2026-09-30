@@ -4462,8 +4462,8 @@ function MovePageDialog({
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
-  const initialParentId = useRef(page.parentId);
-  const [parentId, setParentId] = useState(page.parentId ?? "");
+  const [chosenParentId, setChosenParentId] = useState<string>();
+  const parentId = chosenParentId ?? page.parentId ?? "";
   useEffect(() => {
     const dialog = ref.current;
     dialog?.showModal();
@@ -4493,15 +4493,14 @@ function MovePageDialog({
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          const destination = parentId || null;
-          if (destination !== initialParentId.current) onMove(destination);
+          onMove(parentId || null);
           onClose();
         }}
       >
         <h2>Move “{page.title}”</h2>
         <label>
           Destination
-          <select value={parentId} onChange={(event) => setParentId(event.target.value)}>
+          <select value={parentId} onChange={(event) => setChosenParentId(event.target.value)}>
             <option value="">Top level of this space</option>
             {eligible.map((candidate) => (
               <option key={candidate.id} value={candidate.id}>

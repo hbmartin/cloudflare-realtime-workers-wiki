@@ -4308,9 +4308,11 @@ app.delete("/api/pages/:id", async (c) => {
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
+  const requestedOperationId = c.req.header("x-notes-operation-id");
+  const operationId = requestedOperationId && ID_PATTERN.test(requestedOperationId) ? requestedOperationId : undefined;
   const task = await taskDetail(c.env, page.id);
   if (task && page.archived_at === null) {
-    const taskArchiveOperationId = c.req.header("x-notes-operation-id") ?? crypto.randomUUID();
+    const taskArchiveOperationId = operationId ?? crypto.randomUUID();
     const result = await mutateTask(c.env, member, task.list_id, task.row_id, {
       operationId: taskArchiveOperationId,
       expectedRevision: task.revision,
@@ -4336,8 +4338,6 @@ app.delete("/api/pages/:id", async (c) => {
       cleanup.cleanupPending ? 202 : 200,
     );
   }
-  const requestedOperationId = c.req.header("x-notes-operation-id");
-  const operationId = requestedOperationId && ID_PATTERN.test(requestedOperationId) ? requestedOperationId : undefined;
   const timestamp = now();
   const archiveTimestamp = page.archived_at ?? timestamp;
   const archiveOperationId = page.archived_at === null ? crypto.randomUUID() : (page.archive_operation_id ?? null);
