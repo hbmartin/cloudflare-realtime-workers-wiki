@@ -75,6 +75,7 @@
   "vars": {
     "BETTER_AUTH_URL": "http://localhost:5173",
     "EXPANDED_EMBEDS_ENABLED": "true",
+    "NOTION_MARKDOWN_WRITES_ENABLED": "true",
     "OFFLINE_EDITING_ENABLED": "true",
   },
   "env": {
@@ -139,6 +140,7 @@
       "vars": {
         "BETTER_AUTH_URL": "https://cloudflare-realtime-notes.harold-martin.workers.dev",
         "EXPANDED_EMBEDS_ENABLED": "false",
+        "NOTION_MARKDOWN_WRITES_ENABLED": "false",
         "OFFLINE_EDITING_ENABLED": "false",
       },
     },
@@ -198,6 +200,7 @@
         "BETTER_AUTH_URL": "http://127.0.0.1:4173",
         "WORKFLOW_INLINE": "true",
         "EXPANDED_EMBEDS_ENABLED": "true",
+        "NOTION_MARKDOWN_WRITES_ENABLED": "true",
         "OFFLINE_EDITING_ENABLED": "true",
       },
     },
