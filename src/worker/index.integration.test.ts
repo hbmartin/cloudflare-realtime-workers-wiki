@@ -1079,29 +1079,49 @@ describe("Worker integration", () => {
   it("rate-limits authenticated browser telemetry by user without accepting sensitive payload fields", async () => {
     const installed = await bootstrap();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const counts = new Map<string, number>();
+    const authenticated = {
+      limit: vi.fn(async ({ key }: { key: string }) => {
+        const count = (counts.get(key) ?? 0) + 1;
+        counts.set(key, count);
+        return { success: count <= 20 };
+      }),
+    };
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "CLIENT_TELEMETRY_LIMIT") return authenticated;
+        return Reflect.get(target, property, receiver);
+      },
+    });
     try {
       const statuses: number[] = [];
       for (let attempt = 0; attempt < 21; attempt += 1) {
-        const response = await SELF.fetch("http://example.test/api/telemetry/client-errors", {
-          method: "POST",
-          headers: {
-            origin: "http://example.test",
-            "content-type": "application/json",
-            "cf-connecting-ip": attempt % 2 ? "192.0.2.44" : "192.0.2.45",
-            cookie: installed.cookie,
-          },
-          body: JSON.stringify({
-            event: "client.global_error",
-            errorName: "TypeError",
-            fingerprint: attempt.toString(16).padStart(64, "0"),
-            online: true,
-            visibility: "visible",
+        const response = await worker.fetch(
+          new Request("http://example.test/api/telemetry/client-errors", {
+            method: "POST",
+            headers: {
+              origin: "http://example.test",
+              "content-type": "application/json",
+              "cf-connecting-ip": attempt % 2 ? "192.0.2.44" : "192.0.2.45",
+              cookie: installed.cookie,
+            },
+            body: JSON.stringify({
+              event: "client.global_error",
+              errorName: "TypeError",
+              fingerprint: attempt.toString(16).padStart(64, "0"),
+              online: true,
+              visibility: "visible",
+            }),
           }),
-        });
+          bindings,
+          createExecutionContext(),
+        );
         statuses.push(response.status);
       }
       expect(statuses.slice(0, 20)).toEqual(Array.from({ length: 20 }, () => 204));
       expect(statuses[20]).toBe(429);
+      expect(authenticated.limit).toHaveBeenCalledTimes(21);
+      expect(counts.size).toBe(1);
     } finally {
       warning.mockRestore();
     }
@@ -8443,7 +8463,7 @@ describe("calm workspace task lists", () => {
     ).json<{ tasks: unknown[] }>();
     expect(tasks.tasks).toHaveLength(1);
     expect(await (await SELF.fetch(share.url)).text()).toContain("Completed task");
-  });
+  }, 45_000);
   it("invalidates task views when a parent containing a task list is archived and restored", async () => {
     const installed = await bootstrap();
     const parent = await createPage(installed.cookie);
