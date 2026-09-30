@@ -654,6 +654,74 @@ describe("task views", () => {
     expect(leaseReads).toBeGreaterThan(0);
     expect(taskReads).toBe(before);
   });
+  it("keeps a newly acquired token when an earlier lease poll finishes", async () => {
+    const original = vi.mocked(api).getMockImplementation()!;
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const cleared = vi.spyOn(globalThis, "clearInterval");
+    let finishPoll!: (response: unknown) => void;
+    let deferPoll = false;
+    let acquired = 0;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/task-lists/list/lease" && deferPoll) {
+        deferPoll = false;
+        return new Promise((resolve) => {
+          finishPoll = resolve;
+        });
+      }
+      if (path === "/api/tables/list/lease") {
+        if (init?.method === "POST") return { leaseToken: `lease-${++acquired}`, leaseDurationMs: 60_000 };
+        if (init?.method === "DELETE") return { ok: true };
+      }
+      return original(path, init);
+    });
+    const view = render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit tasks" }));
+    await screen.findByRole("button", { name: "Finish editing" });
+    deferPoll = true;
+    act(() => {
+      intervals.mock.calls.forEach(([callback, delay], index) => {
+        if (delay === 30_000 && !cleared.mock.calls.some(([id]) => id === intervals.mock.results[index]?.value))
+          (callback as () => void)();
+      });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Finish editing" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit tasks" }));
+    await screen.findByRole("button", { name: "Finish editing" });
+    await act(async () => finishPoll({ lease: { holderName: "Morgan", heldByMe: false, expiresAt: null } }));
+    expect(screen.getByLabelText("Status for Ship release")).toBeEnabled();
+    expect(screen.getByText("Editing tasks")).toBeVisible();
+    expect(screen.queryByRole("alert")).toBeNull();
+    view.unmount();
+    expect(
+      vi
+        .mocked(api)
+        .mock.calls.filter(([, init]) => init?.method === "DELETE")
+        .map(([, init]) => JSON.parse(String(init?.body))),
+    ).toEqual([{ leaseToken: "lease-1" }, { leaseToken: "lease-2" }]);
+  });
+  it("releases the current token when a lease poll reports it lost", async () => {
+    const intervals = vi.spyOn(globalThis, "setInterval");
+    const cleared = vi.spyOn(globalThis, "clearInterval");
+    render(<TasksView page={page} member={member} onSelectPage={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit tasks" }));
+    await screen.findByRole("button", { name: "Finish editing" });
+    await act(async () => {
+      intervals.mock.calls.forEach(([callback, delay], index) => {
+        if (delay === 30_000 && !cleared.mock.calls.some(([id]) => id === intervals.mock.results[index]?.value))
+          (callback as () => void)();
+      });
+    });
+    expect(screen.getByLabelText("Status for Ship release")).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("The edit lock expired");
+    expect(api).toHaveBeenCalledWith(
+      "/api/tables/list/lease",
+      expect.objectContaining({
+        method: "DELETE",
+        body: JSON.stringify({ leaseToken: "lease" }),
+        keepalive: true,
+      }),
+    );
+  });
   it("shows the current holder immediately after an edit-lock conflict", async () => {
     const original = vi.mocked(api).getMockImplementation()!;
     vi.mocked(api).mockImplementation(async (path, init) => {

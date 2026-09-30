@@ -6993,8 +6993,8 @@ export default {
         outbox: async () => {
           await sweepOutbox(env);
           await purgeExpiredSlackSearchSessions(env);
-          await pruneLinkPreviews(env);
         },
+        link_previews: () => pruneLinkPreviews(env),
         slack_redrive: () => redriveStaleSlackOutbox(env),
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),

@@ -271,6 +271,42 @@ describe("App error handling", () => {
     });
   });
 
+  it.each([false, true])("only moves a page when the dialog destination changes (%s)", async (changed) => {
+    for (const method of ["showModal", "close"] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
+      Object.defineProperty(HTMLDialogElement.prototype, method, {
+        configurable: true,
+        value(this: HTMLDialogElement) {
+          this.open = method === "showModal";
+        },
+      });
+      onTestFinished(() => {
+        if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, method, descriptor);
+        else Reflect.deleteProperty(HTMLDialogElement.prototype, method);
+      });
+    }
+    const destination = { ...page, id: "destination", title: "Destination", position: "b0" };
+    mockShellApi({ pages: [page, destination] });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === `/api/pages/${page.id}/move`) return { page: { ...page, parentId: destination.id, revision: 2 } };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "Actions for Roadmap" });
+    fireEvent.click(screen.getByRole("button", { name: /Find a page or command/ }));
+    fireEvent.click(await screen.findByRole("option", { name: /Move current page/ }));
+    const dialog = screen.getByRole("dialog", { name: "Move Roadmap" });
+    if (changed) fireEvent.change(within(dialog).getByLabelText("Destination"), { target: { value: destination.id } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Move page" }));
+    expect(screen.queryByRole("dialog", { name: "Move Roadmap" })).toBeNull();
+    const requests = vi.mocked(api).mock.calls.filter(([path]) => path === `/api/pages/${page.id}/move`);
+    expect(requests).toHaveLength(changed ? 1 : 0);
+    expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual(
+      changed ? [{ parentId: destination.id, beforeId: null, afterId: null }] : [],
+    );
+  });
+
   it("lets an editor move a template to Trash and restore it without a page-tree error", async () => {
     const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
     let currentTemplate: Page | null = template;
