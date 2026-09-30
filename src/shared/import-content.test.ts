@@ -801,6 +801,17 @@ describe("import content", () => {
     expect(code.references).toContain("after.md");
   });
 
+  it.each([
+    `${"<? ".repeat(200)} [after](after.md)`,
+    `${"\\.".repeat(200)} [after](after.md)`,
+    `${"*_`".repeat(200)} [after](after.md)`,
+    `[${"<? ".repeat(1_000)}](after.md)`,
+  ])("keeps links in dense inline content below the length limit", (source) => {
+    expect(source.length).toBeLessThan(8192);
+    const parsed = markdownToDocument(source);
+    expect(parsed.references).toContain("after.md");
+    expect(JSON.stringify(parsed.document)).toContain('"href":"after.md"');
+  });
   it("keeps a dense long link label without invoking recursive Marked label parsing", () => {
     const parsed = markdownToDocument(`[${"<? ".repeat(2_000)}](dense.md) ${"\\.".repeat(5_000)}`);
     expect(parsed.references).toContain("dense.md");

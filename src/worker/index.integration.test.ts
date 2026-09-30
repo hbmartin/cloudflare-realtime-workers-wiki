@@ -1389,6 +1389,56 @@ describe("Worker integration", () => {
     }
   });
 
+  it("prunes previews with the flag off even when the outbox task fails", async () => {
+    const installed = await bootstrap();
+    const imageKey = `link-previews/${installed.workspaceId}/expired`;
+    await env.BUCKET.put(imageKey, "expired image");
+    await env.DB.prepare(`INSERT INTO link_preview_cache
+      (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at)
+      VALUES ('expired-preview',?,'https://example.com/expired','Expired','','Example',?,'image/png',0,0)`)
+      .bind(installed.workspaceId, imageKey)
+      .run();
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property === "prepare")
+          return (query: string) => {
+            if (query.includes("UPDATE outbox_sweep_state")) throw new Error("Injected outbox failure");
+            return target.prepare(query);
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const bindings = new Proxy(envWithDatabase(env, database), {
+      get(target, property, receiver) {
+        if (property === "EXPANDED_EMBEDS_ENABLED") return "false";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const context = createExecutionContext();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(worker.scheduled(createScheduledController(), bindings, context)).rejects.toThrow(
+        "Scheduled tasks failed",
+      );
+      await waitOnExecutionContext(context);
+      expect(await env.DB.prepare("SELECT id FROM link_preview_cache WHERE id='expired-preview'").first()).toBeNull();
+      expect(await env.BUCKET.head(imageKey)).toBeNull();
+      const states = await env.DB.prepare(`SELECT task_name,last_succeeded_at,last_failed_at,last_error
+        FROM observability_task_runs WHERE task_name IN ('outbox','link_previews') ORDER BY task_name`).all();
+      expect(states.results).toEqual([
+        { task_name: "link_previews", last_succeeded_at: expect.any(Number), last_failed_at: null, last_error: null },
+        {
+          task_name: "outbox",
+          last_succeeded_at: expect.any(Number),
+          last_failed_at: expect.any(Number),
+          last_error: "Injected outbox failure",
+        },
+      ]);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it("stores a bounded, singly redacted scheduled-task failure", async () => {
     const taskName = "test_redacted_failure";
     const diagnostic = `Authorization: Bearer abc retained-context ${"x".repeat(2_000)}`;
@@ -8372,6 +8422,48 @@ describe("calm workspace task lists", () => {
     ).json<{ tasks: Array<{ assigneeId: string; assigneeName: string }> }>();
     expect(tasks.tasks[0]).toMatchObject({ assigneeId: installed.userId, assigneeName: name });
   });
+  it("replays task archives with the complete detail subtree and current removal state", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const created = await change(installed, list.id, {
+      title: "Task with descendants",
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    const result = await created.json<{ rowId: string; detailPageId: string }>();
+    const child = await createPage(installed.cookie, "document", result.detailPageId);
+    const grandchild = await createPage(installed.cookie, "document", child.id);
+    const body = { archived: true, expectedRevision: 2, operationId: crypto.randomUUID() };
+    const first = await change(installed, list.id, body, result.rowId);
+    expect(first.status).toBe(200);
+    const firstBody = await first.json<{ pageIds: string[]; revision: number }>();
+    expect(firstBody.pageIds.toSorted()).toEqual([result.detailPageId, child.id, grandchild.id].toSorted());
+    const events: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const context = createExecutionContext();
+    const replay = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/task-lists/${list.id}/tasks/${result.rowId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+      envWithCapturedWorkspaceEvents(env, events),
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(replay.status).toBe(200);
+    const replayBody = await replay.json<{ pageIds: string[]; revision: number; replayed: boolean }>();
+    expect(replayBody).toMatchObject({ revision: firstBody.revision, replayed: true });
+    expect(replayBody.pageIds.toSorted()).toEqual(firstBody.pageIds.toSorted());
+    const removal = events.find(({ event }) => event.type === "pages-removed")!.event;
+    expect(removal).toMatchObject({ pageIds: expect.arrayContaining(firstBody.pageIds) });
+    await env.DB.prepare("UPDATE pages SET archived_at=NULL WHERE id=?").bind(grandchild.id).run();
+    expect(await eventForCurrentWorkspaceState(env, installed.workspaceId, removal)).toEqual({
+      type: "pages-removed",
+      permanently: false,
+      pageIds: replayBody.pageIds.filter((id) => id !== grandchild.id),
+    });
+  });
+
   it("archives and restores task details without detaching their row", async () => {
     const installed = await bootstrap();
     const list = await taskList(installed);
