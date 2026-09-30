@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
-import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { ThemeControl, useThemeCommand } from "./ThemeControl";
+import { ThemeCommand, ThemeControl } from "./ThemeControl";
 
 beforeEach(() => {
   const items = new Map<string, string>();
@@ -20,7 +20,7 @@ afterEach(() => {
 });
 
 it("toggles away from the visible system theme", () => {
-  const hook = renderHook(useThemeCommand);
+  const view = render(<ThemeCommand />);
   act(() => {
     window.dispatchEvent(new Event("notes:toggle-theme"));
   });
@@ -29,7 +29,7 @@ it("toggles away from the visible system theme", () => {
     window.dispatchEvent(new Event("notes:toggle-theme"));
   });
   expect(localStorage.getItem("notes:color-scheme")).toBe("dark");
-  hook.unmount();
+  view.unmount();
   act(() => {
     window.dispatchEvent(new Event("notes:toggle-theme"));
   });
@@ -40,9 +40,9 @@ it("shares command and control changes without a provider or writable storage", 
   vi.spyOn(localStorage, "setItem").mockImplementation(() => {
     throw new Error("Storage denied");
   });
-  renderHook(useThemeCommand);
   render(
     <>
+      <ThemeCommand />
       <ThemeControl compact />
       <ThemeControl />
     </>,

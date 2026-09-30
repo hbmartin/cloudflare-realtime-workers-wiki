@@ -82,6 +82,20 @@ function blockDocument(blocks: ProseMirrorJson[]) {
 
 const ESCAPABLE_MARKDOWN = /[!"#$%&'()*+,\-./:;<=>?@[\]\\^_`{|}~]/;
 const INLINE_MARKUP_CHAR = /[!*_[\]`<&]/;
+const INLINE_SECTION_LIMIT = 8192;
+const INLINE_SCAN_LIMIT = 128;
+const INLINE_DELIMITER_LIMIT = 512;
+
+function hasDenseInlineMarkup(value: string) {
+  let scans = 0;
+  let delimiters = 0;
+  for (const character of value) {
+    if ((character === "<" || character === "\\") && ++scans > INLINE_SCAN_LIMIT) return true;
+    if ((character === "*" || character === "_" || character === "`") && ++delimiters > INLINE_DELIMITER_LIMIT)
+      return true;
+  }
+  return false;
+}
 
 function unescapeMarkdown(value: string): string;
 function unescapeMarkdown(value: string, abortOnMarkup: true): string | null;
@@ -106,7 +120,7 @@ function markdownInline(
   if (!prepared) {
     const plain = unescapeMarkdown(value, true);
     if (plain !== null) return inline(plain);
-    if (value.length > 8192 || (value.match(/[<\\]/g)?.length ?? 0) > 128 || (value.match(/[*_`]/g)?.length ?? 0) > 512)
+    if (value.length > INLINE_SECTION_LIMIT || hasDenseInlineMarkup(value))
       return boundedMarkdownInline(value, issues, references);
     if (value.includes("data:image/"))
       return markdownInline(value, issues, references, Lexer.lexInline(value, { gfm: false }), undefined, true);
@@ -614,73 +628,6 @@ function trailingEscape(value: string, boundary: number, start = 0) {
   return count % 2 === 1;
 }
 
-function safeDenseBoundary(value: string, boundary: number) {
-  const boundedClose = closingParenWithin(value);
-  const brackets: number[] = [];
-  const codes = codeRanges(value) ?? [];
-  let codeIndex = 0;
-  let parenDepth = 0;
-  let destinationStart = -1;
-  let linkStart = -1;
-  let quote: string | null = null;
-  let angled = false;
-  for (let index = 0; index < boundary; index += 1) {
-    const character = value[index];
-    const code = codes[codeIndex];
-    if (code && index === code.start) {
-      if (code.end > boundary) return Math.min(code.start, enclosingBracket(brackets, value, -1, code.start));
-      index = code.end - 1;
-      codeIndex += 1;
-      continue;
-    }
-    if (character === "\\") {
-      index += 1;
-      continue;
-    }
-    if (quote) {
-      if (character === quote) quote = null;
-      continue;
-    }
-    if (angled) {
-      if (character === ">") angled = false;
-      continue;
-    }
-    if (!parenDepth && character === "<") {
-      const end = autolinkEnd(value, index);
-      if (end !== null) {
-        if (end >= boundary) return Math.min(index, enclosingBracket(brackets, value, -1, index));
-        index = end;
-        continue;
-      }
-    }
-    if (parenDepth && /\s/.test(value[index - 1] ?? "") && (character === '"' || character === "'")) {
-      quote = character;
-      continue;
-    }
-    if (parenDepth === 1 && character === "<" && startsAngledDestination(value, destinationStart, index)) {
-      angled = true;
-      continue;
-    }
-    if (character === "[") brackets.push(index);
-    else if (character === "]" && brackets.length) {
-      const opening = brackets.pop()!;
-      if (value[index + 1] === "(" && boundedClose(index + 1))
-        linkStart = value[opening - 1] === "!" ? opening - 1 : opening;
-    } else if (
-      character === "(" &&
-      (parenDepth || (value[index - 1] === "]" && !trailingEscape(value, index - 1) && boundedClose(index)))
-    ) {
-      if (!parenDepth) destinationStart = index;
-      parenDepth += 1;
-    } else if (character === ")" && parenDepth) {
-      parenDepth -= 1;
-      if (!parenDepth) linkStart = -1;
-    }
-  }
-  const outer = enclosingBracket(brackets, value, -1, linkStart >= 0 ? linkStart : boundary);
-  return parenDepth && linkStart >= 0 ? Math.min(linkStart, outer) : Math.min(outer, boundary);
-}
-
 function dataImageLabelEnd(value: string, start: number) {
   const limit = Math.min(value.length, start + DATA_IMAGE_LABEL_LIMIT);
   const candidates: number[] = [];
@@ -815,8 +762,14 @@ function boundedMarkdownInline(
   references: string[],
   imageMarkers?: Map<string, DataImage>,
 ) {
-  if (!imageMarkers && value.length > 8192)
-    issues.push({ code: "inline_markup_simplified", detail: "Long inline content was parsed in bounded sections." });
+  if (!imageMarkers)
+    issues.push({
+      code: "inline_markup_simplified",
+      detail:
+        value.length > INLINE_SECTION_LIMIT
+          ? "Long inline content was parsed in bounded sections."
+          : "Dense inline content was parsed in bounded sections; complex formatting may be simplified.",
+    });
   const output: ProseMirrorJson[] = [];
   const recordImage = (image: Pick<DataImage, "href">) => {
     references.push(image.href);
@@ -894,12 +847,40 @@ function boundedMarkdownInline(
     ),
   ];
   specials.sort((left, right) => left.start - right.start);
+  const appendDenseText = (text: string) => {
+    const plain = unescapeMarkdown(text, true);
+    if (plain !== null) return append(inline(plain));
+    for (let start = 0; start < text.length;) {
+      let cut = Math.min(start + INLINE_SECTION_LIMIT, text.length);
+      let scans = 0;
+      let delimiters = 0;
+      for (let index = start; index < cut; index += 1) {
+        const character = text[index];
+        if (
+          ((character === "<" || character === "\\") && ++scans > INLINE_SCAN_LIMIT) ||
+          ((character === "*" || character === "_" || character === "`") && ++delimiters > INLINE_DELIMITER_LIMIT)
+        ) {
+          cut = index;
+          break;
+        }
+      }
+      if (trailingEscape(text, cut, start) && cut < text.length) cut -= 1;
+      const part = text.slice(start, cut);
+      const plainPart = unescapeMarkdown(part, true);
+      if (plainPart !== null) append(inline(plainPart));
+      else {
+        const { lexer } = markdownLexer();
+        append(markdownInline(part, issues, references, lexer.inlineTokens(part), imageMarkers));
+      }
+      start = cut;
+    }
+  };
   const appendDense = (section: string) => {
     const { tokenizer } = markdownLexer();
     const sectionCodes = codeRanges(section) ?? [];
     let sectionCodeIndex = 0;
     let cursor = 0;
-    let candidates = 0;
+    let failedCandidates = 0;
     const dataImagePattern = /data:image\//gi;
     let nextDataImage = dataImagePattern.exec(section)?.index ?? -1;
     for (let index = 0; index < section.length; index += 1) {
@@ -909,7 +890,7 @@ function boundedMarkdownInline(
         const token = autolinkToken(section, index);
         if (token) {
           const end = index + token.raw.length - 1;
-          append(inline(unescapeMarkdown(section.slice(cursor, index))));
+          appendDenseText(section.slice(cursor, index));
           append(markdownInline("", issues, references, [token], imageMarkers));
           cursor = end + 1;
           index = end;
@@ -918,7 +899,7 @@ function boundedMarkdownInline(
       }
       const code = sectionCodes[sectionCodeIndex];
       if (code && code.start === index) {
-        append(inline(unescapeMarkdown(section.slice(cursor, index))));
+        appendDenseText(section.slice(cursor, index));
         let content = section.slice(code.openEnd, code.closeStart).replaceAll("\n", " ");
         if (content.startsWith(" ") && content.endsWith(" ") && content.trim()) content = content.slice(1, -1);
         append(inline(content, [{ type: "code" }]));
@@ -933,12 +914,12 @@ function boundedMarkdownInline(
       }
       if (character !== "[" && !(character === "!" && section[index + 1] === "[")) continue;
       const start = index;
-      if (++candidates > 128) {
+      if (++failedCandidates > INLINE_SCAN_LIMIT) {
         while (nextDataImage >= 0 && nextDataImage < start) nextDataImage = dataImagePattern.exec(section)?.index ?? -1;
         if (character === "!" && nextDataImage >= 0 && nextDataImage - start <= DATA_IMAGE_LABEL_LIMIT + 1) {
           const image = longDataImage(section, start);
           if (image) {
-            append(inline(unescapeMarkdown(section.slice(cursor, start))));
+            appendDenseText(section.slice(cursor, start));
             append(imageLabelContent(image));
             recordImage(image);
             cursor = image.end;
@@ -954,7 +935,7 @@ function boundedMarkdownInline(
         const simple = simpleLongLink(section, start, labelEnd);
         if (!simple) continue;
         const href = safeLink(simple.href);
-        append(inline(unescapeMarkdown(section.slice(cursor, start))));
+        appendDenseText(section.slice(cursor, start));
         if (!href) {
           issues.push({ code: "unsafe_url", detail: simple.href.slice(0, 120) });
           append(inline(simple.label));
@@ -965,18 +946,20 @@ function boundedMarkdownInline(
           append(inline(simple.label, [{ type: "link", attrs: { href } }]));
           references.push(href);
         }
+        failedCandidates -= 1;
         cursor = simple.end;
         index = cursor - 1;
         continue;
       }
       const token = tokenizer.link(section.slice(start));
       if (!token || (token.type !== "link" && token.type !== "image")) continue;
-      append(inline(unescapeMarkdown(section.slice(cursor, start))));
+      appendDenseText(section.slice(cursor, start));
       append(markdownInline("", issues, references, [token], imageMarkers));
+      failedCandidates -= 1;
       cursor = start + token.raw.length;
       index = cursor - 1;
     }
-    append(inline(unescapeMarkdown(section.slice(cursor))));
+    appendDenseText(section.slice(cursor));
   };
   // Bound every Marked call. A malformed tag or escape can make its inline
   // scanner revisit the remainder of its input for each delimiter.
@@ -1004,23 +987,9 @@ function boundedMarkdownInline(
     }
     if (cut <= start) cut = Math.min(start + 8192, special?.start ?? value.length);
     const section = value.slice(start, cut);
-    if ((section.match(/[<\\]/g)?.length ?? 0) > 128) {
-      let count = 0;
-      let boundary = 0;
-      while (boundary < section.length && count < 128) {
-        if (section[boundary] === "<" || section[boundary] === "\\") count += 1;
-        boundary += 1;
-      }
-      boundary = safeDenseBoundary(section, boundary);
-      if (trailingEscape(section, boundary) && boundary < section.length) boundary += 1;
-      const prefix = section.slice(0, boundary);
-      const { tokenizer: prefixTokenizer, lexer: prefixLexer } = markdownLexer();
-      if ((prefix.match(/[*_`]/g)?.length ?? 0) > 512) prefixTokenizer.emStrong = () => undefined;
-      append(markdownInline(prefix, issues, references, prefixLexer.inlineTokens(prefix), imageMarkers));
-      appendDense(section.slice(boundary));
-    } else {
-      const { tokenizer, lexer } = markdownLexer();
-      if ((section.match(/[*_`]/g)?.length ?? 0) > 512) tokenizer.emStrong = () => undefined;
+    if (hasDenseInlineMarkup(section)) appendDense(section);
+    else {
+      const { lexer } = markdownLexer();
       append(markdownInline(section, issues, references, lexer.inlineTokens(section), imageMarkers));
     }
     start = cut;

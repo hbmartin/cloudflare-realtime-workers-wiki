@@ -84,6 +84,25 @@ describe("Slack capture Markdown", () => {
     ]);
   });
 
+  it("keeps attachment links visible when Slack sends empty titles", () => {
+    const markdown = captureMarkdown({
+      ...input,
+      messages: [
+        {
+          ...input.messages[0]!,
+          files: [
+            { title: "  ", name: "Plan.pdf", permalink: "https://workspace.slack.com/files/UOWNER/F123" },
+            { title: "", name: "", permalink: "https://workspace.slack.com/files/UOWNER/F124" },
+          ],
+          attachments: [{ title: "  ", title_link: "https://example.com/design" }],
+        },
+      ],
+    });
+    expect(markdown).toContain("[Plan\\.pdf](<https://workspace.slack.com/files/UOWNER/F123>)");
+    expect(markdown).toContain("[Slack attachment](<https://workspace.slack.com/files/UOWNER/F124>)");
+    expect(markdown).toContain("[Slack attachment](<https://example.com/design>)");
+  });
+
   it("keeps the user's description separate from attributed Slack messages", () => {
     const markdown = captureMarkdown({ ...input, description: "# Follow up with legal" });
     const blocks = markdownToDocument(markdown).document.content![0]!.content!.map(

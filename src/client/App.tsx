@@ -66,7 +66,7 @@ import { SearchView } from "./SearchView";
 import { ExportDialog } from "./ExportDialog";
 import { ImportDialog } from "./ImportDialog";
 import { SlackSettings } from "./SlackSettings";
-import { ThemeControl, useThemeCommand } from "./ThemeControl";
+import { ThemeCommand, ThemeControl } from "./ThemeControl";
 import { ShareControl } from "./ShareControl";
 import { IntegrationsSettings } from "./IntegrationsSettings";
 
@@ -176,19 +176,19 @@ type ArchiveResponse = {
   pendingPageCount: number | null;
 };
 
-function responsePageIds(value: unknown, rootPageId: string) {
+function responsePageIds(value: unknown, rootPageId: string, allowMissingRoot = false) {
   const response = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : null;
   const pageIds = response && "pageIds" in response ? response.pageIds : null;
   if (!Array.isArray(pageIds) || !pageIds.every((pageId) => typeof pageId === "string" && pageId.length > 0)) {
     return null;
   }
   const uniquePageIds = [...new Set(pageIds)];
-  return uniquePageIds.includes(rootPageId) ? uniquePageIds : null;
+  return allowMissingRoot || uniquePageIds.includes(rootPageId) ? uniquePageIds : null;
 }
 
 function archiveResponse(value: unknown, rootPageId: string): ArchiveResponse | null {
   const response = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : null;
-  const uniquePageIds = responsePageIds(value, rootPageId);
+  const uniquePageIds = responsePageIds(value, rootPageId, response?.replayed === true);
   if (!uniquePageIds) return null;
   if (response?.cleanupPending === undefined) {
     return { pageIds: uniquePageIds, cleanupPending: false, pendingPageCount: 0 };
@@ -1093,7 +1093,6 @@ export function useCommittedRef<T>(value: T) {
 }
 
 function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignOut: () => void }) {
-  useThemeCommand();
   const preferencesKey = `notes:ui:${member.workspace.id}:${member.user.id}`;
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readPreference(`${preferencesKey}:collapsed`, false));
   const [sidebarWidth, setSidebarWidth] = useState(() =>
@@ -3407,6 +3406,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       className={`workspace-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}
       style={{ gridTemplateColumns: sidebarCollapsed ? "0 minmax(0, 1fr)" : `${sidebarWidth}px minmax(0, 1fr)` }}
     >
+      <ThemeCommand />
       <aside
         ref={sidebarRef}
         id="workspace-navigation"
@@ -4015,6 +4015,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       )}
       {moveDialogOpen && activeSelected && (
         <MovePageDialog
+          key={activeSelected.id}
           page={activeSelected}
           pages={pages}
           onMove={(parentId) => {
@@ -4040,6 +4041,7 @@ function MovePageDialog({
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
+  const initialParentId = useRef(page.parentId);
   const [parentId, setParentId] = useState(page.parentId ?? "");
   useEffect(() => {
     const dialog = ref.current;
@@ -4070,7 +4072,8 @@ function MovePageDialog({
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          onMove(parentId || null);
+          const destination = parentId || null;
+          if (destination !== initialParentId.current) onMove(destination);
           onClose();
         }}
       >
