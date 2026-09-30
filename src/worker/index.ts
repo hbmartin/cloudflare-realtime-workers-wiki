@@ -23,6 +23,13 @@ import {
 import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
 import { linkPreview, linkPreviewImage, pruneLinkPreviews } from "./link-previews";
 import {
+  deleteDateReminder,
+  getDateReminder,
+  parseReminderInput,
+  processDueDateReminders,
+  putDateReminder,
+} from "./date-reminders";
+import {
   createIntegration,
   integrationGrants,
   listIntegrations,
@@ -3804,6 +3811,32 @@ app.get("/api/pages/:id/content", async (c) => {
   return new Response(response.body, { status: response.status, headers });
 });
 
+app.get("/api/pages/:pageId/date-reminders/:tokenId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "document") throw new HttpError(404, "page_not_found", "Page not found.");
+  requireOrdinaryPage(page);
+  return c.json({ reminder: await getDateReminder(c.env, member, page, c.req.param("tokenId")) });
+});
+
+app.put("/api/pages/:pageId/date-reminders/:tokenId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "document") throw new HttpError(404, "page_not_found", "Page not found.");
+  requireOrdinaryPage(page);
+  const input = parseReminderInput(await jsonBody(c.req.raw));
+  return c.json({ reminder: await putDateReminder(c.env, member, page, c.req.param("tokenId"), input) });
+});
+
+app.delete("/api/pages/:pageId/date-reminders/:tokenId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("pageId"));
+  if (page.kind !== "document") throw new HttpError(404, "page_not_found", "Page not found.");
+  requireOrdinaryPage(page);
+  await deleteDateReminder(c.env, member, page, c.req.param("tokenId"));
+  return c.body(null, 204);
+});
+
 app.get("/api/pages/:id/diagram-thumbnail.svg", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
@@ -6457,7 +6490,21 @@ async function publicPageResponse(c: Context<{ Bindings: Env }>, pageId?: string
   if (!key) return c.text("Not found", 404);
   const share = await resolveSharedPage(c.env, key, pageId);
   if (!share) return c.text("Not found", 404);
-  const html = await renderPublicShare(c.env, share, key, new URL(c.req.url).origin);
+  let html: string | null;
+  try {
+    html = await renderPublicShare(c.env, share, key, new URL(c.req.url).origin);
+  } catch (error) {
+    if (error instanceof HttpError && error.code === "share_content_unavailable")
+      return c.html(
+        '<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Shared content unavailable</title><body><p>Shared content is temporarily unavailable. Please try again shortly.</p></body></html>',
+        503,
+        {
+          "cache-control": "no-store",
+          "retry-after": "5",
+        },
+      );
+    throw error;
+  }
   if (!html) return c.text("Not found", 404);
   c.executionCtx.waitUntil(
     c.env.DB.prepare(
@@ -6950,6 +6997,7 @@ export default {
         slack_redrive: () => redriveStaleSlackOutbox(env),
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
+        date_reminders: () => processDueDateReminders(env),
         slack_digests: () => sendDueSlackChannelDigests(env),
         slack_security_records: () => pruneSlackSecurityRecords(env),
         webhook_history: () => pruneWebhookHistory(env),

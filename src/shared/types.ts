@@ -188,6 +188,7 @@ export type NotificationEventType =
   | "thread_resolved"
   | "thread_reopened"
   | "page_edit"
+  | "reminder"
   | "task_assigned";
 export type NotificationChannelMode = "off" | "immediate" | "digest";
 

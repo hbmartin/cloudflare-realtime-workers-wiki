@@ -11,6 +11,7 @@ const EVENT_LABELS: Record<NotificationEventType, string> = {
   thread_resolved: "Resolved threads",
   thread_reopened: "Reopened threads",
   page_edit: "Watched page edits",
+  reminder: "Date reminders",
 };
 
 type PreferenceResponse = {
@@ -21,6 +22,7 @@ type PreferenceResponse = {
 
 function notificationCopy(notification: Notification) {
   const actor = notification.actor?.name ?? "A collaborator";
+  if (notification.eventType === "reminder") return "Reminder for a date on this page";
   if (notification.eventType === "task_assigned") return `${actor} assigned you a task`;
   if (notification.eventType === "mention") return `${actor} mentioned you`;
   if (notification.eventType === "reply") return `${actor} replied to a thread`;
