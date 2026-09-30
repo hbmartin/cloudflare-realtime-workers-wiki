@@ -80,6 +80,24 @@ test("installed app shell opens offline without caching API responses", async ({
   await expect(reopened.getByRole("heading", { name: "Offline access locked" })).toBeVisible();
 });
 
+test("shows the retry fallback when the offline catalog open never settles", async ({ page, context }) => {
+  await page.goto("/");
+  await expect
+    .poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller)), { timeout: 30_000 })
+    .toBe(true);
+  await page.addInitScript(() => {
+    const originalOpen = IDBFactory.prototype.open;
+    IDBFactory.prototype.open = function (name, version) {
+      if (name === "noteflare-offline-catalog") return new EventTarget() as IDBOpenDBRequest;
+      return originalOpen.call(this, name, version);
+    };
+  });
+  await context.setOffline(true);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.getByRole("heading", { name: "NoteFlare is unavailable" })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByRole("button", { name: "Try again", exact: true })).toBeVisible();
+});
+
 test("retires the shell cache when the worker script is removed", async ({ page, context }) => {
   await page.goto("/");
   await expect

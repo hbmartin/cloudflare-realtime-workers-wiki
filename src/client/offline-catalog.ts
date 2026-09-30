@@ -4,6 +4,7 @@ import * as Y from "yjs";
 
 const DATABASE_NAME = "noteflare-offline-catalog";
 const DATABASE_VERSION = 1;
+const CATALOG_OPEN_TIMEOUT_MS = 5_000;
 
 export type OfflineAccount = {
   key: string;
@@ -290,7 +291,19 @@ function openCatalog() {
   if (!connection) {
     connection = new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
+      let settled = false;
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      };
+      const timer = setTimeout(() => fail(new Error("Offline catalog open timed out.")), CATALOG_OPEN_TIMEOUT_MS);
       request.addEventListener("upgradeneeded", () => {
+        if (settled) {
+          request.transaction?.abort();
+          return;
+        }
         const db = request.result;
         if (!db.objectStoreNames.contains("accounts")) db.createObjectStore("accounts", { keyPath: "key" });
         if (!db.objectStoreNames.contains("pages")) {
@@ -298,15 +311,21 @@ function openCatalog() {
         }
       });
       request.addEventListener("success", () => {
+        clearTimeout(timer);
         const db = request.result;
+        if (settled) {
+          db.close();
+          return;
+        }
+        settled = true;
         db.onversionchange = () => {
           db.close();
           connection = null;
         };
         resolve(db);
       });
-      request.addEventListener("error", () => reject(request.error ?? new Error("Offline catalog is unavailable.")));
-      request.addEventListener("blocked", () => reject(new Error("Offline catalog is in use by another tab.")));
+      request.addEventListener("error", () => fail(request.error ?? new Error("Offline catalog is unavailable.")));
+      request.addEventListener("blocked", () => fail(new Error("Offline catalog is in use by another tab.")));
     }).catch((error: unknown) => {
       connection = null;
       throw error;
