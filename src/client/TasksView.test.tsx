@@ -688,7 +688,7 @@ describe("task views", () => {
     fireEvent.click(screen.getByRole("button", { name: "Edit tasks" }));
     await screen.findByRole("button", { name: "Finish editing" });
     await act(async () => finishPoll({ lease: { holderName: "Morgan", heldByMe: false, expiresAt: null } }));
-    expect(screen.getByLabelText("Status for Ship release")).toBeEnabled();
+    expect(await screen.findByLabelText("Status for Ship release")).toBeEnabled();
     expect(screen.getByText("Editing tasks")).toBeVisible();
     expect(screen.queryByRole("alert")).toBeNull();
     view.unmount();
@@ -711,7 +711,7 @@ describe("task views", () => {
           (callback as () => void)();
       });
     });
-    expect(screen.getByLabelText("Status for Ship release")).toBeDisabled();
+    expect(await screen.findByLabelText("Status for Ship release")).toBeDisabled();
     expect(screen.getByRole("alert")).toHaveTextContent("The edit lock expired");
     expect(api).toHaveBeenCalledWith(
       "/api/tables/list/lease",

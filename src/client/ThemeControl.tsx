@@ -65,7 +65,7 @@ function useThemePreference() {
   return { colorScheme, setColorScheme };
 }
 
-export function useThemeCommand() {
+export function ThemeCommand() {
   const { colorScheme, setColorScheme } = useThemePreference();
   const effectiveScheme = useEffectiveColorScheme();
   useEffect(() => {
@@ -74,6 +74,7 @@ export function useThemeCommand() {
     window.addEventListener("notes:toggle-theme", toggle);
     return () => window.removeEventListener("notes:toggle-theme", toggle);
   }, [colorScheme, effectiveScheme, setColorScheme]);
+  return null;
 }
 
 export function ThemeControl({ compact = false }: { compact?: boolean }) {

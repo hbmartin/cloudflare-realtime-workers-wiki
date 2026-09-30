@@ -271,41 +271,53 @@ describe("App error handling", () => {
     });
   });
 
-  it.each([false, true])("only moves a page when the dialog destination changes (%s)", async (changed) => {
-    for (const method of ["showModal", "close"] as const) {
-      const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
-      Object.defineProperty(HTMLDialogElement.prototype, method, {
-        configurable: true,
-        value(this: HTMLDialogElement) {
-          this.open = method === "showModal";
-        },
+  it.each(["unchanged", "changed", "remote"])(
+    "only moves a page when the dialog destination changes (%s)",
+    async (scenario) => {
+      const changed = scenario === "changed";
+      for (const method of ["showModal", "close"] as const) {
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
+        Object.defineProperty(HTMLDialogElement.prototype, method, {
+          configurable: true,
+          value(this: HTMLDialogElement) {
+            this.open = method === "showModal";
+          },
+        });
+        onTestFinished(() => {
+          if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, method, descriptor);
+          else Reflect.deleteProperty(HTMLDialogElement.prototype, method);
+        });
+      }
+      const destination = { ...page, id: "destination", title: "Destination", position: "b0" };
+      mockShellApi({ pages: [page, destination] });
+      const shellApi = vi.mocked(api).getMockImplementation()!;
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path === `/api/pages/${page.id}/move`) return { page: { ...page, parentId: destination.id, revision: 2 } };
+        return shellApi(path, init);
       });
-      onTestFinished(() => {
-        if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, method, descriptor);
-        else Reflect.deleteProperty(HTMLDialogElement.prototype, method);
-      });
-    }
-    const destination = { ...page, id: "destination", title: "Destination", position: "b0" };
-    mockShellApi({ pages: [page, destination] });
-    const shellApi = vi.mocked(api).getMockImplementation()!;
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path === `/api/pages/${page.id}/move`) return { page: { ...page, parentId: destination.id, revision: 2 } };
-      return shellApi(path, init);
-    });
-    render(<App />);
-    await screen.findByRole("button", { name: "Actions for Roadmap" });
-    fireEvent.click(screen.getByRole("button", { name: /Find a page or command/ }));
-    fireEvent.click(await screen.findByRole("option", { name: /Move current page/ }));
-    const dialog = screen.getByRole("dialog", { name: "Move Roadmap" });
-    if (changed) fireEvent.change(within(dialog).getByLabelText("Destination"), { target: { value: destination.id } });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Move page" }));
-    expect(screen.queryByRole("dialog", { name: "Move Roadmap" })).toBeNull();
-    const requests = vi.mocked(api).mock.calls.filter(([path]) => path === `/api/pages/${page.id}/move`);
-    expect(requests).toHaveLength(changed ? 1 : 0);
-    expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual(
-      changed ? [{ parentId: destination.id, beforeId: null, afterId: null }] : [],
-    );
-  });
+      render(<App />);
+      await screen.findByRole("button", { name: "Actions for Roadmap" });
+      fireEvent.click(screen.getByRole("button", { name: /Find a page or command/ }));
+      fireEvent.click(await screen.findByRole("option", { name: /Move current page/ }));
+      const dialog = screen.getByRole("dialog", { name: "Move Roadmap" });
+      if (scenario === "remote")
+        act(() =>
+          dispatchWorkspaceEvent({
+            type: "pages-upserted",
+            pages: [{ ...page, parentId: destination.id, revision: 2 }],
+          }),
+        );
+      if (changed)
+        fireEvent.change(within(dialog).getByLabelText("Destination"), { target: { value: destination.id } });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Move page" }));
+      expect(screen.queryByRole("dialog", { name: "Move Roadmap" })).toBeNull();
+      const requests = vi.mocked(api).mock.calls.filter(([path]) => path === `/api/pages/${page.id}/move`);
+      expect(requests).toHaveLength(changed ? 1 : 0);
+      expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual(
+        changed ? [{ parentId: destination.id, beforeId: null, afterId: null }] : [],
+      );
+    },
+  );
 
   it("lets an editor move a template to Trash and restore it without a page-tree error", async () => {
     const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
@@ -3543,6 +3555,38 @@ describe("App error handling", () => {
     expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
   });
+
+  it.each([{ pageIds: [] }, { pageIds: ["child"] }])(
+    "keeps a restored root visible after an archive replay removing $pageIds",
+    async ({ pageIds }) => {
+      const child = { ...page, id: "child", title: "Child", parentId: page.id };
+      const reconciliation = deferred<{ pages: Page[] }>();
+      let treeLoads = 0;
+      vi.stubGlobal(
+        "confirm",
+        vi.fn(() => true),
+      );
+      mockShellApi({ pages: [page, child] });
+      const shellApi = vi.mocked(api).getMockImplementation()!;
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path === "/api/pages/tree" && ++treeLoads > 1) return reconciliation.promise;
+        if (path === `/api/pages/${page.id}` && init?.method === "DELETE")
+          return { ok: true, replayed: true, pageIds, cleanupPending: false, pendingPageCount: 0 };
+        return shellApi(path, init);
+      });
+      render(<App />);
+      fireEvent.click(await findArchive("Archive Roadmap"));
+      await waitFor(() => expect(treeLoads).toBe(2));
+      expect(queryArchive("Archive Roadmap")).toBeInTheDocument();
+      expect(mocks.invalidatePagePreview.mock.calls.map(([id]) => id)).toEqual(pageIds);
+      expect(screen.queryByText(/invalid archive response/i)).toBeNull();
+      await act(async () => {
+        reconciliation.resolve({ pages: [page, ...(!pageIds.length ? [child] : [])] });
+        await reconciliation.promise;
+      });
+      expect(queryArchive("Archive Roadmap")).toBeInTheDocument();
+    },
+  );
 
   it("does not let an ordinary upsert bypass an archive tombstone", async () => {
     const reconciliation = deferred<{ pages: Page[] }>();
