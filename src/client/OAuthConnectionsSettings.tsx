@@ -19,12 +19,12 @@ export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
   const load = useCallback(async (cursor?: string) => {
     try {
       const [workspace, grants] = await Promise.all([
-        api<{ enabled: boolean }>("/api/oauth/workspace"),
+        cursor ? Promise.resolve(null) : api<{ enabled: boolean }>("/api/oauth/workspace"),
         api<{ connections: Connection[]; nextCursor: string | null }>(
           `/api/oauth/connections${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
         ),
       ]);
-      setEnabled(workspace.enabled);
+      if (workspace) setEnabled(workspace.enabled);
       setConnections((current) =>
         cursor
           ? [...new Map([...current, ...grants.connections].map((connection) => [connection.id, connection])).values()]
@@ -59,7 +59,10 @@ export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
     setBusy(true);
     try {
       await api<void>(`/api/oauth/connections/${encodeURIComponent(connection.id)}`, { method: "DELETE" });
-      await load();
+      setConnections((current) =>
+        current.map((entry) => (entry.id === connection.id ? { ...entry, revokedAt: Date.now() } : entry)),
+      );
+      setError("");
     } catch (cause) {
       setError(apiErrorMessage(cause, "The connection could not be revoked."));
     } finally {
@@ -92,11 +95,6 @@ export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
           Allow MCP connections in this workspace
         </label>
       )}
-      {nextCursor && (
-        <button type="button" disabled={busy} onClick={() => void loadMore()}>
-          Load more connections
-        </button>
-      )}
       {error && <p role="alert">{error}</p>}
       {connections.length === 0 ? (
         <p>No clients connected.</p>
@@ -115,6 +113,11 @@ export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
             </li>
           ))}
         </ul>
+      )}
+      {nextCursor && (
+        <button type="button" disabled={busy} onClick={() => void loadMore()}>
+          Load more connections
+        </button>
       )}
     </section>
   );

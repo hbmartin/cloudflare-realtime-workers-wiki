@@ -13,10 +13,11 @@ const REFRESH_TTL = 30 * 24 * 60 * 60_000;
 const MAX_CLIENT_DOCUMENT = 32 * 1024;
 const CLIENT_CACHE_TTL = 5 * 60_000;
 const ABANDONED_CLIENT_TTL = 7 * 24 * 60 * 60_000;
+const CLIENT_ACTIVITY_INTERVAL = 60 * 60_000;
 const MAX_CLIENTS = 1_000;
 
-async function clientRegistrationAllowed(env: Env) {
-  return (await consumeFixedWindow(env, "oauth-client-registrations", { window: 60, max: 100 })).allowed;
+function clientRegistrationRate(env: Env) {
+  return consumeFixedWindow(env, "oauth-client-registrations", { window: 60, max: 100 });
 }
 
 async function limitAuthorization(request: Request, env: Env) {
@@ -24,7 +25,10 @@ async function limitAuthorization(request: Request, env: Env) {
     window: 60,
     max: 30,
   });
-  if (!rate.allowed) throw new HttpError(429, "slow_down", "Authorization requests are temporarily rate limited.");
+  if (!rate.allowed)
+    throw new HttpError(429, "slow_down", "Authorization requests are temporarily rate limited.", {
+      retryAfter: rate.retryAfter,
+    });
 }
 
 type OAuthClient = {
@@ -74,10 +78,13 @@ function json(value: unknown, status = 200) {
   return Response.json(value, { status, headers: { "cache-control": "no-store" } });
 }
 
-function oauthError(code: string, description: string, status = 400) {
+function oauthError(code: string, description: string, status = 400, retryAfter: number | null = 60) {
   return Response.json(
     { error: code, error_description: description },
-    { status, headers: { "cache-control": "no-store", ...(status === 429 ? { "retry-after": "60" } : {}) } },
+    {
+      status,
+      headers: { "cache-control": "no-store", ...(status === 429 ? { "retry-after": String(retryAfter ?? 60) } : {}) },
+    },
   );
 }
 
@@ -282,8 +289,11 @@ async function boundedRequestText(request: Request, max: number) {
 
 async function metadataClient(env: Env, clientId: string) {
   let current = publicClientUrl(clientId);
-  if (!(await clientRegistrationAllowed(env)))
-    throw new HttpError(429, "slow_down", "Client metadata requests are temporarily rate limited.");
+  const rate = await clientRegistrationRate(env);
+  if (!rate.allowed)
+    throw new HttpError(429, "slow_down", "Client metadata requests are temporarily rate limited.", {
+      retryAfter: rate.retryAfter,
+    });
   const capacity = await env.DB.prepare(
     "SELECT 1 available WHERE EXISTS (SELECT 1 FROM oauth_clients WHERE client_id=?) OR (SELECT COUNT(*) FROM oauth_clients)<?",
   )
@@ -351,11 +361,18 @@ async function resolveClient(env: Env, clientId: string) {
       .first<OAuthClient>();
     return cached ?? metadataClient(env, clientId);
   }
-  const client = await env.DB.prepare(
-    "UPDATE oauth_clients SET updated_at=? WHERE client_id=? RETURNING client_id,name,redirect_uris_json,metadata_url",
+  let client = await env.DB.prepare(
+    "SELECT client_id,name,redirect_uris_json,metadata_url,updated_at FROM oauth_clients WHERE client_id=?",
   )
-    .bind(Date.now(), clientId)
-    .first<OAuthClient>();
+    .bind(clientId)
+    .first<OAuthClient & { updated_at: number }>();
+  const timestamp = Date.now();
+  if (client && client.updated_at <= timestamp - CLIENT_ACTIVITY_INTERVAL)
+    client = await env.DB.prepare(
+      "UPDATE oauth_clients SET updated_at=MAX(updated_at,?) WHERE client_id=? RETURNING client_id,name,redirect_uris_json,metadata_url,updated_at",
+    )
+      .bind(timestamp, clientId)
+      .first<OAuthClient & { updated_at: number }>();
   if (!client) throw new HttpError(400, "invalid_client", "This client is not registered.");
   return client;
 }
@@ -365,9 +382,8 @@ export async function registerOAuthClient(request: Request, env: Env) {
     window: 60,
     max: 10,
   });
-  if (!rate.allowed) return oauthError("slow_down", "Client registration is temporarily rate limited.", 429);
-  if (!(await clientRegistrationAllowed(env)))
-    return oauthError("slow_down", "Client registration is temporarily rate limited.", 429);
+  if (!rate.allowed)
+    return oauthError("slow_down", "Client registration is temporarily rate limited.", 429, rate.retryAfter);
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json"))
     return oauthError("invalid_client_metadata", "Send JSON client metadata.", 415);
   const source = await boundedRequestText(request, MAX_CLIENT_DOCUMENT);
@@ -381,6 +397,14 @@ export async function registerOAuthClient(request: Request, env: Env) {
     return oauthError("invalid_client_metadata", "Client metadata is invalid.");
   const document = value as Record<string, unknown>;
   const redirects = redirectUris(document.redirect_uris);
+  const registrationRate = await clientRegistrationRate(env);
+  if (!registrationRate.allowed)
+    return oauthError(
+      "slow_down",
+      "Client registration is temporarily rate limited.",
+      429,
+      registrationRate.retryAfter,
+    );
   const clientId = `urn:noteflare:oauth-client:${crypto.randomUUID()}`;
   const name = typeof document.client_name === "string" ? document.client_name.trim().slice(0, 100) : "MCP client";
   const now = Date.now();

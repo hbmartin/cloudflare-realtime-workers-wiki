@@ -40,6 +40,7 @@ describe("OAuth connection settings", () => {
     expect(await screen.findByText("Older client")).toBeInTheDocument();
     expect(screen.getAllByText("Recent client")).toHaveLength(1);
     expect(screen.queryByRole("button", { name: "Load more connections" })).not.toBeInTheDocument();
+    expect(mocks.api.mock.calls.filter(([path]) => path === "/api/oauth/workspace")).toHaveLength(1);
   });
 
   it("preserves visible connections and allows retry after a page load fails", async () => {
@@ -70,24 +71,25 @@ describe("OAuth connection settings", () => {
     });
   });
 
-  it("revokes a connection loaded from an older page and refreshes the list", async () => {
+  it("revokes an older connection without losing loaded rows or the next cursor", async () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
-    let revoked = false;
     mocks.api.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (init?.method === "DELETE") {
-        revoked = true;
-        return undefined;
-      }
+      if (init?.method === "DELETE") return undefined;
       if (path === "/api/oauth/workspace") return { enabled: true };
       return path.endsWith("?cursor=next")
-        ? { connections: [older], nextCursor: null }
-        : { connections: [recent], nextCursor: revoked ? null : "next" };
+        ? { connections: [older], nextCursor: "last" }
+        : { connections: [recent], nextCursor: "next" };
     });
     render(<OAuthConnectionsSettings owner />);
     fireEvent.click(await screen.findByRole("button", { name: "Load more connections" }));
     const oldName = await screen.findByText("Older client");
     fireEvent.click(oldName.closest("li")!.querySelector("button")!);
-    await waitFor(() => expect(screen.queryByText("Older client")).not.toBeInTheDocument());
+    await waitFor(() => expect(oldName.closest("li")).toHaveTextContent("Disconnected"));
+    expect(screen.getByText("Recent client")).toBeInTheDocument();
+    const more = screen.getByRole("button", { name: "Load more connections" });
+    await waitFor(() => expect(more).toBeEnabled());
+    expect(screen.getByRole("list").compareDocumentPosition(more) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(mocks.api.mock.calls.filter(([path]) => path === "/api/oauth/connections")).toHaveLength(1);
     expect(mocks.api).toHaveBeenCalledWith("/api/oauth/connections/older", { method: "DELETE" });
   });
 });

@@ -1136,14 +1136,19 @@ async function oauthProtocolResponse(action: () => Promise<Response>) {
   try {
     return await action();
   } catch (error) {
-    if (error instanceof HttpError)
+    if (error instanceof HttpError) {
+      const retryAfter = (error.details as { retryAfter?: number } | undefined)?.retryAfter;
       return Response.json(
         { error: error.code, error_description: error.message },
         {
           status: error.status,
-          headers: { "cache-control": "no-store", ...(error.status === 429 ? { "retry-after": "60" } : {}) },
+          headers: {
+            "cache-control": "no-store",
+            ...(error.status === 429 ? { "retry-after": String(retryAfter ?? 60) } : {}),
+          },
         },
       );
+    }
     throw error;
   }
 }

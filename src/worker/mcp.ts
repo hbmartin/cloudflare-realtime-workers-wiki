@@ -136,14 +136,27 @@ function creationResult(receipt: unknown) {
   return receipt;
 }
 
-function mutationFailure(response: Response) {
-  if (response.status === 409)
-    return new HttpError(409, "page_changed", "The document changed. Read it again before retrying.");
-  if (response.status === 404 || response.status === 410)
-    return new HttpError(404, "page_not_found", "This document is no longer available.");
+async function mutationFailure(response: Response) {
+  if (response.status === 409) {
+    const conflict = await response.json<{ error?: string }>().catch((): { error?: string } => ({}));
+    if (conflict.error === "revision_changed")
+      return new HttpError(409, "page_changed", "The document changed. Read it again and update the request.");
+    if (conflict.error === "This document is read-only.")
+      return new HttpError(409, "document_read_only", "This document is read-only.");
+    if (conflict.error === "duplicate_date_token")
+      return new HttpError(409, "duplicate_date_token", "Move the original date token before reusing its ID.");
+    if (conflict.error === "idempotency_key_reused")
+      return new HttpError(409, "idempotency_key_reused", "Use a new operation ID for a different mutation.");
+    return new HttpError(409, "mutation_conflict", "The document could not be changed.");
+  }
+  if (response.status === 404)
+    return new HttpError(404, "block_not_found", "The block is no longer available. Read the document again.");
+  if (response.status === 410) return new HttpError(404, "page_not_found", "This document is no longer available.");
   if (response.status === 413) return new HttpError(413, "document_limit", "The mutation exceeds document limits.");
-  if (response.status >= 400 && response.status < 500)
+  if ([400, 415, 422].includes(response.status))
     return new HttpError(422, "invalid_mutation", "The block mutation is invalid.");
+  if (response.status === 429)
+    return new HttpError(429, "document_busy", "The document is busy. Retry with the same operation ID.");
   return new HttpError(
     503,
     "document_unavailable",
@@ -258,8 +271,8 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
       }),
     );
     if (!response.ok) {
-      const error = mutationFailure(response);
-      if (response.status >= 400 && response.status < 500) {
+      const error = await mutationFailure(response);
+      if (error.status < 500 && error.status !== 429) {
         await env.DB.prepare(
           "UPDATE oauth_operation_receipts SET result_json=? WHERE grant_id=? AND operation_id=? AND input_hash=? AND json_extract(result_json,'$.status')='staged'",
         )
@@ -465,7 +478,7 @@ async function updatePageTool(
   if (!response.ok) {
     const committed = await roomMutationReceipt(env, page, operationId);
     if (committed) return complete(committed.sequence);
-    throw mutationFailure(response);
+    throw await mutationFailure(response);
   }
   return complete((await response.json<{ sequence: number }>()).sequence);
 }

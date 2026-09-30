@@ -165,7 +165,7 @@ async function toolCall(token: string, name: string, args: Record<string, unknow
   }>();
 }
 
-function failingMutations(status: number): Env {
+function failingMutations(status: number, error = "test_rejection"): Env {
   return {
     ...env,
     DOCUMENT: new Proxy(env.DOCUMENT, {
@@ -176,7 +176,7 @@ function failingMutations(status: number): Env {
             return {
               fetch: (request: Request) =>
                 new URL(request.url).pathname === "/api-mutate"
-                  ? Promise.resolve(Response.json({ error: "test_rejection" }, { status }))
+                  ? Promise.resolve(Response.json({ error }, { status }))
                   : room.fetch(request),
             };
           };
@@ -187,6 +187,75 @@ function failingMutations(status: number): Env {
 }
 
 describe("OAuth MCP foundation", () => {
+  it("rejects malformed registrations before spending the shared client budget", async () => {
+    for (const [contentType, body, status] of [
+      ["text/plain", "{}", 415],
+      ["application/json", "{", 400],
+      ["application/json", "[]", 400],
+      ["application/json", JSON.stringify({ redirect_uris: ["http://192.168.1.1/callback"] }), 400],
+    ] as const) {
+      const response = await SELF.fetch(`${ORIGIN}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": contentType },
+        body,
+      });
+      expect(response.status).toBe(status);
+    }
+    expect(
+      await env.DB.prepare("SELECT count FROM rateLimit WHERE key='oauth-client-registrations'").first(),
+    ).toBeNull();
+    await register();
+    expect(await env.DB.prepare("SELECT count FROM rateLimit WHERE key='oauth-client-registrations'").first()).toEqual({
+      count: 1,
+    });
+  });
+
+  it("reports the remaining authorization and registration rate windows", async () => {
+    const request = new Request(`${ORIGIN}/oauth/authorize`);
+    const sourceKey = `oauth-authorize:${await sourceRateLimitKey(request)}`;
+    const nextWindow = (Math.floor(Date.now() / 60_000) + 1) * 60_000;
+    await exhaustRate(sourceKey, 30);
+    await exhaustRate("oauth-client-registrations", 100);
+    await env.DB.prepare("UPDATE rateLimit SET lastRequest=?").bind(nextWindow).run();
+    const source = await SELF.fetch(`${ORIGIN}/oauth/authorize?${authorizationParams("not-registered")}`);
+    const registration = await SELF.fetch(`${ORIGIN}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ redirect_uris: ["http://127.0.0.1:3800/callback"] }),
+    });
+    // A future recorded window cannot be reopened by a lagging request.
+    // Its retry time exceeds the old hard-coded 60 seconds.
+    for (const response of [source, registration]) {
+      expect(response.status).toBe(429);
+      expect(Number(response.headers.get("retry-after"))).toBeGreaterThan(60);
+      expect(Number(response.headers.get("retry-after"))).toBeLessThanOrEqual(120);
+    }
+  });
+
+  it("touches registered client activity only when the previous activity is old", async () => {
+    const clientId = await register();
+    const initial = (await env.DB.prepare("SELECT updated_at FROM oauth_clients WHERE client_id=?")
+      .bind(clientId)
+      .first<{ updated_at: number }>())!;
+    const params = authorizationParams(clientId);
+    expect((await authorizeOAuthGet(new Request(`${ORIGIN}/oauth/authorize?${params}`), env)).status).toBe(302);
+    expect(
+      await env.DB.prepare("SELECT updated_at FROM oauth_clients WHERE client_id=?").bind(clientId).first(),
+    ).toEqual(initial);
+    await env.DB.prepare("UPDATE oauth_clients SET updated_at=? WHERE client_id=?")
+      .bind(Date.now() - 2 * 60 * 60_000, clientId)
+      .run();
+    expect((await authorizeOAuthGet(new Request(`${ORIGIN}/oauth/authorize?${params}`), env)).status).toBe(302);
+    const touched = (await env.DB.prepare("SELECT updated_at FROM oauth_clients WHERE client_id=?")
+      .bind(clientId)
+      .first<{ updated_at: number }>())!;
+    expect(touched.updated_at).toBeGreaterThan(initial.updated_at - 60_000);
+    expect((await authorizeOAuthGet(new Request(`${ORIGIN}/oauth/authorize?${params}`), env)).status).toBe(302);
+    expect(
+      await env.DB.prepare("SELECT updated_at FROM oauth_clients WHERE client_id=?").bind(clientId).first(),
+    ).toEqual(touched);
+  });
+
   it("shares an installation limit across anonymous metadata fetches and registrations", async () => {
     await exhaustRate("oauth-client-registrations", 100);
     const fetcher = vi.fn(async (input: URL | string) =>
@@ -523,42 +592,56 @@ describe("OAuth MCP foundation", () => {
   });
 
   it.each([
-    [422, "invalid_mutation", false],
-    [413, "document_limit", false],
-    [410, "page_not_found", false],
-    [503, "document_unavailable", true],
-  ] as const)("preserves the create and update failure class for DO status %s", async (status, code, retryable) => {
-    const cookie = await bootstrap();
-    const connection = await connect(cookie);
-    const args = {
-      space_id: connection.page.spaceId,
-      title: "Rejected page",
-      markdown: "Content",
-      operation_id: "rejected-create",
-    };
-    const created = await toolCall(connection.token, "create_page", args, failingMutations(status));
-    expect(created.result).toMatchObject({ isError: true, structuredContent: { error: { code, retryable } } });
-    const replay = await toolCall(connection.token, "create_page", args);
-    expect(replay.result.isError ?? false).toBe(!retryable);
-    expect(replay.result.structuredContent?.error).toEqual(retryable ? undefined : { code, retryable });
-    const published = await toolCall(connection.token, "create_page", {
-      ...args,
-      title: "Update target",
-      operation_id: "update-target",
-    });
-    const pageId = (JSON.parse(published.result.content[0]!.text) as { id: string }).id;
-    const updated = await toolCall(
-      connection.token,
-      "update_page",
-      {
-        page_id: pageId,
-        command: { type: "insert_content", insert_content: { content: "Another line", position: { type: "end" } } },
-        operation_id: "rejected-update",
-      },
-      failingMutations(status),
-    );
-    expect(updated.result).toMatchObject({ isError: true, structuredContent: { error: { code, retryable } } });
-  });
+    [422, "test_rejection", "invalid_mutation", false],
+    [413, "test_rejection", "document_limit", false],
+    [404, "block_not_found", "block_not_found", false],
+    [410, "test_rejection", "page_not_found", false],
+    [409, "revision_changed", "page_changed", false],
+    [409, "This document is read-only.", "document_read_only", false],
+    [409, "duplicate_date_token", "duplicate_date_token", false],
+    [409, "idempotency_key_reused", "idempotency_key_reused", false],
+    [409, "test_rejection", "mutation_conflict", false],
+    [401, "test_rejection", "document_unavailable", true],
+    [403, "test_rejection", "document_unavailable", true],
+    [408, "test_rejection", "document_unavailable", true],
+    [429, "test_rejection", "document_busy", true],
+    [503, "test_rejection", "document_unavailable", true],
+  ] as const)(
+    "preserves the create and update failure class for DO %s %s",
+    async (status, rejection, code, retryable) => {
+      const cookie = await bootstrap();
+      const connection = await connect(cookie);
+      const args = {
+        space_id: connection.page.spaceId,
+        title: "Rejected page",
+        markdown: "Content",
+        operation_id: "rejected-create",
+      };
+      const created = await toolCall(connection.token, "create_page", args, failingMutations(status, rejection));
+      expect(created.result).toMatchObject({ isError: true, structuredContent: { error: { code, retryable } } });
+      const replay = await toolCall(connection.token, "create_page", args);
+      expect(replay.result.isError ?? false).toBe(!retryable);
+      expect(replay.result.structuredContent?.error).toEqual(retryable ? undefined : { code, retryable });
+      const published = await toolCall(connection.token, "create_page", {
+        ...args,
+        title: "Update target",
+        operation_id: "update-target",
+      });
+      const pageId = (JSON.parse(published.result.content[0]!.text) as { id: string }).id;
+      const updated = await toolCall(
+        connection.token,
+        "update_page",
+        {
+          page_id: pageId,
+          command: { type: "insert_content", insert_content: { content: "Another line", position: { type: "end" } } },
+          operation_id: "rejected-update",
+        },
+        failingMutations(status, rejection),
+      );
+      expect(updated.result).toMatchObject({ isError: true, structuredContent: { error: { code, retryable } } });
+      expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(pageId).first()).toEqual({ id: pageId });
+    },
+  );
 
   it("serves stateless 2026 discovery and read tools with a member token", async () => {
     const cookie = await bootstrap();
