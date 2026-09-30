@@ -4228,3 +4228,90 @@ a:focus-visible,
   outline: 2px solid var(--focus);
   outline-offset: -2px;
 }
+
+.offline-workspace {
+  min-height: 100vh;
+  color: var(--ink);
+  background: var(--canvas);
+}
+.install-tip {
+  margin: 0 12px 8px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+.offline-header,
+.offline-document-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.offline-header {
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--line);
+}
+.offline-header div,
+.offline-list button {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.offline-header span,
+.offline-list span,
+.offline-list time {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.offline-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+}
+.offline-list {
+  min-height: calc(100vh - 72px);
+  padding: 24px 16px;
+  border-right: 1px solid var(--line);
+}
+.offline-list h1 {
+  margin: 0;
+  font-size: 1.15rem;
+}
+.offline-list p {
+  line-height: 1.5;
+  color: var(--muted);
+}
+.offline-list button {
+  width: 100%;
+  margin: 4px 0;
+  padding: 12px;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+}
+.offline-list button:hover,
+.offline-list button[aria-current="page"] {
+  border-color: var(--line);
+  background: var(--surface);
+}
+.offline-document {
+  max-width: 1000px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 24px;
+}
+.offline-document-heading h2 {
+  margin-right: auto;
+}
+@media (max-width: 700px) {
+  .offline-layout {
+    grid-template-columns: 1fr;
+  }
+  .offline-list {
+    min-height: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+}

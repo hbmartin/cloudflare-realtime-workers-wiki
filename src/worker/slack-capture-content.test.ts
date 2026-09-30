@@ -54,6 +54,55 @@ describe("Slack capture Markdown", () => {
     ).toThrow("2 MiB");
   });
 
+  it("imports each reaction and attachment as a separate paragraph", () => {
+    const markdown = captureMarkdown({
+      ...input,
+      messages: [
+        {
+          ...input.messages[0]!,
+          reactions: [
+            { name: "thumbsup", count: 3 },
+            { name: "ignored", count: 0 },
+            { name: "heart", count: 1 },
+          ],
+          files: [{ name: "Plan.pdf", permalink: "https://workspace.slack.com/files/UOWNER/F123" }],
+          attachments: [{ title: "Design", title_link: "https://example.com/design" }, { title: "Plain attachment" }],
+        },
+      ],
+    });
+    const paragraphs = markdownToDocument(markdown)
+      .document.content![0]!.content!.map((container) => container.content![0]!)
+      .filter((block) => block.type === "paragraph")
+      .map((block) => block.content!.map((node) => node.text ?? "").join(""));
+    expect(paragraphs.slice(1)).toEqual([
+      "Ship the plan & tell @Slack member",
+      "Reaction: thumbsup × 3",
+      "Reaction: heart × 1",
+      "Attachment: Plan.pdf",
+      "Attachment: Design",
+      "Attachment: Plain attachment",
+    ]);
+  });
+
+  it("keeps attachment links visible when Slack sends empty titles", () => {
+    const markdown = captureMarkdown({
+      ...input,
+      messages: [
+        {
+          ...input.messages[0]!,
+          files: [
+            { title: "  ", name: "Plan.pdf", permalink: "https://workspace.slack.com/files/UOWNER/F123" },
+            { title: "", name: "", permalink: "https://workspace.slack.com/files/UOWNER/F124" },
+          ],
+          attachments: [{ title: "  ", title_link: "https://example.com/design" }],
+        },
+      ],
+    });
+    expect(markdown).toContain("[Plan\\.pdf](<https://workspace.slack.com/files/UOWNER/F123>)");
+    expect(markdown).toContain("[Slack attachment](<https://workspace.slack.com/files/UOWNER/F124>)");
+    expect(markdown).toContain("[Slack attachment](<https://example.com/design>)");
+  });
+
   it("keeps the user's description separate from attributed Slack messages", () => {
     const markdown = captureMarkdown({ ...input, description: "# Follow up with legal" });
     const blocks = markdownToDocument(markdown).document.content![0]!.content!.map(

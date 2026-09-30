@@ -52,7 +52,7 @@ export type MemberContext = {
 };
 
 export type ClientMemberContext = Omit<MemberContext, "session"> & {
-  features?: { expandedEmbeds: boolean };
+  features?: { expandedEmbeds: boolean; offlineEditing?: boolean };
 };
 
 export type Page = {

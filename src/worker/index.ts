@@ -1528,7 +1528,10 @@ app.get("/api/me", async (c) => {
     user: member.user,
     workspace: member.workspace,
     role: member.role,
-    features: { expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true" },
+    features: {
+      expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true",
+      offlineEditing: c.env.OFFLINE_EDITING_ENABLED === "true",
+    },
   };
   return c.json(context);
 });
@@ -4316,7 +4319,10 @@ app.delete("/api/pages/:id", async (c) => {
       now(),
       "task_detail_delete",
     );
-    return c.json({ ok: true, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
+    return c.json(
+      { ok: true, pageIds, ...(result.replayed ? { replayed: true } : {}), ...cleanup },
+      cleanup.cleanupPending ? 202 : 200,
+    );
   }
   const requestedOperationId = c.req.header("x-notes-operation-id");
   const operationId = requestedOperationId && ID_PATTERN.test(requestedOperationId) ? requestedOperationId : undefined;
@@ -6989,8 +6995,8 @@ export default {
         outbox: async () => {
           await sweepOutbox(env);
           await purgeExpiredSlackSearchSessions(env);
-          await pruneLinkPreviews(env);
         },
+        link_previews: () => pruneLinkPreviews(env),
         slack_redrive: () => redriveStaleSlackOutbox(env),
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),

@@ -5,6 +5,7 @@ export const SCHEDULED_TASK_NAMES = [
   "page_move_receipts",
   "queued_jobs",
   "outbox",
+  "link_previews",
   "slack_redrive",
   "job_artifacts",
   "notification_digests",

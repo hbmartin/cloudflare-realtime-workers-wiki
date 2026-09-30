@@ -24,7 +24,7 @@ The code reuses NoteFlare's verified Slack identity, import, notification, job, 
 
 ## Release and recovery
 
-1. Apply migration `0054_slack_capture_generation.sql` after the Phase 1 migrations and before deploying this Worker.
+1. Apply migrations `0053_slack_capture_receipts.sql`, `0054_slack_capture_generation.sql`, `0055_slack_capture_job_attempt.sql`, and `0056_reconcile_slack_capture_attempts.sql`, in that order, after the Phase 1 migrations and before deploying this Worker.
 2. Confirm the pending old-copy outbox is drained or reconciled. Both shortcut callbacks switch together in the deployed Worker.
 3. Exercise a signed message capture, a private thread capture, a failed job retry through `/?activity=1`, and existing search, App Home, notifications, and unfurls against the deployed Worker. Check that the source receipt and final page IDs agree.
 4. If capture publication fails, disable the two shortcut callbacks with an explicit temporary-unavailable response while leaving search, unfurls, and notifications enabled. Failed jobs retain their receipt for retry after the cause is fixed; staged content is hidden and cleaned on terminal failure.

@@ -48,6 +48,10 @@ export function taskListStatements(db: D1Database, pageId: string) {
   ];
 }
 
+const TASK_DETAIL_SUBTREE_SQL =
+  "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree";
+const ARCHIVED_TASK_DETAIL_SUBTREE_SQL = `SELECT id FROM pages WHERE id IN (${TASK_DETAIL_SUBTREE_SQL}) AND archived_at IS NOT NULL`;
+
 const TASK_FROM = `FROM table_rows r JOIN pages list ON list.id=r.page_id AND list.is_task_list=1
  JOIN table_state state ON state.page_id=list.id
  JOIN table_row_pages link ON link.row_id=r.id JOIN pages detail ON detail.id=link.page_id
@@ -279,12 +283,16 @@ export async function mutateTask(
   if (replay) {
     if (replay.request_hash !== hash)
       throw new HttpError(409, "idempotency_key_reused", "That operation ID describes a different change.");
+    const subtree =
+      body.archived === true
+        ? await env.DB.prepare(ARCHIVED_TASK_DETAIL_SUBTREE_SQL).bind(replay.detail_page_id).all<{ id: string }>()
+        : undefined;
     return {
       rowId: replay.row_id,
       detailPageId: replay.detail_page_id,
       revision: replay.revision,
       replayed: true,
-      pageIds: body.archived === true ? [replay.detail_page_id] : undefined,
+      pageIds: subtree?.results.map((row) => row.id),
     };
   }
   const previous = rowId
@@ -437,8 +445,7 @@ export async function mutateTask(
       env.DB.prepare(`UPDATE table_rows SET updated_at=? WHERE id=? AND ${guard}`).bind(now, id, ...guards),
     );
     if (body.archived === true) {
-      const subtree =
-        "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree";
+      const subtree = TASK_DETAIL_SUBTREE_SQL;
       statements.push(
         env.DB.prepare(`INSERT INTO archive_disconnect_targets(page_id,workspace_id,content_epoch,room,next_attempt_at,created_at,updated_at)
         SELECT id,workspace_id,content_epoch,id||'~'||content_epoch,?,?,? FROM pages WHERE id IN (${subtree}) AND archived_at IS NULL AND kind IN ('document','diagram') AND ${guard}
@@ -463,8 +470,7 @@ export async function mutateTask(
         const archived = await env.DB.prepare("SELECT archive_operation_id,archived_at FROM pages WHERE id=?")
           .bind(detailId)
           .first<{ archive_operation_id: string | null; archived_at: number | null }>();
-        const subtree =
-          "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree";
+        const subtree = TASK_DETAIL_SUBTREE_SQL;
         const ownership = "archive_operation_id IS ? AND archived_at IS ?";
         statements.push(
           env.DB.prepare(
@@ -556,13 +562,7 @@ export async function mutateTask(
       ).bind(member.workspace.id, member.user.id, operationId),
     );
     const subtreeIndex = body.archived === true ? statements.length : -1;
-    if (subtreeIndex !== -1)
-      statements.push(
-        env.DB.prepare(
-          `WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id)
-       SELECT id FROM subtree`,
-        ).bind(detailId),
-      );
+    if (subtreeIndex !== -1) statements.push(env.DB.prepare(ARCHIVED_TASK_DETAIL_SUBTREE_SQL).bind(detailId));
     const batch = await env.DB.batch<Record<string, unknown>>(statements);
     const receipt = batch[receiptIndex]?.results[0] as { request_hash: string; revision: number } | undefined;
     if (!receipt)

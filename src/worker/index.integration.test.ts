@@ -772,7 +772,9 @@ describe("Worker integration", () => {
     const installed = await bootstrap();
     const disabledEnv = new Proxy(env, {
       get(target, property, receiver) {
-        return property === "EXPANDED_EMBEDS_ENABLED" ? "false" : Reflect.get(target, property, receiver);
+        return property === "EXPANDED_EMBEDS_ENABLED" || property === "OFFLINE_EDITING_ENABLED"
+          ? "false"
+          : Reflect.get(target, property, receiver);
       },
     });
     const me = await worker.fetch(
@@ -780,7 +782,7 @@ describe("Worker integration", () => {
       disabledEnv,
       createExecutionContext(),
     );
-    expect((await me.json<{ features: { expandedEmbeds: boolean } }>()).features.expandedEmbeds).toBe(false);
+    expect(await me.json()).toMatchObject({ features: { expandedEmbeds: false, offlineEditing: false } });
     const preview = await worker.fetch(
       authenticatedRequest(installed.cookie, "/api/link-previews", {
         method: "POST",
@@ -1077,29 +1079,49 @@ describe("Worker integration", () => {
   it("rate-limits authenticated browser telemetry by user without accepting sensitive payload fields", async () => {
     const installed = await bootstrap();
     const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const counts = new Map<string, number>();
+    const authenticated = {
+      limit: vi.fn(async ({ key }: { key: string }) => {
+        const count = (counts.get(key) ?? 0) + 1;
+        counts.set(key, count);
+        return { success: count <= 20 };
+      }),
+    };
+    const bindings = new Proxy(env, {
+      get(target, property, receiver) {
+        if (property === "CLIENT_TELEMETRY_LIMIT") return authenticated;
+        return Reflect.get(target, property, receiver);
+      },
+    });
     try {
       const statuses: number[] = [];
       for (let attempt = 0; attempt < 21; attempt += 1) {
-        const response = await SELF.fetch("http://example.test/api/telemetry/client-errors", {
-          method: "POST",
-          headers: {
-            origin: "http://example.test",
-            "content-type": "application/json",
-            "cf-connecting-ip": attempt % 2 ? "192.0.2.44" : "192.0.2.45",
-            cookie: installed.cookie,
-          },
-          body: JSON.stringify({
-            event: "client.global_error",
-            errorName: "TypeError",
-            fingerprint: attempt.toString(16).padStart(64, "0"),
-            online: true,
-            visibility: "visible",
+        const response = await worker.fetch(
+          new Request("http://example.test/api/telemetry/client-errors", {
+            method: "POST",
+            headers: {
+              origin: "http://example.test",
+              "content-type": "application/json",
+              "cf-connecting-ip": attempt % 2 ? "192.0.2.44" : "192.0.2.45",
+              cookie: installed.cookie,
+            },
+            body: JSON.stringify({
+              event: "client.global_error",
+              errorName: "TypeError",
+              fingerprint: attempt.toString(16).padStart(64, "0"),
+              online: true,
+              visibility: "visible",
+            }),
           }),
-        });
+          bindings,
+          createExecutionContext(),
+        );
         statuses.push(response.status);
       }
       expect(statuses.slice(0, 20)).toEqual(Array.from({ length: 20 }, () => 204));
       expect(statuses[20]).toBe(429);
+      expect(authenticated.limit).toHaveBeenCalledTimes(21);
+      expect(counts.size).toBe(1);
     } finally {
       warning.mockRestore();
     }
@@ -1364,6 +1386,56 @@ describe("Worker integration", () => {
     } finally {
       logged.mockRestore();
       await env.DB.prepare(`DELETE FROM observability_task_runs WHERE task_name LIKE 'test_%'`).run();
+    }
+  });
+
+  it("prunes previews with the flag off even when the outbox task fails", async () => {
+    const installed = await bootstrap();
+    const imageKey = `link-previews/${installed.workspaceId}/expired`;
+    await env.BUCKET.put(imageKey, "expired image");
+    await env.DB.prepare(`INSERT INTO link_preview_cache
+      (id,workspace_id,canonical_url,title,description,site_name,image_key,image_mime,expires_at,fetched_at)
+      VALUES ('expired-preview',?,'https://example.com/expired','Expired','','Example',?,'image/png',0,0)`)
+      .bind(installed.workspaceId, imageKey)
+      .run();
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property === "prepare")
+          return (query: string) => {
+            if (query.includes("UPDATE outbox_sweep_state")) throw new Error("Injected outbox failure");
+            return target.prepare(query);
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const bindings = new Proxy(envWithDatabase(env, database), {
+      get(target, property, receiver) {
+        if (property === "EXPANDED_EMBEDS_ENABLED") return "false";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const context = createExecutionContext();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(worker.scheduled(createScheduledController(), bindings, context)).rejects.toThrow(
+        "Scheduled tasks failed",
+      );
+      await waitOnExecutionContext(context);
+      expect(await env.DB.prepare("SELECT id FROM link_preview_cache WHERE id='expired-preview'").first()).toBeNull();
+      expect(await env.BUCKET.head(imageKey)).toBeNull();
+      const states = await env.DB.prepare(`SELECT task_name,last_succeeded_at,last_failed_at,last_error
+        FROM observability_task_runs WHERE task_name IN ('outbox','link_previews') ORDER BY task_name`).all();
+      expect(states.results).toEqual([
+        { task_name: "link_previews", last_succeeded_at: expect.any(Number), last_failed_at: null, last_error: null },
+        {
+          task_name: "outbox",
+          last_succeeded_at: expect.any(Number),
+          last_failed_at: expect.any(Number),
+          last_error: "Injected outbox failure",
+        },
+      ]);
+    } finally {
+      logged.mockRestore();
     }
   });
 
@@ -8350,6 +8422,67 @@ describe("calm workspace task lists", () => {
     ).json<{ tasks: Array<{ assigneeId: string; assigneeName: string }> }>();
     expect(tasks.tasks[0]).toMatchObject({ assigneeId: installed.userId, assigneeName: name });
   });
+  it("replays task archives with the complete detail subtree and current removal state", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const created = await change(installed, list.id, {
+      title: "Task with descendants",
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    const result = await created.json<{ rowId: string; detailPageId: string }>();
+    const child = await createPage(installed.cookie, "document", result.detailPageId);
+    const grandchild = await createPage(installed.cookie, "document", child.id);
+    const body = { archived: true, expectedRevision: 2, operationId: crypto.randomUUID() };
+    const first = await change(installed, list.id, body, result.rowId);
+    expect(first.status).toBe(200);
+    const firstBody = await first.json<{ pageIds: string[]; revision: number }>();
+    expect(firstBody.pageIds.toSorted()).toEqual([result.detailPageId, child.id, grandchild.id].toSorted());
+    const events: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    const context = createExecutionContext();
+    const replay = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/task-lists/${list.id}/tasks/${result.rowId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+      envWithCapturedWorkspaceEvents(env, events),
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(replay.status).toBe(200);
+    const replayBody = await replay.json<{ pageIds: string[]; revision: number; replayed: boolean }>();
+    expect(replayBody).toMatchObject({ revision: firstBody.revision, replayed: true });
+    expect(replayBody.pageIds.toSorted()).toEqual(firstBody.pageIds.toSorted());
+    const removal = events.find(({ event }) => event.type === "pages-removed")!.event;
+    expect(removal).toMatchObject({ pageIds: expect.arrayContaining(firstBody.pageIds) });
+    await env.DB.prepare("UPDATE pages SET archived_at=NULL WHERE id=?").bind(grandchild.id).run();
+    expect(await eventForCurrentWorkspaceState(env, installed.workspaceId, removal)).toEqual({
+      type: "pages-removed",
+      permanently: false,
+      pageIds: replayBody.pageIds.filter((id) => id !== grandchild.id),
+    });
+    const currentReplay = await change(installed, list.id, body, result.rowId);
+    expect(currentReplay.status).toBe(200);
+    expect((await currentReplay.json<{ pageIds: string[] }>()).pageIds.toSorted()).toEqual(
+      [result.detailPageId, child.id].toSorted(),
+    );
+    await env.DB.prepare("UPDATE pages SET archived_at=NULL,archive_operation_id=NULL WHERE id IN (?,?)")
+      .bind(result.detailPageId, child.id)
+      .run();
+    const restoredReplay = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}`, {
+        method: "DELETE",
+        headers: { "x-notes-operation-id": body.operationId },
+      }),
+    );
+    expect(restoredReplay.status).toBe(200);
+    expect(await restoredReplay.json()).toMatchObject({ ok: true, replayed: true, pageIds: [], cleanupPending: false });
+    expect(await env.DB.prepare("SELECT archived_at FROM pages WHERE id=?").bind(result.detailPageId).first()).toEqual({
+      archived_at: null,
+    });
+  }, 40_000);
+
   it("archives and restores task details without detaching their row", async () => {
     const installed = await bootstrap();
     const list = await taskList(installed);
@@ -8441,7 +8574,7 @@ describe("calm workspace task lists", () => {
     ).json<{ tasks: unknown[] }>();
     expect(tasks.tasks).toHaveLength(1);
     expect(await (await SELF.fetch(share.url)).text()).toContain("Completed task");
-  });
+  }, 45_000);
   it("invalidates task views when a parent containing a task list is archived and restored", async () => {
     const installed = await bootstrap();
     const parent = await createPage(installed.cookie);

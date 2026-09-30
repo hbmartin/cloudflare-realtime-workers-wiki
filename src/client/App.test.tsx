@@ -10,6 +10,7 @@ import { ApiClientError, api, EmptyApiResponseError, InvalidApiResponseError, Un
 import { App, fallbackPageId, useCommittedRef } from "./App";
 import { PAGE_NAVIGATE_EVENT } from "./mentions";
 import { PageLoadEventBuffer } from "./page-state";
+import { sha256Hex } from "../shared/import-integrity";
 
 // Rendering the full workspace under coverage can exceed the default one-second wait on CI.
 configure({ asyncUtilTimeout: 3000 });
@@ -57,6 +58,7 @@ vi.mock("./retry", async (importOriginal) => ({
 }));
 
 vi.mock("./EditorPage", () => ({
+  clearLiveRecoveryCopies: vi.fn(),
   EditorPage: (props: EditorPageProps) => {
     mocks.editorRender(props);
     return (
@@ -113,7 +115,7 @@ function mockShellApi(options: { member?: ClientMemberContext; pages?: Page[]; j
   vi.mocked(api).mockImplementation(async (path) => {
     if (path === "/api/install") return { initialized: true };
     if (path === "/api/security/status")
-      return { state: "ready", totp: true, passkeys: 0, codesSaved: true, fresh: false };
+      return { state: "ready", userId: currentMember.user.id, totp: true, passkeys: 0, codesSaved: true, fresh: false };
     if (path === "/api/security/methods") return { passkeys: [], browsers: [] };
     if (path === "/api/me") return currentMember;
     if (path === "/api/mentions/unread-count") return { unreadCount: 0 };
@@ -250,6 +252,72 @@ describe("App error handling", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
   });
+
+  it("keeps a legacy cleanup warning visible while moving it to the account hash", async () => {
+    const accountKey = "user\0workspace";
+    const rawKey = `notes:offline-purge-warning:${accountKey}`;
+    localStorage.setItem(rawKey, "1");
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true };
+      if (path === "/api/security/status") return { state: "signed_out" };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+    expect(await screen.findByText(/Some older offline copies may remain/)).toBeInTheDocument();
+    const hashedKey = `notes:offline-purge-warning:${await sha256Hex(accountKey)}`;
+    await waitFor(() => {
+      expect(localStorage.getItem(rawKey)).toBeNull();
+      expect(localStorage.getItem(hashedKey)).toBe("1");
+    });
+  });
+
+  it.each(["unchanged", "changed", "remote"])(
+    "only moves a page when the dialog destination changes (%s)",
+    async (scenario) => {
+      const changed = scenario === "changed";
+      for (const method of ["showModal", "close"] as const) {
+        const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
+        Object.defineProperty(HTMLDialogElement.prototype, method, {
+          configurable: true,
+          value(this: HTMLDialogElement) {
+            this.open = method === "showModal";
+          },
+        });
+        onTestFinished(() => {
+          if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, method, descriptor);
+          else Reflect.deleteProperty(HTMLDialogElement.prototype, method);
+        });
+      }
+      const destination = { ...page, id: "destination", title: "Destination", position: "b0" };
+      mockShellApi({ pages: [page, destination] });
+      const shellApi = vi.mocked(api).getMockImplementation()!;
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path === `/api/pages/${page.id}/move`) return { page: { ...page, parentId: destination.id, revision: 2 } };
+        return shellApi(path, init);
+      });
+      render(<App />);
+      await screen.findByRole("button", { name: "Actions for Roadmap" });
+      fireEvent.click(screen.getByRole("button", { name: /Find a page or command/ }));
+      fireEvent.click(await screen.findByRole("option", { name: /Move current page/ }));
+      const dialog = screen.getByRole("dialog", { name: "Move Roadmap" });
+      if (scenario === "remote")
+        act(() =>
+          dispatchWorkspaceEvent({
+            type: "pages-upserted",
+            pages: [{ ...page, parentId: destination.id, revision: 2 }],
+          }),
+        );
+      if (changed)
+        fireEvent.change(within(dialog).getByLabelText("Destination"), { target: { value: destination.id } });
+      fireEvent.click(within(dialog).getByRole("button", { name: "Move page" }));
+      expect(screen.queryByRole("dialog", { name: "Move Roadmap" })).toBeNull();
+      const requests = vi.mocked(api).mock.calls.filter(([path]) => path === `/api/pages/${page.id}/move`);
+      expect(requests).toHaveLength(changed ? 1 : 0);
+      expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual(
+        changed ? [{ parentId: destination.id, beforeId: null, afterId: null }] : [],
+      );
+    },
+  );
 
   it("lets an editor move a template to Trash and restore it without a page-tree error", async () => {
     const template: Page = { ...page, id: "template", title: "Brief template", isTemplate: true };
@@ -558,9 +626,9 @@ describe("App error handling", () => {
     });
     sessionStorage.setItem("pending-invite", "retry-token");
     render(<App />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Try later.");
+    expect(await screen.findByRole("heading", { name: "Offline access locked" })).toBeInTheDocument();
     expect(sessionStorage.getItem("pending-invite")).toBe("retry-token");
-    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    fireEvent.click(screen.getByRole("button", { name: "Try connecting again" }));
     await screen.findByRole("button", { name: "Simulate document access denial" });
     expect(sessionStorage.getItem("pending-invite")).toBeNull();
   });
@@ -728,7 +796,7 @@ describe("App error handling", () => {
       Response.json({ error: { code: "challenge_required", message: "Verify again." } }, { status: 401 }),
     );
     await expect(late).rejects.toMatchObject({ code: "challenge_required" });
-    expect(screen.getByRole("button", { name: "Simulate document access denial" })).toBeInTheDocument();
+    expect(screen.queryByText("Verify again.")).not.toBeInTheDocument();
 
     signedOut.resolve({ error: null });
     const email = await screen.findByLabelText("Email");
@@ -736,6 +804,49 @@ describe("App error handling", () => {
 
     expect(screen.getByRole("heading", { name: "Sign in" })).toBeInTheDocument();
     expect(email).toHaveValue("typing@example.test");
+  });
+
+  it("finishes a pending server sign-out before allowing another email sign-in", async () => {
+    mockShellApi();
+    localStorage.setItem("notes:local-signout", "user\u0000workspace");
+    mocks.signOut.mockResolvedValueOnce({ error: { message: "Server unavailable" } });
+    mocks.signInEmail.mockResolvedValue({ error: { message: "Stop after sign-in check" } });
+    render(<App />);
+    const email = await screen.findByLabelText("Email");
+    fireEvent.change(email, { target: { value: "next@example.test" } });
+    fireEvent.change(screen.getByLabelText("Password"), { target: { value: "password" } });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(
+      await screen.findByText("Server sign-out could not be confirmed. Connect and try again."),
+    ).toBeInTheDocument();
+    expect(mocks.signInEmail).not.toHaveBeenCalled();
+    expect(localStorage.getItem("notes:local-signout")).toBe("user\u0000workspace");
+
+    mocks.signOut.mockResolvedValueOnce({ error: null });
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await waitFor(() => expect(mocks.signInEmail).toHaveBeenCalledOnce());
+    expect(localStorage.getItem("notes:local-signout")).toBeNull();
+  });
+
+  it("keeps a new account signed in when an older account left a local sign-out marker", async () => {
+    const nextMember = { ...member, user: { ...member.user, id: "next-user" } };
+    mockShellApi({ member: nextMember });
+    localStorage.setItem("notes:local-signout", "user\u0000workspace");
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Sign out" });
+    expect(localStorage.getItem("notes:local-signout")).toBeNull();
+    expect(mocks.signOut).not.toHaveBeenCalled();
+  });
+
+  it("does not accept an invite into an account whose sign-out is pending", async () => {
+    mockShellApi();
+    localStorage.setItem("notes:local-signout", "user\u0000workspace");
+    history.replaceState(null, "", "/?invite=invite-token");
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Sign in" });
+    expect(vi.mocked(api).mock.calls.some(([path]) => path === "/api/invites/complete")).toBe(false);
   });
 
   it("resolves a global security-policy 401 through status", async () => {
@@ -856,18 +967,17 @@ describe("App error handling", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("Security status unavailable.");
   });
 
-  it("uses service guidance and no sign-out action when startup fails", async () => {
+  it("shows a locked offline state when startup fails without a cached account", async () => {
     vi.mocked(api).mockRejectedValueOnce(new ApiClientError(503, "unavailable", "Install service unavailable."));
 
     render(<App />);
 
-    expect(await screen.findByRole("heading", { name: "NoteFlare is unavailable" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Offline access locked" })).toBeInTheDocument();
     const brand = screen.getByText("NoteFlare").closest(".brand");
     expect(brand).not.toBeNull();
     expect(brand!.querySelector('img[src="/apple-touch-icon.png"]')).toHaveAttribute("alt", "");
-    expect(screen.getByText(/Check your connection/)).toBeInTheDocument();
-    expect(screen.getByRole("alert")).toHaveTextContent("Install service unavailable.");
-    expect(screen.getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.getByText(/No account copy is available here/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Try connecting again" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Sign out" })).not.toBeInTheDocument();
   });
 
@@ -1925,7 +2035,7 @@ describe("App error handling", () => {
 
     const openSidebar = await screen.findByRole("button", { name: "Open navigation" });
     fireEvent.click(openSidebar);
-    fireEvent.click(getArchive("Archive Roadmap"));
+    fireEvent.click(await findArchive("Archive Roadmap"));
 
     expect(await screen.findByText("Archive was rejected.")).toBeInTheDocument();
     expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
@@ -3445,6 +3555,38 @@ describe("App error handling", () => {
     expect(queryArchive("Archive Roadmap")).not.toBeInTheDocument();
     expect(screen.queryByText("Page not found.")).not.toBeInTheDocument();
   });
+
+  it.each([{ pageIds: [] }, { pageIds: ["child"] }])(
+    "keeps a restored root visible after an archive replay removing $pageIds",
+    async ({ pageIds }) => {
+      const child = { ...page, id: "child", title: "Child", parentId: page.id };
+      const reconciliation = deferred<{ pages: Page[] }>();
+      let treeLoads = 0;
+      vi.stubGlobal(
+        "confirm",
+        vi.fn(() => true),
+      );
+      mockShellApi({ pages: [page, child] });
+      const shellApi = vi.mocked(api).getMockImplementation()!;
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path === "/api/pages/tree" && ++treeLoads > 1) return reconciliation.promise;
+        if (path === `/api/pages/${page.id}` && init?.method === "DELETE")
+          return { ok: true, replayed: true, pageIds, cleanupPending: false, pendingPageCount: 0 };
+        return shellApi(path, init);
+      });
+      render(<App />);
+      fireEvent.click(await findArchive("Archive Roadmap"));
+      await waitFor(() => expect(treeLoads).toBe(2));
+      expect(queryArchive("Archive Roadmap")).toBeInTheDocument();
+      expect(mocks.invalidatePagePreview.mock.calls.map(([id]) => id)).toEqual(pageIds);
+      expect(screen.queryByText(/invalid archive response/i)).toBeNull();
+      await act(async () => {
+        reconciliation.resolve({ pages: [page, ...(!pageIds.length ? [child] : [])] });
+        await reconciliation.promise;
+      });
+      expect(queryArchive("Archive Roadmap")).toBeInTheDocument();
+    },
+  );
 
   it("does not let an ordinary upsert bypass an archive tombstone", async () => {
     const reconciliation = deferred<{ pages: Page[] }>();

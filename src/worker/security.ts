@@ -510,7 +510,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
         if (id) await clearExpiredRecoveryHandoff(env, id.userId, Date.now());
         return ctx.json(
           id
-            ? (await readSecurity(env, id.userId, id.sessionId, true)).status
+            ? { ...(await readSecurity(env, id.userId, id.sessionId, true)).status, userId: id.userId }
             : ({
                 state: "signed_out",
                 totp: false,

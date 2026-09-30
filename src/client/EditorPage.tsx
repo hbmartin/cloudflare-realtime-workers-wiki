@@ -1,5 +1,6 @@
 import { createPortal } from "react-dom";
 import type { ReactNode } from "react";
+
 import { ActionMenu, PageTools } from "./WorkspaceUI";
 import { CommentsExtension } from "@blocknote/core/comments";
 import {
@@ -18,14 +19,23 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
-import type { ClientMemberContext } from "../shared/types";
+import type { ClientMemberContext, Space } from "../shared/types";
 import type { MentionSuggestion, Page } from "../shared/types";
 import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { diffBlockIds } from "../shared/block-diff";
 import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
-import { createCollaboration, loadOfflineCopy, type CollaborationBundle, userColor } from "./collaboration";
+import {
+  createCollaboration,
+  loadOfflineCopy,
+  OFFLINE_COPY_MISSING_MESSAGE,
+  OfflineStorageTimeoutError,
+  type CollaborationBundle,
+  userColor,
+} from "./collaboration";
+import { downloadOfflineMarkdown, offlineCopyMarkdown, offlineCopyMarkdownFromKey } from "./offline-export";
 import { createDocumentCloseReconciler } from "./document-connection";
+import { reportClientError } from "./telemetry";
 import { editorBlockFactories, EmbedFeatureContext, safeBookmarkUrl } from "./editor-blocks";
 import { resolveEmbed } from "../shared/embed-providers";
 import { notesCommentSchema, notesSchema } from "./mentions";
@@ -43,12 +53,87 @@ import type { NotificationPreference } from "../shared/types";
 import { ServerThreadStore } from "./server-thread-store";
 import { resolveAttachmentUrl, uploadAttachment } from "./uploads";
 import { useEffectiveColorScheme } from "./ThemeControl";
+import {
+  compactDocumentUpdates,
+  documentPendingMarker,
+  getOfflinePage,
+  markOfflinePagePending,
+  offlineAccountKey,
+  offlineDocumentKey,
+  pendingKeysOf,
+  persistPendingDocumentUpdate,
+  rememberOfflinePage,
+  rememberOfflineAccount,
+  storageEpoch,
+} from "./offline-catalog";
+
+const ACCOUNT_CATALOG_WARNING = "The offline page list could not be updated yet.";
+const PENDING_CATALOG_WARNING = "Local changes are saved, but the offline page list could not be updated yet.";
+const SYNCED_CATALOG_WARNING = "Changes are synced, but the offline page list could not be updated yet.";
+const OFFLINE_INIT_ERROR = "Offline storage is unavailable, so editing and collaboration are disabled for this page.";
+const liveRecoveryCopies = new Map<string, string>();
+const liveRecoveryEntries = new Map<string, RecoveryEntry>();
+export function clearLiveRecoveryCopies(accountKey: string) {
+  const [userId, workspaceId] = accountKey.split("\u0000");
+  const prefix = `account:${userId}:${workspaceId}:`;
+  for (const key of liveRecoveryCopies.keys())
+    if (key.startsWith(prefix)) {
+      liveRecoveryCopies.delete(key);
+      liveRecoveryEntries.delete(key);
+    }
+}
+type RecoveryEntry = { key: string; epoch: number; reason?: "access" | "storage" | "epoch"; storageFailed?: boolean };
+function recoveryEntries(key: string): RecoveryEntry[] {
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(key) ?? "null");
+    const entries = Array.isArray(saved) ? saved : saved ? [saved] : [];
+    return entries.filter(
+      (entry): entry is RecoveryEntry =>
+        entry !== null && typeof entry === "object" && typeof entry.key === "string" && Number.isInteger(entry.epoch),
+    );
+  } catch {
+    return [];
+  }
+}
+function recoveryRank(reason: RecoveryEntry["reason"]) {
+  return reason === "access" ? 3 : reason === "storage" ? 2 : 1;
+}
+function mergedRecovery(stored: RecoveryEntry | undefined, changed: RecoveryEntry): RecoveryEntry {
+  if (!stored) return changed;
+  const storageFailed = Boolean(
+    stored.storageFailed || stored.reason === "storage" || changed.storageFailed || changed.reason === "storage",
+  );
+  return {
+    ...changed,
+    reason: recoveryRank(stored.reason) > recoveryRank(changed.reason) ? stored.reason : changed.reason,
+    ...(storageFailed ? { storageFailed: true } : {}),
+  };
+}
+const RECOVERY_ACTIONS = ["preview", "export", "copy"] as const;
+type RecoveryAction = (typeof RECOVERY_ACTIONS)[number];
+
+function recoveryMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message === OFFLINE_COPY_MISSING_MESSAGE ? error.message : fallback;
+}
+
+function beginRecoveryAction(
+  actions: Map<string, number>,
+  entries: { current: readonly { key: string }[] },
+  entryKey: string,
+  action: RecoveryAction,
+) {
+  const key = `${entryKey}:${action}`;
+  const attempt = (actions.get(key) ?? 0) + 1;
+  actions.set(key, attempt);
+  return () => actions.get(key) === attempt && entries.current.some((entry) => entry.key === entryKey);
+}
 
 export type EditorPageProps = {
   page: Page;
   metadata?: ReactNode;
   taskList?: Page | undefined;
   member: ClientMemberContext;
+  spaceName?: string;
   onPageChanged: (page: Page) => void;
   onPageUnavailable: (pageId: string) => void;
   onAccessDenied: (pageId: string, error: ApiClientError) => void;
@@ -62,6 +147,7 @@ export function EditorPage({
   metadata,
   taskList,
   member,
+  spaceName = "Space",
   onPageChanged,
   onPageUnavailable,
   onAccessDenied,
@@ -71,21 +157,167 @@ export function EditorPage({
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
+  const [hasConfirmedSync, setHasConfirmedSync] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
+  const [storageWriteFailed, setStorageWriteFailed] = useState(false);
+  const currentStorageKey = offlineDocumentKey(member.user.id, member.workspace.id, page.id, page.contentEpoch);
+  const [liveRecovery, setLiveRecovery] = useState<{ key: string; markdown: string } | null>(() => {
+    const markdown = liveRecoveryCopies.get(currentStorageKey);
+    return markdown === undefined ? null : { key: currentStorageKey, markdown };
+  });
+  const [recoveryPersistenceFailed, setRecoveryPersistenceFailed] = useState(false);
+  const [storageLoadingSlow, setStorageLoadingSlow] = useState(false);
+  const [storageRetry, setStorageRetry] = useState(0);
+  const [catalogWarning, setCatalogWarning] = useState<string | null>(null);
+  const [recoveryErrors, setRecoveryErrors] = useState<Record<string, string>>({});
+  const [preparedRecoveryCopy, setPreparedRecoveryCopy] = useState<{ key: string; markdown: string } | null>(null);
+  const recoveryActions = useRef(new Map<string, number>());
+  const recoverySelection = useRef({ preview: 0, prepare: 0 });
+  const recoveryErrorFor = (entryKey: string, action: RecoveryAction, message: string | null) => {
+    const key = `${entryKey}:${action}`;
+    setRecoveryErrors((current) => {
+      if (message === null && !(key in current)) return current;
+      const next = { ...current };
+      if (message === null) delete next[key];
+      else next[key] = message;
+      return next;
+    });
+  };
+  const selectRecovery = (action: "preview" | "prepare") => {
+    const sequence = recoverySelection.current[action] + 1;
+    recoverySelection.current[action] = sequence;
+    return () => recoverySelection.current[action] === sequence;
+  };
+  const clipboardItemSupported =
+    typeof ClipboardItem !== "undefined" && Boolean(navigator.clipboard && "write" in navigator.clipboard);
+  const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [attachmentsOpen, setAttachmentsOpen] = useState(false);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
-  const recoveryKey = `notes:recovery:${member.workspace.id}:${page.id}`;
-  const [recovery, setRecovery] = useState<{ key: string; epoch: number } | null>(() => {
-    try {
-      return JSON.parse(localStorage.getItem(recoveryKey) ?? "null");
-    } catch {
-      return null;
-    }
+  const recoveryKey = `notes:recovery:${member.user.id}:${member.workspace.id}:${page.id}`;
+  const [recovery, setRecovery] = useState<RecoveryEntry[]>(() => {
+    const entries = new Map(recoveryEntries(recoveryKey).map((entry) => [entry.key, entry]));
+    const pagePrefix = `account:${member.user.id}:${member.workspace.id}:${page.id}:`;
+    for (const [key, entry] of liveRecoveryEntries) if (key.startsWith(pagePrefix)) entries.set(key, entry);
+    return [...entries.values()];
   });
-  const [recoveryPreview, setRecoveryPreview] = useState("");
+  const [recoveryPreview, setRecoveryPreview] = useState<{ key: string; text: string } | null>(null);
+  const recoveryRef = useRef(recovery);
+  const dismissedRecovery = useRef<Record<string, number>>({});
+  const replaceRecovery = useCallback(
+    (next: RecoveryEntry[]) => {
+      const previous = recoveryRef.current;
+      const previousByKey = new Map(previous.map((entry) => [entry.key, entry]));
+      const nextByKey = new Map(next.map((entry) => [entry.key, entry]));
+      const stored = new Map(recoveryEntries(recoveryKey).map((entry) => [entry.key, entry]));
+      for (const [key, prior] of previousByKey) {
+        const changed = nextByKey.get(key);
+        if (!changed) {
+          if (!stored.has(key) || JSON.stringify(stored.get(key)) === JSON.stringify(prior)) stored.delete(key);
+        } else if (JSON.stringify(changed) !== JSON.stringify(prior) || !stored.has(key)) {
+          const merged = mergedRecovery(stored.get(key), changed);
+          if (changed.reason === "epoch" && changed.epoch !== page.contentEpoch) merged.reason = "epoch";
+          stored.set(key, merged);
+        }
+      }
+      for (const [key, changed] of nextByKey)
+        if (!previousByKey.has(key)) {
+          const merged = mergedRecovery(stored.get(key), changed);
+          if (changed.reason === "epoch" && changed.epoch !== page.contentEpoch) merged.reason = "epoch";
+          stored.set(key, merged);
+        }
+      const merged = [...stored.values()].sort((left, right) => left.epoch - right.epoch);
+      try {
+        localStorage.setItem(recoveryKey, JSON.stringify(merged));
+        setRecoveryPersistenceFailed(false);
+      } catch (error) {
+        console.error("Unable to persist offline recovery details", error);
+        setRecoveryPersistenceFailed(true);
+      }
+      recoveryRef.current = merged;
+      setRecovery(merged);
+      const retained = new Set(merged.map((entry) => entry.key));
+      for (const entry of previous) {
+        if (retained.has(entry.key)) continue;
+        for (const action of RECOVERY_ACTIONS) {
+          const key = `${entry.key}:${action}`;
+          recoveryActions.current.set(key, (recoveryActions.current.get(key) ?? 0) + 1);
+        }
+      }
+      const retainedError = (key: string) => retained.has(key.slice(0, key.lastIndexOf(":")));
+      setRecoveryErrors((current) =>
+        Object.keys(current).some((key) => !retainedError(key))
+          ? Object.fromEntries(Object.entries(current).filter(([key]) => retainedError(key)))
+          : current,
+      );
+      setRecoveryPreview((current) => (current && !retained.has(current.key) ? null : current));
+      setPreparedRecoveryCopy((current) => (current && !retained.has(current.key) ? null : current));
+      setLiveRecovery((current) => (current && !retained.has(current.key) ? null : current));
+      for (const entry of previous)
+        if (!retained.has(entry.key)) {
+          liveRecoveryCopies.delete(entry.key);
+          liveRecoveryEntries.delete(entry.key);
+        }
+    },
+    [recoveryKey, page.contentEpoch],
+  );
+  useEffect(() => {
+    const changed = (event: StorageEvent) => {
+      if (event.key !== recoveryKey) return;
+      const entries = recoveryEntries(recoveryKey);
+      replaceRecovery([
+        ...entries,
+        ...recoveryRef.current.filter(
+          (entry) =>
+            (recoveryPersistenceFailed || liveRecoveryCopies.has(entry.key)) &&
+            !entries.some((saved) => saved.key === entry.key),
+        ),
+      ]);
+    };
+    window.addEventListener("storage", changed);
+    return () => window.removeEventListener("storage", changed);
+  }, [recoveryKey, recoveryPersistenceFailed, replaceRecovery]);
+  useEffect(() => {
+    try {
+      const saved: unknown = JSON.parse(localStorage.getItem(`${recoveryKey}:dismissed`) ?? "{}");
+      if (Array.isArray(saved)) {
+        const converted = Object.fromEntries(
+          saved.filter((key): key is string => typeof key === "string").map((key) => [key, page.contentEpoch]),
+        );
+        dismissedRecovery.current = converted;
+        try {
+          localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(converted));
+        } catch (error) {
+          console.error("Unable to migrate dismissed recovery details", error);
+        }
+      } else
+        dismissedRecovery.current =
+          saved && typeof saved === "object"
+            ? Object.fromEntries(Object.entries(saved).filter(([key, value]) => key && Number.isInteger(value)))
+            : {};
+    } catch {
+      dismissedRecovery.current = {};
+    }
+    const changed = (event: StorageEvent) => {
+      if (event.key !== `${recoveryKey}:dismissed`) return;
+      try {
+        const saved: unknown = JSON.parse(localStorage.getItem(event.key) ?? "{}");
+        dismissedRecovery.current = Array.isArray(saved)
+          ? Object.fromEntries(
+              saved.filter((key): key is string => typeof key === "string").map((key) => [key, page.contentEpoch]),
+            )
+          : saved && typeof saved === "object"
+            ? Object.fromEntries(Object.entries(saved).filter(([key, value]) => key && Number.isInteger(value)))
+            : {};
+      } catch {
+        dismissedRecovery.current = {};
+      }
+    };
+    window.addEventListener("storage", changed);
+    return () => window.removeEventListener("storage", changed);
+  }, [recoveryKey, page.contentEpoch]);
   const [title, setTitle] = useState(page.title);
   const [titleError, setTitleError] = useState("");
   const [editorError, setEditorError] = useState("");
@@ -94,9 +326,39 @@ export function EditorPage({
   const titlePageIdRef = useRef(page.id);
   const titleRevisionRef = useRef(page.revision);
   const titleDirtyRef = useRef(false);
-  const editable = member.role !== "viewer" && !sizeWarning?.readOnly && !storageError;
+  const titleSavingRef = useRef(0);
+  const writeRecovery = recovery.some(
+    (entry) => entry.key === currentStorageKey && (entry.storageFailed || entry.reason === "storage"),
+  );
+  const editable =
+    member.role !== "viewer" &&
+    !sizeWarning?.readOnly &&
+    !storageError &&
+    !recoveryPersistenceFailed &&
+    !writeRecovery &&
+    !storageWriteFailed &&
+    !accessQuarantine;
   const commentsVisible = commentsOpen;
   const [panelTarget, setPanelTarget] = useState<HTMLDivElement | null>(null);
+  const offlineMetadata = useRef({ page, spaceName });
+  const offlineMember = useRef(member);
+  useEffect(() => {
+    offlineMetadata.current = { page, spaceName };
+  }, [page, spaceName]);
+  useEffect(() => {
+    offlineMember.current = member;
+  }, [member]);
+  const offlineTitle = page.title;
+  const offlineRole = member.role;
+  useEffect(() => {
+    if (!hasConfirmedSync) return;
+    void rememberOfflinePage(
+      offlineMember.current,
+      { ...offlineMetadata.current.page, title: offlineTitle },
+      spaceName,
+      offlineRole !== "viewer",
+    ).catch((error) => console.error("Unable to remember this document for offline use", error));
+  }, [hasConfirmedSync, offlineTitle, spaceName, offlineRole]);
 
   useEffect(() => {
     if (titlePageIdRef.current !== page.id) {
@@ -116,44 +378,384 @@ export function EditorPage({
   }, [page.id, page.revision, page.title]);
 
   useEffect(() => {
-    const next = createCollaboration(member.workspace.id, page.id, page.contentEpoch, setStatus);
     let active = true;
+    queueMicrotask(() => {
+      if (!active) return;
+      setStorageWriteFailed(false);
+      if (storageRetry > 0) setStorageLoadingSlow(false);
+    });
+    queueMicrotask(() => active && setStatus("connecting"));
+    let pendingWrite = Promise.resolve();
+    const quarantine = (key = currentStorageKey, reason: RecoveryEntry["reason"] = "epoch") => {
+      if (!active) return;
+      const value = {
+        key,
+        epoch: storageEpoch(key) ?? page.contentEpoch,
+        reason,
+        ...(reason === "storage" ? { storageFailed: true } : {}),
+      };
+      if (dismissedRecovery.current[key] === page.contentEpoch && reason === "epoch") return;
+      const current = recoveryRef.current;
+      const prior = current.find((entry) => entry.key === key);
+      const combined = mergedRecovery(prior, value);
+      if (reason === "epoch" && value.epoch !== page.contentEpoch) combined.reason = "epoch";
+      if (prior && JSON.stringify(prior) === JSON.stringify(combined)) return;
+      replaceRecovery([...current.filter((entry) => entry.key !== key), combined]);
+    };
+    let next: CollaborationBundle;
+    let catalogFailures = 0;
+    let pendingActive = false;
+    let catalogNeedsRepair = false;
+    let nextCatalogRepairAt = 0;
+    let pendingRevision = 0;
+    let storageFailed = false;
+    let clearRetryTimer: number | undefined;
+    const beforeConnect = async () => {
+      await pendingWrite;
+      if (!active) return false;
+      const readingRevision = pendingRevision;
+      const accountKey = offlineAccountKey(offlineMember.current);
+      let catalogPage;
+      try {
+        catalogPage = await getOfflinePage(accountKey, page.id);
+        catalogFailures = 0;
+      } catch (error) {
+        console.error("Unable to read offline document state", error);
+        if (++catalogFailures >= 3 && active) {
+          setStorageError(OFFLINE_INIT_ERROR);
+          return false;
+        }
+        throw error;
+      }
+      const pendingKeys = catalogPage ? pendingKeysOf(catalogPage) : [];
+      const listed = Boolean(catalogPage?.storageKeys?.includes(currentStorageKey));
+      const marker =
+        pendingKeys.includes(currentStorageKey) ||
+        (!listed &&
+          (await documentPendingMarker(currentStorageKey).catch((error) => {
+            console.error("Unable to read offline document marker", error);
+            return true;
+          })));
+      catalogNeedsRepair =
+        Boolean(catalogPage?.catalogNeedsRepair && pendingKeys.includes(currentStorageKey)) || (marker && !listed);
+      if (readingRevision === pendingRevision) pendingActive = marker;
+      const olderDrafts = pendingKeys.filter((key) => key !== currentStorageKey);
+      for (const key of olderDrafts) quarantine(key);
+      const hasLocalDraft = marker || pendingActive || (!catalogPage && next.hasUnsyncedChanges);
+      const controller = new AbortController();
+      const deadline = window.setTimeout(() => controller.abort(), 10_000);
+      try {
+        const currentMember = await api<ClientMemberContext>("/api/me", { signal: controller.signal });
+        if (!active) return false;
+        if (currentMember.user.id !== member.user.id || currentMember.workspace.id !== member.workspace.id) {
+          window.location.reload();
+          return false;
+        }
+        offlineMember.current = currentMember;
+        try {
+          await rememberOfflineAccount(currentMember);
+          if (active && !catalogNeedsRepair)
+            setCatalogWarning((warning) => (warning === ACCOUNT_CATALOG_WARNING ? null : warning));
+        } catch (error) {
+          console.error("Unable to update offline account metadata", error);
+          if (active)
+            setCatalogWarning((warning) =>
+              warning === PENDING_CATALOG_WARNING || warning === SYNCED_CATALOG_WARNING
+                ? warning
+                : ACCOUNT_CATALOG_WARNING,
+            );
+        }
+        if (!active) return false;
+        if (catalogNeedsRepair) {
+          writePending(true);
+          await pendingWrite;
+        }
+        if (!active) return false;
+        // A clean copy can rely on the document room's page access check.
+        if (!hasLocalDraft && !olderDrafts.length) return true;
+        const [{ page: currentPage }, { spaces }] = await Promise.all([
+          api<{ page: Page }>(`/api/pages/${encodeURIComponent(page.id)}`, { signal: controller.signal }),
+          api<{ spaces: Space[] }>("/api/spaces", { signal: controller.signal }),
+        ]);
+        if (!active) return false;
+        if (currentPage.contentEpoch !== page.contentEpoch) {
+          if (hasLocalDraft) quarantine(currentStorageKey);
+          onPageChanged(currentPage);
+          return false;
+        }
+        const space = spaces.find((item) => item.id === currentPage.spaceId);
+        if (!space || (space.effectiveRole === "viewer" && hasLocalDraft)) {
+          if (hasLocalDraft || olderDrafts.length) {
+            if (hasLocalDraft) quarantine(currentStorageKey, "access");
+            setAccessQuarantine(true);
+          } else {
+            onPageUnavailable(page.id);
+          }
+          return false;
+        }
+        return true;
+      } catch (error) {
+        if (!active) return false;
+        if (error instanceof ApiClientError && [401, 403, 404, 410].includes(error.status)) {
+          if (error.status === 401) {
+            if (hasLocalDraft) quarantine(currentStorageKey, "access");
+            if (hasLocalDraft || olderDrafts.length) setAccessQuarantine(true);
+          } else if (hasLocalDraft || olderDrafts.length) {
+            if (hasLocalDraft) quarantine(currentStorageKey, "access");
+            setAccessQuarantine(true);
+          } else if (error.status === 403) onAccessDenied(page.id, error);
+          else onPageUnavailable(page.id);
+          return false;
+        }
+        throw error;
+      } finally {
+        window.clearTimeout(deadline);
+      }
+    };
+    try {
+      next = createCollaboration(
+        member.workspace.id,
+        page.id,
+        page.contentEpoch,
+        setStatus,
+        member.user.id,
+        beforeConnect,
+      );
+    } catch (error) {
+      console.error("Unable to start local document storage", error);
+      queueMicrotask(() => {
+        if (active) {
+          setStatus("offline");
+          setStorageError(OFFLINE_INIT_ERROR);
+        }
+      });
+      return () => {
+        active = false;
+        setStorageError(null);
+      };
+    }
+    next.doc.off("update", next.indexeddb["_storeUpdate"]);
+    const clearCurrentRecovery = () => {
+      if (!active) return;
+      const current = recoveryRef.current;
+      const remaining = current.filter(
+        (entry) => entry.key !== currentStorageKey || entry.storageFailed || entry.reason === "storage",
+      );
+      if (remaining.length !== current.length) {
+        replaceRecovery(remaining);
+      }
+      setStorageError(null);
+      setCatalogWarning(null);
+    };
+    const writePending = (pending: boolean) => {
+      if (!pending && storageFailed) return;
+      if (pending && pendingActive && (!catalogNeedsRepair || Date.now() < nextCatalogRepairAt)) return;
+      if (!pending && !pendingActive) {
+        clearCurrentRecovery();
+        return;
+      }
+      pendingActive = pending;
+      pendingRevision += 1;
+      const revision = pendingRevision;
+      pendingWrite = pendingWrite
+        .then(async () => {
+          if (revision !== pendingRevision) return;
+          if (!pending && storageFailed) return;
+          const currentMember = offlineMember.current;
+          if (pending) {
+            const remembered = await rememberOfflinePage(
+              currentMember,
+              offlineMetadata.current.page,
+              offlineMetadata.current.spaceName,
+              currentMember.role !== "viewer",
+              false,
+            );
+            if (!remembered) throw new Error("Offline catalog is not accepting page updates.");
+          }
+          const recorded = await markOfflinePagePending(
+            offlineAccountKey(currentMember),
+            page.id,
+            currentStorageKey,
+            pending,
+            () => revision === pendingRevision,
+          );
+          if (pending && !recorded) throw new Error("Offline catalog has no page entry.");
+          if (!pending && revision !== pendingRevision) return;
+          if (pending) {
+            catalogNeedsRepair = false;
+            if (active) setCatalogWarning(null);
+          }
+          if (!pending) {
+            await rememberOfflinePage(
+              currentMember,
+              offlineMetadata.current.page,
+              offlineMetadata.current.spaceName,
+              currentMember.role !== "viewer",
+              true,
+            );
+            clearCurrentRecovery();
+          }
+        })
+        .catch((error) => {
+          console.error("Unable to update offline sync state", error);
+          if (pending && active) {
+            catalogNeedsRepair = true;
+            nextCatalogRepairAt = Date.now() + 5_000;
+            setCatalogWarning(PENDING_CATALOG_WARNING);
+          } else if (!pending && active && revision === pendingRevision) {
+            pendingActive = true;
+            setCatalogWarning(SYNCED_CATALOG_WARNING);
+            if (clearRetryTimer !== undefined) window.clearTimeout(clearRetryTimer);
+            clearRetryTimer = window.setTimeout(() => {
+              clearRetryTimer = undefined;
+              if (active && revision === pendingRevision && !next.hasUnsyncedChanges) writePending(false);
+            }, 5_000);
+          }
+        });
+    };
+    let persistedUpdates = 0;
+    let seededUpdates = false;
+    let compacting: Promise<void> | null = null;
+    const failStorage = (error: unknown) => {
+      storageFailed = true;
+      console.error("Unable to persist local document update", error);
+      if (active) {
+        setStorageWriteFailed(true);
+        try {
+          const markdown = offlineCopyMarkdown(next.doc, offlineMetadata.current.page.title);
+          liveRecoveryCopies.set(currentStorageKey, markdown);
+          liveRecoveryEntries.set(currentStorageKey, {
+            key: currentStorageKey,
+            epoch: page.contentEpoch,
+            reason: "storage",
+            storageFailed: true,
+          });
+          setLiveRecovery({ key: currentStorageKey, markdown });
+        } catch (exportError) {
+          console.error("Unable to prepare the current editor for recovery", exportError);
+        }
+        quarantine(currentStorageKey, "storage");
+      }
+    };
+    const documentUpdate = (_update: Uint8Array, origin: unknown) => {
+      if (origin === next.provider) {
+        next.indexeddb["_storeUpdate"](_update, origin);
+        return;
+      }
+      if (origin !== next.indexeddb) {
+        if (dismissedRecovery.current[currentStorageKey] !== undefined) {
+          delete dismissedRecovery.current[currentStorageKey];
+          try {
+            localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
+          } catch (error) {
+            console.error("Unable to update dismissed recovery details", error);
+          }
+        }
+        try {
+          const db = next.indexeddb.db;
+          if (!db) throw new Error("Offline document storage is unavailable.");
+          const stored = persistPendingDocumentUpdate(db, _update).catch(failStorage);
+          pendingWrite = pendingWrite
+            .then(() => stored)
+            .then(() => {
+              if (storageFailed) return;
+              if (!seededUpdates) {
+                persistedUpdates = next.indexeddb["_dbsize"];
+                seededUpdates = true;
+              }
+              if (++persistedUpdates >= 500) {
+                persistedUpdates = 0;
+                if (!compacting) {
+                  const task = compactDocumentUpdates(next.indexeddb).catch((error) =>
+                    console.error("Unable to compact offline document storage", error),
+                  );
+                  compacting = task;
+                  void task.finally(() => {
+                    if (compacting === task) compacting = null;
+                  });
+                }
+              }
+            })
+            .catch(failStorage);
+          writePending(true);
+        } catch (error) {
+          failStorage(error);
+        }
+      }
+    };
+    next.doc.on("update", documentUpdate);
     const customMessage = (message: string) => {
+      if (!active) return;
       try {
         const value = JSON.parse(message) as { type: string; bytes: number; readOnly: boolean };
         if (value.type === "document-size") setSizeWarning(value);
+        if (value.type === "document-update-ack" && !next.hasUnsyncedChanges) writePending(false);
       } catch {
         // Ignore custom messages from future server versions.
       }
     };
     next.provider.on("custom-message", customMessage);
-    const quarantine = () => {
-      const value = { key: `${member.workspace.id}:${page.id}:${page.contentEpoch}:1`, epoch: page.contentEpoch };
-      const serialized = JSON.stringify(value);
-      if (localStorage.getItem(recoveryKey) !== serialized) localStorage.setItem(recoveryKey, serialized);
-      setRecovery((current) => (current?.key === value.key && current.epoch === value.epoch ? current : value));
-    };
     const closeReconciler = createDocumentCloseReconciler({
       page: { id: page.id, contentEpoch: page.contentEpoch },
       provider: next.provider,
-      canQuarantine: member.role !== "viewer",
       hasUnsyncedChanges: () => next.hasUnsyncedChanges,
       quarantine,
       onPageChanged,
       onPageUnavailable,
-      onAccessDenied,
+      onAccessDenied: (id, error) => {
+        if (next.hasUnsyncedChanges) {
+          quarantine(currentStorageKey, "access");
+          setAccessQuarantine(true);
+        } else onAccessDenied(id, error);
+      },
+      onUnauthorized: () => {
+        if (next.hasUnsyncedChanges) {
+          quarantine(currentStorageKey, "access");
+          setAccessQuarantine(true);
+        } else {
+          onAccessDenied(page.id, new ApiClientError(401, "unauthorized", "Sign in again to edit this page."));
+        }
+      },
     });
-    const connectionClose = (event: CloseEvent) => closeReconciler.handleClose(event);
-    const connectionSync = (synced: boolean) => closeReconciler.handleSync(synced);
+    const connectionClose = (event: CloseEvent) => {
+      if (active) closeReconciler.handleClose(event);
+    };
+    const connectionSync = (synced: boolean) => {
+      if (!active) return;
+      closeReconciler.handleSync(synced);
+      if (synced && active) setHasConfirmedSync(true);
+    };
     next.provider.on("connection-close", connectionClose);
     next.provider.on("sync", connectionSync);
     void (async () => {
       try {
         await next.ready;
-        if (active) setBundle(next);
-      } catch {
+        if (active) {
+          setStorageLoadingSlow(false);
+          setStorageError(null);
+          setBundle(next);
+        }
+      } catch (error) {
         if (!active) return;
-        setStorageError("Offline storage is unavailable, so editing and collaboration are disabled for this page.");
+        if (error instanceof OfflineStorageTimeoutError) {
+          setStorageLoadingSlow(true);
+        } else setStorageError(OFFLINE_INIT_ERROR);
+        void (async () => {
+          try {
+            await next.lateReady;
+            if (!active) return;
+            setStorageLoadingSlow(false);
+            setStorageError(null);
+            setBundle(next);
+          } catch (lateError) {
+            if (!active) return;
+            console.error("Failed to load offline document state", lateError);
+            if (error instanceof OfflineStorageTimeoutError)
+              void reportClientError("client.offline_storage_failed", lateError);
+            setStorageLoadingSlow(false);
+            setStorageError(OFFLINE_INIT_ERROR);
+          }
+        })();
       }
     })();
     return () => {
@@ -162,11 +764,22 @@ export function EditorPage({
       next.provider.off("custom-message", customMessage);
       next.provider.off("connection-close", connectionClose);
       next.provider.off("sync", connectionSync);
-      next.destroy();
+      next.doc.off("update", documentUpdate);
+      if (clearRetryTimer !== undefined) window.clearTimeout(clearRetryTimer);
+      next.stop();
+      void pendingWrite
+        .catch(() => {})
+        .then(async () => {
+          if (compacting) await compacting;
+          next.destroy();
+        });
       setBundle(null);
+      setStorageLoadingSlow(false);
+      setStorageError(null);
     };
   }, [
-    member.role,
+    currentStorageKey,
+    member.user.id,
     member.workspace.id,
     onAccessDenied,
     onPageChanged,
@@ -174,6 +787,8 @@ export function EditorPage({
     page.id,
     page.contentEpoch,
     recoveryKey,
+    replaceRecovery,
+    storageRetry,
   ]);
 
   async function saveTitle() {
@@ -189,6 +804,7 @@ export function EditorPage({
       setTitle(page.title);
       return;
     }
+    titleSavingRef.current += 1;
     try {
       const result = await api<{ page: Page }>(`/api/pages/${page.id}`, {
         method: "PATCH",
@@ -211,7 +827,17 @@ export function EditorPage({
         return;
       }
       setTitleError(apiErrorMessage(error, "The title could not be saved."));
+    } finally {
+      titleSavingRef.current -= 1;
     }
+  }
+
+  async function recoveryMarkdown(entry: RecoveryEntry) {
+    const memoryCopy = liveRecoveryCopies.get(entry.key);
+    if (memoryCopy !== undefined) return memoryCopy;
+    if (liveRecovery?.key === entry.key) return liveRecovery.markdown;
+    const liveDoc = entry.key === currentStorageKey && storageWriteFailed ? bundle?.doc : null;
+    return liveDoc ? offlineCopyMarkdown(liveDoc, page.title) : offlineCopyMarkdownFromKey(entry.key, page.title);
   }
 
   return (
@@ -302,55 +928,232 @@ export function EditorPage({
         </div>
       )}
       {storageError && <div className="notice notice-danger">{storageError}</div>}
-      {recovery && recovery.epoch !== page.contentEpoch && !storageError && (
-        <div className="notice recovery-notice">
-          <div>
-            <strong>Offline copy quarantined</strong>
-            <span>Edits from epoch {recovery.epoch} were not merged after this page was restored.</span>
-          </div>
-          <button
-            className="quiet-button"
-            onClick={async () => {
-              const doc = await loadOfflineCopy(recovery.key);
-              setRecoveryPreview(plainYDoc(doc));
-              doc.destroy();
-            }}
-          >
-            Preview
-          </button>
-          <button
-            className="quiet-button"
-            onClick={async () => {
-              const doc = await loadOfflineCopy(recovery.key);
-              const bytes = Y.encodeStateAsUpdate(doc);
-              const blob = new Blob(
-                [bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer],
-                { type: "application/vnd.yjs" },
-              );
-              const url = URL.createObjectURL(blob);
-              const anchor = document.createElement("a");
-              anchor.href = url;
-              anchor.download = `${page.title}-offline-epoch-${recovery.epoch}.yjs`;
-              anchor.click();
-              URL.revokeObjectURL(url);
-              doc.destroy();
-            }}
-          >
-            Export
-          </button>
-          <button
-            className="quiet-button"
-            onClick={() => {
-              localStorage.removeItem(recoveryKey);
-              setRecovery(null);
-              setRecoveryPreview("");
-            }}
-          >
-            Dismiss
-          </button>
-          {recoveryPreview && <p>{recoveryPreview}</p>}
+      {recoveryPersistenceFailed && (
+        <div className="notice notice-danger" role="alert">
+          Recovery details could not be saved on this device. Export this copy before leaving this tab.
         </div>
       )}
+      {storageLoadingSlow && (
+        <div className="notice">
+          Offline storage is still loading.{" "}
+          <button type="button" onClick={() => setStorageRetry((attempt) => attempt + 1)}>
+            Retry loading this copy
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (titleSavingRef.current > 0) {
+                setTitleError("Wait for the page title to save before reloading.");
+                return;
+              }
+              if (titleDirtyRef.current && !window.confirm("Reload and discard the unsaved page title?")) return;
+              window.location.reload();
+            }}
+          >
+            Reload app
+          </button>
+        </div>
+      )}
+      {catalogWarning && <div className="notice">{catalogWarning}</div>}
+      {recovery
+        .filter(
+          (entry) =>
+            entry.epoch !== page.contentEpoch ||
+            entry.storageFailed ||
+            entry.reason === "storage" ||
+            accessQuarantine ||
+            storageError,
+        )
+        .map((entry) => (
+          <div
+            className={`notice recovery-notice ${entry.storageFailed || entry.reason === "storage" ? "notice-danger" : ""}`}
+            key={entry.key}
+          >
+            <div>
+              <strong>Offline copy quarantined</strong>
+              <span>
+                {entry.reason === "access" || (accessQuarantine && entry.key === currentStorageKey)
+                  ? "Current access could not be confirmed for these edits. They were not sent to the server."
+                  : entry.epoch !== page.contentEpoch
+                    ? `Edits from epoch ${entry.epoch} were not merged after this page was restored.`
+                    : "This copy needs recovery."}
+              </span>
+              {(entry.storageFailed || entry.reason === "storage") && (
+                <span>
+                  {liveRecoveryCopies.has(entry.key)
+                    ? "Offline storage could not record some edits. Export the current editor before leaving."
+                    : "Offline storage missed some edits before this tab closed. The saved copy may be incomplete."}
+                </span>
+              )}
+              {Array.from(
+                new Set(
+                  RECOVERY_ACTIONS.map((action) => recoveryErrors[`${entry.key}:${action}`]).filter(
+                    (message): message is string => Boolean(message),
+                  ),
+                ),
+              ).map((message) => (
+                <span role="alert" key={message}>
+                  {message}
+                </span>
+              ))}
+            </div>
+            <button
+              className="quiet-button"
+              onClick={async () => {
+                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "preview");
+                const stillSelected = selectRecovery("preview");
+                try {
+                  const memoryCopy = liveRecoveryCopies.get(entry.key);
+                  if (memoryCopy !== undefined) {
+                    if (stillCurrent() && stillSelected()) {
+                      setRecoveryPreview({ key: entry.key, text: memoryCopy });
+                      recoveryErrorFor(entry.key, "preview", null);
+                    }
+                    return;
+                  }
+                  const liveDoc = entry.key === currentStorageKey && storageWriteFailed ? bundle?.doc : null;
+                  const doc = liveDoc ?? (await loadOfflineCopy(entry.key));
+                  try {
+                    if (stillCurrent() && stillSelected()) {
+                      setRecoveryPreview({ key: entry.key, text: plainYDoc(doc) });
+                      recoveryErrorFor(entry.key, "preview", null);
+                    }
+                  } finally {
+                    if (!liveDoc) doc.destroy();
+                  }
+                } catch (error) {
+                  console.error("Offline copy preview failed", error);
+                  if (stillCurrent())
+                    recoveryErrorFor(
+                      entry.key,
+                      "preview",
+                      recoveryMessage(error, "This offline copy could not be read."),
+                    );
+                }
+              }}
+            >
+              Preview
+            </button>
+            <button
+              className="quiet-button"
+              onClick={() => {
+                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "export");
+                void recoveryMarkdown(entry)
+                  .then((markdown) =>
+                    downloadOfflineMarkdown(
+                      markdown,
+                      `${page.title}-${liveRecoveryCopies.has(entry.key) ? "current-editor" : `offline-epoch-${entry.epoch}`}.md`,
+                    ),
+                  )
+                  .then(
+                    () => {
+                      if (stillCurrent()) recoveryErrorFor(entry.key, "export", null);
+                    },
+                    (error: unknown) => {
+                      console.error("Offline copy export failed", error);
+                      if (stillCurrent())
+                        recoveryErrorFor(
+                          entry.key,
+                          "export",
+                          recoveryMessage(error, "This offline copy could not be exported."),
+                        );
+                    },
+                  );
+              }}
+            >
+              {liveRecoveryCopies.has(entry.key) ? "Export current editor" : "Export Markdown"}
+            </button>
+            <button
+              className="quiet-button"
+              onClick={async () => {
+                const stillCurrent = beginRecoveryAction(recoveryActions.current, recoveryRef, entry.key, "copy");
+                const showError = (message: string) => {
+                  if (stillCurrent()) recoveryErrorFor(entry.key, "copy", message);
+                };
+                if (!clipboardItemSupported) {
+                  if (preparedRecoveryCopy?.key !== entry.key) {
+                    const stillSelected = selectRecovery("prepare");
+                    try {
+                      const markdown = await recoveryMarkdown(entry);
+                      if (!stillCurrent() || !stillSelected()) return;
+                      setPreparedRecoveryCopy({ key: entry.key, markdown });
+                      recoveryErrorFor(entry.key, "copy", null);
+                    } catch (error) {
+                      console.error("Offline copy preparation failed", error);
+                      showError(recoveryMessage(error, "This offline copy could not be read."));
+                    }
+                    return;
+                  }
+                  try {
+                    if (!navigator.clipboard?.writeText) throw new Error("Clipboard is unavailable.");
+                    await navigator.clipboard.writeText(preparedRecoveryCopy.markdown);
+                    if (stillCurrent()) recoveryErrorFor(entry.key, "copy", null);
+                  } catch (error) {
+                    console.error("Offline copy clipboard failed", error);
+                    showError("This offline copy could not be copied.");
+                  }
+                  return;
+                }
+                const content = recoveryMarkdown(entry);
+                try {
+                  await navigator.clipboard.write([
+                    new ClipboardItem({
+                      "text/plain": content.then((markdown) => new Blob([markdown], { type: "text/plain" })),
+                    }),
+                  ]);
+                  if (stillCurrent()) recoveryErrorFor(entry.key, "copy", null);
+                } catch (error) {
+                  console.error("Offline copy clipboard failed", error);
+                  showError("This offline copy could not be copied.");
+                  void content.catch((loadingError) => {
+                    if (stillCurrent())
+                      setRecoveryErrors((current) =>
+                        current[`${entry.key}:copy`] === "This offline copy could not be copied."
+                          ? {
+                              ...current,
+                              [`${entry.key}:copy`]: recoveryMessage(
+                                loadingError,
+                                "This offline copy could not be read.",
+                              ),
+                            }
+                          : current,
+                      );
+                  });
+                }
+              }}
+            >
+              {clipboardItemSupported
+                ? "Copy Markdown"
+                : preparedRecoveryCopy?.key === entry.key
+                  ? "Copy prepared Markdown"
+                  : "Prepare Markdown to copy"}
+            </button>
+            {!(entry.key === currentStorageKey && (accessQuarantine || storageWriteFailed)) &&
+              (entry.epoch !== page.contentEpoch || entry.reason !== "access" || entry.storageFailed) && (
+                <button
+                  className="quiet-button"
+                  onClick={() => {
+                    if (
+                      (entry.storageFailed || entry.reason === "storage") &&
+                      !liveRecoveryCopies.has(entry.key) &&
+                      !window.confirm("The saved offline copy may be incomplete. Discard this recovery warning?")
+                    )
+                      return;
+                    dismissedRecovery.current[entry.key] = page.contentEpoch;
+                    try {
+                      localStorage.setItem(`${recoveryKey}:dismissed`, JSON.stringify(dismissedRecovery.current));
+                    } catch (error) {
+                      console.error("Unable to update dismissed recovery details", error);
+                    }
+                    replaceRecovery(recoveryRef.current.filter((item) => item.key !== entry.key));
+                  }}
+                >
+                  Dismiss
+                </button>
+              )}
+            {recoveryPreview?.key === entry.key && <p>{recoveryPreview.text}</p>}
+          </div>
+        ))}
       {taskList && (
         <button className="quiet-button task-detail-link" onClick={() => onSelectPage(taskList.id)}>
           ← {taskList.title} · Task properties

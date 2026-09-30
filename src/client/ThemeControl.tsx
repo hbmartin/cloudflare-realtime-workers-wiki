@@ -2,6 +2,7 @@ import { MantineContext, type MantineColorScheme } from "@mantine/core";
 import { useCallback, useContext, useEffect, useState } from "react";
 
 const STORAGE_KEY = "notes:color-scheme";
+const FALLBACK_CHANGE_EVENT = "notes:color-scheme-changed";
 
 const OPTIONS: Array<{ value: MantineColorScheme; label: string; icon: string }> = [
   { value: "light", label: "Light", icon: "☀" },
@@ -25,7 +26,7 @@ export function useEffectiveColorScheme() {
   return observed;
 }
 
-export function ThemeControl({ compact = false }: { compact?: boolean }) {
+function useThemePreference() {
   // App unit tests intentionally render App without its startup provider. Reading
   // the context directly gives the production provider priority while retaining a
   // small, functional fallback for isolated rendering and progressive startup.
@@ -39,7 +40,12 @@ export function ThemeControl({ compact = false }: { compact?: boolean }) {
     }
   });
   const colorScheme = context?.colorScheme ?? fallbackScheme;
-  const effectiveScheme = useEffectiveColorScheme();
+  useEffect(() => {
+    if (context) return undefined;
+    const update = (event: Event) => setFallbackScheme((event as CustomEvent<MantineColorScheme>).detail);
+    window.addEventListener(FALLBACK_CHANGE_EVENT, update);
+    return () => window.removeEventListener(FALLBACK_CHANGE_EVENT, update);
+  }, [context]);
   const setColorScheme = useCallback(
     (value: MantineColorScheme) => {
       if (context) {
@@ -52,16 +58,27 @@ export function ThemeControl({ compact = false }: { compact?: boolean }) {
       } catch {
         // A storage-denied environment still receives the in-memory preference.
       }
+      window.dispatchEvent(new CustomEvent(FALLBACK_CHANGE_EVENT, { detail: value }));
     },
     [context],
   );
+  return { colorScheme, setColorScheme };
+}
+
+export function ThemeCommand() {
+  const { colorScheme, setColorScheme } = useThemePreference();
+  const effectiveScheme = useEffectiveColorScheme();
   useEffect(() => {
-    if (!compact) return undefined;
     const toggle = () =>
       setColorScheme((colorScheme === "auto" ? effectiveScheme : colorScheme) === "dark" ? "light" : "dark");
     window.addEventListener("notes:toggle-theme", toggle);
     return () => window.removeEventListener("notes:toggle-theme", toggle);
-  }, [colorScheme, compact, effectiveScheme, setColorScheme]);
+  }, [colorScheme, effectiveScheme, setColorScheme]);
+  return null;
+}
+
+export function ThemeControl({ compact = false }: { compact?: boolean }) {
+  const { colorScheme, setColorScheme } = useThemePreference();
   if (compact) {
     const current = OPTIONS.find((option) => option.value === colorScheme) ?? OPTIONS[2]!;
     const next = colorScheme === "auto" ? "light" : colorScheme === "light" ? "dark" : "auto";
