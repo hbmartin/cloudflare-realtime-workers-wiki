@@ -1439,6 +1439,42 @@ describe("Worker integration", () => {
     }
   });
 
+  it("runs OAuth and MCP cleanup independently of account security cleanup", async () => {
+    await bootstrap();
+    await env.DB.prepare("INSERT INTO oauth_clients VALUES ('abandoned-client','Client','[]',NULL,0,0)").run();
+    const database = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property === "prepare")
+          return (query: string) => {
+            if (query.includes("DELETE FROM rateLimit")) throw new Error("Injected security cleanup failure");
+            return target.prepare(query);
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const context = createExecutionContext();
+    const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await expect(
+        worker.scheduled(createScheduledController(), envWithDatabase(env, database), context),
+      ).rejects.toThrow("Scheduled tasks failed");
+      await waitOnExecutionContext(context);
+      expect(
+        await env.DB.prepare("SELECT client_id FROM oauth_clients WHERE client_id='abandoned-client'").first(),
+      ).toBeNull();
+      const states = await env.DB.prepare(
+        "SELECT task_name,last_succeeded_at,last_failed_at FROM observability_task_runs WHERE task_name IN ('security_state','oauth_security_records','mcp_staged_pages') ORDER BY task_name",
+      ).all();
+      expect(states.results).toEqual([
+        { task_name: "mcp_staged_pages", last_succeeded_at: expect.any(Number), last_failed_at: null },
+        { task_name: "oauth_security_records", last_succeeded_at: expect.any(Number), last_failed_at: null },
+        { task_name: "security_state", last_succeeded_at: expect.any(Number), last_failed_at: expect.any(Number) },
+      ]);
+    } finally {
+      logged.mockRestore();
+    }
+  });
+
   it("stores a bounded, singly redacted scheduled-task failure", async () => {
     const taskName = "test_redacted_failure";
     const diagnostic = `Authorization: Bearer abc retained-context ${"x".repeat(2_000)}`;

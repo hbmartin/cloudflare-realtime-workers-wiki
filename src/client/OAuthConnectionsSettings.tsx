@@ -13,16 +13,24 @@ type Connection = {
 export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
   const [enabled, setEnabled] = useState(false);
   const [connections, setConnections] = useState<Connection[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const load = useCallback(async () => {
+  const load = useCallback(async (cursor?: string) => {
     try {
       const [workspace, grants] = await Promise.all([
         api<{ enabled: boolean }>("/api/oauth/workspace"),
-        api<{ connections: Connection[] }>("/api/oauth/connections"),
+        api<{ connections: Connection[]; nextCursor: string | null }>(
+          `/api/oauth/connections${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+        ),
       ]);
       setEnabled(workspace.enabled);
-      setConnections(grants.connections);
+      setConnections((current) =>
+        cursor
+          ? [...new Map([...current, ...grants.connections].map((connection) => [connection.id, connection])).values()]
+          : grants.connections,
+      );
+      setNextCursor(grants.nextCursor ?? null);
       setError("");
     } catch (cause) {
       setError(apiErrorMessage(cause, "Connections could not be loaded."));
@@ -59,6 +67,16 @@ export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
     }
   }
 
+  async function loadMore() {
+    if (!nextCursor) return;
+    setBusy(true);
+    try {
+      await load(nextCursor);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <section className="settings-section" aria-labelledby="mcp-connections-title">
       <h2 id="mcp-connections-title">Connected MCP clients</h2>
@@ -73,6 +91,11 @@ export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
           />
           Allow MCP connections in this workspace
         </label>
+      )}
+      {nextCursor && (
+        <button type="button" disabled={busy} onClick={() => void loadMore()}>
+          Load more connections
+        </button>
       )}
       {error && <p role="alert">{error}</p>}
       {connections.length === 0 ? (

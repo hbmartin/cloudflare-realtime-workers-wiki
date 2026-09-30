@@ -71,7 +71,10 @@ export async function pruneStagedMcpPages(env: Env) {
       await deleteR2Prefix(env.BUCKET, `documents/${row.id}/`);
       await env.DB.batch([
         env.DB.prepare(
-          `DELETE FROM oauth_operation_receipts
+          `UPDATE oauth_operation_receipts
+            SET result_json=json_set(json_remove(result_json,'$.children'),'$.status','failed',
+              '$.error',json_object('status',409,'code','page_creation_expired',
+                'message','Staged page creation expired. Start a new operation.'))
             WHERE tool_name='create_page' AND json_extract(result_json,'$.status')='staged'
               AND json_extract(result_json,'$.pageId')=?
               AND EXISTS (SELECT 1 FROM pages WHERE id=? AND import_job_id=? AND updated_at=?)`,
@@ -106,7 +109,46 @@ function toolError(error: unknown) {
     error instanceof HttpError || error instanceof MarkdownWriteError
       ? error.message
       : "The tool could not complete this request.";
-  return { isError: true, content: [{ type: "text" as const, text: message }] };
+  return {
+    isError: true,
+    content: [{ type: "text" as const, text: message }],
+    structuredContent: {
+      error: {
+        code:
+          error instanceof HttpError
+            ? error.code
+            : error instanceof MarkdownWriteError
+              ? "invalid_markdown"
+              : "tool_unavailable",
+        retryable:
+          error instanceof HttpError
+            ? error.status >= 500 || error.status === 429
+            : !(error instanceof MarkdownWriteError),
+      },
+    },
+  };
+}
+
+function creationResult(receipt: unknown) {
+  const value = receipt as { status?: unknown; error?: { status: HttpError["status"]; code: string; message: string } };
+  if (value?.status === "failed" && value.error)
+    throw new HttpError(value.error.status, value.error.code, value.error.message);
+  return receipt;
+}
+
+function mutationFailure(response: Response) {
+  if (response.status === 409)
+    return new HttpError(409, "page_changed", "The document changed. Read it again before retrying.");
+  if (response.status === 404 || response.status === 410)
+    return new HttpError(404, "page_not_found", "This document is no longer available.");
+  if (response.status === 413) return new HttpError(413, "document_limit", "The mutation exceeds document limits.");
+  if (response.status >= 400 && response.status < 500)
+    return new HttpError(422, "invalid_mutation", "The block mutation is invalid.");
+  return new HttpError(
+    503,
+    "document_unavailable",
+    "The document is temporarily unavailable. Retry with the same operation ID.",
+  );
 }
 
 async function writableDestination(env: Env, access: McpAccess, spaceId: string, parentId: string | null) {
@@ -133,7 +175,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
   const inputHash = await sha256(JSON.stringify({ ...input, parent_id: parentId }));
   type Staged = { status: "staged"; pageId: string; children: ReturnType<typeof parseWritableMarkdown> };
   let receipt = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
-  if (receipt && (receipt as { status?: unknown }).status !== "staged") return receipt;
+  if (receipt && (receipt as { status?: unknown }).status !== "staged") return creationResult(receipt);
   if (!receipt) {
     const children = parseWritableMarkdown(input.markdown);
     if (children.length > 100)
@@ -179,7 +221,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
       if (!receipt) throw error;
     }
   }
-  if ((receipt as { status?: unknown }).status !== "staged") return receipt;
+  if ((receipt as { status?: unknown }).status !== "staged") return creationResult(receipt);
   const staged = receipt as Staged;
   const stageId = `mcp:create:${staged.pageId}`;
   const stage = await env.DB.prepare("SELECT content_epoch,import_job_id FROM pages WHERE id=? AND workspace_id=?")
@@ -215,12 +257,26 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
         }),
       }),
     );
-    if (!response.ok)
-      throw new HttpError(
-        response.status === 409 ? 409 : 503,
-        "page_content_failed",
-        "The page content could not be saved.",
-      );
+    if (!response.ok) {
+      const error = mutationFailure(response);
+      if (response.status >= 400 && response.status < 500) {
+        await env.DB.prepare(
+          "UPDATE oauth_operation_receipts SET result_json=? WHERE grant_id=? AND operation_id=? AND input_hash=? AND json_extract(result_json,'$.status')='staged'",
+        )
+          .bind(
+            JSON.stringify({
+              status: "failed",
+              pageId: staged.pageId,
+              error: { status: error.status, code: error.code, message: error.message },
+            }),
+            access.grantId,
+            input.operation_id,
+            inputHash,
+          )
+          .run();
+      }
+      throw error;
+    }
     sequence = (await response.json<{ sequence: number }>()).sequence;
   }
   access = await currentAccess(request, env, ["pages:write"]);
@@ -278,7 +334,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
   } catch (error) {
     const committed = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
     if (!committed || (committed as { status?: unknown }).status === "staged") throw error;
-    return committed;
+    return creationResult(committed);
   }
   const page = await pageForMember(env, access.member, staged.pageId);
   await broadcastWorkspaceEvent(env, access.member.workspace.id, {
@@ -409,11 +465,7 @@ async function updatePageTool(
   if (!response.ok) {
     const committed = await roomMutationReceipt(env, page, operationId);
     if (committed) return complete(committed.sequence);
-    throw new HttpError(
-      response.status === 409 ? 409 : 503,
-      "page_update_failed",
-      "The document edit was not applied.",
-    );
+    throw mutationFailure(response);
   }
   return complete((await response.json<{ sequence: number }>()).sequence);
 }
@@ -738,7 +790,10 @@ export async function mcpRequest(request: Request, env: Env, context: Background
   if (!access) {
     return new Response("Unauthorized", {
       status: 401,
-      headers: { "www-authenticate": mcpBearerChallenge(env, required.join(" ")), "cache-control": "no-store" },
+      headers: {
+        "www-authenticate": `${mcpBearerChallenge(env, required.join(" "))}${/^Bearer(?:\s|$)/i.test(request.headers.get("authorization") ?? "") ? ', error="invalid_token"' : ""}`,
+        "cache-control": "no-store",
+      },
     });
   }
   const rate = await consumeFixedWindow(env, `mcp-grant:${access.grantId}`, { window: 60, max: 120 });

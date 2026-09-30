@@ -11,6 +11,21 @@ const CODE_TTL = 5 * 60_000;
 const ACCESS_TTL = 15 * 60_000;
 const REFRESH_TTL = 30 * 24 * 60 * 60_000;
 const MAX_CLIENT_DOCUMENT = 32 * 1024;
+const CLIENT_CACHE_TTL = 5 * 60_000;
+const ABANDONED_CLIENT_TTL = 7 * 24 * 60 * 60_000;
+const MAX_CLIENTS = 1_000;
+
+async function clientRegistrationAllowed(env: Env) {
+  return (await consumeFixedWindow(env, "oauth-client-registrations", { window: 60, max: 100 })).allowed;
+}
+
+async function limitAuthorization(request: Request, env: Env) {
+  const rate = await consumeFixedWindow(env, `oauth-authorize:${await sourceRateLimitKey(request)}`, {
+    window: 60,
+    max: 30,
+  });
+  if (!rate.allowed) throw new HttpError(429, "slow_down", "Authorization requests are temporarily rate limited.");
+}
 
 type OAuthClient = {
   client_id: string;
@@ -267,6 +282,14 @@ async function boundedRequestText(request: Request, max: number) {
 
 async function metadataClient(env: Env, clientId: string) {
   let current = publicClientUrl(clientId);
+  if (!(await clientRegistrationAllowed(env)))
+    throw new HttpError(429, "slow_down", "Client metadata requests are temporarily rate limited.");
+  const capacity = await env.DB.prepare(
+    "SELECT 1 available WHERE EXISTS (SELECT 1 FROM oauth_clients WHERE client_id=?) OR (SELECT COUNT(*) FROM oauth_clients)<?",
+  )
+    .bind(clientId, MAX_CLIENTS)
+    .first();
+  if (!capacity) throw new HttpError(503, "temporarily_unavailable", "OAuth client registration is at capacity.");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   try {
@@ -294,14 +317,18 @@ async function metadataClient(env: Env, clientId: string) {
       const uris = redirectUris(document.redirect_uris);
       const name = typeof document.client_name === "string" ? document.client_name.trim().slice(0, 100) : "MCP client";
       const now = Date.now();
-      await env.DB.prepare(
+      const saved = await env.DB.prepare(
         `INSERT INTO oauth_clients(client_id,name,redirect_uris_json,metadata_url,created_at,updated_at)
-         VALUES(?,?,?,?,?,?) ON CONFLICT(client_id) DO UPDATE SET name=excluded.name,
+         SELECT ?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM oauth_clients WHERE client_id=?)
+           OR (SELECT COUNT(*) FROM oauth_clients)<?
+         ON CONFLICT(client_id) DO UPDATE SET name=excluded.name,
          redirect_uris_json=excluded.redirect_uris_json, metadata_url=excluded.metadata_url,
          updated_at=excluded.updated_at`,
       )
-        .bind(clientId, name, JSON.stringify(uris), clientId, now, now)
+        .bind(clientId, name, JSON.stringify(uris), clientId, now, now, clientId, MAX_CLIENTS)
         .run();
+      if (!saved.meta.changes)
+        throw new HttpError(503, "temporarily_unavailable", "OAuth client registration is at capacity.");
       return {
         client_id: clientId,
         name,
@@ -316,11 +343,18 @@ async function metadataClient(env: Env, clientId: string) {
 }
 
 async function resolveClient(env: Env, clientId: string) {
-  if (clientId.startsWith("https://")) return metadataClient(env, clientId);
+  if (clientId.startsWith("https://")) {
+    const cached = await env.DB.prepare(
+      "SELECT client_id,name,redirect_uris_json,metadata_url FROM oauth_clients WHERE client_id=? AND metadata_url=? AND updated_at>?",
+    )
+      .bind(clientId, clientId, Date.now() - CLIENT_CACHE_TTL)
+      .first<OAuthClient>();
+    return cached ?? metadataClient(env, clientId);
+  }
   const client = await env.DB.prepare(
-    "SELECT client_id,name,redirect_uris_json,metadata_url FROM oauth_clients WHERE client_id=?",
+    "UPDATE oauth_clients SET updated_at=? WHERE client_id=? RETURNING client_id,name,redirect_uris_json,metadata_url",
   )
-    .bind(clientId)
+    .bind(Date.now(), clientId)
     .first<OAuthClient>();
   if (!client) throw new HttpError(400, "invalid_client", "This client is not registered.");
   return client;
@@ -332,6 +366,8 @@ export async function registerOAuthClient(request: Request, env: Env) {
     max: 10,
   });
   if (!rate.allowed) return oauthError("slow_down", "Client registration is temporarily rate limited.", 429);
+  if (!(await clientRegistrationAllowed(env)))
+    return oauthError("slow_down", "Client registration is temporarily rate limited.", 429);
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json"))
     return oauthError("invalid_client_metadata", "Send JSON client metadata.", 415);
   const source = await boundedRequestText(request, MAX_CLIENT_DOCUMENT);
@@ -348,11 +384,13 @@ export async function registerOAuthClient(request: Request, env: Env) {
   const clientId = `urn:noteflare:oauth-client:${crypto.randomUUID()}`;
   const name = typeof document.client_name === "string" ? document.client_name.trim().slice(0, 100) : "MCP client";
   const now = Date.now();
-  await env.DB.prepare(
-    "INSERT INTO oauth_clients(client_id,name,redirect_uris_json,metadata_url,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+  const saved = await env.DB.prepare(
+    "INSERT INTO oauth_clients(client_id,name,redirect_uris_json,metadata_url,created_at,updated_at) SELECT ?,?,?,?,?,? WHERE (SELECT COUNT(*) FROM oauth_clients)<?",
   )
-    .bind(clientId, name, JSON.stringify(redirects), null, now, now)
+    .bind(clientId, name, JSON.stringify(redirects), null, now, now, MAX_CLIENTS)
     .run();
+  if (!saved.meta.changes)
+    return oauthError("temporarily_unavailable", "OAuth client registration is at capacity.", 503);
   return json(
     { client_id: clientId, client_name: name, redirect_uris: redirects, token_endpoint_auth_method: "none" },
     201,
@@ -393,12 +431,27 @@ type AuthorizationRequest = {
   resource: string;
 };
 
+function registeredRedirect(registered: string[], requested: string) {
+  if (registered.includes(requested)) return true;
+  try {
+    if (new URL(requested).protocol !== "http:") return false;
+  } catch {
+    return false;
+  }
+  // RFC 8252 permits an ephemeral port on HTTP loopback IP redirects only.
+  // Keep every other character, including the path and query, exact.
+  const loopback = /^(http:\/\/(?:127\.0\.0\.1|\[::1\]))(?::[0-9]+)?(?=[/?]|$)/;
+  if (!loopback.test(requested)) return false;
+  const withoutPort = requested.replace(loopback, "$1");
+  return registered.some((uri) => loopback.test(uri) && uri.replace(loopback, "$1") === withoutPort);
+}
+
 async function authorizationRequest(params: URLSearchParams, env: Env): Promise<AuthorizationRequest | Response> {
   const clientId = singleton(params, "client_id");
   if (clientId.length > 2048) throw new HttpError(400, "invalid_client", "Client ID is too long.");
   const client = await resolveClient(env, clientId);
   const redirectUri = singleton(params, "redirect_uri");
-  if (!(JSON.parse(client.redirect_uris_json) as string[]).includes(redirectUri))
+  if (!registeredRedirect(JSON.parse(client.redirect_uris_json) as string[], redirectUri))
     throw new HttpError(400, "invalid_request", "The redirect URI is not registered for this client.");
   const providedState = params.getAll("state");
   try {
@@ -444,6 +497,7 @@ function authorizationRedirect(
 }
 
 export async function authorizeOAuthGet(request: Request, env: Env) {
+  await limitAuthorization(request, env);
   const source = new URL(request.url).searchParams;
   const input = await authorizationRequest(source, env);
   if (input instanceof Response) return input;
@@ -500,6 +554,7 @@ function randomCredential() {
 
 export async function authorizeOAuthPost(request: Request, env: Env) {
   checkBrowserOrigin(request, env);
+  await limitAuthorization(request, env);
   const params = await formParams(request);
   const input = await authorizationRequest(params, env);
   if (input instanceof Response) return input;
@@ -745,6 +800,22 @@ export async function pruneOAuthSecurityRecords(env: Env) {
     env.DB.prepare(
       "DELETE FROM oauth_operation_receipts WHERE (grant_id,operation_id) IN (SELECT grant_id,operation_id FROM oauth_operation_receipts WHERE expires_at<=? ORDER BY expires_at LIMIT 100)",
     ).bind(timestamp),
+    env.DB.prepare(
+      `DELETE FROM oauth_grants WHERE id IN (
+        SELECT grant.id FROM oauth_grants grant WHERE grant.created_at<?
+          AND (grant.revoked_at IS NULL OR grant.revoked_at<?)
+          AND NOT EXISTS (SELECT 1 FROM oauth_access_tokens WHERE grant_id=grant.id)
+          AND NOT EXISTS (SELECT 1 FROM oauth_refresh_tokens WHERE grant_id=grant.id)
+          AND NOT EXISTS (SELECT 1 FROM oauth_operation_receipts WHERE grant_id=grant.id)
+        ORDER BY grant.created_at LIMIT 100)`,
+    ).bind(timestamp - REFRESH_TTL, timestamp - REFRESH_TTL),
+    env.DB.prepare(
+      `DELETE FROM oauth_clients WHERE client_id IN (
+        SELECT client.client_id FROM oauth_clients client WHERE client.updated_at<?
+          AND NOT EXISTS (SELECT 1 FROM oauth_grants WHERE client_id=client.client_id)
+          AND NOT EXISTS (SELECT 1 FROM oauth_authorization_codes WHERE client_id=client.client_id AND expires_at>?)
+        ORDER BY client.updated_at LIMIT 100)`,
+    ).bind(timestamp - ABANDONED_CLIENT_TTL, timestamp),
   ]);
 }
 
@@ -785,12 +856,34 @@ export async function oauthRevoke(request: Request, env: Env) {
 
 export async function listOAuthConnections(request: Request, env: Env) {
   const member = await requireMember(request, env);
+  const cursor = new URL(request.url).searchParams.get("cursor");
+  let after: { active: boolean; createdAt: number; id: string } | null = null;
+  if (cursor) {
+    try {
+      if (cursor.length > 512) throw new Error("Invalid cursor");
+      const parsed = JSON.parse(atob(cursor.replaceAll("-", "+").replaceAll("_", "/"))) as Record<string, unknown>;
+      if (
+        !parsed ||
+        typeof parsed.active !== "boolean" ||
+        !Number.isSafeInteger(parsed.createdAt) ||
+        Number(parsed.createdAt) < 0 ||
+        typeof parsed.id !== "string" ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(parsed.id)
+      )
+        throw new Error("Invalid cursor");
+      after = { active: parsed.active, createdAt: Number(parsed.createdAt), id: parsed.id };
+    } catch {
+      throw new HttpError(400, "invalid_cursor", "The connections cursor is invalid.");
+    }
+  }
   const rows = await env.DB.prepare(
     `SELECT grant.id,grant.scopes,grant.created_at,grant.revoked_at,client.client_id,client.name
        FROM oauth_grants grant JOIN oauth_clients client ON client.client_id=grant.client_id
-      WHERE grant.user_id=? AND grant.workspace_id=? ORDER BY grant.created_at DESC,grant.id DESC LIMIT 100`,
+      WHERE grant.user_id=? AND grant.workspace_id=?
+        ${after ? "AND (grant.revoked_at IS NULL,grant.created_at,grant.id)<(?,?,?)" : ""}
+      ORDER BY (grant.revoked_at IS NULL) DESC,grant.created_at DESC,grant.id DESC LIMIT 101`,
   )
-    .bind(member.user.id, member.workspace.id)
+    .bind(member.user.id, member.workspace.id, ...(after ? [after.active ? 1 : 0, after.createdAt, after.id] : []))
     .all<{
       id: string;
       scopes: string;
@@ -799,8 +892,17 @@ export async function listOAuthConnections(request: Request, env: Env) {
       client_id: string;
       name: string;
     }>();
+  const connections = rows.results.slice(0, 100);
+  const last = connections.at(-1);
   return json({
-    connections: rows.results.map((row) => ({
+    nextCursor:
+      rows.results.length > 100 && last
+        ? btoa(JSON.stringify({ active: last.revoked_at === null, createdAt: last.created_at, id: last.id }))
+            .replaceAll("+", "-")
+            .replaceAll("/", "_")
+            .replace(/=+$/, "")
+        : null,
+    connections: connections.map((row) => ({
       id: row.id,
       clientId: row.client_id,
       name: row.name,
