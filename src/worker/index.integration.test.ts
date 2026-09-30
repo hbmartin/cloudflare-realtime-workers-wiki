@@ -8488,10 +8488,11 @@ describe("calm workspace task lists", () => {
     async (operationId) => {
       const installed = await bootstrap();
       const list = await taskList(installed);
+      const createOperationId = crypto.randomUUID();
       const created = await change(installed, list.id, {
         title: "Archive with a malformed retry header",
         expectedRevision: 1,
-        operationId: crypto.randomUUID(),
+        operationId: createOperationId,
       });
       const { detailPageId } = await created.json<{ detailPageId: string }>();
       const ordinary = await createPage(installed.cookie);
@@ -8508,6 +8509,13 @@ describe("calm workspace task lists", () => {
           archived_at: expect.any(Number),
         });
       }
+      const receipts = await env.DB.prepare(
+        "SELECT operation_id FROM task_mutation_receipts WHERE detail_page_id=? AND operation_id<>?",
+      )
+        .bind(detailPageId, createOperationId)
+        .all();
+      const generatedId = expect.stringMatching(/^[\w-]{1,100}$/);
+      expect(receipts.results).toEqual([{ operation_id: operationId === "retry-1" ? operationId : generatedId }]);
     },
   );
 

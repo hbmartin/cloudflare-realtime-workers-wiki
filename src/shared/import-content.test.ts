@@ -832,6 +832,15 @@ describe("import content", () => {
     const parsed = markdownToDocument(source);
     expect(JSON.stringify(parsed.document)).toContain('"text":"bold","marks":[{"type":"bold"}]');
   });
+  it.each([
+    { source: `${"*".repeat(513)}x*`, mark: "italic" },
+    { source: `${"*".repeat(514)}x**`, mark: "bold" },
+  ])("keeps $mark next to an oversized opening run", ({ source, mark }) => {
+    const parsed = markdownToDocument(source);
+    const nodes = parsed.document.content![0]!.content![0]!.content![0]!.content!;
+    expect(nodes.map((node) => node.text ?? "").join("")).toBe(`${"*".repeat(512)}x`);
+    expect(nodes.at(-1)).toMatchObject({ text: "x", marks: [{ type: mark }] });
+  });
   it("keeps every valid link after dense escaped text", () => {
     const source = `${"\\.".repeat(150)} ${Array.from({ length: 200 }, (_, index) => `[doc](file${index}.md)`).join(" ")}`;
     expect(source.length).toBeLessThan(8192);

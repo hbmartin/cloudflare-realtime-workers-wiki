@@ -65,6 +65,8 @@ describe("Slack capture Markdown", () => {
             { name: "ignored", count: 0 },
             { name: "", count: 3 },
             { name: " \t ", count: 2 },
+            { name: "ok\n\n    fake", count: 1 },
+            { name: " thumbsup ", count: 2 },
             { name: "heart", count: 1 },
           ],
           files: [{ name: "Plan.pdf", permalink: "https://workspace.slack.com/files/UOWNER/F123" }],
@@ -79,6 +81,7 @@ describe("Slack capture Markdown", () => {
     expect(paragraphs.slice(1)).toEqual([
       "Ship the plan & tell @Slack member",
       "Reaction: thumbsup × 3",
+      "Reaction: thumbsup × 2",
       "Reaction: heart × 1",
       "Attachment: Plan.pdf",
       "Attachment: Design",

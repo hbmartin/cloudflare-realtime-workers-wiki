@@ -271,10 +271,31 @@ describe("App error handling", () => {
     });
   });
 
-  it.each(["unchanged", "changed", "remote", "remote-top-level", "draft-remote", "draft-remote-same"])(
-    "only moves a page when the dialog destination changes (%s)",
-    async (scenario) => {
-      const changed = ["changed", "remote-top-level", "draft-remote"].includes(scenario);
+  it.each<{
+    name: string;
+    picked?: string;
+    remoteParent?: string;
+    removePicked?: boolean;
+    nextPicked?: string;
+    moveTo?: string | null;
+  }>([
+    { name: "unchanged" },
+    { name: "changed", picked: "destination", moveTo: "destination" },
+    { name: "remote", remoteParent: "destination" },
+    { name: "remote-top-level", remoteParent: "destination", nextPicked: "", moveTo: null },
+    { name: "draft-remote", picked: "destination", remoteParent: "other-destination", moveTo: "destination" },
+    { name: "draft-remote-same", picked: "destination", remoteParent: "destination" },
+    { name: "unavailable", picked: "destination", removePicked: true },
+    {
+      name: "replace-unavailable",
+      picked: "destination",
+      removePicked: true,
+      nextPicked: "other-destination",
+      moveTo: "other-destination",
+    },
+  ])(
+    "only moves a page when the dialog destination changes ($name)",
+    async ({ picked, remoteParent, removePicked = false, nextPicked, moveTo }) => {
       for (const method of ["showModal", "close"] as const) {
         const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
         Object.defineProperty(HTMLDialogElement.prototype, method, {
@@ -303,28 +324,31 @@ describe("App error handling", () => {
       fireEvent.click(await screen.findByRole("option", { name: /Move current page/ }));
       const dialog = screen.getByRole("dialog", { name: "Move Roadmap" });
       const select = within(dialog).getByLabelText("Destination");
-      if (scenario === "changed" || scenario.startsWith("draft-"))
-        fireEvent.change(select, { target: { value: destination.id } });
-      if (scenario.startsWith("remote") || scenario.startsWith("draft-")) {
+      if (picked !== undefined) fireEvent.change(select, { target: { value: picked } });
+      if (remoteParent !== undefined) {
         act(() =>
           dispatchWorkspaceEvent({
             type: "pages-upserted",
-            pages: [
-              { ...page, parentId: scenario === "draft-remote" ? otherDestination.id : destination.id, revision: 2 },
-            ],
+            pages: [{ ...page, parentId: remoteParent, revision: 2 }],
           }),
         );
       }
-      expect(select).toHaveValue(scenario === "unchanged" ? "" : destination.id);
-      if (scenario === "remote-top-level") fireEvent.change(select, { target: { value: "" } });
-      fireEvent.click(within(dialog).getByRole("button", { name: "Move page" }));
-      expect(screen.queryByRole("dialog", { name: "Move Roadmap" })).toBeNull();
+      if (removePicked)
+        act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [destination.id], permanently: false }));
+      expect(select).toHaveValue(picked ?? remoteParent ?? "");
+      const submit = within(dialog).getByRole("button", { name: "Move page" });
+      expect(submit).toHaveProperty("disabled", removePicked);
+      expect(within(dialog).getByRole("status").textContent).toBe(
+        removePicked ? "That destination is no longer available. Choose another destination." : "",
+      );
+      if (nextPicked !== undefined) fireEvent.change(select, { target: { value: nextPicked } });
+      fireEvent.click(submit);
+      expect(screen.queryByRole("dialog", { name: "Move Roadmap" })).toBe(
+        removePicked && nextPicked === undefined ? dialog : null,
+      );
       const requests = vi.mocked(api).mock.calls.filter(([path]) => path === `/api/pages/${page.id}/move`);
-      expect(requests).toHaveLength(changed ? 1 : 0);
       expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual(
-        changed
-          ? [{ parentId: scenario === "remote-top-level" ? null : destination.id, beforeId: null, afterId: null }]
-          : [],
+        moveTo !== undefined ? [{ parentId: moveTo, beforeId: null, afterId: null }] : [],
       );
     },
   );

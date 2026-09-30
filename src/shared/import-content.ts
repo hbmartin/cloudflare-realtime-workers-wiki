@@ -85,6 +85,7 @@ const INLINE_MARKUP_CHAR = /[!*_[\]`<&]/;
 const INLINE_SECTION_LIMIT = 8192;
 const INLINE_SCAN_LIMIT = 128;
 const INLINE_DELIMITER_LIMIT = 512;
+const INLINE_DELIMITERS = "*_`";
 
 function inlineMarkupOverflow(value: string, start = 0, end = value.length): number | null {
   let scans = 0;
@@ -92,8 +93,7 @@ function inlineMarkupOverflow(value: string, start = 0, end = value.length): num
   for (let index = start; index < end; index += 1) {
     const character = value[index];
     if ((character === "<" || character === "\\") && ++scans > INLINE_SCAN_LIMIT) return index;
-    if ((character === "*" || character === "_" || character === "`") && ++delimiters > INLINE_DELIMITER_LIMIT)
-      return index;
+    if (character && INLINE_DELIMITERS.includes(character) && ++delimiters > INLINE_DELIMITER_LIMIT) return index;
   }
   return null;
 }
@@ -859,18 +859,19 @@ function boundedMarkdownInline(
       let cut = Math.min(start + INLINE_SECTION_LIMIT, text.length);
       cut = inlineMarkupOverflow(text, start, cut) ?? cut;
       const delimiter = text[cut];
-      if (delimiter && "*_`".includes(delimiter) && text[cut - 1] === delimiter) {
+      if (delimiter && INLINE_DELIMITERS.includes(delimiter) && text[cut - 1] === delimiter) {
         let boundary = cut;
         while (boundary > start && text[boundary - 1] === delimiter) boundary -= 1;
         if (trailingEscape(text, boundary, start)) boundary -= 1;
         if (boundary > start) cut = boundary;
         else {
-          // An oversized leading run stays literal so the parser remains bounded
-          // and the next section starts after the complete delimiter run.
+          // Keep a bounded tail of the opening run and reserve half the budget
+          // for closing delimiters so nearby emphasis still reaches Marked intact.
           let end = cut + 1;
           while (text[end] === delimiter) end += 1;
-          append(inline(unescapeMarkdown(text.slice(start, end))));
-          start = end;
+          const literalEnd = end - Math.floor(INLINE_DELIMITER_LIMIT / 2);
+          append(inline(unescapeMarkdown(text.slice(start, literalEnd))));
+          start = literalEnd;
           continue;
         }
       }
