@@ -4,7 +4,7 @@ import { HttpError } from "./http";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import { TASK_STATUSES, TASK_STATUS_LABELS, type Task, type TaskFields } from "../shared/tasks";
 import { effectiveSpaceRole, pageForMember } from "./page-access";
-import { listTasks, mutateTask, taskAssignees, taskListStatements } from "./tasks";
+import { listTasks, mutateTask, taskAssignees, taskListStatements, validateTaskFields } from "./tasks";
 import { identityFor, verifiedMember, validateChannel, requireChannelMember } from "./slack-threads";
 import { slackApi, type SlackInstallation, type SlackInteractionPayload, type SlackHistoryMessage } from "./slack";
 import { safeSlackText, slackLabel } from "./slack-blocks";
@@ -13,6 +13,12 @@ import { broadcastWorkspaceEvent } from "./workspace-events";
 import type { ProseMirrorJson } from "../shared/document-projection";
 import { PAGE_TITLE_MAX } from "../shared/validation";
 import { logger } from "./observability";
+import {
+  claimSlackCapture,
+  retryFailedSlackCapture,
+  SLACK_CAPTURE_PAGE_GONE_MESSAGE,
+  type SlackCaptureSource,
+} from "./slack-capture";
 
 const plain = (text: string) => ({ type: "plain_text", text: text.slice(0, 150) });
 
@@ -27,7 +33,7 @@ const ID = /^[A-Za-z0-9:_-]{1,200}$/;
 const TS = /^\d{1,16}\.\d{1,16}$/;
 const CALLBACK = "noteflare_compose";
 const truncateTitle = (value: string) => Array.from(value).slice(0, PAGE_TITLE_MAX).join("");
-type Source = { channelId: string; ts: string; thread: boolean; text: string; author: string };
+type Source = SlackCaptureSource;
 type State = {
   kind: "document" | "task" | "task-list";
   source?: Source;
@@ -46,6 +52,7 @@ type Session = {
   state_json: string;
   view_id: string | null;
   request_hash: string | null;
+  capture_id: string | null;
   result_page_id: string | null;
   created_at: number;
 };
@@ -381,8 +388,36 @@ function resultView(env: Env, id: string, pageId: string, pending: boolean) {
     ...(pending ? [{ type: "actions", elements: [button("Check / retry copy", "noteflare_copy_retry", id)] }] : []),
   ]);
 }
+function captureView(env: Env, id: string, capture: { state: string; page_id: string | null; job_id: string | null }) {
+  if (capture.state === "succeeded" && capture.page_id) return resultView(env, id, capture.page_id, false);
+  if (capture.state === "succeeded")
+    return modal(id, [{ type: "section", text: { type: "mrkdwn", text: SLACK_CAPTURE_PAGE_GONE_MESSAGE } }]);
+  return modal(id, [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          capture.state === "failed"
+            ? capture.job_id
+              ? `Capture failed. <${new URL(env.BETTER_AUTH_URL).origin}/?activity=1|Open NoteFlare activities> to review and retry it.`
+              : "Capture failed. Use Retry capture below to try again."
+            : "Capture queued. The page will become available after the source and imported content are verified.",
+      },
+    },
+    {
+      type: "actions",
+      elements: [
+        button("Check capture", "noteflare_capture_status", id),
+        ...(capture.state === "failed" && !capture.job_id
+          ? [button("Retry capture", "noteflare_capture_retry", id)]
+          : []),
+      ],
+    },
+  ]);
+}
 async function submit(env: Env, payload: SlackInteractionPayload) {
-  const { session, member, state } = await sessionFor(env, payload);
+  const { session, installation, member, state } = await sessionFor(env, payload);
   const enteredTitle = textValue(payload, "title").trim();
   const title = state.task?.title && enteredTitle === truncateTitle(state.task.title) ? state.task.title : enteredTitle;
   if (!title || (title.length > PAGE_TITLE_MAX && title !== state.task?.title))
@@ -400,6 +435,107 @@ async function submit(env: Env, payload: SlackInteractionPayload) {
     dueDate: (stateField(payload, "due").selected_date as string | undefined) ?? null,
   };
   const body = textValue(payload, "body");
+  if (state.source && (kind === "document" || kind === "task")) {
+    if (body.length > 3000) throw new HttpError(422, "invalid_body", "Keep the description under 3000 characters.");
+    if (kind === "task" && (!dest.taskList || !dest.parentId))
+      throw new HttpError(422, "task_destination", "Select a Task List as the destination for a task.");
+    if (kind === "task" && dest.parentId) {
+      validateTaskFields(taskFields);
+      if (
+        taskFields.assigneeId &&
+        !(await taskAssignees(env, member, dest.parentId)).some((user) => user.id === taskFields.assigneeId)
+      )
+        throw new HttpError(422, "invalid_assignee", "The assignee must have access to this task list.");
+    }
+    await validateChannel(env, installation, state.source.channelId);
+    await requireChannelMember(env, installation, state.source.channelId, session.slack_user_id);
+    if (session.result_page_id) {
+      const legacyHash = await sha256Hex(canonicalJson({ kind, dest, taskFields, body }));
+      if (session.request_hash && session.request_hash !== legacyHash)
+        throw new HttpError(
+          409,
+          "already_saved",
+          "This form was already saved with different values. Open a new form to make another change.",
+        );
+      await pageForMember(env, member, session.result_page_id);
+      if (!state.copied) await queueCopy(env, session, member.workspace.id);
+      return {
+        response_action: "update",
+        view: resultView(env, session.id, session.result_page_id, !state.copied),
+      };
+    }
+    // A queued copy from the previous shortcut implementation already owns this
+    // Slack source. Finish that page instead of creating a second imported page.
+    const legacy = await env.DB.prepare(
+      `SELECT * FROM slack_product_sessions WHERE installation_id=? AND slack_user_id=? AND id<>?
+        AND result_page_id IS NOT NULL AND capture_id IS NULL
+        AND json_extract(state_json,'$.source.channelId')=?
+        AND json_extract(state_json,'$.source.ts')=?
+        AND ((?=0 AND json_extract(state_json,'$.source.thread')=0
+          AND coalesce(json_extract(state_json,'$.source.author'),'')<>'Slack thread')
+          OR (?=1 AND (json_extract(state_json,'$.source.thread')=1
+            OR json_extract(state_json,'$.source.author')='Slack thread')))
+        ORDER BY created_at DESC,id DESC LIMIT 1`,
+    )
+      .bind(
+        installation.id,
+        session.slack_user_id,
+        session.id,
+        state.source.channelId,
+        state.source.ts,
+        state.source.thread ? 1 : 0,
+        state.source.thread ? 1 : 0,
+      )
+      .first<Session>();
+    if (legacy?.result_page_id) {
+      await pageForMember(env, member, legacy.result_page_id);
+      const legacyState = JSON.parse(legacy.state_json) as State;
+      if (!legacyState.copied) {
+        if (legacy.generation !== installation.generation)
+          await env.DB.prepare(
+            `UPDATE slack_product_sessions SET generation=?,identity_json=?
+             WHERE id=? AND installation_id=? AND slack_user_id=? AND generation=?`,
+          )
+            .bind(
+              installation.generation,
+              session.identity_json,
+              legacy.id,
+              installation.id,
+              session.slack_user_id,
+              legacy.generation,
+            )
+            .run();
+        await queueCopy(env, legacy, member.workspace.id);
+      }
+      return {
+        response_action: "update",
+        view: modal(session.id, [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `${legacyState.copied ? "Already saved." : "An earlier capture is finishing."}\n<${new URL(env.BETTER_AUTH_URL).origin}/?page=${legacy.result_page_id}|Open in NoteFlare>`,
+            },
+          },
+        ]),
+      };
+    }
+    const capture = await claimSlackCapture(env, {
+      installation,
+      member,
+      sessionId: session.id,
+      source: state.source,
+      spaceId: dest.spaceId,
+      parentId: dest.parentId,
+      title,
+      body,
+      kind,
+      ...(kind === "task"
+        ? { taskFields: { status: taskFields.status, assigneeId: taskFields.assigneeId, dueDate: taskFields.dueDate } }
+        : {}),
+    });
+    return { response_action: "update", view: captureView(env, session.id, capture) };
+  }
   if (kind === "task-list" && (state.source || body))
     throw new HttpError(
       422,
@@ -633,6 +769,8 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
       "noteflare_compose_page",
       "noteflare_edit_task",
       "noteflare_copy_retry",
+      "noteflare_capture_status",
+      "noteflare_capture_retry",
     ].includes(String(action?.action_id));
   if (!shortcut && !productAction) return { handled: false };
   const installation = await installationForTeam(env, payload.team?.id);
@@ -644,7 +782,9 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
     if (
       typeof payload.channel?.id !== "string" ||
       typeof payload.message?.ts !== "string" ||
-      !TS.test(payload.message.ts)
+      !TS.test(payload.message.ts) ||
+      (payload.message.thread_ts !== undefined &&
+        (typeof payload.message.thread_ts !== "string" || !TS.test(payload.message.thread_ts)))
     )
       throw new HttpError(422, "slack_source", "Choose a channel message to capture.");
     state.source = {
@@ -654,11 +794,12 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
           ? payload.message.thread_ts
           : payload.message.ts,
       thread: payload.callback_id === "noteflare_new_page_from_thread",
-      text: typeof payload.message.text === "string" ? payload.message.text.slice(0, 40_000) : "",
+      ...(typeof payload.message.thread_ts === "string" ? { threadTs: payload.message.thread_ts } : {}),
+      text: typeof payload.message.text === "string" ? payload.message.text : "",
       author: typeof payload.message.user === "string" ? payload.message.user : "Slack member",
     };
-    await validateChannel(env, installation, state.source.channelId);
-    await requireChannelMember(env, installation, state.source.channelId, payload.user.id);
+    await validateChannel(env, installation, payload.channel.id);
+    await requireChannelMember(env, installation, payload.channel.id, payload.user.id);
   }
   if (action?.action_id === "noteflare_edit_task") {
     if (typeof action.value !== "string" || !ID.test(action.value)) return { handled: true, response: {} };
@@ -669,6 +810,22 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
   if (action?.action_id === "noteflare_copy_retry") {
     const current = await sessionFor(env, payload);
     if (!current.state.copied) await queueCopy(env, current.session, member.workspace.id);
+    return { handled: true, response: {} };
+  }
+  if (action?.action_id === "noteflare_capture_status" || action?.action_id === "noteflare_capture_retry") {
+    const current = await sessionFor(env, payload);
+    let capture = current.session.capture_id
+      ? await env.DB.prepare(`SELECT state, page_id, job_id FROM slack_captures WHERE id=?`)
+          .bind(current.session.capture_id)
+          .first<{ state: string; page_id: string | null; job_id: string | null }>()
+      : null;
+    if (!capture) throw new HttpError(404, "slack_capture_unavailable", "Reopen the capture form.");
+    if (action.action_id === "noteflare_capture_retry" && current.session.capture_id)
+      capture = await retryFailedSlackCapture(env, current.session.capture_id);
+    await slackApi(env, installation, "views.update", {
+      view_id: String(payload.view?.id),
+      view: captureView(env, current.session.id, capture),
+    });
     return { handled: true, response: {} };
   }
   const { id } = await newSession(env, installation, payload.user.id, state, payload.trigger_id);

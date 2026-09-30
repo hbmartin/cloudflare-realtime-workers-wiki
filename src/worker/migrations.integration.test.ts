@@ -485,6 +485,111 @@ describe("D1 migrations", () => {
     });
   });
 
+  it("replays the Slack capture receipt migration with its destination and session link intact", async () => {
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    const captures = await env.DB.prepare("PRAGMA table_info(slack_captures)").all<{ name: string }>();
+    const sessions = await env.DB.prepare("PRAGMA table_info(slack_product_sessions)").all<{ name: string }>();
+    expect(captures.results.map((column) => column.name)).toEqual(
+      expect.arrayContaining([
+        "destination_space_id",
+        "destination_parent_id",
+        "target_kind",
+        "title",
+        "request_hash",
+        "attempt",
+        "error_category",
+        "last_failed_job_attempt",
+        "published_at",
+      ]),
+    );
+    expect(sessions.results.map((column) => column.name)).toContain("capture_id");
+  });
+
+  it("backfills failed capture job attempts before replaying the migration", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0055"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+        VALUES ('owner','Owner','owner@example.test',1,1)`),
+      env.DB.prepare(`INSERT INTO workspaces(id,name,created_at) VALUES ('workspace','Notes',1)`),
+      env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,
+        bot_token_ciphertext,scopes,installed_by,created_at,updated_at)
+        VALUES ('installation','workspace','T123','Slack','UBOT','cipher','chat:write','owner',1,1)`),
+      env.DB.prepare(`INSERT INTO jobs(id,workspace_id,type,status,requested_by,attempt,created_at,updated_at)
+        VALUES ('capture','workspace','import','failed','owner',3,1,1)`),
+      env.DB.prepare(`INSERT INTO slack_captures(id,installation_id,workspace_id,channel_id,source_ts,
+        source_kind,requested_by,job_id,state,created_at,updated_at)
+        VALUES ('capture','installation','workspace','C123','1700000000.000001',
+          'message','owner','capture','failed',1,1)`),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      await env.DB.prepare(`SELECT last_failed_job_attempt FROM slack_captures WHERE id='capture'`).first(),
+    ).toEqual({ last_failed_job_attempt: 3 });
+  });
+
+  it("corrects a failed capture whose next job attempt was already queued when 0055 ran", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0055"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+        VALUES ('owner','Owner','owner@example.test',1,1)`),
+      env.DB.prepare(`INSERT INTO workspaces(id,name,created_at) VALUES ('workspace','Notes',1)`),
+      env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,
+        bot_token_ciphertext,scopes,installed_by,created_at,updated_at)
+        VALUES ('installation','workspace','T123','Slack','UBOT','cipher','chat:write','owner',1,1)`),
+      env.DB.prepare(`INSERT INTO jobs(id,workspace_id,type,status,requested_by,attempt,created_at,updated_at)
+        VALUES ('capture','workspace','import','queued','owner',4,1,2)`),
+      env.DB.prepare(`INSERT INTO slack_captures(id,installation_id,workspace_id,channel_id,source_ts,
+        source_kind,requested_by,job_id,state,created_at,updated_at)
+        VALUES ('capture','installation','workspace','C123','1700000000.000001',
+          'message','owner','capture','failed',1,1)`),
+    ]);
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0056"),
+    );
+    expect(
+      await env.DB.prepare(`SELECT last_failed_job_attempt FROM slack_captures WHERE id='capture'`).first(),
+    ).toEqual({ last_failed_job_attempt: 4 });
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      await env.DB.prepare(`SELECT last_failed_job_attempt FROM slack_captures WHERE id='capture'`).first(),
+    ).toEqual({ last_failed_job_attempt: 3 });
+  });
+
+  it("does not infer the failed attempt from a later capture timestamp", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0055"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+        VALUES ('owner','Owner','owner@example.test',1,1)`),
+      env.DB.prepare(`INSERT INTO workspaces(id,name,created_at) VALUES ('workspace','Notes',1)`),
+      env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,
+        bot_token_ciphertext,scopes,installed_by,created_at,updated_at)
+        VALUES ('installation','workspace','T123','Slack','UBOT','cipher','chat:write','owner',1,1)`),
+      env.DB.prepare(`INSERT INTO jobs(id,workspace_id,type,status,requested_by,attempt,created_at,updated_at)
+        VALUES ('capture','workspace','import','running','owner',4,1,2)`),
+      env.DB.prepare(`INSERT INTO slack_captures(id,installation_id,workspace_id,channel_id,source_ts,
+        source_kind,requested_by,job_id,state,created_at,updated_at)
+        VALUES ('capture','installation','workspace','C123','1700000000.000001',
+          'message','owner','capture','failed',1,3)`),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      await env.DB.prepare(`SELECT last_failed_job_attempt FROM slack_captures WHERE id='capture'`).first(),
+    ).toEqual({ last_failed_job_attempt: 3 });
+  });
+
   it("preserves preloaded account security when a restore inserts the user row later", async () => {
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
     const trigger = await env.DB.prepare(

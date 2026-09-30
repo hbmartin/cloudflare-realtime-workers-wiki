@@ -39,6 +39,53 @@ const workspaceSpace: Space = {
 afterEach(cleanup);
 
 describe("ActivitiesTray", () => {
+  it("offers a space-root recovery action for a failed parented import", () => {
+    const retry = vi.fn();
+    const job: Job = {
+      ...runningJob,
+      type: "import",
+      status: "failed",
+      importParentId: "archived-parent",
+      error: { code: "job_failed", message: "The import destination is unavailable." },
+    };
+    const view = render(
+      <ActivitiesTray
+        jobs={[job]}
+        spaces={[workspaceSpace]}
+        loading={false}
+        error=""
+        pendingJobId={null}
+        onClose={vi.fn()}
+        onRefresh={vi.fn()}
+        onCancel={vi.fn()}
+        onCleanup={vi.fn()}
+        onRetry={retry}
+        onConfirm={vi.fn()}
+        onOpenResult={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry at space root" }));
+    expect(retry).toHaveBeenCalledWith(job, null);
+    view.rerender(
+      <ActivitiesTray
+        jobs={[job]}
+        spaces={[workspaceSpace]}
+        loading={false}
+        error=""
+        pendingJobId={job.id}
+        onClose={vi.fn()}
+        onRefresh={vi.fn()}
+        onCancel={vi.fn()}
+        onCleanup={vi.fn()}
+        onRetry={retry}
+        onConfirm={vi.fn()}
+        onOpenResult={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "Retrying at space root…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeDisabled();
+  });
+
   it("renders progress and exposes the valid action for a running job", () => {
     const cancel = vi.fn();
     render(
@@ -177,6 +224,47 @@ describe("ActivitiesTray", () => {
     expect(screen.getByText("Assets").parentElement).toHaveTextContent("5");
     fireEvent.click(screen.getByRole("button", { name: "Confirm import" }));
     expect(confirm).toHaveBeenCalledWith(importJob, { Workspace: "space-1" });
+  });
+
+  it("shows progress only on the selected parent override action", () => {
+    const job: Job = {
+      ...runningJob,
+      type: "import",
+      status: "awaiting_confirmation",
+      spaceId: workspaceSpace.id,
+      importParentId: "parent",
+      result: {
+        preview: {
+          format: "markdown",
+          filename: "notes.md",
+          pages: 1,
+          tables: 0,
+          assets: 0,
+          warnings: [],
+          groups: [{ key: "Imported", name: "Imported", pages: 1, roots: 1, suggestedVisibility: "workspace" }],
+        },
+      },
+    };
+    const props = {
+      jobs: [job],
+      spaces: [workspaceSpace],
+      loading: false,
+      error: "",
+      pendingJobId: null as string | null,
+      onClose: vi.fn(),
+      onRefresh: vi.fn(),
+      onCancel: vi.fn(),
+      onCleanup: vi.fn(),
+      onRetry: vi.fn(),
+      onConfirm: vi.fn(),
+      onOpenResult: vi.fn(),
+    };
+    const view = render(<ActivitiesTray {...props} />);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm at space root" }));
+    expect(props.onConfirm).toHaveBeenCalledWith(job, { Imported: workspaceSpace.id }, null);
+    view.rerender(<ActivitiesTray {...props} pendingJobId={job.id} />);
+    expect(screen.getByRole("button", { name: "Starting at space root…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Confirm import" })).toBeDisabled();
   });
 
   it("resets destination choices when a replacement preview arrives", () => {

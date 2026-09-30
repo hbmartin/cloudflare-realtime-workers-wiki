@@ -928,6 +928,15 @@ describe("App error handling", () => {
     expect(jobLoads).toBe(3);
   });
 
+  it("opens activities from a Slack capture retry link", async () => {
+    history.replaceState(null, "", "/?activity=1");
+    mockShellApi({ jobs: () => [] });
+    render(<App />);
+    expect(await screen.findByRole("heading", { name: "Imports & exports" })).toBeInTheDocument();
+    expect(vi.mocked(api).mock.calls.some(([path]) => path === "/api/jobs")).toBe(true);
+    expect(window.location.search).not.toContain("activity");
+  });
+
   it("reloads a changed import preview and confirms the replacement identity", async () => {
     const preview = {
       previewId: "old-preview",

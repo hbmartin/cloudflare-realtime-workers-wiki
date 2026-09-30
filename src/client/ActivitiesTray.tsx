@@ -36,12 +36,14 @@ function ImportConfirmation({
   job,
   spaces = [],
   pending,
+  pendingAction,
   onConfirm,
 }: {
   job: Job;
   spaces?: Space[];
   pending: boolean;
-  onConfirm: (job: Job, groupSpaceIds: Record<string, string>) => void;
+  pendingAction: "confirm" | "confirm-root" | null;
+  onConfirm: (job: Job, groupSpaceIds: Record<string, string>, parentOverride?: null) => void;
 }) {
   const preview = job.result?.preview;
   const [mapping, setMapping] = useState<Record<string, string>>(() =>
@@ -127,8 +129,13 @@ function ImportConfirmation({
         </label>
       ))}
       <button className="primary-small" disabled={pending || incomplete} onClick={() => onConfirm(job, mapping)}>
-        {pending ? "Starting…" : "Confirm import"}
+        {pending && pendingAction === "confirm" ? "Starting…" : "Confirm import"}
       </button>
+      {job.importParentId && (
+        <button className="quiet-button" disabled={pending || incomplete} onClick={() => onConfirm(job, mapping, null)}>
+          {pending && pendingAction === "confirm-root" ? "Starting at space root…" : "Confirm at space root"}
+        </button>
+      )}
     </div>
   );
 }
@@ -156,12 +163,26 @@ export function ActivitiesTray({
   onRefresh: () => void;
   onCancel: (job: Job) => void;
   onCleanup: (job: Job) => void;
-  onRetry: (job: Job) => void;
-  onConfirm: (job: Job, groupSpaceIds: Record<string, string>) => void;
+  onRetry: (job: Job, parentOverride?: null) => void;
+  onConfirm: (job: Job, groupSpaceIds: Record<string, string>, parentOverride?: null) => void;
   onOpenResult: (job: Job) => void;
 }) {
   const closeButton = useRef<HTMLButtonElement>(null);
   const tray = useRef<HTMLDialogElement>(null);
+  const [pendingAction, setPendingAction] = useState<{
+    jobId: string;
+    kind: "confirm" | "confirm-root" | "retry" | "retry-root";
+  } | null>(null);
+  const confirm = (job: Job, mapping: Record<string, string>, parentOverride?: null) => {
+    setPendingAction({ jobId: job.id, kind: parentOverride === null ? "confirm-root" : "confirm" });
+    if (parentOverride === undefined) onConfirm(job, mapping);
+    else onConfirm(job, mapping, parentOverride);
+  };
+  const retry = (job: Job, parentOverride?: null) => {
+    setPendingAction({ jobId: job.id, kind: parentOverride === null ? "retry-root" : "retry" });
+    if (parentOverride === undefined) onRetry(job);
+    else onRetry(job, parentOverride);
+  };
 
   useEffect(() => {
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -257,7 +278,13 @@ export function ActivitiesTray({
                       job={job}
                       spaces={spaces}
                       pending={pending}
-                      onConfirm={onConfirm}
+                      pendingAction={
+                        pendingAction?.jobId === job.id &&
+                        (pendingAction.kind === "confirm" || pendingAction.kind === "confirm-root")
+                          ? pendingAction.kind
+                          : null
+                      }
+                      onConfirm={confirm}
                     />
                   )}
                   {job.warnings.map((warning) => (
@@ -288,10 +315,21 @@ export function ActivitiesTray({
                         </button>
                       ) : null}
                       {(job.status === "failed" || job.status === "canceled") && !job.cleanupPending && (
-                        <button className="quiet-button" disabled={pending} onClick={() => onRetry(job)}>
-                          {pending ? "Retrying…" : "Retry"}
+                        <button className="quiet-button" disabled={pending} onClick={() => retry(job)}>
+                          {pending && pendingAction?.jobId === job.id && pendingAction.kind === "retry"
+                            ? "Retrying…"
+                            : "Retry"}
                         </button>
                       )}
+                      {(job.status === "failed" || job.status === "canceled") &&
+                        !job.cleanupPending &&
+                        job.importParentId && (
+                          <button className="quiet-button" disabled={pending} onClick={() => retry(job, null)}>
+                            {pending && pendingAction?.jobId === job.id && pendingAction.kind === "retry-root"
+                              ? "Retrying at space root…"
+                              : "Retry at space root"}
+                          </button>
+                        )}
                     </span>
                   </div>
                 </li>

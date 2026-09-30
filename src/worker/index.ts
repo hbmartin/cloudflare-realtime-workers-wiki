@@ -1,8 +1,9 @@
 import { acceptSlackProductInteraction, openSlackProduct } from "./slack-product";
+import { authorizeSlackCaptureJobRetry } from "./slack-capture";
 import { taskListStatements, listTasks, mutateTask, taskAssignees } from "./tasks";
 import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror, verifySlackMirrorRecovery } from "./slack-threads";
 import { acceptSlackWorkspaceInteraction, openSlackSearch, purgeExpiredSlackSearchSessions } from "./slack-workspace";
-import { pageForMember, effectiveSpaceRole, type PageRow } from "./page-access";
+import { pageForMember, effectiveSpaceRole, sidebarHiddenPageIds, type PageRow } from "./page-access";
 import { mentionsInbox, markMentionsRead } from "./mentions-inbox";
 import { generateJitteredKeyBetween, generateNJitteredKeysBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
@@ -115,6 +116,7 @@ import {
   isCurrentImportPreview,
   normalizeGroupSpaceIds,
   parseImportOptions,
+  type ImportOptions,
 } from "../shared/import-space-mapping";
 import { constantTimeEqual } from "../shared/security";
 import { CLIENT_ERROR_EVENTS, isClientErrorName, isTelemetryIdentifier } from "../shared/client-telemetry-contract";
@@ -2119,6 +2121,7 @@ app.post("/api/import-uploads", async (c) => {
     throw new HttpError(413, "import_too_large", "Import uploads are limited to 24 MiB.");
   }
   const spaceId = text(form.get("spaceId"), "spaceId", 100);
+  const parentId = nullableId(form.get("parentId"), "parentId");
   const space = await spaceForMember(c.env, member, spaceId);
   if (effectiveSpaceRole(member.role, space.visibility, space.space_role) === "viewer") {
     throw new HttpError(403, "read_only", "Your role in this space is read-only.");
@@ -2136,11 +2139,14 @@ app.post("/api/import-uploads", async (c) => {
   if (!format) {
     throw new HttpError(415, "unsupported_import", "Choose a Markdown, HTML, or Notion ZIP file.");
   }
+  if (parentId && format === "notion_zip")
+    throw new HttpError(422, "import_parent_invalid", "A parent can only be selected for a single-page import.");
+  if (parentId) await validateImportParent(c.env, member, parentId, spaceId);
   const job = await createJob(c.env, {
     member,
     type: "import",
     spaceId,
-    options: { filename, format, confirmed: false },
+    options: { filename, format, confirmed: false, ...(parentId ? { parentId } : {}) },
   });
   const inputKey = `jobs/${job.id}/input/${encodeURIComponent(filename)}`;
   try {
@@ -2177,16 +2183,46 @@ app.post("/api/import-uploads", async (c) => {
   return c.json({ job: jobJson(uploaded) }, 202);
 });
 
+async function validateImportParent(env: Env, member: MemberContext, parentId: string, spaceId: string) {
+  const parent = await pageForMember(env, member, parentId);
+  requireOrdinaryPage(parent);
+  requirePageEditor(parent);
+  if (parent.space_id !== spaceId)
+    throw new HttpError(422, "cross_space_parent", "A parent page must belong to the destination space.");
+}
+
+async function validateImportDestinationParent(env: Env, member: MemberContext, job: JobRow, options: ImportOptions) {
+  if (!options.parentId) return;
+  if (options.format === "notion_zip")
+    throw new HttpError(422, "import_parent_invalid", "A parent can only be selected for a single-page import.");
+  const spaceId = options.groupSpaceIds?.Imported ?? job.space_id;
+  if (!spaceId) throw new HttpError(409, "space_required", "The import destination space is missing.");
+  await validateImportParent(env, member, options.parentId, spaceId);
+}
+
 function savedImportPreview(job: JobRow) {
   return (JSON.parse(job.result_json) as { preview?: ImportPreview }).preview;
 }
 
-async function refreshImportPreview(c: Context<{ Bindings: Env }>, member: MemberContext, job: JobRow) {
+async function refreshImportPreview(
+  c: Context<{ Bindings: Env }>,
+  member: MemberContext,
+  job: JobRow,
+  parentOverride?: string | null,
+) {
   requireEditor(member);
-  if (job.space_id) await editableSpaceForMember(c.env, member, job.space_id);
   const saved = storedJobOptions(job);
-  const options = parseImportOptions({ filename: saved.filename, format: saved.format, confirmed: false });
+  const options = parseImportOptions({
+    filename: saved.filename,
+    format: saved.format,
+    confirmed: false,
+    parentId: parentOverride === undefined ? saved.parentId : parentOverride,
+    ...(saved.format === "notion_zip" ? {} : { groupSpaceIds: saved.groupSpaceIds }),
+  });
   if (!options) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
+  for (const spaceId of importDestinationSpaceIds(job.space_id, options.groupSpaceIds))
+    await editableSpaceForMember(c.env, member, spaceId);
+  await validateImportDestinationParent(c.env, member, job, options);
   if (!job.input_key?.startsWith(`jobs/${job.id}/input/`)) {
     throw new HttpError(
       409,
@@ -2241,9 +2277,14 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
     filename: options.filename,
     format: options.format,
     confirmed: false,
+    parentId: options.parentId,
   });
   if (!inspectionOptions) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
-  if (!isCurrentImportPreview(preview, inspectionOptions.format)) return refreshImportPreview(c, member, job);
+  const requestedParentId = Object.hasOwn(body, "parentId") ? nullableId(body.parentId, "parentId") : undefined;
+  if (requestedParentId && inspectionOptions.format === "notion_zip")
+    throw new HttpError(422, "import_parent_invalid", "A parent can only be selected for a single-page import.");
+  if (!isCurrentImportPreview(preview, inspectionOptions.format))
+    return refreshImportPreview(c, member, job, requestedParentId);
   if (body.previewId !== preview!.previewId) {
     throw new HttpError(
       409,
@@ -2279,8 +2320,10 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
   }
   const destinations = importDestinationSpaceIds(job.space_id, savedGroupSpaceIds ?? undefined);
   for (const spaceId of destinations) await editableSpaceForMember(c.env, member, spaceId);
+  const parentId = requestedParentId === undefined ? inspectionOptions.parentId : requestedParentId;
   const confirmedOptions = parseImportOptions({
     ...options,
+    parentId,
     confirmed: true,
     groupSpaceIds: savedGroupSpaceIds,
     ...(groups.length ? { previewGroupKeys: groups.map((group) => group.key) } : {}),
@@ -2288,6 +2331,7 @@ async function confirmImport(c: Context<{ Bindings: Env }>, routeJobId?: string)
     previewId: preview?.previewId,
   });
   if (!confirmedOptions) throw new HttpError(409, "job_options_invalid", "This import's saved options are invalid.");
+  await validateImportDestinationParent(c.env, member, job, confirmedOptions);
   const instanceId = crypto.randomUUID();
   const queued = await c.env.DB.prepare(
     `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, options_json = ?, progress_label = 'Queued',
@@ -2433,11 +2477,15 @@ function storedJobOptions(job: JobRow) {
   }
 }
 
-async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow) {
+async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow, parentOverride?: string | null) {
   const options = storedJobOptions(job);
   if (job.type === "import") {
     requireEditor(member);
-    const parsed = parseImportOptions(options);
+    if (parentOverride && options.format === "notion_zip")
+      throw new HttpError(422, "import_parent_invalid", "A parent can only be selected for a single-page import.");
+    const parsed = parseImportOptions(
+      parentOverride === undefined ? options : { ...options, parentId: parentOverride },
+    );
     const destinations = importDestinationSpaceIds(job.space_id, parsed?.groupSpaceIds);
     if (!parsed || destinations.size === 0)
       throw new HttpError(
@@ -2446,6 +2494,7 @@ async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow) {
         "This import's saved space mappings are invalid. Upload the file again to inspect and confirm its destinations.",
       );
     for (const spaceId of destinations) await editableSpaceForMember(env, member, spaceId);
+    await validateImportDestinationParent(env, member, job, parsed);
     return;
   }
   if (job.type === "template_clone") {
@@ -2473,28 +2522,44 @@ app.post("/api/jobs/:id/retry", async (c) => {
   if (job.status !== "failed" && job.status !== "canceled") {
     throw new HttpError(409, "job_not_retryable", "Only failed or canceled jobs can be retried.");
   }
-  await authorizeJobRetry(c.env, member, job);
-  if (job.type === "import") {
+  const retryBody = job.type === "import" ? await optionalJsonBody(c.req.raw) : {};
+  const parentOverride = Object.hasOwn(retryBody, "parentId") ? nullableId(retryBody.parentId, "parentId") : undefined;
+  const captureId = job.type === "import" ? parseImportOptions(storedJobOptions(job))?.captureId : undefined;
+  if (captureId && parentOverride !== undefined)
+    throw new HttpError(422, "slack_capture_destination_fixed", "Retry this capture at its original destination.");
+  await authorizeJobRetry(c.env, member, job, parentOverride);
+  if (captureId) await authorizeSlackCaptureJobRetry(c.env, captureId, job.id);
+  if (job.type === "import" && !captureId) {
     const options = storedJobOptions(job);
     const preview = savedImportPreview(job);
-    const parsed = parseImportOptions(options);
+    const parsed = parseImportOptions(
+      parentOverride === undefined ? options : { ...options, parentId: parentOverride },
+    );
     if (
       !parsed ||
       !isCurrentImportPreview(preview, parsed.format) ||
       (parsed.confirmed &&
         (!hasCurrentImportConfirmation(parsed) || !importConfirmationMatchesPreview(parsed, preview)))
     ) {
-      return refreshImportPreview(c, member, job);
+      return refreshImportPreview(c, member, job, parentOverride);
     }
   }
   const instanceId = crypto.randomUUID();
   const retried = await c.env.DB.prepare(
-    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1, progress_current = 0,
+    `UPDATE jobs SET status = 'queued', workflow_instance_id = ?, attempt = attempt + 1, options_json = ?, progress_current = 0,
        progress_label = 'Queued', error_code = NULL, error_message = NULL, updated_at = ?
       WHERE id = ? AND attempt = ? AND status IN ('failed', 'canceled') AND cleanup_target IS NULL
       RETURNING *`,
   )
-    .bind(instanceId, now(), job.id, job.attempt)
+    .bind(
+      instanceId,
+      job.type === "import" && parentOverride !== undefined
+        ? JSON.stringify({ ...storedJobOptions(job), parentId: parentOverride })
+        : job.options_json,
+      now(),
+      job.id,
+      job.attempt,
+    )
     .first<JobRow>();
   if (!retried) throw new HttpError(409, "job_not_retryable", "This job was already retried.");
   c.executionCtx.waitUntil(
@@ -3040,25 +3105,6 @@ app.get("/api/pages/tree", async (c) => {
     .all<PageRow>();
   return c.json({ pages: rows.results.map(pageJson) });
 });
-
-async function sidebarHiddenPageIds(env: Env, workspaceId: string, pageIds: readonly string[]) {
-  if (!pageIds.length) return [];
-  const hidden = await env.DB.prepare(
-    `WITH RECURSIVE hidden(id) AS (
-       SELECT link.page_id FROM table_row_pages link JOIN pages root ON root.id=link.page_id
-        WHERE root.workspace_id=?
-       UNION
-       SELECT source.page_id FROM page_import_sources source JOIN pages root ON root.id=source.page_id
-        WHERE root.workspace_id=? AND source.source_role='table_row_detail'
-       UNION ALL
-       SELECT child.id FROM pages child JOIN hidden parent ON child.parent_id=parent.id
-        WHERE child.workspace_id=?
-     ) SELECT id FROM hidden WHERE id IN (SELECT value FROM json_each(?))`,
-  )
-    .bind(workspaceId, workspaceId, workspaceId, JSON.stringify(pageIds))
-    .all<{ id: string }>();
-  return hidden.results.map((row) => row.id);
-}
 
 app.post("/api/pages", async (c) => {
   const member = await requireMember(c.req.raw, c.env);

@@ -1,4 +1,6 @@
 import type { ImportPreview } from "./types";
+import { ID_PATTERN } from "./validation";
+import { TASK_STATUSES, type TaskStatus } from "./tasks";
 
 // Bump when ownership, grouping, or structural preview semantics change. Older previews must be inspected again.
 export const NOTION_GROUPING_VERSION = 2;
@@ -7,6 +9,10 @@ export type ImportOptions = {
   filename: string;
   format: ImportPreview["format"];
   confirmed: boolean;
+  title?: string;
+  captureId?: string;
+  task?: { listId: string; status: TaskStatus; assigneeId: string | null; dueDate: string | null };
+  parentId?: string | undefined;
   groupSpaceIds?: Record<string, string>;
   previewGroupKeys?: string[];
   previewGroupingVersion?: number;
@@ -23,6 +29,37 @@ export function requireImportOptions(options: Record<string, unknown>): ImportOp
     throw new Error("Import options are invalid.");
   const groupSpaceIds = normalizeGroupSpaceIds(options.groupSpaceIds);
   const keys = options.previewGroupKeys;
+  if (
+    options.parentId !== undefined &&
+    options.parentId !== null &&
+    (typeof options.parentId !== "string" || !ID_PATTERN.test(options.parentId) || options.format === "notion_zip")
+  ) {
+    throw new Error("Import parent is invalid.");
+  }
+  if (
+    options.title !== undefined &&
+    (typeof options.title !== "string" || !options.title.trim() || options.title.length > 200)
+  )
+    throw new Error("Import title is invalid.");
+  if (options.captureId !== undefined && (typeof options.captureId !== "string" || !ID_PATTERN.test(options.captureId)))
+    throw new Error("Import capture is invalid.");
+  if (options.task !== undefined) {
+    const task = options.task;
+    if (!task || typeof task !== "object" || Array.isArray(task)) throw new Error("Import task is invalid.");
+    const fields = task as Record<string, unknown>;
+    if (
+      typeof fields.listId !== "string" ||
+      !ID_PATTERN.test(fields.listId) ||
+      !TASK_STATUSES.includes(fields.status as TaskStatus) ||
+      (fields.assigneeId !== null && (typeof fields.assigneeId !== "string" || !ID_PATTERN.test(fields.assigneeId))) ||
+      (fields.dueDate !== null &&
+        (typeof fields.dueDate !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(fields.dueDate))) ||
+      fields.listId !== options.parentId ||
+      options.format === "notion_zip" ||
+      !options.captureId
+    )
+      throw new Error("Import task is invalid.");
+  }
   if (groupSpaceIds === null || (groupSpaceIds && Object.keys(groupSpaceIds).length === 0)) {
     throw new Error("Import space mappings are invalid.");
   }
@@ -41,7 +78,12 @@ export function requireImportOptions(options: Record<string, unknown>): ImportOp
   ) {
     throw new Error("Import space mappings are invalid.");
   }
-  return { ...options, groupSpaceIds, previewGroupKeys: keys } as ImportOptions;
+  return {
+    ...options,
+    parentId: options.parentId ?? undefined,
+    groupSpaceIds,
+    previewGroupKeys: keys,
+  } as ImportOptions;
 }
 
 export function parseImportOptions(options: Record<string, unknown>): ImportOptions | null {
