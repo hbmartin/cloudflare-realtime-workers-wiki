@@ -274,6 +274,9 @@ test("opens two visited documents offline and keeps local edits through refresh"
 
 test("retries a failed offline write without claiming a partial save", async ({ page, context }) => {
   await signInOwner(page);
+  await expect
+    .poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller)), { timeout: 30_000 })
+    .toBe(true);
   const previousPage = new URL(page.url()).searchParams.get("page");
   await page.getByRole("button", { name: /Find a page or command/ }).click();
   await page
