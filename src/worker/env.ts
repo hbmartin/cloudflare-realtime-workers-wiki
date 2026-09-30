@@ -34,6 +34,7 @@ export interface AppBindings {
   DO_LOCATION_HINT?: DurableObjectLocationHint;
   WORKFLOW_INLINE?: "true";
   EXPANDED_EMBEDS_ENABLED?: "true" | "false";
+  NOTION_MARKDOWN_WRITES_ENABLED?: "true" | "false";
   OFFLINE_EDITING_ENABLED?: "true" | "false";
   OBSERVABILITY_PROBE_TOKEN?: string;
 }
@@ -42,6 +43,9 @@ export interface Env extends AppBindings {}
 
 declare global {
   namespace Cloudflare {
-    interface Env extends Omit<AppBindings, "BROWSER" | "EXPANDED_EMBEDS_ENABLED" | "OFFLINE_EDITING_ENABLED"> {}
+    interface Env extends Omit<
+      AppBindings,
+      "BROWSER" | "EXPANDED_EMBEDS_ENABLED" | "NOTION_MARKDOWN_WRITES_ENABLED" | "OFFLINE_EDITING_ENABLED"
+    > {}
   }
 }

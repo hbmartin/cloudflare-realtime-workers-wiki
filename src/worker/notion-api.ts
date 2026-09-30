@@ -12,11 +12,17 @@ import {
   type NotionBlock,
 } from "../shared/notion-blocks";
 import { constantTimeEqual, hmacSha256Hex } from "../shared/security";
+import { MAX_MARKDOWN_BLOCKS, MAX_UNKNOWN_BLOCK_IDS, projectNotionMarkdown } from "../shared/notion-markdown";
+import { parseMarkdownCommand } from "../shared/notion-markdown-commands";
+import { markdownEditTargets, markdownMutations } from "../shared/notion-markdown-mutations";
+import { MarkdownWriteError } from "../shared/notion-markdown-write";
+import { sha256Hex } from "../shared/import-integrity";
 import type { Comment, CommentThread, DocumentContentEnvelope, WorkspaceEvent } from "../shared/types";
 import { PAGE_TITLE_MAX } from "../shared/validation";
 import { processArchiveDisconnectTargets } from "./archive";
 import { createCommentThread, softDeleteComment, updateComment, type CommentActor, type CommentPage } from "./comments";
 import {
+  activeIntegrationPrincipal,
   authenticateIntegration,
   integrationBearerToken,
   IntegrationAuthError,
@@ -26,6 +32,21 @@ import {
   type IntegrationPage,
   type IntegrationPrincipal,
 } from "./integrations";
+import {
+  claimMarkdownTask,
+  claimExhaustedMarkdownTasks,
+  completeMarkdownTask,
+  createMarkdownTask,
+  dueMarkdownTasks,
+  failMarkdownTask,
+  markdownTaskForIntegration,
+  markdownTaskForRequestKey,
+  markdownTaskJson,
+  pruneMarkdownTasks,
+  renewMarkdownTaskLease,
+  RESULT_RETENTION_MS,
+  type MarkdownTaskRow,
+} from "./notion-markdown-tasks";
 import type { Env } from "./env";
 import { isInlineMime } from "./attachments";
 import { attachmentDisposition, HttpError } from "./http";
@@ -65,6 +86,12 @@ class NotionError extends Error {
     readonly retryAfter?: number,
   ) {
     super(message);
+  }
+}
+
+class UnknownMutationOutcome extends NotionError {
+  constructor() {
+    super(409, "conflict_error", "The mutation outcome is unknown. Fetch the page before retrying.");
   }
 }
 
@@ -485,15 +512,25 @@ async function metadataForPage(env: Env, pageId: string) {
   return new Map(rows.results.map((row) => [row.internal_id, row]));
 }
 
+function localAttachmentId(rawUrl: string, baseUrl: string) {
+  try {
+    const url = new URL(rawUrl, baseUrl);
+    return /^\/api\/attachments\/([A-Za-z0-9_-]+)\/?$/.exec(url.pathname)?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function blockObject(env: Env, page: IntegrationPage, block: NotionBlock, metadata: Map<string, BlockMetadata>) {
   const record = metadata.get(block.internalId);
   const payload = notionPayloadForBlock(block);
   if (["image", "video", "audio", "file", "pdf"].includes(payload.type)) {
     const external = payload.payload.external as { url?: unknown } | undefined;
-    const match = typeof external?.url === "string" ? /\/api\/attachments\/([A-Za-z0-9_-]+)/.exec(external.url) : null;
-    if (match?.[1]) {
+    const attachmentId =
+      typeof external?.url === "string" ? localAttachmentId(external.url, env.BETTER_AUTH_URL) : null;
+    if (attachmentId) {
       const attachment = await env.DB.prepare(`SELECT id FROM attachments WHERE id = ? AND page_id = ?`)
-        .bind(match[1], page.id)
+        .bind(attachmentId, page.id)
         .first<{ id: string }>();
       if (attachment) {
         const expires = Date.now() + 60 * 60_000;
@@ -560,19 +597,28 @@ async function mutateDocument(
   principal: IntegrationPrincipal,
   operations: unknown[],
   suppressExternalEffects = false,
-  options: { expectedSequence?: number } = {},
+  options: { expectedSequence?: number; operationId?: string } = {},
 ) {
-  const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
-    new Request("https://document.internal/api-mutate", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-notes-internal": env.BETTER_AUTH_SECRET,
-        ...correlationHeaders(),
-      },
-      body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects, ...options }),
-    }),
-  );
+  const unknownOutcome = () =>
+    options.expectedSequence !== undefined && !options.operationId
+      ? new UnknownMutationOutcome()
+      : new NotionError(503, "service_unavailable", "The document is temporarily unavailable.");
+  let response: Response;
+  try {
+    response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
+      new Request("https://document.internal/api-mutate", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-notes-internal": env.BETTER_AUTH_SECRET,
+          ...correlationHeaders(),
+        },
+        body: JSON.stringify({ actorId: principal.botUserId, operations, suppressExternalEffects, ...options }),
+      }),
+    );
+  } catch {
+    throw unknownOutcome();
+  }
   if (response.status === 404) throw new NotionError(404, "object_not_found", "Block not found.");
   if (response.status === 409) {
     const result = await response.json<{ error?: string }>().catch((): { error?: string } => ({}));
@@ -587,8 +633,20 @@ async function mutateDocument(
     );
   }
   if (response.status === 413) throw new NotionError(413, "validation_error", "The mutation exceeds document limits.");
+  if (response.status >= 500) throw unknownOutcome();
   if (!response.ok) throw new NotionError(400, "validation_error", "The block mutation is invalid.");
   return response.json<{ document: DocumentContentEnvelope["document"]; sequence: number }>();
+}
+
+async function mutationReceipt(env: Env, page: IntegrationPage, operationId: string) {
+  const url = new URL("https://document.internal/api-mutate-receipt");
+  url.searchParams.set("operationId", operationId);
+  const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
+    new Request(url, { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() } }),
+  );
+  if (response.status === 404) return null;
+  if (!response.ok) throw new NotionError(503, "service_unavailable", "The document receipt is unavailable.");
+  return response.json<{ found: true; document: DocumentContentEnvelope["document"]; sequence: number }>();
 }
 
 async function cleanupStagedPage(env: Env, pageId: string, contentEpoch: number, stageId: string) {
@@ -666,6 +724,519 @@ notionApi.get("/pages/:pageId", async (c) => {
       new URL(c.req.url).origin,
     ),
   );
+});
+
+async function pageMarkdownProjection(
+  env: Env,
+  principal: IntegrationPrincipal,
+  page: IntegrationPage,
+  requestUrl: string,
+  suppliedSnapshot?: DocumentContentEnvelope,
+) {
+  const [snapshot, metadata, id, commentBlocks] = await Promise.all([
+    suppliedSnapshot ?? liveDocument(env, page),
+    metadataForPage(env, page.id),
+    publicPageId(env, page.id),
+    env.DB.prepare(`SELECT DISTINCT block_id FROM comment_threads WHERE page_id=? AND block_id IS NOT NULL`)
+      .bind(page.id)
+      .all<{ block_id: string }>(),
+  ]);
+  const referencedAttachments = new Set<string>();
+  const linkedPages = new Set<string>();
+  for (const block of documentBlocks(snapshot.document)) {
+    if (block.type === "linkToPage" && typeof block.node.attrs?.pageId === "string")
+      linkedPages.add(block.node.attrs.pageId);
+    if (["image", "video", "audio", "file", "pdf"].includes(block.type) && typeof block.node.attrs?.url === "string") {
+      const attachmentId = localAttachmentId(block.node.attrs.url, env.BETTER_AUTH_URL);
+      if (attachmentId && referencedAttachments.size < MAX_MARKDOWN_BLOCKS) referencedAttachments.add(attachmentId);
+    }
+  }
+  const [attachments, childPages] = await Promise.all([
+    referencedAttachments.size
+      ? env.DB.prepare(`SELECT id FROM attachments WHERE page_id = ? AND id IN (SELECT value FROM json_each(?))`)
+          .bind(page.id, JSON.stringify([...referencedAttachments]))
+          .all<{ id: string }>()
+      : Promise.resolve({ results: [] as Array<{ id: string }> }),
+    env.DB.prepare(
+      `SELECT id, title FROM pages WHERE parent_id = ? AND workspace_id = ? AND archived_at IS NULL
+       AND import_job_id IS NULL AND is_template=0 AND kind = 'document'
+       AND id NOT IN (SELECT value FROM json_each(?))
+       ORDER BY position, id LIMIT ?`,
+    )
+      .bind(
+        page.id,
+        principal.workspaceId,
+        JSON.stringify([...linkedPages]),
+        MAX_MARKDOWN_BLOCKS + MAX_UNKNOWN_BLOCK_IDS + 1,
+      )
+      .all<{ id: string; title: string }>(),
+  ]);
+  const signedMedia = new Map(
+    await Promise.all(
+      attachments.results.map(
+        async ({ id: attachmentId }) =>
+          [attachmentId, await notionFileUrl(env, attachmentId, Date.now() + 60 * 60_000)] as const,
+      ),
+    ),
+  );
+  const canonicalMediaUrls = new Map<string, string>();
+  for (const block of documentBlocks(snapshot.document)) {
+    const url = block.node.attrs?.url;
+    if (block.type !== "image" || typeof url !== "string") continue;
+    const attachmentId = localAttachmentId(url, env.BETTER_AUTH_URL);
+    const signed = attachmentId ? signedMedia.get(attachmentId) : null;
+    if (signed) canonicalMediaUrls.set(signed, url);
+  }
+  const ids = new Map([...metadata].map(([internalId, value]) => [internalId, value.id]));
+  const commentedPublicIds = new Set(commentBlocks.results.map((row) => row.block_id));
+  const protectedBlockIds = new Set(
+    [...metadata].filter(([, value]) => commentedPublicIds.has(value.id)).map(([internalId]) => internalId),
+  );
+  const childIds = await publicPageIds(
+    env,
+    childPages.results.map((child) => child.id),
+  );
+  for (const [internalId, publicId] of childIds) ids.set(internalId, publicId);
+  const childBlocks = childPages.results.map((child) => ({
+    id: child.id,
+    internalId: child.id,
+    type: "linkToPage",
+    node: { type: "linkToPage", attrs: { pageId: child.id, title: child.title } },
+    children: [],
+  }));
+  const mediaCache = new Map<string, string | null>();
+  const mediaHref = (url: string) => {
+    if (mediaCache.has(url)) return mediaCache.get(url)!;
+    const attachmentId = localAttachmentId(url, env.BETTER_AUTH_URL);
+    if (attachmentId) {
+      const signed = signedMedia.get(attachmentId) ?? null;
+      mediaCache.set(url, signed);
+      return signed;
+    }
+    try {
+      if (new URL(url, env.BETTER_AUTH_URL).pathname.startsWith("/api/attachments/")) {
+        mediaCache.set(url, null);
+        return null;
+      }
+    } catch {
+      mediaCache.set(url, null);
+      return null;
+    }
+    mediaCache.set(url, url);
+    return url;
+  };
+  const projection = projectNotionMarkdown(
+    snapshot.document,
+    ids,
+    {
+      pageHref: (pageId) => new URL(`/?page=${encodeURIComponent(pageId)}`, requestUrl).toString(),
+      mediaHref,
+    },
+    childBlocks,
+  );
+  return { snapshot, id, projection, protectedBlockIds, canonicalMediaUrls, signedMedia };
+}
+
+function refreshMarkdownFileUrls(input: Record<string, unknown>, signedMedia: ReadonlyMap<string, string>) {
+  const replace = (value: unknown, depth: number): unknown => {
+    if (depth > 4) return value;
+    if (typeof value === "string")
+      return value.replace(/https?:\/\/[^\s<>)\]]+/g, (candidate) => {
+        const path = candidate.indexOf("/v1/files/");
+        if (path < 0) return candidate;
+        const match = /^\/v1\/files\/([^/?#]+)\?expires=\d+&signature=[A-Za-z0-9_-]+/.exec(candidate.slice(path));
+        if (!match) return candidate;
+        const url = candidate.slice(0, path) + match[0];
+        try {
+          const current = signedMedia.get(decodeURIComponent(match[1]!));
+          return current && new URL(url).origin === new URL(current).origin
+            ? current + candidate.slice(url.length)
+            : candidate;
+        } catch {
+          return candidate;
+        }
+      });
+    if (Array.isArray(value)) return value.map((part) => replace(part, depth + 1));
+    if (value && typeof value === "object")
+      return Object.fromEntries(Object.entries(value).map(([key, part]) => [key, replace(part, depth + 1)]));
+    return value;
+  };
+  return replace(input, 0) as Record<string, unknown>;
+}
+
+function pageMarkdownJson(current: Awaited<ReturnType<typeof pageMarkdownProjection>>) {
+  return {
+    object: "page_markdown" as const,
+    id: current.id,
+    markdown: current.projection.markdown,
+    truncated: current.projection.truncated,
+    unknown_block_ids: current.projection.unknownBlockIds,
+  };
+}
+
+async function markdownRequestKey(
+  env: Env,
+  principal: IntegrationPrincipal,
+  page: IntegrationPage,
+  request: Request,
+  mode: "sync" | "async",
+) {
+  const key = request.headers.get("idempotency-key");
+  if (key === null) return null;
+  if (!/^[A-Za-z0-9._~:-]{1,128}$/.test(key))
+    throw new NotionError(400, "validation_error", "Idempotency-Key must be 1 to 128 URL-safe characters.");
+  return hmacSha256Hex(env.BETTER_AUTH_SECRET, `${mode}:${principal.integrationId}:${page.id}:${key}`);
+}
+
+async function taskPage(env: Env, task: MarkdownTaskRow) {
+  const principal = await activeIntegrationPrincipal(env, task.integration_id);
+  if (!principal || !principal.updateContent || !principal.readContent || principal.workspaceId !== task.workspace_id)
+    throw new NotionError(403, "restricted_resource", "The integration can no longer update this page.");
+  const page = await pageForIntegration(env, principal, task.page_id);
+  if (!page || page.kind !== "document")
+    throw new NotionError(404, "object_not_found", "The page grant is no longer available.");
+  if (page.content_epoch !== task.page_epoch)
+    throw new NotionError(409, "conflict_error", "The page content version changed before this task ran.");
+  return { principal, page };
+}
+
+async function completeMarkdownFromReceipt(
+  env: Env,
+  task: MarkdownTaskRow,
+  principal: IntegrationPrincipal,
+  page: IntegrationPage,
+  receipt: { document: DocumentContentEnvelope["document"]; sequence: number },
+) {
+  const current = await pageMarkdownProjection(env, principal, page, env.BETTER_AUTH_URL, {
+    schemaVersion: 1,
+    pageId: page.id,
+    contentEpoch: page.content_epoch,
+    document: receipt.document,
+    sequence: receipt.sequence,
+  });
+  await completeMarkdownTask(env, task, pageMarkdownJson(current));
+}
+
+function keepMarkdownTaskLease(env: Env, task: MarkdownTaskRow) {
+  const timer = setInterval(() => {
+    void renewMarkdownTaskLease(env, task).catch((error) =>
+      logger.warn(
+        "notion_api.markdown_task.lease_failed",
+        "notion-api",
+        "Markdown task lease could not be renewed.",
+        { taskId: task.id },
+        error,
+      ),
+    );
+  }, 20_000);
+  return () => clearInterval(timer);
+}
+
+/** A D1 lease and a document-room receipt make crashes after commit safe to retry. */
+async function runNotionMarkdownTask(env: Env, id: string) {
+  if (env.NOTION_MARKDOWN_WRITES_ENABLED !== "true") return;
+  const task = await claimMarkdownTask(env, id);
+  if (!task) return;
+  const stopLease = keepMarkdownTaskLease(env, task);
+  try {
+    let { principal, page } = await taskPage(env, task);
+    const receipt = await mutationReceipt(env, page, task.operation_id);
+    if (receipt) {
+      await completeMarkdownFromReceipt(env, task, principal, page, receipt);
+      return;
+    }
+    const input = JSON.parse(task.request_json) as Record<string, unknown>;
+    let current = await pageMarkdownProjection(env, principal, page, env.BETTER_AUTH_URL);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      let operations;
+      try {
+        const command = parseMarkdownCommand(
+          refreshMarkdownFileUrls(input, current.signedMedia),
+          current.projection.markdown,
+        );
+        const targets = await sha256Hex(
+          JSON.stringify(markdownEditTargets(current.snapshot.document, current.projection, command.edits)),
+        );
+        if (targets !== task.target_signature)
+          throw new MarkdownWriteError("The selected content changed before this task ran.");
+        operations = markdownMutations(
+          current.snapshot.document,
+          current.projection,
+          command.edits,
+          command.allowDeletingContent,
+          current.protectedBlockIds,
+          current.canonicalMediaUrls,
+        );
+      } catch (error) {
+        if (error instanceof MarkdownWriteError) throw new NotionError(409, "conflict_error", error.message);
+        throw error;
+      }
+      if (!operations.length) {
+        await completeMarkdownTask(env, task, pageMarkdownJson(current));
+        return;
+      }
+      ({ principal, page } = await taskPage(env, task));
+      try {
+        const committed = await mutateDocument(env, page, principal, operations, false, {
+          expectedSequence: current.snapshot.sequence,
+          operationId: task.operation_id,
+        });
+        current = await pageMarkdownProjection(env, principal, page, env.BETTER_AUTH_URL, {
+          ...current.snapshot,
+          document: committed.document,
+          sequence: committed.sequence,
+        });
+        await completeMarkdownTask(env, task, pageMarkdownJson(current));
+        return;
+      } catch (error) {
+        if (!(error instanceof NotionError) || error.status !== 409 || attempt === 1) throw error;
+        current = await pageMarkdownProjection(env, principal, page, env.BETTER_AUTH_URL);
+      }
+    }
+  } catch (error) {
+    const terminal = error instanceof NotionError && error.status !== 503;
+    // After the final mutation attempt, recovery still needs one receipt check.
+    const retry = !terminal;
+    if (retry)
+      logger.warn(
+        "notion_api.markdown_task.retry",
+        "notion-api",
+        "Markdown task will retry after an infrastructure failure.",
+        { taskId: task.id, attempt: task.attempts },
+        error,
+      );
+    const failure =
+      error instanceof NotionError
+        ? error
+        : new NotionError(503, "service_unavailable", "The Markdown update could not be completed.");
+    await failMarkdownTask(
+      env,
+      task,
+      {
+        object: "error",
+        status: failure.status,
+        code: failure.code,
+        message: failure.message,
+      },
+      retry,
+    );
+  } finally {
+    stopLease();
+  }
+}
+
+export async function recoverNotionMarkdownTasks(env: Env) {
+  if (env.NOTION_MARKDOWN_WRITES_ENABLED === "true") {
+    for (let recovered = 0; recovered < 5; recovered += 1) {
+      const task = (await claimExhaustedMarkdownTasks(env))[0];
+      if (!task) break;
+      const stopLease = keepMarkdownTaskLease(env, task);
+      try {
+        const { principal, page } = await taskPage(env, task);
+        const receipt = await mutationReceipt(env, page, task.operation_id);
+        if (!receipt) {
+          await failMarkdownTask(
+            env,
+            task,
+            task.error_json
+              ? JSON.parse(task.error_json)
+              : {
+                  object: "error",
+                  status: 503,
+                  code: "service_unavailable",
+                  message: "The Markdown update could not be completed.",
+                },
+            false,
+          );
+          continue;
+        }
+        await completeMarkdownFromReceipt(env, task, principal, page, receipt);
+      } catch (error) {
+        const retry =
+          !(error instanceof SyntaxError || error instanceof RangeError) &&
+          (!(error instanceof NotionError) || error.status === 503) &&
+          Date.now() <= task.expires_at + RESULT_RETENTION_MS;
+        await failMarkdownTask(
+          env,
+          task,
+          {
+            object: "error",
+            status: error instanceof NotionError ? error.status : 503,
+            code: error instanceof NotionError ? error.code : "service_unavailable",
+            message: error instanceof NotionError ? error.message : "The Markdown update could not be completed.",
+          },
+          retry,
+        );
+      } finally {
+        stopLease();
+      }
+    }
+    for (const id of await dueMarkdownTasks(env)) await runNotionMarkdownTask(env, id);
+  }
+  await pruneMarkdownTasks(env);
+}
+
+notionApi.get("/pages/:pageId/markdown", async (c) => {
+  const principal = c.get("principal");
+  capability(principal, "readContent");
+  const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
+  const { id, projection } = await pageMarkdownProjection(c.env, principal, page, c.req.url);
+  return c.json({
+    object: "page_markdown",
+    id,
+    markdown: projection.markdown,
+    truncated: projection.truncated,
+    unknown_block_ids: projection.unknownBlockIds,
+  });
+});
+
+notionApi.patch("/pages/:pageId/markdown", async (c) => {
+  if (c.env.NOTION_MARKDOWN_WRITES_ENABLED !== "true")
+    throw new NotionError(404, "object_not_found", "Markdown updates are unavailable.");
+  const principal = c.get("principal");
+  capability(principal, "updateContent");
+  capability(principal, "readContent");
+  const page = await accessiblePage(c.env, principal, c.req.param("pageId"));
+  const input = await body(c.req.raw);
+  if (input.allow_async !== undefined && typeof input.allow_async !== "boolean")
+    throw new NotionError(400, "validation_error", "allow_async must be a boolean.");
+  const requestJson = JSON.stringify(input);
+  const requestKey = await markdownRequestKey(
+    c.env,
+    principal,
+    page,
+    c.req.raw,
+    input.allow_async === true ? "async" : "sync",
+  );
+  if (requestKey && input.allow_async === true) {
+    const existing = await markdownTaskForRequestKey(c.env, principal.integrationId, requestKey);
+    if (existing) {
+      if (existing.expires_at <= Date.now())
+        throw new NotionError(409, "conflict_error", "Idempotency-Key has expired. Use a new key.");
+      if (existing.page_id !== page.id || existing.request_json !== requestJson)
+        throw new NotionError(409, "conflict_error", "Idempotency-Key was used for another request.");
+      return c.json(markdownTaskJson(existing, c.req.url), 202);
+    }
+  }
+  if (requestKey && input.allow_async !== true && (await mutationReceipt(c.env, page, `markdown:sync:${requestKey}`)))
+    throw new NotionError(409, "conflict_error", "This Markdown request was already committed. Fetch the page.");
+  let current = await pageMarkdownProjection(c.env, principal, page, c.req.url);
+  if (input.allow_async === true) {
+    let targets: string;
+    try {
+      const command = parseMarkdownCommand(
+        refreshMarkdownFileUrls(input, current.signedMedia),
+        current.projection.markdown,
+      );
+      markdownMutations(
+        current.snapshot.document,
+        current.projection,
+        command.edits,
+        command.allowDeletingContent,
+        current.protectedBlockIds,
+        current.canonicalMediaUrls,
+      );
+      targets = await sha256Hex(
+        JSON.stringify(markdownEditTargets(current.snapshot.document, current.projection, command.edits)),
+      );
+    } catch (error) {
+      if (error instanceof MarkdownWriteError) throw new NotionError(400, "validation_error", error.message);
+      throw error;
+    }
+    const id = `task_${crypto.randomUUID()}`;
+    const task = await createMarkdownTask(c.env, {
+      id,
+      workspace_id: principal.workspaceId,
+      integration_id: principal.integrationId,
+      page_id: page.id,
+      page_epoch: page.content_epoch,
+      request_json: requestJson,
+      request_key_hash: requestKey,
+      target_signature: targets,
+      operation_id: `markdown:${id}`,
+    });
+    if (task.row.expires_at <= Date.now() || task.row.page_id !== page.id || task.row.request_json !== requestJson)
+      throw new NotionError(409, "conflict_error", "Idempotency-Key was used for another request.");
+    if (task.created)
+      c.executionCtx.waitUntil(
+        runNotionMarkdownTask(c.env, task.row.id).catch((error) =>
+          logger.error(
+            "notion_api.markdown_task.start_failed",
+            "notion-api",
+            "Queued Markdown task could not start.",
+            { taskId: task.row.id },
+            error,
+          ),
+        ),
+      );
+    return c.json(markdownTaskJson(task.row, c.req.url), 202);
+  }
+  let originalTargets: string | null = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let operations;
+    try {
+      const command = parseMarkdownCommand(
+        refreshMarkdownFileUrls(input, current.signedMedia),
+        current.projection.markdown,
+      );
+      const targets = JSON.stringify(markdownEditTargets(current.snapshot.document, current.projection, command.edits));
+      if (originalTargets !== null && originalTargets !== targets)
+        throw new MarkdownWriteError("The selected content changed while applying the Markdown edit.");
+      originalTargets = targets;
+      operations = markdownMutations(
+        current.snapshot.document,
+        current.projection,
+        command.edits,
+        command.allowDeletingContent,
+        current.protectedBlockIds,
+        current.canonicalMediaUrls,
+      );
+    } catch (error) {
+      if (error instanceof MarkdownWriteError)
+        throw new NotionError(attempt ? 409 : 400, attempt ? "conflict_error" : "validation_error", error.message);
+      throw error;
+    }
+    if (!operations.length) {
+      return c.json(pageMarkdownJson(current));
+    }
+    try {
+      const committed = await mutateDocument(c.env, page, principal, operations, false, {
+        expectedSequence: current.snapshot.sequence,
+        ...(requestKey ? { operationId: `markdown:sync:${requestKey}` } : {}),
+      });
+      current = await pageMarkdownProjection(c.env, principal, page, c.req.url, {
+        ...current.snapshot,
+        document: committed.document,
+        sequence: committed.sequence,
+      });
+      return c.json(pageMarkdownJson(current));
+    } catch (error) {
+      if (
+        error instanceof UnknownMutationOutcome ||
+        !(error instanceof NotionError) ||
+        error.status !== 409 ||
+        attempt === 1
+      )
+        throw error;
+      current = await pageMarkdownProjection(c.env, principal, page, c.req.url);
+    }
+  }
+  throw new NotionError(409, "conflict_error", "The document changed while applying the Markdown edit.");
+});
+
+notionApi.get("/async_tasks/:taskId", async (c) => {
+  const principal = c.get("principal");
+  capability(principal, "readContent");
+  const task = await markdownTaskForIntegration(
+    c.env,
+    c.req.param("taskId"),
+    principal.workspaceId,
+    principal.integrationId,
+  );
+  if (!task) throw new NotionError(404, "object_not_found", "Async task not found.");
+  if (!(await pageForIntegration(c.env, principal, task.page_id)))
+    throw new NotionError(404, "object_not_found", "Async task not found.");
+  return c.json(markdownTaskJson(task, c.req.url));
 });
 
 notionApi.get("/pages/:pageId/properties/:propertyId", async (c) => {
@@ -802,6 +1373,8 @@ notionApi.post("/pages", async (c) => {
         .first<{ import_job_id: string | null }>();
       if (state?.import_job_id !== null) {
         await cleanupStagedPage(c.env, pageId, staged.content_epoch, stageId);
+        if (error instanceof NotionError && error.status === 409)
+          throw new NotionError(503, "service_unavailable", "The staged page could not be initialized.");
         throw error;
       }
     }
@@ -1141,6 +1714,7 @@ notionApi.get("/blocks/:blockId/children", async (c) => {
   if (page) {
     const childPages = await c.env.DB.prepare(
       `SELECT * FROM pages WHERE parent_id = ? AND workspace_id = ? AND archived_at IS NULL AND kind = 'document'
+        AND import_job_id IS NULL AND is_template=0
         ORDER BY position, id LIMIT ? OFFSET ?`,
     )
       .bind(page.id, principal.workspaceId, size + 1, Math.max(0, offset - blocks.length))

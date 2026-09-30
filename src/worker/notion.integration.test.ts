@@ -3,6 +3,7 @@ import { Client } from "@notionhq/client";
 import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "./index";
+import { recoverNotionMarkdownTasks } from "./notion-api";
 import { dateMentionWireProps } from "../shared/date-mentions";
 
 function authenticated(cookie: string, path: string, init: RequestInit = {}) {
@@ -106,6 +107,382 @@ beforeEach(async () => {
 });
 
 describe("Notion-compatible API", () => {
+  it("updates one Markdown block without replacing its neighboring block ID", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    const inserted = await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [
+        { paragraph: { rich_text: [{ text: { content: "First paragraph" } }] } },
+        { paragraph: { rich_text: [{ text: { content: "Second paragraph" } }] } },
+      ] as never,
+    });
+    expect(inserted.results).toHaveLength(2);
+    const before = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(before.markdown).toContain("First paragraph\n\nSecond paragraph");
+    const patched = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          type: "update_content",
+          update_content: { content_updates: [{ old_str: "First", new_str: "Changed" }] },
+        }),
+      }),
+    );
+    expect(patched.status).toBe(200);
+    expect((await patched.json<{ markdown: string }>()).markdown).toContain("Changed paragraph\n\nSecond paragraph");
+    const after = await client.blocks.children.list({ block_id: installed.pageId });
+    expect(after.results.map((item) => item.id)).toEqual(inserted.results.map((item) => item.id));
+  });
+
+  it("keeps a local image durable when replacing Markdown copied from an earlier GET", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    const attachmentId = crypto.randomUUID();
+    const owner = await env.DB.prepare(`SELECT workspace_id, created_by FROM pages WHERE id=?`)
+      .bind(installed.pageId)
+      .first<{ workspace_id: string; created_by: string }>();
+    await env.DB.prepare(
+      `INSERT INTO attachments(id,workspace_id,page_id,r2_key,name,mime,size,created_by,created_at)
+       VALUES (?,?,?,?,?,'image/png',4,?,?)`,
+    )
+      .bind(
+        attachmentId,
+        owner!.workspace_id,
+        installed.pageId,
+        `test/${attachmentId}`,
+        "diagram.png",
+        owner!.created_by,
+        Date.now(),
+      )
+      .run();
+    await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [
+        { image: { type: "external", external: { url: `http://example.test/api/attachments/${attachmentId}` } } },
+      ] as never,
+    });
+    const before = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(before.markdown).toContain(`/v1/files/${attachmentId}?expires=`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const updated = await client.pages.updateMarkdown({
+      page_id: installed.pageId,
+      type: "replace_content",
+      replace_content: { new_str: `${before.markdown}\nAdded` },
+    });
+    expect(updated.markdown).toContain("Added");
+    const blocks = await client.blocks.children.list({ block_id: installed.pageId });
+    expect(blocks.results[0]).toMatchObject({ type: "image", image: { type: "file" } });
+  });
+
+  it("rejects a retried synchronous insert with the same operation key", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const request = () =>
+      notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", "idempotency-key": "insert-once" },
+        body: JSON.stringify({ type: "insert_content", insert_content: { content: "Once" } }),
+      });
+    expect((await SELF.fetch(request())).status).toBe(200);
+    const retry = await SELF.fetch(request());
+    expect(retry.status).toBe(409);
+    expect(
+      (await notion(createdIntegration.token).pages.retrieveMarkdown({ page_id: installed.pageId })).markdown,
+    ).toBe("Once\n");
+  });
+
+  it("runs all four Markdown commands through the Notion SDK", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [
+        { paragraph: { rich_text: [{ text: { content: "First paragraph" } }] } },
+        { paragraph: { rich_text: [{ text: { content: "Second paragraph" } }] } },
+      ] as never,
+    });
+    const inserted = await client.pages.updateMarkdown({
+      page_id: installed.pageId,
+      type: "insert_content",
+      insert_content: { content: "Intro\n\n", position: { type: "start" } },
+    });
+    expect(inserted.markdown).toContain("Intro\n\nFirst paragraph");
+    const updated = await client.pages.updateMarkdown({
+      page_id: installed.pageId,
+      type: "update_content",
+      update_content: { content_updates: [{ old_str: "First", new_str: "Changed" }] },
+    });
+    expect(updated.markdown).toContain("Changed paragraph");
+    const ranged = await client.pages.updateMarkdown({
+      page_id: installed.pageId,
+      type: "replace_content_range",
+      replace_content_range: { content_range: "Second...paragraph", content: "Last" },
+    });
+    expect(ranged.markdown).toContain("Last");
+    const replaced = await client.pages.updateMarkdown({
+      page_id: installed.pageId,
+      type: "replace_content",
+      replace_content: { new_str: "## Replaced\n\nNew body" },
+    });
+    expect(replaced.markdown).toBe("## Replaced\n\nNew body\n");
+  });
+
+  it("rejects ambiguous and unsafe Markdown without changing the page", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [
+        { paragraph: { rich_text: [{ text: { content: "First paragraph" } }] } },
+        { paragraph: { rich_text: [{ text: { content: "Second paragraph" } }] } },
+      ] as never,
+    });
+    const before = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    for (const input of [
+      { type: "update_content", update_content: { content_updates: [{ old_str: "paragraph", new_str: "text" }] } },
+      { type: "replace_content", replace_content: { new_str: "<script>alert(1)</script>" } },
+    ]) {
+      const response = await SELF.fetch(
+        notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(input),
+        }),
+      );
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ object: "error", code: "validation_error" });
+      expect((await client.pages.retrieveMarkdown({ page_id: installed.pageId })).markdown).toBe(before.markdown);
+    }
+  });
+
+  it("runs an async Markdown task once and scopes polling to its integration", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const otherIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [{ paragraph: { rich_text: [{ text: { content: "Before" } }] } }] as never,
+    });
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", "idempotency-key": "async-once" },
+        body: JSON.stringify({
+          type: "update_content",
+          update_content: { content_updates: [{ old_str: "Before", new_str: "After" }] },
+          allow_async: true,
+        }),
+      }),
+      env,
+      context,
+    );
+    expect(response.status).toBe(202);
+    const accepted = await response.json<{
+      id: string;
+      status: string;
+      status_url: string;
+      operation: { name: string };
+    }>();
+    expect(accepted).toMatchObject({
+      object: "async_task",
+      status: "queued",
+      operation: { name: "PATCH /v1/pages/:page_id/markdown" },
+    });
+    expect(accepted.status_url).toContain(`/v1/async_tasks/${accepted.id}`);
+    const duplicate = await SELF.fetch(
+      notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", "idempotency-key": "async-once" },
+        body: JSON.stringify({
+          type: "update_content",
+          update_content: { content_updates: [{ old_str: "Before", new_str: "After" }] },
+          allow_async: true,
+        }),
+      }),
+    );
+    expect(duplicate.status).toBe(202);
+    expect((await duplicate.json<{ id: string }>()).id).toBe(accepted.id);
+    expect((await SELF.fetch(notionRequest(otherIntegration.token, `/async_tasks/${accepted.id}`))).status).toBe(404);
+    await waitOnExecutionContext(context);
+    const polled = await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`));
+    expect(polled.status).toBe(200);
+    expect(await polled.json()).toMatchObject({
+      object: "async_task",
+      status: "succeeded",
+      result: { object: "page_markdown", markdown: "After\n" },
+    });
+    expect((await client.pages.retrieveMarkdown({ page_id: installed.pageId })).markdown).toBe("After\n");
+    const committedOperation = await env.DB.prepare("SELECT operation_id FROM notion_markdown_tasks WHERE id=?")
+      .bind(accepted.id)
+      .first<{ operation_id: string }>();
+    await env.DB.prepare(
+      `UPDATE notion_markdown_tasks SET status='running',attempts=10,lease_token='stale',
+         lease_expires_at=?,next_attempt_at=?,result_json=NULL WHERE id=?`,
+    )
+      .bind(Date.now() - 1, Date.now() - 1, accepted.id)
+      .run();
+    await recoverNotionMarkdownTasks(env);
+    const recovered = await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`));
+    expect((await recovered.json<{ status: string }>()).status).toBe("succeeded");
+    await env.DB.prepare(
+      `UPDATE notion_markdown_tasks SET status='running',attempts=10,operation_id='markdown:missing-receipt',
+         lease_token='stale',lease_expires_at=?,next_attempt_at=?,result_json=NULL WHERE id=?`,
+    )
+      .bind(Date.now() - 1, Date.now() - 1, accepted.id)
+      .run();
+    await recoverNotionMarkdownTasks(env);
+    expect(
+      (
+        await (
+          await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))
+        ).json<{ status: string }>()
+      ).status,
+    ).toBe("failed");
+    await env.DB.prepare(
+      `UPDATE notion_markdown_tasks SET status='running',attempts=10,operation_id='markdown:missing-receipt',
+         error_json=?,lease_token='stale',lease_expires_at=?,next_attempt_at=? WHERE id=?`,
+    )
+      .bind(
+        JSON.stringify({
+          object: "error",
+          status: 503,
+          code: "service_unavailable",
+          message: "Earlier write failure.",
+        }),
+        Date.now() - 1,
+        Date.now() - 1,
+        accepted.id,
+      )
+      .run();
+    await recoverNotionMarkdownTasks(env);
+    expect(
+      await (
+        await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))
+      ).json<{ error: { message: string } }>(),
+    ).toMatchObject({ status: "failed", error: { message: "Earlier write failure." } });
+    await env.DB.prepare(
+      `UPDATE notion_markdown_tasks SET status='running',attempts=10,operation_id=?,lease_token='stale',
+         lease_expires_at=?,next_attempt_at=?,expires_at=? WHERE id=?`,
+    )
+      .bind(
+        committedOperation!.operation_id,
+        Date.now() - 1,
+        Date.now() - 1,
+        Date.now() - 8 * 24 * 60 * 60_000,
+        accepted.id,
+      )
+      .run();
+    await recoverNotionMarkdownTasks(env);
+    expect(
+      await (
+        await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))
+      ).json<{ status: string }>(),
+    ).toMatchObject({ status: "succeeded" });
+    const revokeRead = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ readContent: false }),
+      }),
+    );
+    expect(revokeRead.status).toBe(200);
+    expect((await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))).status).toBe(403);
+    const restoreRead = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ readContent: true }),
+      }),
+    );
+    expect(restoreRead.status).toBe(200);
+    await env.DB.prepare(`UPDATE notion_markdown_tasks SET expires_at=? WHERE id=?`)
+      .bind(Date.now() - 1, accepted.id)
+      .run();
+    expect((await SELF.fetch(notionRequest(createdIntegration.token, `/async_tasks/${accepted.id}`))).status).toBe(404);
+  });
+
+  it("retrieves Markdown only with a valid read grant", async () => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    const client = notion(createdIntegration.token);
+    const inserted = await client.blocks.children.append({
+      block_id: installed.pageId,
+      children: [{ heading_2: { rich_text: [{ text: { content: "Plans" } }] } }] as never,
+    });
+    expect(inserted.results).toHaveLength(1);
+    const markdown = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(markdown).toMatchObject({
+      object: "page_markdown",
+      markdown: "## Plans\n",
+      truncated: false,
+      unknown_block_ids: [],
+    });
+    const child = await client.pages.create({
+      parent: { type: "page_id", page_id: installed.pageId },
+      properties: { title: { type: "title", title: [{ text: { content: "Child specification" } }] } },
+    });
+    const withChild = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(withChild.markdown).toContain("Child specification");
+    expect(withChild.markdown).toContain("?page=");
+    expect(withChild.unknown_block_ids).toEqual([]);
+    await env.DB.prepare(`UPDATE pages SET is_template=1 WHERE id=?`).bind(child.id).run();
+    const withoutTemplate = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(withoutTemplate.markdown).not.toContain("Child specification");
+    await env.DB.prepare(`UPDATE pages SET is_template=0,import_job_id='staged' WHERE id=?`).bind(child.id).run();
+    const withoutStaged = await client.pages.retrieveMarkdown({ page_id: installed.pageId });
+    expect(withoutStaged.markdown).not.toContain("Child specification");
+    const missing = await SELF.fetch(notionRequest("invalid", `/pages/${installed.pageId}/markdown`));
+    expect(missing.status).toBe(401);
+    const deniedCapability = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ readContent: false }),
+      }),
+    );
+    expect(deniedCapability.status).toBe(200);
+    expect(
+      (await SELF.fetch(notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`))).status,
+    ).toBe(403);
+    expect(
+      (
+        await SELF.fetch(
+          notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ type: "insert_content", insert_content: { content: "" } }),
+          }),
+        )
+      ).status,
+    ).toBe(403);
+    const restoredCapability = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ readContent: true }),
+      }),
+    );
+    expect(restoredCapability.status).toBe(200);
+    const removedGrant = await SELF.fetch(
+      authenticated(installed.cookie, `/api/integrations/${createdIntegration.integration.id}/grants`, {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ rootPageIds: [] }),
+      }),
+    );
+    expect(removedGrant.status).toBe(200);
+    expect(
+      (await SELF.fetch(notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`))).status,
+    ).toBe(404);
+  });
   it("preserves an authored date token through block reads and writes", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);
@@ -690,7 +1067,7 @@ describe("Notion-compatible API", () => {
     );
     await waitOnExecutionContext(context);
 
-    expect(failed.status).toBe(400);
+    expect(failed.status).toBe(503);
     expect(calls.map((call) => call.path)).toEqual([
       expect.stringMatching(/\/api-mutate$/),
       expect.stringMatching(/\/purge$/),

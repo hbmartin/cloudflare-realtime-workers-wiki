@@ -228,6 +228,7 @@ type ApiBlockMutation =
       position?: { type: "start" | "end" | "after_block"; afterInternalId?: string };
     }
   | { type: "update_block"; internalId: string; node: ProseMirrorJson }
+  | { type: "replace_block"; internalId: string; container: ProseMirrorJson }
   | { type: "delete_block"; internalId: string };
 
 function yNode(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {
@@ -373,6 +374,13 @@ function applyApiMutation(document: Y.Doc, operation: ApiBlockMutation) {
   if (!found) throw new Error("block_not_found");
   if (operation.type === "delete_block") {
     found.group.delete(found.index, 1);
+    return;
+  }
+  if (operation.type === "replace_block") {
+    if (operation.container.type !== "blockContainer" || operation.container.attrs?.id !== operation.internalId)
+      throw new Error("invalid_block_replacement");
+    found.group.delete(found.index, 1);
+    found.group.insert(found.index, [yNode(operation.container)]);
     return;
   }
   const children = found.container.toArray();
@@ -935,6 +943,20 @@ export class Document extends YServer {
         headers: { etag: `"${await sha256Hex(canonicalJson(envelope))}"`, "x-notes-content-current": "1" },
       });
     }
+    if (request.method === "GET" && url.pathname.endsWith("/api-mutate-receipt")) {
+      const operationId = url.searchParams.get("operationId");
+      if (!operationId || !/^[A-Za-z0-9:_-]{1,200}$/.test(operationId))
+        return Response.json({ error: "Invalid operation ID." }, { status: 400 });
+      if (!this.document.getMap<string>("api-operation-receipts").has(operationId))
+        return Response.json({ found: false }, { status: 404 });
+      this.flushPendingUpdates();
+      if (this.metadata.dirty) await this.compact();
+      return Response.json({
+        found: true,
+        document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")),
+        sequence: this.metadata.snapshot_seq,
+      });
+    }
     if (request.method === "POST" && url.pathname.endsWith("/api-mutate")) {
       if (this.metadata.content_kind !== "document") {
         return Response.json({ error: "Block mutations are only available for document pages." }, { status: 422 });
@@ -977,6 +999,12 @@ export class Document extends YServer {
       const requestHash = operationId
         ? await sha256Hex(canonicalJson({ actorId: body.actorId, operations: body.operations }))
         : null;
+      if (body.expectedSequence !== undefined) {
+        this.flushPendingUpdates();
+        if (this.metadata.dirty || this.compaction) await this.compact();
+        this.flushPendingUpdates();
+        if (this.metadata.dirty) await this.compact();
+      }
       const receipts = operationId ? this.document.getMap<string>("api-operation-receipts") : null;
       if (operationId && receipts?.has(operationId)) {
         if (receipts.get(operationId) !== requestHash)
@@ -987,6 +1015,13 @@ export class Document extends YServer {
           sequence: this.metadata.snapshot_seq,
         });
       }
+      if (
+        body.expectedSequence !== undefined &&
+        (!Number.isInteger(body.expectedSequence) ||
+          this.metadata.dirty ||
+          this.metadata.snapshot_seq !== body.expectedSequence)
+      )
+        return Response.json({ error: "revision_changed" }, { status: 409 });
       const clone = new Y.Doc();
       Y.applyUpdate(clone, Y.encodeStateAsUpdate(this.document));
       try {
@@ -1026,15 +1061,13 @@ export class Document extends YServer {
       clone.destroy();
       this.flushPendingUpdates();
       if (
-        body.expectedSequence !== undefined &&
-        (this.purged ||
-          this.metadata.retired ||
-          this.metadata.restore_pending ||
-          this.transition ||
-          this.metadata.read_only ||
-          this.metadata.dirty ||
-          this.compaction ||
-          this.metadata.snapshot_seq !== body.expectedSequence)
+        this.purged ||
+        this.metadata.retired ||
+        this.metadata.restore_pending ||
+        this.transition ||
+        this.metadata.read_only ||
+        (body.expectedSequence !== undefined &&
+          (this.metadata.dirty || this.compaction || this.metadata.snapshot_seq !== body.expectedSequence))
       )
         return Response.json({ error: "revision_changed" }, { status: 409 });
       this.pendingAuthorId = body.actorId;

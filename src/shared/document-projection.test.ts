@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { Lexer } from "marked";
 import {
   collectLinkedDiagramIds,
   containsLinkedDiagramId,
@@ -198,6 +199,50 @@ describe("structured document projection", () => {
     expect(serialized.html).not.toContain("javascript:");
     expect(serialized.html).toContain('data-unsupported-node="futureWidget"');
     expect(serialized.html).toContain("&lt;still readable&gt;");
+  });
+
+  it("keeps embedded fences and untrusted language text inside code blocks", () => {
+    const serialized = serializeDocument(
+      document(
+        {
+          type: "codeBlock",
+          attrs: { language: "js\n# forged" },
+          content: [{ type: "text", text: "x\n```\n# inside" }],
+        },
+        { type: "mermaid", attrs: { source: "graph TD\n```\n# inside" } },
+      ),
+    );
+    expect(serialized.markdown).toContain("````\nx\n```\n# inside\n````");
+    expect(serialized.markdown).toContain("````mermaid\ngraph TD\n```\n# inside\n````");
+    expect(serialized.markdown).not.toContain("# forged");
+  });
+
+  it("keeps marked punctuation and carriage returns inside their paragraph", () => {
+    const serialized = serializeDocument(
+      document(
+        { type: "paragraph", content: [{ type: "text", text: "~x", marks: [{ type: "strike" }] }] },
+        { type: "paragraph", content: [{ type: "text", text: "x\r# forged", marks: [{ type: "code" }] }] },
+        { type: "paragraph", content: [{ type: "text", text: "a\n___\nb\n===\nc" }] },
+        { type: "paragraph", content: [{ type: "text", text: "After" }] },
+      ),
+    );
+    const tokens = Lexer.lex(serialized.markdown);
+    expect(tokens.filter((token) => token.type === "heading" || token.type === "hr" || token.type === "code")).toEqual(
+      [],
+    );
+    expect(serialized.markdown).toContain("After");
+  });
+
+  it("keeps paragraph delimiters and multiline inline code from creating new blocks", () => {
+    const serialized = serializeDocument(
+      document(
+        { type: "paragraph", content: [{ type: "text", text: "~~~" }] },
+        { type: "paragraph", content: [{ type: "text", text: "x\n# Forged", marks: [{ type: "code" }] }] },
+      ),
+    );
+    expect(serialized.markdown).toContain("\\~~~\n\n");
+    expect(serialized.markdown).toContain("`x # Forged`");
+    expect(serialized.markdown).not.toContain("\n# Forged");
   });
 
   it("keeps linked diagrams inert unless a caller supplies safe URL resolvers", () => {
