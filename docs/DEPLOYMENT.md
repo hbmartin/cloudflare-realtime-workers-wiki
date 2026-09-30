@@ -189,6 +189,13 @@ hand. Before upgrading an existing installation, take a D1 export and stop any r
 then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
 new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
 
+For OAuth and MCP releases, apply `0062_oauth_mcp.sql`, `0063_oauth_staged_receipt_index.sql`,
+`0064_oauth_cleanup_indexes.sql`, and `0065_mcp_workspace_generation.sql` in order before
+deploying this Worker. Migration `0065` adds a workspace consent generation and a pending-code
+index; it preserves existing grants and document content. Disabling MCP after deployment revokes
+all workspace connections and pending authorization codes. Re-enabling MCP requires clients to
+reconnect.
+
 For the security lifecycle follow-up, apply `0029_security_lifecycle.sql` and then
 `0030_security_review_followups.sql` before deploying the updated Worker. Migration `0030` is compatible
 with the Worker released alongside `0029`, so both migrations can finish before the code rollout. It adds

@@ -501,11 +501,11 @@ async function authorizationRequest(params: URLSearchParams, env: Env): Promise<
 
 async function consentMember(request: Request, env: Env) {
   const member = await requireMember(request, env);
-  const row = await env.DB.prepare("SELECT mcp_enabled FROM workspaces WHERE id=?")
+  const row = await env.DB.prepare("SELECT mcp_enabled,mcp_generation FROM workspaces WHERE id=?")
     .bind(member.workspace.id)
-    .first<{ mcp_enabled: number }>();
+    .first<{ mcp_enabled: number; mcp_generation: number }>();
   if (row?.mcp_enabled !== 1) throw new HttpError(403, "mcp_disabled", "MCP is not enabled for this workspace.");
-  return member;
+  return { ...member, mcpGeneration: row.mcp_generation };
 }
 
 function authorizationRedirect(
@@ -580,15 +580,17 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
   checkBrowserOrigin(request, env);
   await limitAuthorization(request, env);
   const params = await formParams(request);
-  const input = await authorizationRequest(params, env);
-  if (input instanceof Response) return input;
-  let member: MemberContext;
+  // Capture consent before resolving remote client metadata, which may stall
+  // while an owner disables and re-enables MCP.
+  let member: Awaited<ReturnType<typeof consentMember>> | null = null;
   try {
     member = await consentMember(request, env);
   } catch (error) {
     if (!(error instanceof HttpError) || ![401, 403].includes(error.status)) throw error;
-    return authorizationRedirect(input, { error: "access_denied" }, env);
   }
+  const input = await authorizationRequest(params, env);
+  if (input instanceof Response) return input;
+  if (!member) return authorizationRedirect(input, { error: "access_denied" }, env);
   let decision: string;
   try {
     decision = singleton(params, "decision");
@@ -603,8 +605,11 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
   const issued = await env.DB.prepare(
     `INSERT INTO oauth_authorization_codes
       (code_hash,client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge,security_generation,expires_at)
-     SELECT ?,?,?,?,?,?,?,?,generation,? FROM account_security
-      WHERE user_id=? AND recovery_required=0 AND codes_saved=1`,
+     SELECT ?,?,?,?,?,?,?,?,security.generation,? FROM account_security security
+       JOIN workspace_members member ON member.user_id=security.user_id
+       JOIN workspaces workspace ON workspace.id=member.workspace_id
+      WHERE security.user_id=? AND security.recovery_required=0 AND security.codes_saved=1
+        AND workspace.id=? AND workspace.mcp_enabled=1 AND workspace.mcp_generation=?`,
   )
     .bind(
       await sha256(code),
@@ -617,12 +622,14 @@ export async function authorizeOAuthPost(request: Request, env: Env) {
       input.challenge,
       Date.now() + CODE_TTL,
       member.user.id,
+      member.workspace.id,
+      member.mcpGeneration,
     )
     .run();
   if (!issued.meta.changes)
     return authorizationRedirect(
       input,
-      { error: "access_denied", error_description: "Account protection is required." },
+      { error: "access_denied", error_description: "Workspace access or account protection changed. Try again." },
       env,
     );
   return authorizationRedirect(input, { code }, env);
@@ -636,37 +643,49 @@ async function pkceChallenge(verifier: string) {
   return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }
 
-async function issueTokens(
-  env: Env,
-  grantId: string,
-  resource: string,
-  scope: string,
-  familyId: string = crypto.randomUUID(),
-) {
+async function issueTokens(env: Env, codeHash: string, code: CodeRow) {
+  const grantId = crypto.randomUUID();
+  const familyId = crypto.randomUUID();
   const accessToken = randomCredential();
   const refreshToken = randomCredential();
   const now = Date.now();
-  await env.DB.batch([
-    env.DB.prepare("INSERT INTO oauth_access_tokens(token_hash,grant_id,resource,expires_at) VALUES(?,?,?,?)").bind(
-      await sha256(accessToken),
-      grantId,
-      resource,
-      now + ACCESS_TTL,
-    ),
-    env.DB.prepare("INSERT INTO oauth_refresh_tokens(token_hash,grant_id,family_id,expires_at) VALUES(?,?,?,?)").bind(
-      await sha256(refreshToken),
-      grantId,
-      familyId,
-      now + REFRESH_TTL,
-    ),
+  const issued = await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at)
+       SELECT ?,code.client_id,code.user_id,code.workspace_id,code.scopes,code.security_generation,?
+         FROM oauth_authorization_codes code
+         JOIN workspaces workspace ON workspace.id=code.workspace_id
+         JOIN workspace_members member ON member.workspace_id=code.workspace_id AND member.user_id=code.user_id
+         JOIN account_security security ON security.user_id=code.user_id
+        WHERE code.code_hash=? AND code.client_id=? AND code.redirect_uri=? AND code.resource=?
+          AND code.code_challenge=? AND code.consumed_at IS NULL AND code.expires_at>?
+          AND workspace.mcp_enabled=1 AND security.generation=code.security_generation
+          AND security.recovery_required=0 AND security.codes_saved=1`,
+    ).bind(grantId, now, codeHash, code.client_id, code.redirect_uri, code.resource, code.code_challenge, now),
+    // The unique grant identifies this transaction's winning exchange. A failed
+    // token insert rolls back both this consumption and the grant creation.
+    env.DB.prepare(
+      `UPDATE oauth_authorization_codes SET consumed_at=? WHERE code_hash=? AND consumed_at IS NULL
+        AND EXISTS (SELECT 1 FROM oauth_grants WHERE id=?)`,
+    ).bind(now, codeHash, grantId),
+    env.DB.prepare(
+      `INSERT INTO oauth_access_tokens(token_hash,grant_id,resource,expires_at)
+       SELECT ?,id,?,? FROM oauth_grants WHERE id=?`,
+    ).bind(await sha256(accessToken), code.resource, now + ACCESS_TTL, grantId),
+    env.DB.prepare(
+      `INSERT INTO oauth_refresh_tokens(token_hash,grant_id,family_id,expires_at)
+       SELECT ?,id,?,? FROM oauth_grants WHERE id=?`,
+    ).bind(await sha256(refreshToken), familyId, now + REFRESH_TTL, grantId),
   ]);
+  if (issued.some((result) => result.meta.changes !== 1))
+    return oauthError("invalid_grant", "The authorization code is invalid or already used.");
   return json({
     access_token: accessToken,
     token_type: "Bearer",
     expires_in: ACCESS_TTL / 1000,
     refresh_token: refreshToken,
-    scope,
-    resource,
+    scope: code.scopes,
+    resource: code.resource,
   });
 }
 
@@ -693,11 +712,12 @@ async function exchangeCode(params: URLSearchParams, env: Env) {
   const credentialRate = await consumeFixedWindow(env, `oauth-code:${codeHash}`, { window: 60, max: 60 });
   if (!credentialRate.allowed) return oauthError("slow_down", "Authorization code requests are rate limited.", 429);
   const row = await env.DB.prepare(
-    `UPDATE oauth_authorization_codes SET consumed_at=? WHERE code_hash=? AND client_id=?
+    `SELECT client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge,security_generation
+      FROM oauth_authorization_codes WHERE code_hash=? AND client_id=?
       AND redirect_uri=? AND resource=? AND code_challenge=? AND consumed_at IS NULL AND expires_at>?
-      RETURNING client_id,user_id,workspace_id,redirect_uri,resource,scopes,code_challenge,security_generation`,
+    `,
   )
-    .bind(Date.now(), codeHash, clientId, redirectUri, resource, challenge, Date.now())
+    .bind(codeHash, clientId, redirectUri, resource, challenge, Date.now())
     .first<CodeRow>();
   if (!row) return oauthError("invalid_grant", "The authorization code is invalid or already used.");
   const enabled = await env.DB.prepare(
@@ -709,13 +729,7 @@ async function exchangeCode(params: URLSearchParams, env: Env) {
     .bind(row.user_id, row.workspace_id, row.security_generation)
     .first();
   if (!enabled) return oauthError("access_denied", "Workspace access is no longer available.", 403);
-  const grantId = crypto.randomUUID();
-  await env.DB.prepare(
-    "INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at) VALUES(?,?,?,?,?,?,?)",
-  )
-    .bind(grantId, row.client_id, row.user_id, row.workspace_id, row.scopes, row.security_generation, Date.now())
-    .run();
-  return issueTokens(env, grantId, row.resource, row.scopes);
+  return issueTokens(env, codeHash, row);
 }
 
 type RefreshRow = {
@@ -780,7 +794,10 @@ async function refreshGrant(params: URLSearchParams, env: Env) {
          AND consumed_at IS NULL AND expires_at>?
          AND EXISTS (SELECT 1 FROM oauth_grants grant JOIN account_security security
            ON security.user_id=grant.user_id
+           JOIN workspaces workspace ON workspace.id=grant.workspace_id
+           JOIN workspace_members member ON member.workspace_id=grant.workspace_id AND member.user_id=grant.user_id
            WHERE grant.id=oauth_refresh_tokens.grant_id AND grant.revoked_at IS NULL
+             AND workspace.mcp_enabled=1
              AND grant.security_generation=security.generation
              AND security.recovery_required=0 AND security.codes_saved=1)`,
     ).bind(rotatedAt, rotationId, tokenHash, rotatedAt),
@@ -962,9 +979,25 @@ export async function setWorkspaceMcpEnabled(request: Request, env: Env) {
   )
     throw new HttpError(400, "invalid_input", "enabled must be a boolean.");
   const enabled = (source as { enabled: boolean }).enabled;
-  await env.DB.prepare("UPDATE workspaces SET mcp_enabled=? WHERE id=?")
-    .bind(enabled ? 1 : 0, member.workspace.id)
-    .run();
+  const statements = [
+    env.DB.prepare("UPDATE workspaces SET mcp_enabled=?,mcp_generation=mcp_generation+? WHERE id=?").bind(
+      enabled ? 1 : 0,
+      enabled ? 0 : 1,
+      member.workspace.id,
+    ),
+  ];
+  if (!enabled) {
+    statements.push(
+      env.DB.prepare("UPDATE oauth_grants SET revoked_at=? WHERE workspace_id=? AND revoked_at IS NULL").bind(
+        Date.now(),
+        member.workspace.id,
+      ),
+      env.DB.prepare("DELETE FROM oauth_authorization_codes WHERE workspace_id=? AND consumed_at IS NULL").bind(
+        member.workspace.id,
+      ),
+    );
+  }
+  await env.DB.batch(statements);
   return json({ enabled });
 }
 

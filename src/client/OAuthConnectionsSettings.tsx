@@ -46,6 +46,10 @@ export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
     try {
       await api("/api/oauth/workspace", { method: "POST", body: json({ enabled: next }) });
       setEnabled(next);
+      if (!next) {
+        const revokedAt = Date.now();
+        setConnections((current) => current.map((entry) => ({ ...entry, revokedAt: entry.revokedAt ?? revokedAt })));
+      }
       setError("");
     } catch (cause) {
       setError(apiErrorMessage(cause, "MCP access could not be updated."));
@@ -85,15 +89,20 @@ export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
       <h2 id="mcp-connections-title">Connected MCP clients</h2>
       <p>Clients use your current workspace and page permissions. Disconnecting one stops its next request.</p>
       {owner && (
-        <label>
-          <input
-            type="checkbox"
-            checked={enabled}
-            disabled={busy}
-            onChange={(event) => void changeEnabled(event.currentTarget.checked)}
-          />
-          Allow MCP connections in this workspace
-        </label>
+        <>
+          <label>
+            <input
+              type="checkbox"
+              checked={enabled}
+              disabled={busy}
+              onChange={(event) => void changeEnabled(event.currentTarget.checked)}
+            />
+            Allow MCP connections in this workspace
+          </label>
+          <p>
+            Disabling MCP disconnects all clients in this workspace. After re-enabling it, each client must reconnect.
+          </p>
+        </>
       )}
       {error && <p role="alert">{error}</p>}
       {connections.length === 0 ? (

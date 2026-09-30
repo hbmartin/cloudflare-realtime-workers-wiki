@@ -1,7 +1,8 @@
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { z } from "zod";
-import { createCommentThread, type CommentPage } from "./comments";
+import { createCommentThread, protectedCommentBlockIds, type CommentPage } from "./comments";
+import { findDocumentBlock } from "../shared/notion-blocks";
 import { projectNotionMarkdown } from "../shared/notion-markdown";
 import { MarkdownWriteError, parseWritableMarkdown } from "../shared/notion-markdown-write";
 import { markdownMutations } from "../shared/notion-markdown-mutations";
@@ -438,20 +439,13 @@ async function updatePageTool(
     pageHref: (id) => new URL(`/?page=${encodeURIComponent(id)}`, env.BETTER_AUTH_URL).href,
   });
   const command = parseMarkdownCommand(input.command, projection.markdown);
-  const protectedRows = await env.DB.prepare(
-    `SELECT DISTINCT COALESCE(block.internal_id,thread.block_id) internal_id FROM comment_threads thread
-       LEFT JOIN api_blocks block ON (block.id=thread.block_id OR block.internal_id=thread.block_id)
-         AND block.page_id=thread.page_id
-      WHERE thread.page_id=? AND thread.block_id IS NOT NULL`,
-  )
-    .bind(page.id)
-    .all<{ internal_id: string }>();
+  const protectedIds = await protectedCommentBlockIds(env, page.id, envelope.document);
   const operations = markdownMutations(
     envelope.document,
     projection,
     command.edits,
     command.allowDeletingContent,
-    new Set(protectedRows.results.map((row) => row.internal_id)),
+    protectedIds,
   );
   if (!operations.length) return complete(envelope.sequence);
   access = await currentAccess(request, env, ["pages:write"]);
@@ -530,7 +524,25 @@ async function commentTool(
   const cached = await receiptFor(env, access.grantId, input.operation_id, "create_comment", inputHash);
   if (cached) return cached;
   access = await currentAccess(request, env, scopes);
-  const page = await pageForMember(env, access.member, input.page_id);
+  let page = await pageForMember(env, access.member, input.page_id);
+  if (input.block_id !== undefined) {
+    if (page.kind !== "document") throw new HttpError(404, "block_not_found", "The comment block was not found.");
+    const envelope = await roomContent(env, access, page);
+    const block = await env.DB.prepare("SELECT page_id,internal_id,deleted_at FROM api_blocks WHERE id=?")
+      .bind(input.block_id)
+      .first<{ page_id: string; internal_id: string; deleted_at: number | null }>();
+    const internalId = block
+      ? block.page_id === page.id && block.deleted_at === null
+        ? block.internal_id
+        : null
+      : input.block_id;
+    if (!internalId || !findDocumentBlock(envelope.document, internalId))
+      throw new HttpError(404, "block_not_found", "The comment block was not found.");
+    access = await currentAccess(request, env, scopes);
+    page = await pageForMember(env, access.member, input.page_id);
+    if (page.content_epoch !== envelope.contentEpoch)
+      throw new HttpError(409, "page_changed", "The page content version changed.");
+  }
   const scoped: CommentPage = {
     id: page.id,
     workspace_id: page.workspace_id,

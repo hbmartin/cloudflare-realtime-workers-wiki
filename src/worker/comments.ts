@@ -1,5 +1,6 @@
 import { slackThreadFanoutStatements } from "./slack-thread-fanout";
-import type { Comment, CommentAnchor, CommentBody, CommentThread, Role } from "../shared/types";
+import type { Comment, CommentAnchor, CommentBody, CommentThread, ProseMirrorJson, Role } from "../shared/types";
+import { flattenDocumentBlocks } from "../shared/notion-blocks";
 import { ID_PATTERN } from "../shared/validation";
 import type { Env } from "./env";
 import { HttpError } from "./http";
@@ -11,6 +12,35 @@ import { webhookEventStatements } from "./webhooks";
 const COMMENT_BODY_MAX_BYTES = 32 * 1024;
 const COMMENT_BODY_MAX_NODES = 2_000;
 const COMMENT_BODY_MAX_DEPTH = 30;
+
+export async function protectedCommentBlockIds(env: Env, pageId: string, document: ProseMirrorJson) {
+  const liveIds = new Set(flattenDocumentBlocks(document).map((block) => block.internalId));
+  const rows = await env.DB.prepare(
+    `SELECT DISTINCT thread.block_id,block.id public_id,block.internal_id,block.page_id,block.deleted_at
+       FROM comment_threads thread LEFT JOIN api_blocks block ON block.id=thread.block_id
+      WHERE thread.page_id=? AND thread.block_id IS NOT NULL`,
+  )
+    .bind(pageId)
+    .all<{
+      block_id: string;
+      public_id: string | null;
+      internal_id: string | null;
+      page_id: string | null;
+      deleted_at: number | null;
+    }>();
+  const protectedIds = new Set<string>();
+  for (const row of rows.results) {
+    // Public IDs are global; native IDs are scoped to the live document. A
+    // known foreign or deleted public ID must never fall back to a native ID.
+    const internalId = row.public_id
+      ? row.page_id === pageId && row.deleted_at === null
+        ? row.internal_id
+        : null
+      : row.block_id;
+    if (internalId && liveIds.has(internalId)) protectedIds.add(internalId);
+  }
+  return protectedIds;
+}
 
 export type CommentPage = {
   id: string;

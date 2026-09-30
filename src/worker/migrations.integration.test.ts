@@ -6,6 +6,35 @@ import { createAuth } from "./auth";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("upgrades and replays the MCP workspace generation migration without reviving grants or altering content", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0065"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES ('owner','Owner','owner@example.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at,mcp_enabled) VALUES ('workspace','Notes',1,1)"),
+      env.DB.prepare("INSERT INTO workspace_members VALUES ('workspace','owner','owner',1)"),
+      env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+        VALUES ('page','workspace','workspace-general','document','a0','Preserved link','owner',1,1)`),
+      env.DB.prepare("INSERT INTO oauth_clients VALUES ('client','Client','[]',NULL,1,1)"),
+      env.DB.prepare("INSERT INTO oauth_grants VALUES ('grant','client','owner','workspace','pages:read',0,1,123)"),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    await env.DB.prepare("UPDATE workspaces SET mcp_generation=4 WHERE id='workspace'").run();
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      await env.DB.prepare("SELECT mcp_enabled,mcp_generation FROM workspaces WHERE id='workspace'").first(),
+    ).toEqual({ mcp_enabled: 1, mcp_generation: 4 });
+    expect(await env.DB.prepare("SELECT revoked_at FROM oauth_grants WHERE id='grant'").first()).toEqual({
+      revoked_at: 123,
+    });
+    expect(await env.DB.prepare("SELECT title FROM pages WHERE id='page'").first()).toEqual({
+      title: "Preserved link",
+    });
+  });
   it("replays the reminder absence migration after the original reminder table", async () => {
     await applyD1Migrations(
       env.DB,

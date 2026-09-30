@@ -5,6 +5,7 @@ import {
   authorizeOAuthGet,
   authorizeOAuthPost,
   mcpAccess,
+  oauthToken,
   pruneOAuthSecurityRecords,
   registerOAuthClient,
 } from "./oauth";
@@ -12,6 +13,8 @@ import { mcpRequest, pruneStagedMcpPages } from "./mcp";
 import { sha256 } from "./http";
 import { sourceRateLimitKey } from "./source-rate-limit";
 import type { Env } from "./env";
+import { protectedCommentBlockIds } from "./comments";
+import type { DocumentContentEnvelope, ProseMirrorJson } from "../shared/types";
 
 const ORIGIN = "http://example.test";
 const RESOURCE = `${ORIGIN}/mcp`;
@@ -124,6 +127,50 @@ async function connect(cookie: string) {
   return { clientId, grantId, token, ...me, page: tree.pages[0]! };
 }
 
+async function issueCode(cookie: string) {
+  const clientId = await register();
+  const verifier = "v".repeat(43);
+  const params = new URLSearchParams(authorizationParams(clientId));
+  params.set("code_challenge", await challenge(verifier));
+  params.set("decision", "approve");
+  const approval = await SELF.fetch(`${ORIGIN}/oauth/authorize`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  const code = new URL(approval.headers.get("location")!).searchParams.get("code");
+  expect(code).toBeTruthy();
+  return {
+    clientId,
+    codeHash: await sha256(code!),
+    tokenRequest: {
+      grant_type: "authorization_code",
+      client_id: clientId,
+      code: code!,
+      redirect_uri: "http://127.0.0.1:3800/callback",
+      resource: RESOURCE,
+      code_verifier: verifier,
+    },
+  };
+}
+
+function exchangeTokens(request: Record<string, string>) {
+  return SELF.fetch(`${ORIGIN}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: form(request),
+  });
+}
+
+function toggleMcp(cookie: string, enabled: boolean) {
+  return SELF.fetch(`${ORIGIN}/api/oauth/workspace`, {
+    method: "POST",
+    headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+}
+
 async function toolCall(token: string, name: string, args: Record<string, unknown>, bindings: Env = env) {
   const context = createExecutionContext();
   const response = await mcpRequest(
@@ -186,7 +233,391 @@ function failingMutations(status: number, error = "test_rejection"): Env {
   };
 }
 
+function afterDatabaseRead(match: string, action: () => Promise<void>): Env {
+  let intercepted = false;
+  return {
+    ...env,
+    DB: new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+              new Proxy(statement, {
+                get(stmt, method) {
+                  if (method === "bind") return (...values: unknown[]) => wrap(stmt.bind(...values));
+                  if (method === "first")
+                    return async (...args: []) => {
+                      const result = await stmt.first(...args);
+                      if (!intercepted && sql.includes(match)) {
+                        intercepted = true;
+                        await action();
+                      }
+                      return result;
+                    };
+                  const value = Reflect.get(stmt, method);
+                  return typeof value === "function" ? value.bind(stmt) : value;
+                },
+              });
+            return wrap(target.prepare(sql));
+          };
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  };
+}
+
+async function seedCommentBlocks(connection: Awaited<ReturnType<typeof connect>>) {
+  const nativeId = crypto.randomUUID();
+  const nestedId = crypto.randomUUID();
+  const block = (id: string, text: string): ProseMirrorJson => ({
+    type: "blockContainer",
+    attrs: { id },
+    content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+  });
+  const container = block(nativeId, "Parent");
+  container.content!.push({ type: "blockGroup", content: [block(nestedId, "Nested")] });
+  const room = env.DOCUMENT.getByName(`${connection.page.id}~1`);
+  expect(
+    (
+      await room.fetch(
+        new Request("https://document.internal/api-mutate", {
+          method: "POST",
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "content-type": "application/json" },
+          body: JSON.stringify({
+            actorId: connection.user.id,
+            operations: [{ type: "append_children", children: [container] }],
+          }),
+        }),
+      )
+    ).status,
+  ).toBe(200);
+  const snapshot = await (
+    await room.fetch(
+      new Request("https://document.internal/content", {
+        headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+      }),
+    )
+  ).json<DocumentContentEnvelope>();
+  const alias = (await env.DB.prepare("SELECT id FROM api_blocks WHERE page_id=? AND internal_id=?")
+    .bind(connection.page.id, nativeId)
+    .first<{ id: string }>())!.id;
+  return { nativeId, nestedId, alias, snapshot, room };
+}
+
 describe("OAuth MCP foundation", () => {
+  it("rejects an unknown comment block without creating a thread or operation receipt", async () => {
+    const cookie = await bootstrap();
+    const connection = await connect(cookie);
+    const response = await toolCall(connection.token, "create_comment", {
+      page_id: connection.page.id,
+      block_id: crypto.randomUUID(),
+      body: "Unknown block",
+      operation_id: "unknown-block",
+    });
+    expect(response.result).toMatchObject({ isError: true, structuredContent: { error: { code: "block_not_found" } } });
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM comment_threads").first()).toEqual({ count: 0 });
+    expect(
+      await env.DB.prepare(
+        "SELECT operation_id FROM oauth_operation_receipts WHERE operation_id='unknown-block'",
+      ).first(),
+    ).toBeNull();
+  });
+
+  it("rolls back a failed token issuance so the same authorization code can be retried", async () => {
+    const cookie = await bootstrap();
+    const issued = await issueCode(cookie);
+    await env.DB.prepare(`CREATE TRIGGER reject_test_token BEFORE INSERT ON oauth_refresh_tokens
+      BEGIN SELECT RAISE(ABORT,'Injected token failure'); END`).run();
+    expect((await exchangeTokens(issued.tokenRequest)).status).toBe(500);
+    for (const table of ["oauth_grants", "oauth_access_tokens", "oauth_refresh_tokens"])
+      expect(await env.DB.prepare(`SELECT COUNT(*) count FROM ${table}`).first()).toEqual({ count: 0 });
+    expect(
+      await env.DB.prepare("SELECT consumed_at FROM oauth_authorization_codes WHERE code_hash=?")
+        .bind(issued.codeHash)
+        .first(),
+    ).toEqual({ consumed_at: null });
+    await env.DB.prepare("DROP TRIGGER reject_test_token").run();
+    expect((await exchangeTokens(issued.tokenRequest)).status).toBe(200);
+    expect((await exchangeTokens(issued.tokenRequest)).status).toBe(400);
+  });
+
+  it("keeps grants and pending authorization codes revoked across disable and re-enable", async () => {
+    const cookie = await bootstrap();
+    const issued = await issueCode(cookie);
+    const tokenResponse = await exchangeTokens(issued.tokenRequest);
+    expect(tokenResponse.status).toBe(200);
+    const tokens = await tokenResponse.json<{ access_token: string; refresh_token: string }>();
+    const pending = await issueCode(cookie);
+    expect((await toggleMcp(cookie, false)).status).toBe(200);
+    expect((await toggleMcp(cookie, true)).status).toBe(200);
+    expect(
+      await mcpAccess(new Request(RESOURCE, { headers: { authorization: `Bearer ${tokens.access_token}` } }), env),
+    ).toBeNull();
+    expect(
+      (
+        await exchangeTokens({
+          grant_type: "refresh_token",
+          client_id: issued.clientId,
+          refresh_token: tokens.refresh_token,
+          resource: RESOURCE,
+        })
+      ).status,
+    ).toBe(400);
+    expect((await exchangeTokens(pending.tokenRequest)).status).toBe(400);
+    const next = await issueCode(cookie);
+    expect((await exchangeTokens(next.tokenRequest)).status).toBe(200);
+  });
+
+  it("accepts live public and native comment IDs, including nested blocks, and replays after deletion", async () => {
+    const connection = await connect(await bootstrap());
+    const blocks = await seedCommentBlocks(connection);
+    const responses = [];
+    for (const id of [blocks.alias, blocks.nativeId, blocks.nestedId]) {
+      const response = await toolCall(connection.token, "create_comment", {
+        page_id: connection.page.id,
+        body: "Valid comment",
+        block_id: id,
+        operation_id: `comment:${id}`,
+      });
+      expect(response.result.isError).not.toBe(true);
+      responses.push(response);
+    }
+    const blockedEdit = await toolCall(connection.token, "update_page", {
+      page_id: connection.page.id,
+      operation_id: "protect-native-comment",
+      command: { type: "replace_content", replace_content: { new_str: "Replacement", allow_deleting_content: true } },
+    });
+    expect(blockedEdit.result.isError).toBe(true);
+    expect(JSON.stringify(blockedEdit)).toContain("comments or comment anchors");
+    expect(
+      (
+        await blocks.room.fetch(
+          new Request("https://document.internal/api-mutate", {
+            method: "POST",
+            headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, "content-type": "application/json" },
+            body: JSON.stringify({
+              actorId: connection.user.id,
+              operations: [{ type: "delete_block", internalId: blocks.nativeId }],
+            }),
+          }),
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      await toolCall(connection.token, "create_comment", {
+        page_id: connection.page.id,
+        body: "Valid comment",
+        block_id: blocks.alias,
+        operation_id: `comment:${blocks.alias}`,
+      }),
+    ).toEqual(responses[0]);
+    const rejected = await toolCall(connection.token, "create_comment", {
+      page_id: connection.page.id,
+      body: "Deleted target",
+      block_id: blocks.alias,
+      operation_id: "deleted-target",
+    });
+    expect(rejected.result.structuredContent?.error.code).toBe("block_not_found");
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM comment_threads").first()).toEqual({ count: 3 });
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) count FROM oauth_operation_receipts WHERE tool_name='create_comment'",
+      ).first(),
+    ).toEqual({ count: 3 });
+  });
+
+  it("rejects a foreign public ID even when it matches a live native ID and ignores poisoned protection IDs", async () => {
+    const connection = await connect(await bootstrap());
+    const blocks = await seedCommentBlocks(connection);
+    await env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+      SELECT 'foreign-page',workspace_id,space_id,kind,'z9','Other page',created_by,created_at,updated_at FROM pages WHERE id=?`)
+      .bind(connection.page.id)
+      .run();
+    await env.DB.prepare(`INSERT INTO api_blocks(id,page_id,internal_id,content_hash,created_at,updated_at)
+      VALUES (?,'foreign-page','foreign-native','hash',1,1)`)
+      .bind(blocks.nativeId)
+      .run();
+    const rejected = await toolCall(connection.token, "create_comment", {
+      page_id: connection.page.id,
+      body: "Foreign target",
+      block_id: blocks.nativeId,
+      operation_id: "foreign-target",
+    });
+    expect(rejected.result.structuredContent?.error.code).toBe("block_not_found");
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM comment_threads").first()).toEqual({ count: 0 });
+    for (const id of [blocks.alias, blocks.nestedId, blocks.nativeId, "unmatched-raw-id"]) {
+      await env.DB.prepare(`INSERT INTO comment_threads(id,workspace_id,space_id,page_id,created_by,block_id,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,1,1)`)
+        .bind(
+          crypto.randomUUID(),
+          connection.workspace.id,
+          connection.page.spaceId,
+          connection.page.id,
+          connection.user.id,
+          id,
+        )
+        .run();
+    }
+    // Native nested IDs remain valid even when the derived API index is missing.
+    await env.DB.prepare("DELETE FROM api_blocks WHERE page_id=? AND internal_id=?")
+      .bind(connection.page.id, blocks.nestedId)
+      .run();
+    expect(await protectedCommentBlockIds(env, connection.page.id, blocks.snapshot.document)).toEqual(
+      new Set([blocks.nativeId, blocks.nestedId]),
+    );
+    await env.DB.prepare("UPDATE api_blocks SET deleted_at=1 WHERE id=?").bind(blocks.alias).run();
+    expect(await protectedCommentBlockIds(env, connection.page.id, blocks.snapshot.document)).toEqual(
+      new Set([blocks.nestedId]),
+    );
+    await env.DB.prepare("DELETE FROM comment_threads WHERE page_id=?").bind(connection.page.id).run();
+    await env.DB.prepare(`INSERT INTO comment_threads(id,workspace_id,space_id,page_id,created_by,block_id,created_at,updated_at)
+      VALUES ('poisoned',?,?,?,?,?,1,1)`)
+      .bind(connection.workspace.id, connection.page.spaceId, connection.page.id, connection.user.id, blocks.nativeId)
+      .run();
+    const edited = await toolCall(connection.token, "update_page", {
+      page_id: connection.page.id,
+      operation_id: "ignore-foreign-comment",
+      command: { type: "replace_content", replace_content: { new_str: "Replacement", allow_deleting_content: true } },
+    });
+    expect(edited.result.isError).not.toBe(true);
+  });
+
+  it("lets only one concurrent exchange consume a code and leaves the winning grant usable", async () => {
+    const issued = await issueCode(await bootstrap());
+    const responses = await Promise.all([exchangeTokens(issued.tokenRequest), exchangeTokens(issued.tokenRequest)]);
+    expect(responses.map((response) => response.status).sort((left, right) => left - right)).toEqual([200, 400]);
+    const tokens = await responses.find((response) => response.status === 200)!.json<{ access_token: string }>();
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM oauth_grants").first()).toEqual({ count: 1 });
+    expect(
+      await mcpAccess(new Request(RESOURCE, { headers: { authorization: `Bearer ${tokens.access_token}` } }), env),
+    ).not.toBeNull();
+  });
+
+  it.each([
+    "SELECT mcp_enabled,mcp_generation",
+    "SELECT client_id,name,redirect_uris_json,metadata_url,updated_at FROM oauth_clients WHERE client_id=?",
+  ])("rejects consent already in progress across a disable and re-enable cycle during %s", async (query) => {
+    const cookie = await bootstrap();
+    const clientId = await register();
+    const bindings = afterDatabaseRead(query, async () => {
+      expect((await toggleMcp(cookie, false)).status).toBe(200);
+      expect((await toggleMcp(cookie, true)).status).toBe(200);
+    });
+    const response = await authorizeOAuthPost(
+      new Request(`${ORIGIN}/oauth/authorize`, {
+        method: "POST",
+        headers: { cookie, origin: ORIGIN, "content-type": "application/x-www-form-urlencoded" },
+        body: `${authorizationParams(clientId)}&decision=approve`,
+      }),
+      bindings,
+    );
+    expect(new URL(response.headers.get("location")!).searchParams.get("error")).toBe("access_denied");
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM oauth_authorization_codes").first()).toEqual({ count: 0 });
+  });
+
+  it.each(["authorization_code", "refresh_token"])(
+    "rejects an in-flight %s exchange after disabling and re-enabling MCP",
+    async (grantType) => {
+      const cookie = await bootstrap();
+      const issued = await issueCode(cookie);
+      let values: Record<string, string> = issued.tokenRequest;
+      if (grantType === "refresh_token") {
+        const tokens = await (await exchangeTokens(issued.tokenRequest)).json<{ refresh_token: string }>();
+        values = {
+          grant_type: grantType,
+          client_id: issued.clientId,
+          refresh_token: tokens.refresh_token,
+          resource: RESOURCE,
+        };
+      }
+      const bindings = afterDatabaseRead(
+        grantType === "authorization_code" ? "SELECT 1 valid FROM workspace_members member" : "SELECT refresh.grant_id",
+        async () => {
+          expect((await toggleMcp(cookie, false)).status).toBe(200);
+          expect((await toggleMcp(cookie, true)).status).toBe(200);
+        },
+      );
+      const response = await oauthToken(
+        new Request(`${ORIGIN}/oauth/token`, {
+          method: "POST",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: form(values),
+        }),
+        bindings,
+      );
+      expect(response.status).toBe(400);
+      expect(await env.DB.prepare("SELECT COUNT(*) count FROM oauth_grants WHERE revoked_at IS NULL").first()).toEqual({
+        count: 0,
+      });
+      expect(await env.DB.prepare("SELECT COUNT(*) count FROM oauth_access_tokens").first()).toEqual({
+        count: grantType === "refresh_token" ? 1 : 0,
+      });
+    },
+  );
+
+  it("revokes all workspace members' grants atomically without changing other workspaces or previous revocation times", async () => {
+    const cookie = await bootstrap();
+    const connection = await connect(cookie);
+    const issued = await issueCode(cookie);
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES ('other-member','Member','member@example.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspace_members VALUES (?, 'other-member','editor',1)").bind(
+        connection.workspace.id,
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at,mcp_enabled) VALUES ('other-workspace','Other',1,1)"),
+      env.DB.prepare(`INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at,revoked_at)
+        SELECT 'other-member-grant',client_id,'other-member',workspace_id,scopes,security_generation,created_at,NULL FROM oauth_grants WHERE id=?`).bind(
+        connection.grantId,
+      ),
+      env.DB.prepare(`INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at,revoked_at)
+        SELECT 'other-workspace-grant',client_id,user_id,'other-workspace',scopes,security_generation,created_at,NULL FROM oauth_grants WHERE id=?`).bind(
+        connection.grantId,
+      ),
+      env.DB.prepare(`INSERT INTO oauth_grants(id,client_id,user_id,workspace_id,scopes,security_generation,created_at,revoked_at)
+        SELECT 'already-revoked',client_id,user_id,workspace_id,scopes,security_generation,created_at,123 FROM oauth_grants WHERE id=?`).bind(
+        connection.grantId,
+      ),
+    ]);
+    await env.DB.prepare(
+      "CREATE TRIGGER reject_test_disable BEFORE UPDATE ON oauth_grants BEGIN SELECT RAISE(ABORT,'Injected disable failure'); END",
+    ).run();
+    expect((await toggleMcp(cookie, false)).status).toBe(500);
+    expect(
+      await env.DB.prepare("SELECT mcp_enabled,mcp_generation FROM workspaces WHERE id=?")
+        .bind(connection.workspace.id)
+        .first(),
+    ).toEqual({ mcp_enabled: 1, mcp_generation: 0 });
+    expect(
+      await env.DB.prepare("SELECT consumed_at FROM oauth_authorization_codes WHERE code_hash=?")
+        .bind(issued.codeHash)
+        .first(),
+    ).toEqual({ consumed_at: null });
+    await env.DB.prepare("DROP TRIGGER reject_test_disable").run();
+    expect((await toggleMcp(cookie, true)).status).toBe(200);
+    expect(
+      await env.DB.prepare("SELECT revoked_at FROM oauth_grants WHERE id=?").bind(connection.grantId).first(),
+    ).toEqual({ revoked_at: null });
+    expect((await toggleMcp(cookie, false)).status).toBe(200);
+    const rows = (
+      await env.DB.prepare("SELECT id,revoked_at FROM oauth_grants ORDER BY id").all<{
+        id: string;
+        revoked_at: number | null;
+      }>()
+    ).results;
+    expect(rows.find((row) => row.id === "other-workspace-grant")?.revoked_at).toBeNull();
+    expect(rows.find((row) => row.id === "already-revoked")?.revoked_at).toBe(123);
+    for (const id of [connection.grantId, "other-member-grant"])
+      expect(rows.find((row) => row.id === id)?.revoked_at).toBeGreaterThan(123);
+    expect(
+      await env.DB.prepare("SELECT COUNT(*) count FROM oauth_authorization_codes WHERE code_hash=?")
+        .bind(issued.codeHash)
+        .first(),
+    ).toEqual({ count: 0 });
+  });
+
   it("rejects malformed registrations before spending the shared client budget", async () => {
     for (const [contentType, body, status] of [
       ["text/plain", "{}", 415],

@@ -92,4 +92,26 @@ describe("OAuth connection settings", () => {
     expect(mocks.api.mock.calls.filter(([path]) => path === "/api/oauth/connections")).toHaveLength(1);
     expect(mocks.api).toHaveBeenCalledWith("/api/oauth/connections/older", { method: "DELETE" });
   });
+
+  it("shows every loaded connection as disconnected when MCP is disabled and keeps them disconnected on enable", async () => {
+    mocks.api.mockImplementation(async (path: string) => {
+      if (path === "/api/oauth/workspace") return { enabled: true };
+      return path.endsWith("?cursor=next")
+        ? { connections: [older], nextCursor: "last" }
+        : { connections: [recent], nextCursor: "next" };
+    });
+    render(<OAuthConnectionsSettings owner />);
+    fireEvent.click(await screen.findByRole("button", { name: "Load more connections" }));
+    await screen.findByText("Older client");
+    const toggle = screen.getByRole("checkbox", { name: "Allow MCP connections in this workspace" });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(screen.getAllByText(/Disconnected/)).toHaveLength(2));
+    expect(screen.queryByRole("button", { name: "Disconnect" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Load more connections" })).toBeEnabled();
+    expect(screen.getByText(/each client must reconnect/)).toBeInTheDocument();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(screen.getAllByText(/Disconnected/)).toHaveLength(2);
+    expect(mocks.api.mock.calls.filter(([path]) => path === "/api/oauth/connections")).toHaveLength(1);
+  });
 });
