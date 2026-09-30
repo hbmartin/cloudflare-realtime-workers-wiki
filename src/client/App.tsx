@@ -69,6 +69,7 @@ import { SlackSettings } from "./SlackSettings";
 import { ThemeCommand, ThemeControl } from "./ThemeControl";
 import { ShareControl } from "./ShareControl";
 import { IntegrationsSettings } from "./IntegrationsSettings";
+import { OAuthConnectionsSettings } from "./OAuthConnectionsSettings";
 import {
   clearRevokedOfflinePages,
   forgetOfflineAccount,
@@ -1017,6 +1018,17 @@ export function App() {
     if (state.screen === "workspace") return onApiUnauthorized(sessionExpired);
     return undefined;
   }, [sessionExpired, state.screen]);
+
+  useEffect(() => {
+    if (state.screen !== "workspace") return;
+    const authorize = new URLSearchParams(window.location.search).get("oauthAuthorize");
+    if (authorize?.startsWith("/oauth/authorize?")) {
+      const current = new URL(window.location.href);
+      current.searchParams.delete("oauthAuthorize");
+      window.history.replaceState(window.history.state, "", current);
+      window.location.assign(authorize);
+    }
+  }, [state.screen]);
 
   useEffect(() => {
     void load();
@@ -4778,6 +4790,7 @@ function MembersView({ member, spaces, pages }: { member: ClientMemberContext; s
       </div>
       <SecurityScreen settings />
       <SlackSettings owner={member.role === "owner"} spaces={spaces} pages={pages} />
+      <OAuthConnectionsSettings owner={member.role === "owner"} />
       <IntegrationsSettings owner={member.role === "owner"} pages={pages} />
     </main>
   );

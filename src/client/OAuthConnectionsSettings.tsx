@@ -1,0 +1,98 @@
+import { useCallback, useEffect, useState } from "react";
+import { api, apiErrorMessage, json } from "./api";
+
+type Connection = {
+  id: string;
+  clientId: string;
+  name: string;
+  scopes: string[];
+  createdAt: number;
+  revokedAt: number | null;
+};
+
+export function OAuthConnectionsSettings({ owner }: { owner: boolean }) {
+  const [enabled, setEnabled] = useState(false);
+  const [connections, setConnections] = useState<Connection[]>([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    try {
+      const [workspace, grants] = await Promise.all([
+        api<{ enabled: boolean }>("/api/oauth/workspace"),
+        api<{ connections: Connection[] }>("/api/oauth/connections"),
+      ]);
+      setEnabled(workspace.enabled);
+      setConnections(grants.connections);
+      setError("");
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "Connections could not be loaded."));
+    }
+  }, []);
+  useEffect(() => {
+    const timer = window.setTimeout(() => void load(), 0);
+    return () => window.clearTimeout(timer);
+  }, [load]);
+
+  async function changeEnabled(next: boolean) {
+    setBusy(true);
+    try {
+      await api("/api/oauth/workspace", { method: "POST", body: json({ enabled: next }) });
+      setEnabled(next);
+      setError("");
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "MCP access could not be updated."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function revoke(connection: Connection) {
+    if (!confirm(`Disconnect ${connection.name}?`)) return;
+    setBusy(true);
+    try {
+      await api<void>(`/api/oauth/connections/${encodeURIComponent(connection.id)}`, { method: "DELETE" });
+      await load();
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "The connection could not be revoked."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="settings-section" aria-labelledby="mcp-connections-title">
+      <h2 id="mcp-connections-title">Connected MCP clients</h2>
+      <p>Clients use your current workspace and page permissions. Disconnecting one stops its next request.</p>
+      {owner && (
+        <label>
+          <input
+            type="checkbox"
+            checked={enabled}
+            disabled={busy}
+            onChange={(event) => void changeEnabled(event.currentTarget.checked)}
+          />
+          Allow MCP connections in this workspace
+        </label>
+      )}
+      {error && <p role="alert">{error}</p>}
+      {connections.length === 0 ? (
+        <p>No clients connected.</p>
+      ) : (
+        <ul>
+          {connections.map((connection) => (
+            <li key={connection.id}>
+              <strong>{connection.name}</strong> · {connection.scopes.join(", ")}
+              {connection.revokedAt ? (
+                <span> · Disconnected</span>
+              ) : (
+                <button type="button" disabled={busy} onClick={() => void revoke(connection)}>
+                  Disconnect
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}

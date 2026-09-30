@@ -285,13 +285,14 @@ export async function createCommentThread(
   bodyValue: unknown,
   anchor: CommentAnchor | null = null,
   blockId: string | null = null,
+  source?: { threadId: string; commentId: string; receipt: D1PreparedStatement },
 ) {
   if (blockId !== null && !ID_PATTERN.test(blockId)) {
     throw new HttpError(422, "invalid_comment_block", "The comment block is invalid.");
   }
   const body = validatedCommentBody(bodyValue);
-  const threadId = crypto.randomUUID();
-  const commentId = crypto.randomUUID();
+  const threadId = source?.threadId ?? crypto.randomUUID();
+  const commentId = source?.commentId ?? crypto.randomUUID();
   const timestamp = Date.now();
   const mentionedUserIds = commentMentionUserIds(body.body);
   await env.DB.batch([
@@ -349,6 +350,7 @@ export async function createCommentThread(
       createdAt: timestamp,
     }),
     ...refreshPageSearchV2Statements(env.DB, page.id),
+    ...(source ? [source.receipt] : []),
   ]);
   return commentThread(env, member, page, threadId);
 }

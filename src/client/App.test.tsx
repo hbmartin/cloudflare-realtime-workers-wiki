@@ -1111,6 +1111,7 @@ describe("App error handling", () => {
     render(<App />);
     await screen.findByText("Roadmap", { selector: ".breadcrumbs button" });
     const saves = () => save.mock.calls.filter(([key]) => key === "notes:last-page:workspace:user");
+    await waitFor(() => expect(saves()).toHaveLength(1));
     const before = saves().length;
     act(() =>
       dispatchWorkspaceEvent({

@@ -1552,7 +1552,10 @@ export class Document extends YServer {
       let versionKey: string | null = null;
       let versionStatementIndex = -1;
       let pageProjected = false;
-      const effectsSuppressed = suppressExternalEffects && page?.import_job_id?.startsWith("notion-create:") === true;
+      const effectsSuppressed =
+        suppressExternalEffects &&
+        (page?.import_job_id?.startsWith("notion-create:") === true ||
+          page?.import_job_id?.startsWith("mcp:create:") === true);
 
       if (page) {
         const [oldPageTargets, oldUserTargets, watcherRows] = await Promise.all([

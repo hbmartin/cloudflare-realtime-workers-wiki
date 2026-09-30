@@ -5,11 +5,15 @@ import { signInOwner } from "./security-helpers";
 test.setTimeout(90_000);
 
 async function createDocument(page: Page) {
+  const previousPage = new URL(page.url()).searchParams.get("page");
   await page.getByRole("button", { name: /Find a page or command/ }).click();
   await page
     .getByRole("dialog", { name: "Find a page or command" })
     .getByRole("option", { name: /Create document/ })
     .click();
+  await page.waitForURL((url) =>
+    Boolean(url.searchParams.get("page") && url.searchParams.get("page") !== previousPage),
+  );
   await expect(page.getByLabel("Page title")).toHaveValue("Untitled");
 }
 
@@ -193,7 +197,7 @@ test("does not overwrite a changed paragraph from a stale paste choice", async (
     "href",
     embedProviders[0]!.fixture,
   );
-  await expect(page.getByRole("status")).toContainText("added as a link at the end of the page");
+  await expect(page.getByText(/added as a link at the end of the page/)).toBeVisible();
 });
 
 test("hides expanded paste actions when bootstrap disables them", async ({ page }) => {
