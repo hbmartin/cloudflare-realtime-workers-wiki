@@ -1,6 +1,8 @@
 # Phase 6: member-scoped OAuth and MCP
 
-Status: implementation pending. Depends on shared page operations and Phase 5 Markdown output.
+Status: implemented in #206 with review fixes in #209 (merged 30 September 2026) and
+deployed. Migrations `0062` through `0065` are applied. MCP remains disabled until a workspace
+owner enables it; live client discovery, consent, and token rotation are pending.
 
 ## User contract
 

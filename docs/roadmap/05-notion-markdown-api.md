@@ -1,6 +1,8 @@
 # Phase 5: Notion-compatible page Markdown API
 
-Status: implementation pending. Contract fixture: Notion API version `2026-03-11`.
+Status: implemented in #205 (merged 30 September 2026) and deployed with
+`NOTION_MARKDOWN_WRITES_ENABLED=false`. GET is live; PATCH and async tasks wait on the live SDK
+and concurrent-editor pilot. Contract fixture: Notion API version `2026-03-11`.
 
 ## User contract and API contract
 

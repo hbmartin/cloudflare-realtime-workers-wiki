@@ -1,14 +1,16 @@
 # Slack integration roadmap
 
-Status: planned
+Status: Milestones 0–3 shipped; Milestone 4 partial; Milestone 5 not started (audited 1 October 2026 against
+`main` at `2ef1450`)
 
 Scope: product requirements and phased implementation milestones
 
 ## Summary
 
-NoteFlare's current Slack integration supports installation, manual identity linking, slash-command search, link
-unfurls, personal notifications, and one-way channel notifications. This roadmap turns that integration into a
-secure working surface for discussion, search, capture, sharing, and operations.
+When this roadmap was written, NoteFlare's Slack integration supported installation, manual identity linking,
+slash-command search, link unfurls, personal notifications, and one-way channel notifications. This roadmap turns that
+integration into a secure working surface for discussion, search, capture, sharing, and operations. The
+[implementation status](#implementation-status) section records what has since shipped.
 
 The roadmap covers seven related capabilities:
 
@@ -23,6 +25,35 @@ The roadmap covers seven related capabilities:
 The work is deliberately phased around a single bot-scope expansion and workspace reauthorization. New inbound
 features remain disabled until the installation has the required scopes, a member has an explicitly verified Slack
 identity, and an owner opts an existing mapping into the relevant behavior.
+
+## Implementation status
+
+Audited on 1 October 2026 against `main` at `2ef1450`. Milestones are listed in their implementation order.
+
+| Milestone                               | Status         | Evidence and remaining work                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| --------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0 — Secure foundation                   | Shipped        | Better Auth Slack OIDC with implicit linking and signup disabled (`src/worker/auth.ts`). Invite-gated signup, team matching, and the MFA handoff are in place. The schema foundations are in migration `0035_slack_secure_foundation.sql`. Typed `SlackApiContracts` and scope health live in `src/worker/slack.ts`. The manifest already requests every scope below. **Remaining:** deprecate `/notes link`, which still issues legacy links.                                                                                                                                                                                                      |
+| 1 — Bidirectional threads               | Shipped        | Owner mirror opt-in (`PATCH /api/slack/channels/:id/mirror`). `slack_thread_links` and `slack_thread_deliveries` handle outbound delivery. Inbound replies go through `slack_inbound_receipts`, mrkdwn conversion, mention translation, and source suppression (`src/worker/slack-threads.ts`, `slack-thread-fanout.ts`). Migrations `0036`–`0046` add delivery ordering, recovery, and redrive.                                                                                                                                                                                                                                                    |
+| 2 — Interactive workspace               | Shipped        | `POST /api/slack/interactions` acknowledges within a 2.7-second deadline. It handles Resolve/Reopen, Watch, Mute, Snooze (1, 8, or 24 hours), and owner share actions; the search modal (ten-result paging); and the App Home Mentions inbox (`src/worker/slack-workspace.ts`, `slack-blocks.ts`). Interaction receipts are in `slack_interaction_receipts` and `slack_action_commits`.                                                                                                                                                                                                                                                             |
+| 3 — Atomic capture                      | Shipped (#202) | Both shortcuts claim `slack_captures` and publish a hidden staged import only after verification (`src/worker/slack-capture.ts`, `slack-capture-content.ts`; migrations `0053`–`0056`). Live signed-capture verification is tracked in [roadmap Phase 2](roadmap/02-phase2-evidence.md). The shipped modal can also create a **task**; this roadmap describes documents only.                                                                                                                                                                                                                                                                       |
+| 4 — Rich digests and share lifecycle    | Partial        | **Done:** owner-only share creation through the shared share service; `slack_share_references` is written for actionable unfurls. **Absent:** Block Kit digests with changed pages, actors, and unresolved-thread counts. `sendDueSlackChannelDigests` still sends one mrkdwn event list. Also absent: `files.getUploadURLExternal`/`files.completeUploadExternal`, the `slack_file_upload` topic, and writes to `slack_file_artifacts`. The `slack_share_refresh` topic is missing too: `chat.unfurl` runs only on the first unfurl, `revokeShare` in `src/worker/shares.ts` has no Slack hook, and reference lifecycle states are never advanced. |
+| 5 — Operations channel and GA hardening | Not started    | `slack_operations_destinations` and `slack_incidents` exist only as tables from `0035`. Nothing produces incidents, and there is no `slack_ops_alert` topic. No queue consumer reads the delivery DLQs configured in `wrangler.jsonc`, and there is no ops-channel API, UI, or `SlackStatus` field. **Partial:** delivery-health endpoints (`slack_delivery_failures`, `0043`) and mirror disable without uninstalling.                                                                                                                                                                                                                             |
+
+Open gaps outside the milestone list:
+
+- **Channel validation at mapping time.** `upsertSlackChannelSubscription` stores a channel ID without calling
+  `conversations.info`. Validation runs only when mirroring is enabled or an action, share, or capture executes, so
+  one-way notifications can target an unvalidated mapping. This contradicts
+  [§2](#2-channel-and-permission-boundaries).
+- **Durable topics as built.** `slack_thread_reply`, `slack_interaction_response`, and `slack_home_publish` match
+  this plan. The implementation added `slack_inbound_reply`, `slack_thread_action`, `slack_workspace_action`,
+  `slack_unfurl`, `slack_search_update`, `slack_share_response`, `slack_controls_expire`, `slack_capture`,
+  `slack_capture_feedback`, `slack_product_copy` (legacy reconciliation only), and `slack_channel`.
+  `slack_share_refresh`, `slack_file_upload`, and `slack_ops_alert` remain to be built.
+- **Undocumented surface.** `/notes` also supports `new`, `task`, `tasks`, and `task-list`, and capture can target a
+  task. Those flows are covered by `docs/CONFIGURATION.md` rather than this roadmap.
+
+The remaining Milestone 4 and 5 work is scheduled as Round 2 phases in [the phased roadmap](roadmap/README.md).
 
 ## Goals and success criteria
 
@@ -370,9 +401,13 @@ Token refresh remains centralized and all logs pass through existing error redac
 
 ## Slack app manifest and reauthorization
 
+Status: complete. `slack-app-manifest.yaml` and `SLACK_BOT_SCOPES` in `src/worker/slack.ts` already request all eleven
+scopes and four events below, and Slack Settings offers **Reauthorize Slack** when stored scopes are missing. The lists
+are kept as the reference contract.
+
 Request one bot-scope expansion after backward-compatible code is deployed.
 
-Existing bot scopes:
+Original bot scopes:
 
 - `commands`
 - `chat:write`
@@ -409,6 +444,8 @@ on its required scopes.
 
 ### Milestone 0 — Secure foundation and single reauthorization
 
+Status: Shipped.
+
 #### Deliverables
 
 - Better Auth Slack provider with implicit linking disabled.
@@ -426,6 +463,8 @@ not yet reauthorized.
 
 ### Milestone 1 — Canonical bidirectional threads
 
+Status: Shipped.
+
 #### Deliverables
 
 - Owner mirror opt-in and deterministic mapping selection.
@@ -442,6 +481,8 @@ writes.
 
 ### Milestone 2 — Interactive Slack workspace
 
+Status: Shipped.
+
 #### Deliverables
 
 - Reusable Block Kit builders and `/api/slack/interactions`.
@@ -455,6 +496,8 @@ All actions enforce current permissions, modal and App Home navigation remain st
 receipts prevent duplicate mutations, and handlers acknowledge within Slack's deadline.
 
 ### Milestone 3 — Atomic Slack capture
+
+Status: Shipped in #202; live verification pending.
 
 #### Deliverables
 
@@ -471,6 +514,8 @@ and a workflow failure leaves no published partial page.
 
 ### Milestone 4 — Rich digests and share lifecycle
 
+Status: Partial: owner share creation and stored references are done; digests, thumbnails, and refresh remain.
+
 #### Deliverables
 
 - Content-rich, bounded Block Kit digests with unresolved-thread context.
@@ -484,6 +529,8 @@ Digests stay within Slack limits; image failure degrades to text; revoked shares
 unfurl; and private thumbnails never traverse a public endpoint.
 
 ### Milestone 5 — Operations channel and GA hardening
+
+Status: Not started.
 
 #### Deliverables
 

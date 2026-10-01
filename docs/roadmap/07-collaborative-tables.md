@@ -1,6 +1,6 @@
 # Phase 7: collaborative table authority
 
-Status: implementation pending. Must ship before new table views or property types.
+Status: not started. Round 2 candidate; must ship before new table views or property types.
 
 ## User contract
 

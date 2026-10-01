@@ -1,6 +1,6 @@
 # Phase 2 implementation evidence
 
-Baseline: the verified Phase 1 implementation on branch `feat/phase2-slack-capture`. Local verification: 29 September 2026. Production deployment has not been performed, so Phase 2 remains pending in the owner-supplied roadmap.
+Baseline: the verified Phase 1 implementation on branch `feat/phase2-slack-capture`. Local verification: 29 September 2026. The code shipped to production through automatic deployment after #202 merged on 30 September 2026. Phase 2 stays pending until the live checks below pass.
 
 | Exit scenario                                                                          | Evidence                                                                                  |
 | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
@@ -29,4 +29,4 @@ The code reuses NoteFlare's verified Slack identity, import, notification, job, 
 3. Exercise a signed message capture, a private thread capture, a failed job retry through `/?activity=1`, and existing search, App Home, notifications, and unfurls against the deployed Worker. Check that the source receipt and final page IDs agree.
 4. If capture publication fails, disable the two shortcut callbacks with an explicit temporary-unavailable response while leaving search, unfurls, and notifications enabled. Failed jobs retain their receipt for retry after the cause is fixed; staged content is hidden and cleaned on terminal failure.
 
-The owner-supplied `docs/roadmap/README.md` and `docs/roadmap/02-slack-capture.md` are untracked local documents and are deliberately excluded from this branch. Mark Phase 2 shipped in those files only after live verification.
+Status, 1 October 2026: the deploy workflow applied migrations `0053`–`0056` and both shortcut callbacks now use the capture path in production. Step 3 still needs live verification and is tracked in [README.md](README.md#round-1-release-closeout). Mark Phase 2 shipped there once it passes.

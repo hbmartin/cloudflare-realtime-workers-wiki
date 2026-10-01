@@ -1,6 +1,9 @@
 # Phase 4: offline documents
 
-Status: implementation pending. Tables and diagrams remain online in this phase.
+Status: implemented in #204 and #208 (merged 30 September 2026) and deployed with
+`OFFLINE_EDITING_ENABLED=false`. The installable shell and cached catalog ship; offline editing
+waits on the two-device and live reconnection pilot. Tables and diagrams remain online in this
+phase.
 
 ## User contract
 

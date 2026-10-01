@@ -10,6 +10,7 @@ Cloudflare Workers Paid, D1, R2, and two SQLite-backed Durable Object classes.
 | Stand up a new installation                             | [Deployment](DEPLOYMENT.md)                           |
 | Deploy automatically on every push to `main`            | [Continuous deployment](CONTINUOUS_DEPLOYMENT.md)     |
 | Look up a variable, secret, binding, or limit           | [Configuration](CONFIGURATION.md)                     |
+| Turn a feature flag or owner setting on or off          | [Flags and release controls](FLAGS.md)                |
 | Invite members, rotate secrets, inspect the work queues | [Operations](OPERATIONS.md)                           |
 | Import a Notion workspace export                        | [Operations](OPERATIONS.md#importing-a-notion-export) |
 | Diagnose an error code, close code, or failed deploy    | [Troubleshooting](TROUBLESHOOTING.md)                 |

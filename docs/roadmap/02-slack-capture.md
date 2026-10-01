@@ -1,7 +1,9 @@
 # Phase 2: finish Slack capture
 
-Status: implementation pending. The two shortcuts already open live forms; this plan closes the
-remaining Milestone 3 contract in `SLACK_INTEGRATION_ROADMAP.md`.
+Status: implemented in #202 (merged 30 September 2026) and deployed to production with no
+flag, so both shortcuts publish through the new capture path. The live signed-capture checks in
+[02-phase2-evidence.md](02-phase2-evidence.md) are still pending. This plan closed the
+Milestone 3 contract in `SLACK_INTEGRATION_ROADMAP.md`.
 
 ## User contract and baseline audit
 

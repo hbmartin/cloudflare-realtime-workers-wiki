@@ -1,6 +1,7 @@
 # Baseline and dependency map
 
-Status: planning baseline complete on 28 September 2026 at app commit `499af28`.
+Status: Round 1 planning baseline, completed on 28 September 2026 at app commit `499af28`. Rows below
+describe that baseline; for current status see [README.md](README.md).
 Reference: [PARITY.md](../../../PARITY.md), dated 25 September 2026. Refresh this audit if the
 checkout changes before a phase begins; the parity report alone is not an implementation ticket.
 
@@ -16,8 +17,8 @@ checkout changes before a phase begins; the parity report alone is not an implem
 | Public API    | `notion-api.ts` supports versioned `/v1` pages, blocks, comments, search        | Page Markdown GET/PATCH commands and async polling                                     |
 | Tables        | D1 tables, five types, revision checks, 60-second lease                         | DO collaboration first; shared views and core property types afterward                 |
 
-The untracked `IDEAS.md` and `SLACK_INTEGRATION_ROADMAP.md` are user work and remain untouched.
-In particular, the latter's Milestone 3 contract sets the Slack capture target. Existing buttons
+`docs/IDEAS.md` and `docs/SLACK_INTEGRATION_ROADMAP.md` are now tracked alongside this plan. The
+latter's Milestone 3 contract set the Slack capture target, which Phase 2 implemented. Existing buttons
 and routes count as partial implementation only when their complete user flow has been verified.
 
 ## Comparator evidence

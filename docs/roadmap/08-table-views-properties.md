@@ -1,6 +1,6 @@
 # Phase 8: table views and core properties
 
-Status: implementation pending. Requires Phase 7's Table Durable Object and verified D1 projection.
+Status: not started. Requires Phase 7's Table Durable Object and verified D1 projection.
 
 ## User contract
 
