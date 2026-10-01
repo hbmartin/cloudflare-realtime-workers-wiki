@@ -30,14 +30,14 @@ identity, and an owner opts an existing mapping into the relevant behavior.
 
 Audited on 1 October 2026 against `main` at `2ef1450`. Milestones are listed in their implementation order.
 
-| Milestone                               | Status         | Evidence and remaining work                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| --------------------------------------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0 — Secure foundation                   | Shipped        | Better Auth Slack OIDC with implicit linking and signup disabled (`src/worker/auth.ts`). Invite-gated signup, team matching, and the MFA handoff are in place. The schema foundations are in migration `0035_slack_secure_foundation.sql`. Typed `SlackApiContracts` and scope health live in `src/worker/slack.ts`. The manifest already requests every scope below. **Remaining:** deprecate `/notes link`, which still issues legacy links.                                                                                                                                                                                                      |
-| 1 — Bidirectional threads               | Shipped        | Owner mirror opt-in (`PATCH /api/slack/channels/:id/mirror`). `slack_thread_links` and `slack_thread_deliveries` handle outbound delivery. Inbound replies go through `slack_inbound_receipts`, mrkdwn conversion, mention translation, and source suppression (`src/worker/slack-threads.ts`, `slack-thread-fanout.ts`). Migrations `0036`–`0046` add delivery ordering, recovery, and redrive.                                                                                                                                                                                                                                                    |
-| 2 — Interactive workspace               | Shipped        | `POST /api/slack/interactions` acknowledges within a 2.7-second deadline. It handles Resolve/Reopen, Watch, Mute, Snooze (1, 8, or 24 hours), and owner share actions; the search modal (ten-result paging); and the App Home Mentions inbox (`src/worker/slack-workspace.ts`, `slack-blocks.ts`). Interaction receipts are in `slack_interaction_receipts` and `slack_action_commits`.                                                                                                                                                                                                                                                             |
-| 3 — Atomic capture                      | Shipped (#202) | Both shortcuts claim `slack_captures` and publish a hidden staged import only after verification (`src/worker/slack-capture.ts`, `slack-capture-content.ts`; migrations `0053`–`0056`). Live signed-capture verification is tracked in [roadmap Phase 2](roadmap/02-phase2-evidence.md). The shipped modal can also create a **task**; this roadmap describes documents only.                                                                                                                                                                                                                                                                       |
-| 4 — Rich digests and share lifecycle    | Partial        | **Done:** owner-only share creation through the shared share service; `slack_share_references` is written for actionable unfurls. **Absent:** Block Kit digests with changed pages, actors, and unresolved-thread counts. `sendDueSlackChannelDigests` still sends one mrkdwn event list. Also absent: `files.getUploadURLExternal`/`files.completeUploadExternal`, the `slack_file_upload` topic, and writes to `slack_file_artifacts`. The `slack_share_refresh` topic is missing too: `chat.unfurl` runs only on the first unfurl, `revokeShare` in `src/worker/shares.ts` has no Slack hook, and reference lifecycle states are never advanced. |
-| 5 — Operations channel and GA hardening | Not started    | `slack_operations_destinations` and `slack_incidents` exist only as tables from `0035`. Nothing produces incidents, and there is no `slack_ops_alert` topic. No queue consumer reads the delivery DLQs configured in `wrangler.jsonc`, and there is no ops-channel API, UI, or `SlackStatus` field. **Partial:** delivery-health endpoints (`slack_delivery_failures`, `0043`) and mirror disable without uninstalling.                                                                                                                                                                                                                             |
+| Milestone                               | Status                     | Evidence and remaining work                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0 — Secure foundation                   | Shipped                    | Better Auth Slack OIDC with implicit linking and signup disabled (`src/worker/auth.ts`). Invite-gated signup, team matching, and the MFA handoff are in place. The schema foundations are in migration `0035_slack_secure_foundation.sql`. Typed `SlackApiContracts` and scope health live in `src/worker/slack.ts`. The manifest already requests every scope below. **Remaining:** deprecate `/notes link`, which still issues legacy links. |
+| 1 — Bidirectional threads               | Shipped                    | Owner mirror opt-in (`PATCH /api/slack/channels/:id/mirror`). `slack_thread_links` and `slack_thread_deliveries` handle outbound delivery. Inbound replies go through `slack_inbound_receipts`, mrkdwn conversion, mention translation, and source suppression (`src/worker/slack-threads.ts`, `slack-thread-fanout.ts`). Migrations `0036`–`0046` add delivery ordering, recovery, and redrive.                                               |
+| 2 — Interactive workspace               | Shipped                    | `POST /api/slack/interactions` acknowledges within a 2.7-second deadline. It handles Resolve/Reopen, Watch, Mute, Snooze (1, 8, or 24 hours), and owner share actions; the search modal (ten-result paging); and the App Home Mentions inbox (`src/worker/slack-workspace.ts`, `slack-blocks.ts`). Interaction receipts are in `slack_interaction_receipts` and `slack_action_commits`.                                                        |
+| 3 — Atomic capture                      | Shipped (#202)             | Both shortcuts claim `slack_captures` and publish a hidden staged import only after verification (`src/worker/slack-capture.ts`, `slack-capture-content.ts`; migrations `0053`–`0056`). Live signed-capture verification is tracked in [roadmap Phase 2](roadmap/02-phase2-evidence.md). The shipped modal can also create a **task**; this roadmap describes documents only.                                                                  |
+| 4 — Rich digests and share lifecycle    | Implemented locally; gated | Round 2 adds validated channel selection, saved daily schedules, canonical Activity/Open work, grouped digests, private PNG uploads, transactional share refreshes and delivery reconciliation. Production controls remain off pending the [Phase 9 live exit matrix](roadmap/09-slack-digests-shares.md#exit-matrix).                                                                                                                         |
+| 5 — Operations channel and GA hardening | Not started                | `slack_operations_destinations` and `slack_incidents` exist only as tables from `0035`. Nothing produces incidents, and there is no `slack_ops_alert` topic. No queue consumer reads the delivery DLQs configured in `wrangler.jsonc`, and there is no ops-channel API, UI, or `SlackStatus` field. **Partial:** delivery-health endpoints (`slack_delivery_failures`, `0043`) and mirror disable without uninstalling.                        |
 
 Open gaps outside the milestone list:
 
@@ -272,32 +272,65 @@ import.
 
 ### 6. Content-rich digests and honest shares
 
+The approved Round 2 contract and exit matrix are in [Phase 9](roadmap/09-slack-digests-shares.md). Operations alerts
+remain Phase 10.
+
+#### Channels, schedules, and workspace Activity
+
+- Owners choose joined, unarchived public/private channels with a searchable paginated picker. Reject all shared
+  channels, DMs and MPIMs, including existing mappings. Slack supplies canonical names. Validate create/update and
+  delivery, then revalidate every 15 minutes. Successful checks automatically resume delivery while preserving
+  owner mute/snooze and mirror opt-in; Settings shows specific health reasons.
+- Save an editable daily time, IANA timezone and open-work toggle per digest mapping. Migrate to 09:00 in the
+  operator-supplied `SLACK_DIGEST_DEFAULT_TIMEZONE`; persist the default so later operator changes affect new mappings
+  only. Missing/invalid configuration prevents new digest activation. Include weekends and use existing DST
+  resolution: earlier repeated occurrence, first valid minute after a gap.
+- Send the latest scheduled window only, on the first scheduler tick after the boundary. Drop older missed windows;
+  schedule edits begin at the next future boundary. Mute/snooze discards paused channel activity while retaining
+  canonical workspace history.
+- Add page creation, moves, archives and task status changes to the five existing channel selections, enabled on
+  migration and by default on new mappings. Owners may deselect them in either cadence. Personal notification
+  preferences stay separate. Continue suppressing comment activity already mirrored into the channel.
+- Activity is a workspace-member sidebar destination independent of Slack. Its chronological cursor-paginated feed
+  defaults to seven days and filters by space/page/event. Open work shows current unresolved comments and unfinished
+  tasks regardless of age. Record successful mutations from every publication path after activation, deduplicate
+  retries, retain metadata for 30 days and enforce current access on every request.
+
 #### Digests
 
-- Replace event-count text with bounded Block Kit groups describing changed pages, actors, change types, unresolved
-  thread counts, and NoteFlare links.
-- Read digest content from the current D1 projections at send time and re-check that the subscription, page, and space
-  remain eligible.
-- Respect Slack block and text limits with deterministic truncation and a final “Open in NoteFlare” continuation link.
-- For diagrams, load the existing private SVG thumbnail and upload it with
-  [`files.getUploadURLExternal`](https://docs.slack.dev/reference/methods/files.getUploadURLExternal/) followed by
-  `files.completeUploadExternal`.
-- Cache Slack file IDs by installation, page, epoch, and content hash. If generation or upload fails, send the text
-  digest and record the thumbnail failure rather than failing the entire digest.
-- Never place a private diagram thumbnail behind a temporary public URL.
+- Group qualifying activity by page, showing link, distinct actor names without pings, change types, current task
+  status, unresolved-comment count and a current plain-text excerpt. Default bounds are 240 excerpt characters,
+  five actors plus the remaining count, and ten pages in one message with escaped bounded Slack text.
+- With open-work enabled by default, include unchanged pages with unresolved comments or tasks in To do/In progress,
+  marked “No new activity.” Send nothing on quiet days with no open work. Changed pages sort by newest activity,
+  then unchanged open work by unresolved count; page ID breaks ties deterministically.
+- Archived/moved-out pages receive departure notices with authorized current titles or generic wording; omit
+  excerpts and thumbnails. End every digest with the deployed Activity mapping-filtered continuation link. That
+  live overview includes recent activity and current open work with access to both tabs; mapping IDs grant no access.
+- Prepare private diagram SVG projections asynchronously as PNG using `BROWSER`, then upload privately through typed
+  `files.getUploadURLExternal` and `files.completeUploadExternal`. Ready images use `slack_file.id`. Cache by
+  installation generation, page, epoch and content hash, allowing multiple revisions per epoch. Missing/failed
+  images send text immediately; never edit posted digests later or expose R2 objects publicly.
+- Durable digest receipts fence installation generation, mapping and boundary. Use claims, message metadata and
+  history reconciliation after uncertain posts/checkpoint failures. Unresolved uncertainty stays blocked and
+  visible; retries honor Slack Retry-After and cannot blindly duplicate delivery.
 
 #### Share lifecycle
 
-- Only a current NoteFlare workspace owner may create a public share from an unfurl action.
-- Reuse the existing share service and its one-active-share behavior instead of creating a Slack-specific share path.
-- Store the installation, channel, message timestamp, unfurled URL, page ID, and share ID for every actionable share
-  attachment.
-- Refresh the original user-authored message attachment with
-  [`chat.unfurl`](https://docs.slack.dev/reference/methods/chat.unfurl/) when a share is created or revoked.
-- Do not use `chat.update` on the original user message; that API can update only messages authored by the
-  authenticated bot or user.
-- Re-check owner status and page visibility when the action is accepted and when its queued refresh executes.
-- A revoked attachment clearly says that public access was revoked and no longer presents the old URL as active.
+- Only current workspace owners may perform share actions; reuse NoteFlare's shared share service. Track both page
+  links and direct public-share URLs in valid mapped channels, with observer/provenance and lifecycle revision.
+- Queue initial tracked unfurls and all share/availability transitions transactionally. Create/revoke from Slack or
+  NoteFlare, page archive/delete/move, mapping changes, membership/role changes and space-access changes trigger
+  refreshes. Preserve cleanup targets before cascades. No periodic lifecycle sweep; recover already queued work.
+- Serialize effects per message/reference and reread current state. Active previews keep existing share actions.
+  Revoked previews retain authorized title/excerpt, state revocation, remove active URLs and offer owner-only Create
+  share. Access loss renders generic unavailable text without actions, including cleanup after mapping removal or
+  owner demotion while the bot retains channel access.
+- Old direct public-share URLs stay revoked after replacements; page-link previews may show the replacement.
+  Repeated [`chat.unfurl`](https://docs.slack.dev/reference/methods/chat.unfurl/) updates attachments. Never use
+  `chat.update` on the original user message. Permanent rejections for existing accessible messages produce one
+  bot thread fallback per transition; missing/deleted originals do not. Use durable fallback receipts and reconcile
+  uncertain post outcomes before retries.
 
 ### 7. Separate operations channel
 
@@ -514,11 +547,12 @@ and a workflow failure leaves no published partial page.
 
 ### Milestone 4 — Rich digests and share lifecycle
 
-Status: Partial: owner share creation and stored references are done; digests, thumbnails, and refresh remain.
+Status: implemented locally behind production controls initially off; deployed validation and live exit gates remain.
 
 #### Deliverables
 
-- Content-rich, bounded Block Kit digests with unresolved-thread context.
+- Strict channel picker/validation, saved daily schedules, and canonical workspace Activity/Open work.
+- Content-rich, bounded Block Kit digests with unresolved-thread and unfinished-task context.
 - Slack-hosted diagram thumbnails with content-hash caching and text fallback.
 - Owner-only share creation and stored unfurl lifecycle references.
 - Unfurl refresh on share creation and revocation.
@@ -526,7 +560,12 @@ Status: Partial: owner share creation and stored references are done; digests, t
 #### Exit gate
 
 Digests stay within Slack limits; image failure degrades to text; revoked shares are visibly marked in every stored
-unfurl; and private thumbnails never traverse a public endpoint.
+unfurl; private thumbnails never traverse a public endpoint; and all scheduling, activity, permissions and delivery
+recovery scenarios in the [Phase 9 exit matrix](roadmap/09-slack-digests-shares.md#exit-matrix) pass against the deployed
+Worker. Review increments: channel settings/validation, activity recording/feed, queued share lifecycle, then rich
+digests/thumbnails. Run a channel backfill dry-run and configure the operator timezone before strict activation.
+Separate controls gate Activity, strict validation, share refresh and rich rendering. Disabling rich rendering retains
+text digests, scheduling, validation and receipts.
 
 ### Milestone 5 — Operations channel and GA hardening
 

@@ -1,3 +1,4 @@
+import type { ChannelEventType } from "./activity";
 import type { PageKind } from "./page-kind";
 
 export type { PageKind } from "./page-kind";
@@ -52,7 +53,7 @@ export type MemberContext = {
 };
 
 export type ClientMemberContext = Omit<MemberContext, "session"> & {
-  features?: { expandedEmbeds: boolean; offlineEditing?: boolean };
+  features?: { expandedEmbeds: boolean; offlineEditing?: boolean; workspaceActivity?: boolean };
 };
 
 export type Page = {
@@ -228,7 +229,36 @@ export type SlackCapabilityHealth = {
   missingScopes: string[];
 };
 
+export type SlackChannelSubscription = {
+  id: string;
+  spaceId: string;
+  pageId: string | null;
+  channelId: string;
+  channelName: string;
+  eventTypes: ChannelEventType[];
+  digestTime: string;
+  digestTimezone: string | null;
+  digestOpenWork: boolean;
+  nextDigestAt: number | null;
+  cadence: "immediate" | "digest";
+  channelType?: "public_channel" | "private_channel" | "im" | "mpim" | null;
+  validationState?: "unvalidated" | "valid" | "invalid";
+  validatedAt?: number | null;
+  validationError?: string | null;
+  botIsMember?: boolean | null;
+  mirrorEnabled?: boolean;
+  blockedDeliveries?: number;
+  waitingDeliveries?: number;
+  failedDeliveries?: number;
+  notificationBlockedAt?: number | null;
+  notificationError?: string | null;
+  controlsError?: string | null;
+  mutedAt?: number | null;
+  snoozedUntil?: number | null;
+};
+
 export type SlackStatus = {
+  round2?: { channels: boolean; shares: boolean; richDigests: boolean; defaultTimezone: string | null };
   available: boolean;
   missing: string[];
   installation: {

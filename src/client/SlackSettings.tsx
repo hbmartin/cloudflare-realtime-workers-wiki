@@ -1,5 +1,13 @@
+import { SlackChannelPicker } from "./SlackChannelPicker";
+import { ACTIVITY_LABELS, CHANNEL_EVENT_TYPES } from "../shared/activity";
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
-import type { NotificationEventType, Page, SlackStatus, Space } from "../shared/types";
+import type {
+  NotificationEventType,
+  Page,
+  SlackChannelSubscription as ChannelSubscription,
+  SlackStatus,
+  Space,
+} from "../shared/types";
 import { api, apiErrorMessage, authClient, json } from "./api";
 
 const EVENT_OPTIONS: Array<{ value: NotificationEventType; label: string }> = [
@@ -9,30 +17,6 @@ const EVENT_OPTIONS: Array<{ value: NotificationEventType; label: string }> = [
   { value: "thread_reopened", label: "Reopened threads" },
   { value: "page_edit", label: "Page edits" },
 ];
-
-type ChannelSubscription = {
-  id: string;
-  spaceId: string;
-  pageId: string | null;
-  channelId: string;
-  channelName: string;
-  eventTypes: NotificationEventType[];
-  cadence: "immediate" | "digest";
-  channelType?: "public_channel" | "private_channel" | "im" | "mpim" | null;
-  validationState?: "unvalidated" | "valid" | "invalid";
-  validatedAt?: number | null;
-  validationError?: string | null;
-  botIsMember?: boolean | null;
-  mirrorEnabled?: boolean;
-  blockedDeliveries?: number;
-  waitingDeliveries?: number;
-  failedDeliveries?: number;
-  notificationBlockedAt?: number | null;
-  notificationError?: string | null;
-  controlsError?: string | null;
-  mutedAt?: number | null;
-  snoozedUntil?: number | null;
-};
 
 function removeLinkToken() {
   const url = new URL(window.location.href);
@@ -192,7 +176,9 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
     event.preventDefault();
     const form = event.currentTarget;
     const values = new FormData(form);
-    const eventTypes = EVENT_OPTIONS.filter(({ value }) => values.has(`event:${value}`)).map(({ value }) => value);
+    const eventTypes = (status?.round2?.channels ? CHANNEL_EVENT_TYPES.map((value) => ({ value })) : EVENT_OPTIONS)
+      .filter(({ value }) => values.has(`event:${value}`))
+      .map(({ value }) => value);
     setBusy(true);
     setError("");
     try {
@@ -202,9 +188,16 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
           spaceId: resolvedSpaceId,
           pageId: String(values.get("pageId") ?? "") || null,
           channelId: String(values.get("channelId") ?? ""),
-          channelName: String(values.get("channelName") ?? ""),
+          ...(status?.round2?.channels ? {} : { channelName: String(values.get("channelName") ?? "") }),
           cadence: String(values.get("cadence") ?? "immediate"),
           eventTypes,
+          ...(status?.round2?.channels
+            ? {
+                digestTime: String(values.get("digestTime") ?? "09:00"),
+                ...(values.get("digestTimezone") ? { digestTimezone: String(values.get("digestTimezone")) } : {}),
+                digestOpenWork: values.has("digestOpenWork"),
+              }
+            : {}),
         }),
       });
       form.reset();
@@ -413,25 +406,60 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                   ))}
                 </select>
               </label>
-              <label>
-                Channel ID
-                <input name="channelId" placeholder="C0123456789" maxLength={30} required />
-              </label>
-              <label>
-                Channel name
-                <input name="channelName" placeholder="product-notes" maxLength={100} required />
-              </label>
+              {status?.round2?.channels ? (
+                <SlackChannelPicker />
+              ) : (
+                <>
+                  <label>
+                    Channel ID
+                    <input name="channelId" placeholder="C0123456789" maxLength={30} required />
+                  </label>
+                  <label>
+                    Channel name
+                    <input name="channelName" placeholder="product-notes" maxLength={100} required />
+                  </label>
+                </>
+              )}
               <label>
                 Cadence
                 <select name="cadence" defaultValue="immediate">
                   <option value="immediate">Immediate</option>
-                  <option value="digest">Daily digest at 09:00 UTC</option>
+                  <option value="digest">
+                    {status?.round2?.channels ? "Daily digest" : "Daily digest at 09:00 UTC"}
+                  </option>
                 </select>
               </label>
             </div>
+            {status?.round2?.channels && (
+              <div className="slack-field-grid">
+                <label>
+                  Daily send time
+                  <input type="time" name="digestTime" defaultValue="09:00" required />
+                </label>
+                <label>
+                  Digest timezone
+                  <input
+                    name="digestTimezone"
+                    defaultValue={status.round2.defaultTimezone ?? ""}
+                    placeholder="Operator default timezone"
+                    maxLength={100}
+                  />
+                </label>
+                <label>
+                  <input type="checkbox" name="digestOpenWork" defaultChecked /> Include unresolved comments and
+                  unfinished tasks
+                </label>
+                {!status.round2.defaultTimezone && (
+                  <p>The operator must configure a default timezone before enabling digests.</p>
+                )}
+              </div>
+            )}
             <fieldset className="slack-event-options">
               <legend>Events</legend>
-              {EVENT_OPTIONS.map((option) => (
+              {(status?.round2?.channels
+                ? CHANNEL_EVENT_TYPES.map((value) => ({ value, label: ACTIVITY_LABELS[value] }))
+                : EVENT_OPTIONS
+              ).map((option) => (
                 <label key={option.value}>
                   <input name={`event:${option.value}`} type="checkbox" defaultChecked /> {option.label}
                 </label>
@@ -459,6 +487,13 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       {page ? ` / ${page.title}` : " / all pages"} · {subscription.cadence}
                     </p>
                     <p>{subscription.mirrorEnabled ? "Thread mirror enabled" : "One-way notifications"}</p>
+                    {status?.round2?.channels && <SlackMappingEditor subscription={subscription} onSaved={load} />}
+                    {subscription.nextDigestAt && subscription.cadence === "digest" && (
+                      <p>
+                        Next digest: {new Date(subscription.nextDigestAt).toLocaleString()} (
+                        {subscription.digestTimezone})
+                      </p>
+                    )}
                     {subscription.mutedAt !== null && subscription.mutedAt !== undefined ? (
                       <p>Muted until you unmute this mapping.</p>
                     ) : subscription.snoozedUntil !== null &&
@@ -467,12 +502,16 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       <p>Snoozed until {new Date(subscription.snoozedUntil).toLocaleString()}.</p>
                     ) : null}
                     {subscription.validationState === "invalid" && (
-                      <p>Channel validation failed. Check bot membership and channel access.</p>
+                      <p>
+                        Channel validation failed:{" "}
+                        {subscription.validationError?.replaceAll("_", " ") ?? "channel unavailable"}. Delivery resumes
+                        automatically when access is restored.
+                      </p>
                     )}
                     {subscription.notificationBlockedAt && (
                       <output>
-                        One-way notifications are blocked because the bot cannot use this channel. Pending updates were
-                        discarded.
+                        Channel delivery is paused because the bot cannot use this channel. Access is checked every 15
+                        minutes.
                       </output>
                     )}
                     {subscription.controlsError === "no_authorized_owner" && (
@@ -482,8 +521,8 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                     )}
                     {Boolean(subscription.blockedDeliveries) && (
                       <output>
-                        {subscription.blockedDeliveries} thread deliveries need reconciliation. Later replies are
-                        waiting to prevent duplicates.
+                        {subscription.blockedDeliveries} deliveries need reconciliation. Unconfirmed messages stay
+                        blocked to prevent duplicates.
                       </output>
                     )}
                     {Boolean(subscription.waitingDeliveries) && (
@@ -599,5 +638,76 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
           </article>
         ))}
     </section>
+  );
+}
+
+function SlackMappingEditor({
+  subscription,
+  onSaved,
+}: {
+  subscription: ChannelSubscription;
+  onSaved: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function save(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/api/slack/channels/${encodeURIComponent(subscription.id)}`, {
+        method: "PATCH",
+        body: json({
+          cadence: String(data.get("cadence")),
+          digestTime: String(data.get("digestTime")),
+          ...(data.get("digestTimezone") ? { digestTimezone: String(data.get("digestTimezone")) } : {}),
+          digestOpenWork: data.has("digestOpenWork"),
+          eventTypes: CHANNEL_EVENT_TYPES.filter((t) => data.has(`event:${t}`)),
+        }),
+      });
+      await onSaved();
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "Mapping could not be updated."));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <details>
+      <summary>Edit schedule and events</summary>
+      <form onSubmit={save}>
+        <label>
+          Cadence
+          <select name="cadence" defaultValue={subscription.cadence}>
+            <option value="immediate">Immediate</option>
+            <option value="digest">Daily digest</option>
+          </select>
+        </label>
+        <label>
+          Daily send time
+          <input type="time" name="digestTime" defaultValue={subscription.digestTime ?? "09:00"} required />
+        </label>
+        <label>
+          Digest timezone
+          <input name="digestTimezone" defaultValue={subscription.digestTimezone ?? ""} maxLength={100} />
+        </label>
+        <label>
+          <input type="checkbox" name="digestOpenWork" defaultChecked={subscription.digestOpenWork} />
+          Include unresolved comments and unfinished tasks
+        </label>
+        <fieldset>
+          <legend>Events</legend>
+          {CHANNEL_EVENT_TYPES.map((t) => (
+            <label key={t}>
+              <input type="checkbox" name={`event:${t}`} defaultChecked={subscription.eventTypes.includes(t)} />
+              {ACTIVITY_LABELS[t]}
+            </label>
+          ))}
+        </fieldset>
+        {error && <p role="alert">{error}</p>}
+        <button disabled={busy}>Save mapping settings</button>
+      </form>
+    </details>
   );
 }

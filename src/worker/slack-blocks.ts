@@ -1,8 +1,108 @@
 import type { Task } from "../shared/tasks";
-import { TASK_STATUS_LABELS } from "../shared/tasks";
+
 import type { Notification } from "../shared/types";
 import type { SearchResponse } from "../shared/types";
 import type { MentionCursor } from "./mentions-inbox";
+import { ACTIVITY_LABELS, type ChannelEventType } from "../shared/activity";
+import { TASK_STATUS_LABELS, type TaskStatus } from "../shared/tasks";
+
+export type DigestPage = {
+  pageId: string;
+  title: string;
+  excerpt: string;
+  actors: string[];
+  actorCount: number;
+  eventTypes: ChannelEventType[];
+  unresolvedThreads: number;
+  taskStatus: TaskStatus | null;
+  changedAt: number;
+  departure: boolean;
+  available: boolean;
+  fileId?: string;
+};
+export function digestBlocks(pages: DigestPage[], origin: string, mappingId: string, rich = true) {
+  const blocks: unknown[] = [{ type: "header", text: { type: "plain_text", text: "NoteFlare daily digest" } }];
+  for (const page of pages.slice(0, 10)) {
+    const title = page.available ? digestText(page.title, 300) : "A page is no longer available";
+    const heading =
+      page.available && !page.departure
+        ? `*<${origin}/?page=${encodeURIComponent(page.pageId)}|${title}>*`
+        : `*${title}*`;
+    const changes = page.departure
+      ? page.eventTypes.includes("page_archived")
+        ? "Page archived"
+        : "Page left this mapping"
+      : page.eventTypes.length
+        ? page.eventTypes.map((t) => ACTIVITY_LABELS[t]).join(" · ")
+        : "No new activity";
+    const actors = page.actors
+      .slice(0, 5)
+      .map((n) => digestText(Array.from(n).slice(0, 80).join(""), 120))
+      .join(", ");
+    const extra = page.actorCount > 5 ? ` and ${page.actorCount - 5} others` : "";
+    const metadata = [
+      digestText(changes, 300),
+      actors ? `${actors}${extra}` : "",
+      page.taskStatus ? TASK_STATUS_LABELS[page.taskStatus] : "",
+      `${page.unresolvedThreads} unresolved thread${page.unresolvedThreads === 1 ? "" : "s"}`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        verbatim: true,
+        text: `${heading}\n${metadata}${page.excerpt && !page.departure ? `\n${digestText(Array.from(page.excerpt).slice(0, 240).join(""), 600)}` : ""}`,
+      },
+    });
+    if (rich && page.fileId && !page.departure && page.available)
+      blocks.push({
+        type: "image",
+        slack_file: { id: page.fileId },
+        alt_text: Array.from(`Diagram: ${page.title}`).slice(0, 1000).join(""),
+      });
+  }
+  blocks.push({
+    type: "context",
+    elements: [
+      {
+        type: "mrkdwn",
+        verbatim: true,
+        text: `<${origin}/?view=activity&mapping=${encodeURIComponent(mappingId)}|Open activity and open work in NoteFlare>`,
+      },
+    ],
+  });
+  return blocks;
+}
+
+// Bound the escaped output as well as the source, including pathological names/excerpts.
+function digestText(value: string, max: number) {
+  let result = "";
+  for (const char of value) {
+    const escaped =
+      char === "&"
+        ? "&amp;"
+        : char === "<"
+          ? "&lt;"
+          : char === ">"
+            ? "&gt;"
+            : char === "|"
+              ? "¦"
+              : char === "*"
+                ? "∗"
+                : char === "_"
+                  ? "＿"
+                  : char === "~"
+                    ? "～"
+                    : char === "`"
+                      ? "ˋ"
+                      : char;
+    if (result.length + escaped.length > max) break;
+    result += escaped;
+  }
+  return result;
+}
 
 export function safeSlackText(value: string, max = 3000) {
   return value

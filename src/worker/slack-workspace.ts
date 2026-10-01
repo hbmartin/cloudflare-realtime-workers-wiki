@@ -1399,11 +1399,9 @@ async function deliverShareAction(
     ];
     if (context.referenceId)
       statements.push(
-        env.DB.prepare(`UPDATE slack_share_references SET share_link_id = ?, updated_at = ? WHERE id = ?`).bind(
-          shareId,
-          Date.now(),
-          context.referenceId,
-        ),
+        env.DB.prepare(
+          `UPDATE slack_share_references SET share_link_id = CASE WHEN reference_kind='page' THEN ? ELSE share_link_id END, updated_at = ? WHERE id = ?`,
+        ).bind(shareId, Date.now(), context.referenceId),
       );
     if (context.linkId && isCreate) {
       const refreshId = `${context.linkId}:refresh:${receiptId}`;

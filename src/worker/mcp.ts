@@ -1,3 +1,4 @@
+import { syncRound2Configuration } from "./slack-channels";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { z } from "zod";
@@ -831,6 +832,7 @@ export async function mcpRequest(request: Request, env: Env, context: Background
         "cache-control": "no-store",
       },
     });
+  await syncRound2Configuration(env);
   const handler = createMcpHandler(() => serverFor(request, env, context, access), {
     legacy: "reject",
     responseMode: "json",

@@ -1,4 +1,12 @@
-import type { NotificationEventType, SlackCapability, SlackCapabilityHealth, SlackStatus } from "../shared/types";
+import type { ChannelEventType } from "../shared/activity";
+import { defaultDigestTimezone, digestWindow, channelInvalidReason } from "./slack-schedule";
+import type {
+  NotificationEventType,
+  SlackCapability,
+  SlackCapabilityHealth,
+  SlackChannelSubscription,
+  SlackStatus,
+} from "../shared/types";
 import { tracing } from "cloudflare:workers";
 import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256 } from "../shared/security";
 import type { Env, MemberContext } from "./env";
@@ -188,6 +196,21 @@ export type SlackApiContracts = {
       };
     };
   };
+  "conversations.list": {
+    input: { types: string; exclude_archived: boolean; limit: number; cursor?: string };
+    output: {
+      channels: SlackApiContracts["conversations.info"]["output"]["channel"][];
+      response_metadata?: { next_cursor?: string };
+    };
+  };
+  "files.getUploadURLExternal": {
+    input: { filename: string; length: number };
+    output: { upload_url: string; file_id: string };
+  };
+  "files.completeUploadExternal": {
+    input: { files: Array<{ id: string; title: string }> };
+    output: { files: Array<{ id: string; title?: string }> };
+  };
   "conversations.members": {
     input: { channel: string; cursor?: string; limit: number };
     output: { members: string[]; response_metadata?: { next_cursor?: string } };
@@ -275,6 +298,7 @@ export type SlackApiMethod = keyof SlackApiContracts;
 const SLACK_READ_METHODS = new Set<SlackApiMethod>([
   "chat.getPermalink",
   "conversations.info",
+  "conversations.list",
   "conversations.members",
   "conversations.history",
   "conversations.replies",
@@ -659,6 +683,12 @@ export async function slackWorkspaceStatus(env: Env, member: MemberContext) {
   const identityState = link?.migration_state ?? "unlinked";
   return {
     ...slackConfigurationStatus(env),
+    round2: {
+      channels: env.SLACK_CHANNEL_VALIDATION_ENABLED === "true",
+      shares: env.SLACK_SHARE_REFRESH_ENABLED === "true",
+      richDigests: env.SLACK_RICH_DIGESTS_ENABLED === "true",
+      defaultTimezone: env.SLACK_DIGEST_DEFAULT_TIMEZONE ?? null,
+    },
     installation: installation
       ? {
           teamId: installation.team_id,
@@ -700,10 +730,14 @@ export async function slackWorkspaceStatus(env: Env, member: MemberContext) {
   } satisfies SlackStatus;
 }
 
-export async function listSlackChannelSubscriptions(env: Env, member: MemberContext) {
+export async function listSlackChannelSubscriptions(
+  env: Env,
+  member: MemberContext,
+): Promise<SlackChannelSubscription[]> {
   const rows = await env.DB.prepare(
     `SELECT subscription.id, subscription.space_id, subscription.page_id, subscription.channel_id,
             subscription.channel_name, subscription.event_types_json, subscription.cadence,
+            subscription.digest_time,subscription.digest_timezone,subscription.digest_open_work,subscription.digest_not_before,
             subscription.channel_type, subscription.validation_state, subscription.validated_at,
             subscription.validation_error, subscription.bot_is_member, subscription.mirror_enabled,
             subscription.muted_at, subscription.snoozed_until,
@@ -711,7 +745,10 @@ export async function listSlackChannelSubscriptions(env: Env, member: MemberCont
             (SELECT COUNT(*) FROM slack_thread_deliveries d JOIN slack_thread_links l ON l.id=d.link_id
               WHERE l.subscription_id=subscription.id AND l.state IN ('pending','active')
                 AND (d.state='blocked' OR (d.state='sending' AND
-                  d.attempted_at<=unixepoch('subsec')*1000-60000))) blocked_deliveries,
+                  d.attempted_at<=unixepoch('subsec')*1000-60000)))
+            + (SELECT count(*) FROM slack_digest_receipts r WHERE r.subscription_id=subscription.id AND (r.state='blocked' OR (r.state='sending' AND r.attempted_at<=unixepoch('subsec')*1000-60000)))
+            + (SELECT count(*) FROM slack_channel_events e WHERE e.subscription_id=subscription.id AND (e.round2_state='blocked' OR (e.round2_state='sending' AND e.attempted_at<=unixepoch('subsec')*1000-60000)))
+            + (SELECT count(*) FROM slack_share_refreshes r WHERE r.installation_id=installation.id AND r.channel_id=subscription.channel_id AND (r.state='blocked' OR (r.state='sending' AND r.attempted_at<=unixepoch('subsec')*1000-60000))) blocked_deliveries,
             (SELECT COUNT(*) FROM slack_thread_deliveries d JOIN slack_thread_links l ON l.id=d.link_id
               WHERE l.subscription_id=subscription.id AND l.state IN ('pending','active') AND d.state='pending'
                 AND EXISTS (SELECT 1 FROM slack_thread_deliveries prior
@@ -737,6 +774,10 @@ export async function listSlackChannelSubscriptions(env: Env, member: MemberCont
       channel_name: string;
       event_types_json: string;
       cadence: "immediate" | "digest";
+      digest_time: string;
+      digest_timezone: string | null;
+      digest_open_work: number;
+      digest_not_before: number;
       channel_type: "public_channel" | "private_channel" | "im" | "mpim" | null;
       validation_state: "unvalidated" | "valid" | "invalid";
       validated_at: number | null;
@@ -760,8 +801,15 @@ export async function listSlackChannelSubscriptions(env: Env, member: MemberCont
     pageId: row.page_id,
     channelId: row.channel_id,
     channelName: row.channel_name,
-    eventTypes: JSON.parse(row.event_types_json) as NotificationEventType[],
+    eventTypes: JSON.parse(row.event_types_json) as ChannelEventType[],
     cadence: row.cadence,
+    digestTime: row.digest_time,
+    digestTimezone: row.digest_timezone,
+    digestOpenWork: Boolean(row.digest_open_work),
+    nextDigestAt:
+      row.cadence === "digest" && row.digest_timezone && !row.muted_at
+        ? digestWindow(Math.max(Date.now(), row.snoozed_until ?? 0), row.digest_time, row.digest_timezone).next
+        : null,
     channelType: row.channel_type,
     validationState: row.validation_state,
     validatedAt: row.validated_at,
@@ -815,31 +863,62 @@ export async function upsertSlackChannelSubscription(
     pageId: string | null;
     channelId: string;
     channelName: string;
-    eventTypes: NotificationEventType[];
+    eventTypes: Array<ChannelEventType | NotificationEventType>;
     cadence: "immediate" | "digest";
+    mappingId?: string;
+    digestTime?: string | undefined;
+    digestTimezone?: string | undefined;
+    digestOpenWork?: boolean;
   },
 ) {
   const installation = await env.DB.prepare(
-    `SELECT id FROM slack_installations WHERE workspace_id = ? AND disconnected_at IS NULL`,
+    `SELECT * FROM slack_installations WHERE workspace_id = ? AND disconnected_at IS NULL`,
   )
     .bind(member.workspace.id)
-    .first<{ id: string }>();
+    .first<SlackInstallation>();
   if (!installation) throw new HttpError(409, "slack_not_connected", "Connect Slack before adding a channel.");
+  const strict = env.SLACK_CHANNEL_VALIDATION_ENABLED === "true";
+  const channel = strict ? await validatedSlackChannel(env, installation, input.channelId) : null;
   const existing = await env.DB.prepare(
-    `SELECT id FROM slack_channel_subscriptions WHERE installation_id = ? AND channel_id = ?
-      AND space_id = ? AND ifnull(page_id, '') = ifnull(?, '')`,
+    `SELECT id,cadence,digest_timezone,digest_time,digest_open_work FROM slack_channel_subscriptions WHERE installation_id=?
+      AND ((? IS NOT NULL AND id=?) OR (? IS NULL AND channel_id=? AND space_id=? AND ifnull(page_id,'')=ifnull(?,'')))`,
   )
-    .bind(installation.id, input.channelId, input.spaceId, input.pageId)
-    .first<{ id: string }>();
-  const id = existing?.id ?? crypto.randomUUID();
+    .bind(
+      installation.id,
+      input.mappingId ?? null,
+      input.mappingId ?? null,
+      input.mappingId ?? null,
+      input.channelId,
+      input.spaceId,
+      input.pageId,
+    )
+    .first<{
+      id: string;
+      cadence: string;
+      digest_timezone: string | null;
+      digest_time: string;
+      digest_open_work: number;
+    }>();
+  if (strict && input.cadence === "digest" && (existing?.cadence !== "digest" || !existing.digest_timezone))
+    defaultDigestTimezone(env);
+  const zone =
+    input.digestTimezone ??
+    existing?.digest_timezone ??
+    (strict && env.SLACK_DIGEST_DEFAULT_TIMEZONE ? defaultDigestTimezone(env) : null);
+  const time = input.digestTime ?? existing?.digest_time ?? "09:00";
+  if (zone) digestWindow(Date.now(), time, zone);
+  const id = input.mappingId ?? existing?.id ?? crypto.randomUUID();
   const timestamp = Date.now();
-  await env.DB.prepare(
+  const saved = await env.DB.prepare(
     `INSERT INTO slack_channel_subscriptions
       (id, installation_id, space_id, page_id, channel_id, channel_name, event_types_json, cadence,
-       created_by, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-     ON CONFLICT(id) DO UPDATE SET channel_name = excluded.channel_name,
-       event_types_json = excluded.event_types_json, cadence = excluded.cadence, updated_at = excluded.updated_at`,
+       created_by, created_at, updated_at,digest_time,digest_timezone,digest_open_work,digest_not_before,round2_initialized)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')
+     ON CONFLICT(id) DO UPDATE SET channel_name = excluded.channel_name,channel_id=excluded.channel_id,
+       space_id=excluded.space_id,page_id=excluded.page_id,event_types_json = excluded.event_types_json, cadence = excluded.cadence,
+       digest_not_before=CASE WHEN digest_timezone IS NOT excluded.digest_timezone OR digest_time<>excluded.digest_time OR cadence<>excluded.cadence THEN excluded.updated_at ELSE digest_not_before END,
+       digest_time=excluded.digest_time,digest_timezone=excluded.digest_timezone,digest_open_work=excluded.digest_open_work,updated_at=excluded.updated_at
+       WHERE installation_id=excluded.installation_id AND EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=? AND user_id=? AND role='owner')`,
   )
     .bind(
       id,
@@ -847,14 +926,30 @@ export async function upsertSlackChannelSubscription(
       input.spaceId,
       input.pageId,
       input.channelId,
-      input.channelName,
+      channel?.name ?? input.channelName,
       JSON.stringify(input.eventTypes),
       input.cadence,
       member.user.id,
       timestamp,
       timestamp,
+      time,
+      zone,
+      input.digestOpenWork === undefined ? (existing?.digest_open_work ?? 1) : input.digestOpenWork ? 1 : 0,
+      timestamp,
+      strict ? 1 : 0,
+      member.workspace.id,
+      member.user.id,
+      member.workspace.id,
+      member.user.id,
     )
     .run();
+  if (!saved.meta.changes)
+    throw new HttpError(403, "owner_required", "Only a current owner can change Slack mappings.");
+  if (channel)
+    await env.DB.prepare(`UPDATE slack_channel_subscriptions SET channel_name=?,channel_type=?,validation_state='valid',validation_error=NULL,
+    bot_is_member=1,validated_at=?,notification_blocked_at=NULL,notification_error=NULL WHERE id=? AND installation_id=?`)
+      .bind(channel.name, channel.is_private ? "private_channel" : "public_channel", Date.now(), id, installation.id)
+      .run();
   return (await listSlackChannelSubscriptions(env, member)).find((subscription) => subscription.id === id)!;
 }
 
@@ -1669,6 +1764,7 @@ export function slackChannelFanoutStatements(
               AND (? IS NULL OR p.content_epoch = ?))
             AND subscription.space_id = ? AND (subscription.page_id IS NULL OR subscription.page_id = ?)
             AND subscription.notification_blocked_at IS NULL
+            AND NOT EXISTS(SELECT 1 FROM round2_runtime WHERE activity_enabled=1 AND subscription.round2_initialized=1)
             AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
             AND NOT EXISTS (SELECT 1 FROM slack_thread_links mirror WHERE mirror.installation_id = installation.id
               AND mirror.thread_id = ? AND mirror.channel_id = subscription.channel_id AND mirror.state IN ('pending', 'active'))
@@ -1809,8 +1905,12 @@ async function blockSlackInstallationNotifications(env: Env, installationId: str
   await recordSlackInstallationError(env, installationId, error);
 }
 
-function eventCopy(eventType: NotificationEventType, actorName: string | null, pageTitle: string) {
+function eventCopy(eventType: ChannelEventType | NotificationEventType, actorName: string | null, pageTitle: string) {
   const actor = actorName ?? "A collaborator";
+  if (eventType === "page_created") return `${actor} created ${pageTitle}`;
+  if (eventType === "page_moved") return `${actor} moved ${pageTitle}`;
+  if (eventType === "page_archived") return `${actor} archived ${pageTitle}`;
+  if (eventType === "task_status_changed") return `${actor} changed task status in ${pageTitle}`;
   if (eventType === "mention") return `${actor} mentioned someone in ${pageTitle}`;
   if (eventType === "reply") return `${actor} replied to a comment in ${pageTitle}`;
   if (eventType === "thread_resolved") return `${actor} resolved a comment in ${pageTitle}`;
@@ -1839,6 +1939,12 @@ const channelActorAccessSql = `(
     WHERE bot.workspace_id = page.workspace_id AND bot.bot_user_id = event.actor_id
       AND bot.revoked_at IS NULL AND bot.read_comments = 1 AND bot.insert_comments = 1)
 )`;
+
+export const channelActivityActorAccessSql = channelActorAccessSql.replace(
+  "bot.read_comments = 1 AND bot.insert_comments = 1",
+  `((event.event_type IN ('mention','reply','thread_resolved','thread_reopened') AND bot.read_comments=1 AND bot.insert_comments=1)
+    OR (event.event_type IN ('page_created','page_edit','page_moved','page_archived','task_status_changed') AND bot.read_content=1 AND (bot.insert_content=1 OR bot.update_content=1)))`,
+);
 
 export async function deliverSlackChannelEvent(env: Env, eventId: string) {
   if (!(await channelEvent(env, eventId))) return;
@@ -1976,16 +2082,34 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
   const member = await linkedMember(env, payload.team_id, payload.event.user);
   const installation = await activeInstallation(env, payload.team_id);
   if (!member || !installation) return { ok: true };
+  if (env.SLACK_SHARE_REFRESH_ENABLED === "true" && /^[CG]/.test(payload.event.channel)) {
+    try {
+      await validatedSlackChannel(env, installation, payload.event.channel);
+    } catch (error) {
+      if (error instanceof HttpError || (error instanceof SlackApiError && error.status < 500)) return { ok: true };
+      throw error;
+    }
+  }
   const unfurls: Record<string, unknown> = {};
   const shareReferences: D1PreparedStatement[] = [];
   const notesOrigin = new URL(env.BETTER_AUTH_URL).origin;
   for (const link of payload.event.links ?? []) {
     if (typeof link.url !== "string") continue;
     let pageId: string | null;
+    let pinnedShare: { id: string; root_page_id: string; revoked_at: number | null } | null = null;
     try {
       const pageUrl = new URL(link.url);
       if (pageUrl.origin !== notesOrigin) continue;
       pageId = pageUrl.searchParams.get("page");
+      if (env.SLACK_SHARE_REFRESH_ENABLED === "true" && /^\/share\/[^/]+\/?$/.test(pageUrl.pathname)) {
+        const key = decodeURIComponent(pageUrl.pathname.split("/")[2]!);
+        pinnedShare = await env.DB.prepare(
+          `SELECT id,root_page_id,revoked_at FROM share_links WHERE url_key=? AND workspace_id=?`,
+        )
+          .bind(key, installation.workspace_id)
+          .first();
+        pageId = pinnedShare?.root_page_id ?? null;
+      }
     } catch {
       continue;
     }
@@ -2028,7 +2152,11 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
       }>();
     if (!page?.accessible || (page.visibility === "private" && !payload.event.channel.startsWith("D") && !page.mapped))
       continue;
-    if (!page.actionable || page.kind === "diagram" || !/^[CG][A-Z0-9]+$/.test(payload.event.channel)) {
+    if (
+      !page.actionable ||
+      (page.kind === "diagram" && env.SLACK_SHARE_REFRESH_ENABLED !== "true") ||
+      !/^[CG][A-Z0-9]+$/.test(payload.event.channel)
+    ) {
       unfurls[link.url] = {
         blocks: [
           {
@@ -2057,23 +2185,25 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     shareReferences.push(
       env.DB.prepare(
         `INSERT INTO slack_share_references
-        (id, installation_id, installation_generation, share_link_id, page_id, channel_id, message_ts, url, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (id, installation_id, installation_generation, share_link_id, page_id, channel_id, message_ts, url, created_at, updated_at,observed_user_id,reference_kind)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,?,?)
        ON CONFLICT(installation_id, channel_id, message_ts, url) DO UPDATE SET
          installation_generation = excluded.installation_generation,
          share_link_id = excluded.share_link_id, page_id = excluded.page_id,
-         state = 'observed', updated_at = excluded.updated_at`,
+         observed_user_id=excluded.observed_user_id,reference_kind=excluded.reference_kind,state = 'observed', updated_at = excluded.updated_at`,
       ).bind(
         referenceId,
         installation.id,
         installation.generation,
-        activeShare?.id ?? null,
+        pinnedShare?.id ?? activeShare?.id ?? null,
         page.id,
         payload.event.channel,
         payload.event.message_ts,
         link.url,
         Date.now(),
         Date.now(),
+        member.user.id,
+        pinnedShare ? "share" : "page",
       ),
     );
     unfurls[link.url] = {
@@ -2081,9 +2211,22 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
         title: page.title,
         excerpt: page.plain_text || `A page in ${page.space_name}`,
         referenceId,
-        shareActive: Boolean(activeShare),
+        shareActive: pinnedShare ? pinnedShare.revoked_at === null : Boolean(activeShare),
       }),
     };
+    if (pinnedShare?.revoked_at !== null && pinnedShare)
+      unfurls[link.url] = {
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              verbatim: true,
+              text: `*${safeSlackText(page.title, 200)}*\nPublic access was revoked.`,
+            },
+          },
+        ],
+      };
   }
   if (Object.keys(unfurls).length) {
     const id = typeof payload.event_id === "string" && payload.event_id ? payload.event_id : crypto.randomUUID();
@@ -2091,6 +2234,17 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     const timestamp = Date.now();
     await env.DB.batch([
       ...shareReferences,
+      ...(env.SLACK_SHARE_REFRESH_ENABLED === "true"
+        ? [
+            env.DB.prepare(`UPDATE slack_share_references SET lifecycle_revision=lifecycle_revision+1
+        WHERE installation_id=? AND channel_id=? AND message_ts=? AND url IN (SELECT key FROM json_each(?))`).bind(
+              installation.id,
+              payload.event.channel,
+              payload.event.message_ts,
+              JSON.stringify(unfurls),
+            ),
+          ]
+        : []),
       env.DB.prepare(
         `INSERT OR IGNORE INTO slack_unfurls
           (id, installation_id, installation_generation, workspace_id, user_id, channel_id, message_ts, unfurls_json, created_at)
@@ -2176,6 +2330,16 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
   const stored = JSON.parse(row.unfurls_json) as Record<string, unknown>;
   const unfurls: Record<string, unknown> = {};
   for (const [url, value] of Object.entries(stored)) {
+    {
+      // Tracked attachments are rendered and serialized through the refresh queue.
+      // Never replay captured blocks after a newer lifecycle transition.
+      const tracked = await env.DB.prepare(
+        `SELECT 1 FROM slack_share_references WHERE installation_id=? AND channel_id=? AND message_ts=? AND url=? AND lifecycle_revision>0`,
+      )
+        .bind(row.id, row.channel_id, row.message_ts, url)
+        .first();
+      if (tracked) continue;
+    }
     let pageId: string | null = null;
     try {
       pageId = new URL(url).searchParams.get("page");
@@ -2358,4 +2522,11 @@ export async function pruneSlackSecurityRecords(env: Env, timestamp = Date.now()
     env.DB.prepare(`DELETE FROM slack_request_replays WHERE expires_at < ?`).bind(timestamp),
     env.DB.prepare(`DELETE FROM slack_primary_factor_proofs WHERE expires_at < ?`).bind(timestamp),
   ]);
+}
+
+export async function validatedSlackChannel(env: Env, installation: SlackInstallation, channelId: string) {
+  const { channel } = await slackApi(env, installation, "conversations.info", { channel: channelId });
+  const reason = channel?.id !== channelId ? "channel_not_found" : channelInvalidReason(channel);
+  if (reason) throw new HttpError(422, reason, `Slack channel unavailable: ${reason.replaceAll("_", " ")}.`);
+  return channel;
 }

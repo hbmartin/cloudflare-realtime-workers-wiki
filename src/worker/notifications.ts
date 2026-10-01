@@ -168,6 +168,25 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         idPrefix,
         `${prefix};`,
       ),
+    database
+      .prepare(`INSERT OR IGNORE INTO workspace_activity(id,workspace_id,page_id,space_id,actor_id,thread_id,event_type,created_at)
+      SELECT ?,p.workspace_id,p.id,p.space_id,?,?,?,? FROM pages p WHERE p.id=? AND p.workspace_id=?
+        AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0
+        AND (? IS NULL OR p.content_epoch=?)
+        AND ? IN ('mention','reply','thread_resolved','thread_reopened','page_edit')
+        AND (SELECT activity_enabled FROM round2_runtime WHERE id=1)=1`)
+      .bind(
+        prefix,
+        fanout.actorId,
+        fanout.threadId,
+        fanout.eventType,
+        fanout.createdAt,
+        fanout.pageId,
+        fanout.workspaceId,
+        fanout.contentEpoch ?? null,
+        fanout.contentEpoch ?? null,
+        fanout.eventType,
+      ),
     ...(fanout.emitSlackChannel ? slackChannelFanoutStatements(database, { ...fanout, coalesceAfter }) : []),
   ];
 }
