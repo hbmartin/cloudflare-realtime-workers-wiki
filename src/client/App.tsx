@@ -1513,7 +1513,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const [recentIds, setRecentIds] = useState<string[]>(() => readPreference(`${preferencesKey}:recent`, []));
   const [paletteMode, setPaletteMode] = useState<PaletteMode | null>(null);
-  const [moveDialogOpen, setMoveDialogOpen] = useState(false);
+  const [moveDialogPageId, setMoveDialogPageId] = useState<string | null>(null);
   useEffect(() => {
     savePreference(`${preferencesKey}:collapsed`, sidebarCollapsed);
     savePreference(`${preferencesKey}:width`, sidebarWidth);
@@ -3017,6 +3017,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     [currentSpaceId, pages, sidebarHiddenPageIds],
   );
   const activeSelected = selected && (!currentSpaceId || selected.spaceId === currentSpaceId) ? selected : null;
+  useEffect(() => {
+    if (moveDialogPageId !== null && moveDialogPageId !== activeSelected?.id) {
+      // Clear the source so a later selection cannot reopen a discarded dialog.
+      // eslint-disable-next-line react/set-state-in-effect
+      setMoveDialogPageId(null);
+    }
+  }, [activeSelected?.id, moveDialogPageId]);
   const resolvedSelectedId = pendingSelectionId ? null : pagesLoaded ? (activeSelected?.id ?? null) : selectedId;
   const canEditActiveSpace = (activeSpace?.effectiveRole ?? member.role) !== "viewer";
   const canCreatePage = canEditActiveSpace && pagesLoaded && pendingSelectionId === null && Boolean(currentSpaceId);
@@ -3799,7 +3806,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
       label: "Move current page",
       shortcut: "",
       isAvailable: () => Boolean(activeSelected && !activeSelected.isTemplate && canEditActiveSpace),
-      run: () => setMoveDialogOpen(true),
+      run: () => setMoveDialogPageId(activeSelected?.id ?? null),
     },
   ];
 
@@ -4434,7 +4441,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onClose={() => setPaletteMode(null)}
         />
       )}
-      {moveDialogOpen && activeSelected && (
+      {activeSelected && moveDialogPageId === activeSelected.id && (
         <MovePageDialog
           key={activeSelected.id}
           page={activeSelected}
@@ -4442,7 +4449,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           onMove={(parentId) => {
             if (parentId !== activeSelected.parentId) void move(activeSelected.id, parentId);
           }}
-          onClose={() => setMoveDialogOpen(false)}
+          onClose={() => setMoveDialogPageId(null)}
         />
       )}
       {sidebarOpen && <div className="sidebar-scrim" aria-hidden="true" onClick={() => closeSidebar(true)} />}
@@ -4496,7 +4503,7 @@ function MovePageDialog({
           event.preventDefault();
           if (!destinationAvailable) return;
           const destination = parentId || null;
-          if (destination !== page.parentId) onMove(destination);
+          onMove(destination);
           onClose();
         }}
       >

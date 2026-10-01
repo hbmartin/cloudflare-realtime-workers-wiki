@@ -289,11 +289,14 @@ async function boundedRequestText(request: Request, max: number) {
 
 async function metadataClient(env: Env, clientId: string) {
   let current = publicClientUrl(clientId);
-  const rate = await clientRegistrationRate(env);
-  if (!rate.allowed)
-    throw new HttpError(429, "slow_down", "Client metadata requests are temporarily rate limited.", {
-      retryAfter: rate.retryAfter,
-    });
+  const existing = await env.DB.prepare("SELECT 1 FROM oauth_clients WHERE client_id=?").bind(clientId).first();
+  if (!existing) {
+    const rate = await clientRegistrationRate(env);
+    if (!rate.allowed)
+      throw new HttpError(429, "slow_down", "Client metadata requests are temporarily rate limited.", {
+        retryAfter: rate.retryAfter,
+      });
+  }
   const capacity = await env.DB.prepare(
     "SELECT 1 available WHERE EXISTS (SELECT 1 FROM oauth_clients WHERE client_id=?) OR (SELECT COUNT(*) FROM oauth_clients)<?",
   )

@@ -28,6 +28,10 @@ function escapeMarkdown(value: string) {
   return value.replace(/[\s\S]/gu, (character) => (MARKDOWN_SPECIAL.has(character) ? `\\${character}` : character));
 }
 
+function singleLine(value: string) {
+  return value.replace(/\s+/gu, " ").trim();
+}
+
 function slackEntity(value: string) {
   return value.replace(/&(?:amp|lt|gt);/g, (entity) => ({ "&amp;": "&", "&lt;": "<", "&gt;": ">" })[entity]!);
 }
@@ -44,7 +48,7 @@ function safeHttpsLink(value: string, slackOnly = false) {
 }
 
 function link(label: string, href: string) {
-  return `[${escapeMarkdown(label)}](<${href.replaceAll(">", "%3E")}>)`;
+  return `[${escapeMarkdown(singleLine(label))}](<${href.replaceAll(">", "%3E")}>)`;
 }
 
 function messageText(value: string) {
@@ -78,7 +82,7 @@ export function captureMarkdown(input: {
     throw new HttpError(422, "thread_too_large", "This thread exceeds the capture limit of 2,000 messages.");
   const permalink = safeHttpsLink(input.permalink, true);
   if (!permalink) throw new HttpError(422, "slack_source", "The Slack source link is unavailable.");
-  const lines = [`# ${escapeMarkdown(input.title)}`, ""];
+  const lines = [`# ${escapeMarkdown(singleLine(input.title))}`, ""];
   if (input.description?.trim()) lines.push("## Description", "", escapeMarkdown(input.description.trim()), "");
   lines.push(
     "## Slack source",
@@ -88,7 +92,8 @@ export function captureMarkdown(input: {
   for (const message of input.messages) {
     if (!/^\d{1,16}\.\d{1,16}$/.test(message.ts))
       throw new HttpError(422, "slack_source", "A Slack message timestamp is invalid.");
-    lines.push("", `### ${escapeMarkdown(message.user ?? message.bot_id ?? "Slack member")} · ${message.ts}`, "");
+    const author = singleLine(message.user ?? "") || singleLine(message.bot_id ?? "") || "Slack member";
+    lines.push("", `### ${escapeMarkdown(author)} · ${message.ts}`, "");
     lines.push(messageText(message.text ?? ""));
     for (const reaction of message.reactions ?? []) {
       if (typeof reaction.name !== "string") continue;
@@ -97,12 +102,12 @@ export function captureMarkdown(input: {
         lines.push("", `Reaction: ${escapeMarkdown(name)} × ${reaction.count}`);
     }
     for (const file of message.files ?? []) {
-      const name = file.title?.trim() || file.name?.trim() || "Slack attachment";
+      const name = singleLine(file.title ?? "") || singleLine(file.name ?? "") || "Slack attachment";
       const href = safeHttpsLink(file.permalink ?? "", true);
       lines.push("", href ? `Attachment: ${link(name, href)}` : `Attachment: ${escapeMarkdown(name)}`);
     }
     for (const attachment of message.attachments ?? []) {
-      const name = attachment.title?.trim() || "Slack attachment";
+      const name = singleLine(attachment.title ?? "") || "Slack attachment";
       const href = safeHttpsLink(attachment.title_link ?? "");
       lines.push("", href ? `Attachment: ${link(name, href)}` : `Attachment: ${escapeMarkdown(name)}`);
     }

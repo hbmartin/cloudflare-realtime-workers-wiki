@@ -8246,7 +8246,17 @@ describe("calm workspace task lists", () => {
           operationId: archivedPage!.archive_operation_id,
           errorMessage: "Injected archive cleanup failure",
         });
-        expect(delivered.map(({ event }) => event.type)).toContain("pages-removed");
+        expect(delivered.filter(({ event }) => event.type === "pages-removed")).toEqual([
+          {
+            workspaceId: installed.workspaceId,
+            event: {
+              type: "pages-removed",
+              pageIds: expect.arrayContaining([rootPageId]),
+              permanently: false,
+              operationId,
+            },
+          },
+        ]);
         expect(delivered.filter(({ event }) => event.type === "task-list-invalidated")).toEqual(
           listId
             ? [
@@ -8491,12 +8501,16 @@ describe("calm workspace task lists", () => {
     expect(replayBody).toMatchObject({ revision: firstBody.revision, replayed: true });
     expect(replayBody.pageIds.toSorted()).toEqual(firstBody.pageIds.toSorted());
     const removal = events.find(({ event }) => event.type === "pages-removed")!.event;
-    expect(removal).toMatchObject({ pageIds: expect.arrayContaining(firstBody.pageIds) });
+    expect(removal).toMatchObject({
+      pageIds: expect.arrayContaining(firstBody.pageIds),
+      operationId: body.operationId,
+    });
     await env.DB.prepare("UPDATE pages SET archived_at=NULL WHERE id=?").bind(grandchild.id).run();
     expect(await eventForCurrentWorkspaceState(env, installed.workspaceId, removal)).toEqual({
       type: "pages-removed",
       permanently: false,
       pageIds: replayBody.pageIds.filter((id) => id !== grandchild.id),
+      operationId: body.operationId,
     });
     const currentReplay = await change(installed, list.id, body, result.rowId);
     expect(currentReplay.status).toBe(200);
@@ -8532,28 +8546,69 @@ describe("calm workspace task lists", () => {
       });
       const { detailPageId } = await created.json<{ detailPageId: string }>();
       const ordinary = await createPage(installed.cookie);
+      const events: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
       for (const id of [ordinary.id, detailPageId]) {
-        const archived = await SELF.fetch(
+        const context = createExecutionContext();
+        const archived = await worker.fetch(
           authenticatedRequest(installed.cookie, `/api/pages/${id}`, {
             method: "DELETE",
             headers: { "x-notes-operation-id": operationId },
           }),
+          envWithCapturedWorkspaceEvents(env, events),
+          context,
         );
+        await waitOnExecutionContext(context);
         expect(archived.status).toBe(200);
         expect(await archived.json()).toMatchObject({ ok: true, pageIds: [id] });
         expect(await env.DB.prepare("SELECT archived_at FROM pages WHERE id=?").bind(id).first()).toEqual({
           archived_at: expect.any(Number),
         });
       }
+      const removal = events.find(
+        ({ event }) => event.type === "pages-removed" && event.pageIds.includes(detailPageId),
+      )?.event;
+      const generatedId = expect.stringMatching(/^[\w-]{1,100}$/);
+      expect(removal).toMatchObject({
+        operationId: operationId === "retry-1" ? operationId : generatedId,
+      });
       const receipts = await env.DB.prepare(
         "SELECT operation_id FROM task_mutation_receipts WHERE detail_page_id=? AND operation_id<>?",
       )
         .bind(detailPageId, createOperationId)
         .all();
-      const generatedId = expect.stringMatching(/^[\w-]{1,100}$/);
       expect(receipts.results).toEqual([{ operation_id: operationId === "retry-1" ? operationId : generatedId }]);
     },
   );
+  it("preserves the task-detail DELETE operation ID on archive replay", async () => {
+    const installed = await bootstrap();
+    const list = await taskList(installed);
+    const created = await change(installed, list.id, {
+      title: "Archive replay",
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    const { detailPageId } = await created.json<{ detailPageId: string }>();
+    const operationId = crypto.randomUUID();
+    const events: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const context = createExecutionContext();
+      const response = await worker.fetch(
+        authenticatedRequest(installed.cookie, `/api/pages/${detailPageId}`, {
+          method: "DELETE",
+          headers: { "x-notes-operation-id": operationId },
+        }),
+        envWithCapturedWorkspaceEvents(env, events),
+        context,
+      );
+      await waitOnExecutionContext(context);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ ok: true, pageIds: [detailPageId] });
+    }
+    expect(events.filter(({ event }) => event.type === "pages-removed").map(({ event }) => event)).toEqual([
+      { type: "pages-removed", pageIds: [detailPageId], permanently: false, operationId },
+      { type: "pages-removed", pageIds: [detailPageId], permanently: false, operationId },
+    ]);
+  });
 
   it("archives and restores task details without detaching their row", async () => {
     const installed = await bootstrap();

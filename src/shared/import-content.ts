@@ -859,16 +859,16 @@ function boundedMarkdownInline(
       let cut = Math.min(start + INLINE_SECTION_LIMIT, text.length);
       cut = inlineMarkupOverflow(text, start, cut) ?? cut;
       const delimiter = text[cut];
-      if (delimiter && INLINE_DELIMITERS.includes(delimiter) && text[cut - 1] === delimiter) {
+      if (delimiter && INLINE_DELIMITERS.includes(delimiter) && INLINE_DELIMITERS.includes(text[cut - 1] ?? " ")) {
         let boundary = cut;
-        while (boundary > start && text[boundary - 1] === delimiter) boundary -= 1;
+        while (boundary > start && INLINE_DELIMITERS.includes(text[boundary - 1]!)) boundary -= 1;
         if (trailingEscape(text, boundary, start)) boundary -= 1;
         if (boundary > start) cut = boundary;
         else {
           // Keep a bounded tail of the opening run and reserve half the budget
           // for closing delimiters so nearby emphasis still reaches Marked intact.
           let end = cut + 1;
-          while (text[end] === delimiter) end += 1;
+          while (end < text.length && INLINE_DELIMITERS.includes(text[end]!)) end += 1;
           const literalEnd = end - Math.floor(INLINE_DELIMITER_LIMIT / 2);
           append(inline(unescapeMarkdown(text.slice(start, literalEnd))));
           start = literalEnd;

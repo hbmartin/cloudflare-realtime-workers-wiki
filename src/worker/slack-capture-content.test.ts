@@ -96,16 +96,73 @@ describe("Slack capture Markdown", () => {
         {
           ...input.messages[0]!,
           files: [
-            { title: "  ", name: "Plan.pdf", permalink: "https://workspace.slack.com/files/UOWNER/F123" },
-            { title: "", name: "", permalink: "https://workspace.slack.com/files/UOWNER/F124" },
+            { title: " \r\n\t ", name: "Plan.pdf", permalink: "https://workspace.slack.com/files/UOWNER/F123" },
+            { title: "", name: "\r\n\t", permalink: "https://workspace.slack.com/files/UOWNER/F124" },
           ],
-          attachments: [{ title: "  ", title_link: "https://example.com/design" }],
+          attachments: [{ title: " \r\n\t ", title_link: "https://example.com/design" }],
         },
       ],
     });
     expect(markdown).toContain("[Plan\\.pdf](<https://workspace.slack.com/files/UOWNER/F123>)");
     expect(markdown).toContain("[Slack attachment](<https://workspace.slack.com/files/UOWNER/F124>)");
     expect(markdown).toContain("[Slack attachment](<https://example.com/design>)");
+  });
+
+  it.each(["\n", "\r\n"])("keeps multiline capture metadata on one line (%j)", (newline) => {
+    const markdown = captureMarkdown({
+      ...input,
+      title: `Launch${newline}${newline}  decision`,
+      messages: [
+        {
+          ...input.messages[0]!,
+          user: `UOWNER${newline}${newline}  label`,
+          files: [
+            { title: `Plan${newline}${newline}  draft`, permalink: "https://workspace.slack.com/files/UOWNER/F123" },
+            { name: `Notes${newline}${newline}  draft` },
+          ],
+          attachments: [
+            { title: `Design${newline}${newline}  draft`, title_link: "https://example.com/design" },
+            { title: `Plain${newline}${newline}  draft` },
+          ],
+        },
+      ],
+    });
+    const blocks = markdownToDocument(markdown).document.content![0]!.content!.map(
+      (container) => container.content![0]!,
+    );
+    const text = blocks.map((block) => block.content?.map((node) => node.text ?? "").join(""));
+    expect(text).toEqual([
+      "Launch decision",
+      "Slack source",
+      "Captured from Slack on 2026-09-29T12:00:00.000Z. View source",
+      "UOWNER label · 1700000000.000001",
+      "Ship the plan & tell @Slack member",
+      "Attachment: Plan draft",
+      "Attachment: Notes draft",
+      "Attachment: Design draft",
+      "Attachment: Plain draft",
+    ]);
+    expect(blocks[5]?.content?.[1]?.marks).toEqual([
+      { type: "link", attrs: { href: "https://workspace.slack.com/files/UOWNER/F123" } },
+    ]);
+    expect(blocks[7]?.content?.[1]?.marks).toEqual([{ type: "link", attrs: { href: "https://example.com/design" } }]);
+  });
+
+  it("normalizes bot headings and inline message link labels while preserving multiline bodies", () => {
+    const markdown = captureMarkdown({
+      ...input,
+      description: "First description line\nSecond description line\n\nAnother paragraph",
+      messages: [
+        {
+          ts: input.messages[0]!.ts,
+          bot_id: " BOT\r\n\tLABEL ",
+          text: "First message line\nSecond message line\n\n<https://example.com| label\rwith\ttabs >",
+        },
+      ],
+    });
+    expect(markdown).toContain("First description line\nSecond description line\n\nAnother paragraph");
+    expect(markdown).toContain("### BOT LABEL · 1700000000.000001");
+    expect(markdown).toContain("First message line\nSecond message line\n\n[label with tabs](<https://example.com/>)");
   });
 
   it("keeps the user's description separate from attributed Slack messages", () => {

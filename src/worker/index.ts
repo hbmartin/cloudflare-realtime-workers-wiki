@@ -4333,7 +4333,12 @@ app.delete("/api/pages/:id", async (c) => {
       operationId: taskArchiveOperationId,
       forceRefresh: true,
     });
-    sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
+    sendWorkspaceEvent(c, member.workspace.id, {
+      type: "pages-removed",
+      pageIds,
+      permanently: false,
+      operationId: taskArchiveOperationId,
+    });
     const cleanup = await archiveCleanupAfterCommit(
       c.env,
       page.id,
@@ -5696,8 +5701,8 @@ app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   if (body.archived !== true) return c.json(result);
   const pageIds = result.pageIds ?? [result.detailPageId];
-  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false });
   const operationId = typeof body.operationId === "string" ? body.operationId : "";
+  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false, operationId });
   const cleanup = await archiveCleanupAfterCommit(c.env, result.detailPageId, { operationId }, now(), "task_patch");
   return c.json({ ...result, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
 });
