@@ -1,0 +1,207 @@
+import { DomUtils, ElementType, parseDocument } from "htmlparser2";
+import type { ImportIssue } from "../shared/import-content";
+import type { ProseMirrorJson } from "../shared/types";
+
+type HtmlNode = ReturnType<typeof parseDocument>["children"][number];
+type HtmlElement = ReturnType<typeof DomUtils.getElementsByTagName>[number];
+function isTag(node: HtmlNode): node is HtmlElement {
+  return "attribs" in node;
+}
+const BLOCK_ATTRS = { backgroundColor: "default", textColor: "default", textAlignment: "left" };
+
+const text = (value: string, marks: ProseMirrorJson["marks"] = []): ProseMirrorJson[] =>
+  value ? [{ type: "text", text: value, ...(marks.length ? { marks } : {}) }] : [];
+
+export function safeDocxHref(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const href = value.trim();
+  if (!href || Array.from(href).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127 || char === "\\"))
+    return null;
+  try {
+    return ["http:", "https:", "mailto:"].includes(new URL(href, "https://docx.invalid").protocol) ? href : null;
+  } catch {
+    return null;
+  }
+}
+
+// Mammoth's semantic HTML needs a tree parser: the general HTML importer flattens
+// nested lists and tables. This adapter only handles DOCX conversion output.
+export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<string> = new Set()) {
+  const issues: ImportIssue[] = [];
+  let sequence = 0;
+  const container = (block: ProseMirrorJson, children: ProseMirrorJson[] = []): ProseMirrorJson => ({
+    type: "blockContainer",
+    attrs: { id: `docx-${++sequence}` },
+    content: [block, ...(children.length ? [{ type: "blockGroup", content: children }] : [])],
+  });
+
+  function inline(
+    nodes: HtmlNode[],
+    marks: ProseMirrorJson["marks"] = [],
+    depth = 0,
+    flattenLists = false,
+  ): ProseMirrorJson[] {
+    if (depth > 64) {
+      issues.push({ code: "docx_nesting_simplified", detail: "Deeply nested formatting" });
+      return text(nodes.map((node) => DomUtils.textContent(node)).join(""), marks);
+    }
+    return nodes.flatMap((node, index): ProseMirrorJson[] => {
+      if (node.type === ElementType.Text) return text(node.data, marks);
+      if (!isTag(node) || ["script", "style", "template"].includes(node.name)) return [];
+      const name = node.name;
+      if (name === "ul" || name === "ol") return flattenLists ? inline(node.children, marks, depth + 1, true) : [];
+      if (name === "br") return [{ type: "hardBreak" }];
+      if (name === "img") {
+        const label = node.attribs.alt || "Image";
+        const source = node.attribs.src ?? "";
+        if (imageSources.has(source))
+          return [
+            {
+              type: "image",
+              attrs: {
+                backgroundColor: "default",
+                textAlignment: "left",
+                url: source,
+                caption: node.attribs.alt ?? "",
+                name: label,
+                showPreview: true,
+                previewWidth: 512,
+              },
+            },
+          ];
+        const href = safeDocxHref(source);
+        issues.push({ code: "docx_image_not_embedded", detail: label });
+        return text(`[${label}]`, href ? [{ type: "link", attrs: { href } }] : marks);
+      }
+      const style = (
+        {
+          strong: "bold",
+          b: "bold",
+          em: "italic",
+          i: "italic",
+          u: "underline",
+          s: "strike",
+          del: "strike",
+          code: "code",
+        } as Record<string, string>
+      )[name];
+      let active = style && !marks.some((mark) => mark.type === style) ? [...marks, { type: style }] : marks;
+      if (name === "a") {
+        const href = safeDocxHref(node.attribs.href);
+        if (href) active = [...active, { type: "link", attrs: { href } }];
+        else if (node.attribs.href) issues.push({ code: "unsafe_url", detail: node.attribs.href.slice(0, 120) });
+      }
+      const content = inline(node.children, active, depth + 1, flattenLists);
+      return (name === "p" || (flattenLists && name === "li")) && content.length && index < nodes.length - 1
+        ? [...content, { type: "hardBreak" }]
+        : content;
+    });
+  }
+
+  function paragraphs(content: ProseMirrorJson[], type = "paragraph", attrs: Record<string, unknown> = {}) {
+    const output: ProseMirrorJson[] = [];
+    let pending: ProseMirrorJson[] = [];
+    const flush = () => {
+      if (pending.length) output.push(container({ type, attrs: { ...BLOCK_ATTRS, ...attrs }, content: pending }));
+      pending = [];
+    };
+    for (const node of content) {
+      if (node.type === "image") {
+        flush();
+        output.push(container(node));
+      } else pending.push(node);
+    }
+    flush();
+    return output.length ? output : [container({ type, attrs: { ...BLOCK_ATTRS, ...attrs } })];
+  }
+
+  function blocks(nodes: HtmlNode[], depth = 0): ProseMirrorJson[] {
+    if (depth > 64) {
+      issues.push({ code: "docx_nesting_simplified", detail: "Deeply nested blocks" });
+      return paragraphs(text(nodes.map((node) => DomUtils.textContent(node)).join("")));
+    }
+    const output: ProseMirrorJson[] = [];
+    for (const node of nodes) {
+      if (!isTag(node)) {
+        if (node.type === ElementType.Text && node.data.trim()) output.push(...paragraphs(text(node.data)));
+        continue;
+      }
+      if (["script", "style", "template"].includes(node.name)) continue;
+      if (node.name === "ul" || node.name === "ol") {
+        for (const item of node.children.filter((child) => isTag(child) && child.name === "li")) {
+          if (!isTag(item)) continue;
+          const nested = item.children.filter((child) => isTag(child) && ["ul", "ol"].includes(child.name));
+          const own = paragraphs(inline(item.children), node.name === "ol" ? "numberedListItem" : "bulletListItem");
+          const children = blocks(nested, depth + 1);
+          if (children.length) own[0]!.content!.push({ type: "blockGroup", content: children });
+          output.push(...own);
+        }
+      } else if (node.name === "table") {
+        const rows = DomUtils.getElementsByTagName("tr", node.children).filter((row) => {
+          let parent = row.parent;
+          while (parent && parent !== node) {
+            if (isTag(parent) && parent.name === "table") return false;
+            parent = parent.parent;
+          }
+          return parent === node;
+        });
+        const images: ProseMirrorJson[] = [];
+        const converted = rows.map((row): ProseMirrorJson => ({
+          type: "tableRow",
+          content: row.children
+            .filter((cell) => isTag(cell) && ["td", "th"].includes(cell.name))
+            .map((cell): ProseMirrorJson => {
+              if (!isTag(cell)) throw new Error("Invalid table cell");
+              if (
+                Number(cell.attribs.colspan || 1) > 1 ||
+                Number(cell.attribs.rowspan || 1) > 1 ||
+                DomUtils.getElementsByTagName("table", cell.children).length ||
+                DomUtils.getElementsByTagName("ul", cell.children).length ||
+                DomUtils.getElementsByTagName("ol", cell.children).length
+              )
+                issues.push({ code: "docx_table_simplified", detail: "Merged or nested table cell" });
+              const content = inline(cell.children, [], 0, true);
+              images.push(...content.filter((child) => child.type === "image"));
+              const own = content.filter((child) => child.type !== "image");
+              return {
+                type: cell.name === "th" ? "tableHeader" : "tableCell",
+                attrs: { colspan: 1, rowspan: 1, colwidth: null },
+                content: [
+                  { type: "tableParagraph", attrs: { ...BLOCK_ATTRS }, ...(own.length ? { content: own } : {}) },
+                ],
+              };
+            }),
+        }));
+        const width = Math.max(0, ...converted.map((row) => row.content!.length));
+        for (const row of converted)
+          while (row.content!.length < width)
+            row.content!.push({
+              type: "tableCell",
+              attrs: { colspan: 1, rowspan: 1, colwidth: null },
+              content: [{ type: "tableParagraph", attrs: { ...BLOCK_ATTRS } }],
+            });
+        if (width) output.push(container({ type: "table", attrs: { ...BLOCK_ATTRS }, content: converted }));
+        if (images.length) {
+          issues.push({ code: "docx_table_images_moved", detail: "Images moved below their table" });
+          output.push(...images.map((image) => container(image)));
+        }
+      } else if (/^h[1-6]$/.test(node.name)) {
+        output.push(
+          ...paragraphs(inline(node.children), "heading", { level: Number(node.name[1]), isToggleable: false }),
+        );
+      } else if (node.name === "blockquote") output.push(...paragraphs(inline(node.children), "quote"));
+      else if (node.name === "p" || node.name === "img")
+        output.push(...paragraphs(inline(node.name === "img" ? [node] : node.children)));
+      else if (node.name === "hr") output.push(container({ type: "divider" }));
+      else output.push(...blocks(node.children, depth + 1));
+    }
+    return output;
+  }
+
+  const content = blocks(parseDocument(html).children);
+  const document: ProseMirrorJson = {
+    type: "doc",
+    content: [{ type: "blockGroup", content: content.length ? content : paragraphs([]) }],
+  };
+  return { document, issues };
+}

@@ -44,7 +44,7 @@ export function ExportDialog({
     try {
       const result = await api<{ job: Job }>(`/api/pages/${encodeURIComponent(page.id)}/exports`, {
         method: "POST",
-        body: json({ format, portable: format === "pdf" || format === "png" ? false : portable }),
+        body: json({ format, portable: format === "pdf" || format === "png" || format === "docx" ? false : portable }),
       });
       onQueued(result.job);
     } catch (cause) {
@@ -153,8 +153,22 @@ export function ExportDialog({
               <strong>PDF</strong>
               <small>{pdfAvailable ? "Print-ready single file" : "Unavailable until Browser Run is configured"}</small>
             </label>
+            {page.kind === "document" && (
+              <label htmlFor="export-format-docx">
+                <input
+                  id="export-format-docx"
+                  type="radio"
+                  name="format"
+                  value="docx"
+                  checked={format === "docx"}
+                  onChange={() => setFormat("docx")}
+                />
+                <strong>Word (.docx)</strong>
+                <small>Editable document with rich text, tables, and embedded images</small>
+              </label>
+            )}
           </fieldset>
-          {format !== "pdf" && format !== "png" && (
+          {format !== "pdf" && format !== "png" && format !== "docx" && (
             <label className="portable-option" htmlFor="export-portable">
               <input
                 id="export-portable"

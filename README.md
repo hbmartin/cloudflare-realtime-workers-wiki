@@ -19,8 +19,8 @@ Documents use BlockNote backed by Yjs, while diagrams use React Flow backed by t
 - Server-authoritative anchored comment threads, watches, in-app notifications, channel preferences, and timezone-aware digests.
 - Private R2 attachments with authorization, all HTTP range forms, conditional ETags, safe disposition, `nosniff`, MIME rejection, inline editor media, and chunked direct-to-R2 uploads for large files.
 - Full-page typed tables with 60-second single-editor leases, revision conflicts, owner force unlock, server-side paging and sorting, replayable bulk writes, and a 20,000-row limit.
-- In-app Markdown, sanitized HTML, and nested Notion ZIP import with staged verification and atomic publication.
-- Document Markdown/HTML/portable ZIP/PDF export and diagram JSON/SVG/PNG/PDF export through resumable Cloudflare Workflows.
+- In-app Markdown, sanitized HTML, Word (.docx), and nested Notion ZIP import with staged verification and atomic publication.
+- Document Markdown/HTML/Word (.docx)/portable ZIP/PDF export and diagram JSON/SVG/PNG/PDF export through resumable Cloudflare Workflows.
 - Optional Slack bot OAuth plus verified Slack OpenID identities, invite-gated Slack signup, private slash search, access-filtered unfurls, channel mappings, and queued personal/channel notifications.
 
 This is an early v1 implementation. Production billing-grade hibernation verification and high-concurrency load tests still require a deployed Workers Paid account.

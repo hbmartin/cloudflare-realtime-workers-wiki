@@ -1,3 +1,4 @@
+import { DOCX_MIME } from "./docx";
 import { acceptSlackProductInteraction, openSlackProduct } from "./slack-product";
 import { authorizeSlackCaptureJobRetry } from "./slack-capture";
 import { taskListStatements, listTasks, mutateTask, taskAssignees } from "./tasks";
@@ -2163,11 +2164,13 @@ app.post("/api/import-uploads", async (c) => {
       ? "markdown"
       : lower.endsWith(".html") || lower.endsWith(".htm")
         ? "html"
-        : lower.endsWith(".zip")
-          ? "notion_zip"
-          : null;
+        : lower.endsWith(".docx")
+          ? "docx"
+          : lower.endsWith(".zip")
+            ? "notion_zip"
+            : null;
   if (!format) {
-    throw new HttpError(415, "unsupported_import", "Choose a Markdown, HTML, or Notion ZIP file.");
+    throw new HttpError(415, "unsupported_import", "Choose a Markdown, HTML, Word (.docx), or Notion ZIP file.");
   }
   if (parentId && format === "notion_zip")
     throw new HttpError(422, "import_parent_invalid", "A parent can only be selected for a single-page import.");
@@ -2182,7 +2185,14 @@ app.post("/api/import-uploads", async (c) => {
   try {
     await c.env.BUCKET.put(inputKey, file.stream(), {
       httpMetadata: {
-        contentType: format === "markdown" ? "text/markdown" : format === "html" ? "text/html" : "application/zip",
+        contentType:
+          format === "markdown"
+            ? "text/markdown"
+            : format === "html"
+              ? "text/html"
+              : format === "docx"
+                ? DOCX_MIME
+                : "application/zip",
       },
       customMetadata: { filename, jobId: job.id },
     });
@@ -3079,13 +3089,17 @@ app.post("/api/pages/:id/exports", async (c) => {
   const body = await jsonBody(c.req.raw);
   const format = text(body.format, "format", 20) as ExportFormat;
   const allowedFormats: ExportFormat[] =
-    page.kind === "diagram" ? ["json", "svg", "png", "pdf"] : ["markdown", "html", "pdf"];
+    page.kind === "diagram"
+      ? ["json", "svg", "png", "pdf"]
+      : page.kind === "document"
+        ? ["markdown", "html", "pdf", "docx"]
+        : ["markdown", "html", "pdf"];
   if (!allowedFormats.includes(format)) {
     throw new HttpError(422, "invalid_export_format", `Choose ${allowedFormats.join(", ")}.`);
   }
   const portable = body.portable === true;
-  if ((format === "pdf" || format === "png") && portable) {
-    throw new HttpError(422, "invalid_export_options", "PDF and PNG exports are always a single file.");
+  if ((format === "pdf" || format === "png" || format === "docx") && portable) {
+    throw new HttpError(422, "invalid_export_options", "PDF, PNG, and Word exports are always a single file.");
   }
   if ((format === "pdf" || format === "png") && !c.env.BROWSER) {
     throw new HttpError(503, "browser_export_unavailable", "Browser exports are not configured for this installation.");

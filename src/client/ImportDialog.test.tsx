@@ -48,6 +48,22 @@ afterEach(() => {
 });
 
 describe("ImportDialog", () => {
+  it("accepts a Word file in the existing single-file upload flow", async () => {
+    vi.mocked(api).mockResolvedValue({ job });
+    const onQueued = vi.fn();
+    render(<ImportDialog spaces={[space]} initialSpaceId={space.id} onClose={vi.fn()} onQueued={onQueued} />);
+    const input = screen.getByLabelText(/^File/);
+    expect(input.getAttribute("accept")).toContain(".docx");
+    const file = new File(["Word package"], "brief.docx", {
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    });
+    fireEvent.change(input, { target: { files: [file] } });
+    fireEvent.submit(screen.getByRole("button", { name: "Upload and inspect" }).closest("form")!);
+    await waitFor(() => expect(onQueued).toHaveBeenCalledWith(job));
+    const body = vi.mocked(api).mock.calls[0]![1]!.body as FormData;
+    expect(body.get("file")).toBe(file);
+  });
+
   it("uploads one supported file into the selected space", async () => {
     vi.mocked(api).mockResolvedValue({ job });
     const onQueued = vi.fn();
