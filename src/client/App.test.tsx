@@ -191,6 +191,22 @@ function dispatchWorkspaceEvent(event: WorkspaceEvent) {
   onEvent(event);
 }
 
+function mockDialogMethods() {
+  for (const method of ["showModal", "close"] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
+    Object.defineProperty(HTMLDialogElement.prototype, method, {
+      configurable: true,
+      value(this: HTMLDialogElement) {
+        this.open = method === "showModal";
+      },
+    });
+    onTestFinished(() => {
+      if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, method, descriptor);
+      else Reflect.deleteProperty(HTMLDialogElement.prototype, method);
+    });
+  }
+}
+
 function mockWorkspaceApi(treeReloadFailure?: ApiClientError, archiveFailure?: ApiClientError) {
   let treeLoads = 0;
   vi.mocked(api).mockImplementation(async (path, init) => {
@@ -296,19 +312,7 @@ describe("App error handling", () => {
   ])(
     "only moves a page when the dialog destination changes ($name)",
     async ({ picked, remoteParent, removePicked = false, nextPicked, moveTo }) => {
-      for (const method of ["showModal", "close"] as const) {
-        const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
-        Object.defineProperty(HTMLDialogElement.prototype, method, {
-          configurable: true,
-          value(this: HTMLDialogElement) {
-            this.open = method === "showModal";
-          },
-        });
-        onTestFinished(() => {
-          if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, method, descriptor);
-          else Reflect.deleteProperty(HTMLDialogElement.prototype, method);
-        });
-      }
+      mockDialogMethods();
       const destination = { ...page, id: "destination", title: "Destination", position: "b0" };
       const otherDestination = { ...destination, id: "other-destination", title: "Other destination", position: "b1" };
       mockShellApi({ pages: [page, destination, otherDestination] });
@@ -350,6 +354,43 @@ describe("App error handling", () => {
       expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual(
         moveTo !== undefined ? [{ parentId: moveTo, beforeId: null, afterId: null }] : [],
       );
+    },
+  );
+
+  it.each(["removal-with-fallback", "removal-without-fallback", "navigation"] as const)(
+    "discards the Move dialog when its source is no longer selected (%s)",
+    async (scenario) => {
+      mockDialogMethods();
+      const other = { ...page, id: "other", title: "Other page", position: "b0" };
+      mockShellApi({ pages: scenario === "removal-without-fallback" ? [page] : [page, other] });
+      render(<App />);
+      await screen.findByRole("button", { name: "Actions for Roadmap" });
+      fireEvent.click(screen.getByRole("button", { name: /Find a page or command/ }));
+      fireEvent.click(await screen.findByRole("option", { name: /Move current page/ }));
+      expect(screen.getByRole("dialog", { name: "Move Roadmap" })).toBeInTheDocument();
+
+      act(() => {
+        if (scenario === "navigation") window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: other.id }));
+        else dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [page.id], permanently: false });
+      });
+      expect(screen.queryByRole("dialog", { name: /^Move / })).toBeNull();
+      if (scenario === "removal-without-fallback")
+        act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [other] }));
+      act(() => {
+        window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: other.id }));
+      });
+      await screen.findByRole("button", { name: "Actions for Other page" });
+      expect(screen.queryByRole("dialog", { name: /^Move / })).toBeNull();
+      if (scenario === "navigation") {
+        act(() => {
+          window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: page.id }));
+        });
+      }
+      await screen.findByRole("button", {
+        name: scenario === "navigation" ? "Actions for Roadmap" : "Actions for Other page",
+      });
+      expect(screen.queryByRole("dialog", { name: /^Move / })).toBeNull();
+      expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith("/move"))).toEqual([]);
     },
   );
 
@@ -1077,7 +1118,7 @@ describe("App error handling", () => {
     mockShellApi({ jobs: () => [] });
     render(<App />);
     expect(await screen.findByRole("heading", { name: "Imports & exports" })).toBeInTheDocument();
-    expect(vi.mocked(api).mock.calls.some(([path]) => path === "/api/jobs")).toBe(true);
+    await waitFor(() => expect(vi.mocked(api).mock.calls.some(([path]) => path === "/api/jobs")).toBe(true));
     expect(window.location.search).not.toContain("activity");
   });
 

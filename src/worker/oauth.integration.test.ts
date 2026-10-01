@@ -826,6 +826,40 @@ describe("OAuth MCP foundation", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
+  it.each([false, true])(
+    "refreshes known metadata without spending an exhausted registration budget (at capacity: %s)",
+    async (atCapacity) => {
+      const clientId = "https://client.public.org/client.json";
+      const uris = JSON.stringify(["http://127.0.0.1:3800/callback"]);
+      await env.DB.prepare("INSERT INTO oauth_clients VALUES (?,'Metadata client',?,?,0,0)")
+        .bind(clientId, uris, clientId)
+        .run();
+      if (atCapacity)
+        await env.DB.prepare(`INSERT INTO oauth_clients(client_id,name,redirect_uris_json,metadata_url,created_at,updated_at)
+        WITH RECURSIVE counter(value) AS (SELECT 1 UNION ALL SELECT value+1 FROM counter WHERE value<999)
+        SELECT 'client-'||value,'Client',?,NULL,0,0 FROM counter`)
+          .bind(uris)
+          .run();
+      await exhaustRate("oauth-client-registrations", 100);
+      const fetcher = vi.fn(async () => Response.json({ client_id: clientId, redirect_uris: JSON.parse(uris) }));
+      vi.stubGlobal("fetch", fetcher);
+      const request = new Request(`${ORIGIN}/oauth/authorize?${authorizationParams(clientId)}`);
+      expect((await authorizeOAuthGet(request, env)).status).toBe(302);
+      expect((await authorizeOAuthGet(request, env)).status).toBe(302);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+      expect(
+        await env.DB.prepare("SELECT count FROM rateLimit WHERE key='oauth-client-registrations'").first(),
+      ).toEqual({ count: 100 });
+      await expect(
+        authorizeOAuthGet(
+          new Request(`${ORIGIN}/oauth/authorize?${authorizationParams("https://new.public.org/client.json")}`),
+          env,
+        ),
+      ).rejects.toMatchObject({ status: 429 });
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    },
+  );
+
   it("caches validated metadata across sign-in and consent, then refreshes it", async () => {
     const cookie = await bootstrap();
     const clientId = "https://client.public.org/client.json";

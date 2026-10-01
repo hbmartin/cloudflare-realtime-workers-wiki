@@ -1813,11 +1813,9 @@ function CollaborativeEditor({
               </button>
             </fieldset>
           )}
-          {pasteNotice && (
-            <output className="muted" aria-live="polite">
-              {pasteNotice}
-            </output>
-          )}
+          <output className="muted" aria-live="polite">
+            {pasteNotice}
+          </output>
           {dateInsert && (
             <DateMentionPicker
               key={dateInsert.tokenId}

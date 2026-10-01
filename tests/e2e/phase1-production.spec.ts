@@ -174,6 +174,11 @@ test("offers safe paste choices and keeps the link when preview fetch fails", as
 test("does not overwrite a changed paragraph from a stale paste choice", async ({ page }) => {
   await signInOwner(page);
   await createDocument(page);
+  const notice = page.locator('output[aria-live="polite"]');
+  await expect(notice).toHaveCount(1);
+  await expect(notice).toHaveText("");
+  const originalNotice = await notice.elementHandle();
+  expect(originalNotice).not.toBeNull();
   const paragraph = page.locator('.bn-editor [data-content-type="paragraph"]').last();
   await paragraph.click();
   await page.locator(".bn-editor").focus();
@@ -198,6 +203,25 @@ test("does not overwrite a changed paragraph from a stale paste choice", async (
     embedProviders[0]!.fixture,
   );
   await expect(page.getByRole("status").filter({ hasText: /added as a link at the end of the page/ })).toBeVisible();
+  expect(await notice.evaluate((current, original) => current === original, originalNotice)).toBe(true);
+  await page.locator(".bn-editor").focus();
+  await page.keyboard.press("End");
+  await page.keyboard.press("Enter");
+  await page.evaluate((url) => {
+    const clipboardData = new DataTransfer();
+    clipboardData.setData("text/plain", url);
+    document.activeElement?.dispatchEvent(
+      new ClipboardEvent("paste", { clipboardData, bubbles: true, cancelable: true }),
+    );
+  }, embedProviders[0]!.fixture);
+  await expect(choices).toBeVisible();
+  await expect(notice).toHaveText("");
+  expect(await notice.evaluate((current, original) => current === original, originalNotice)).toBe(true);
+  await choices.getByRole("button", { name: "Cancel" }).click();
+  await expect(choices).toHaveCount(0);
+  await expect(notice).toHaveCount(1);
+  expect(await notice.evaluate((current, original) => current === original, originalNotice)).toBe(true);
+  await originalNotice?.dispose();
 });
 
 test("hides expanded paste actions when bootstrap disables them", async ({ page }) => {

@@ -833,6 +833,29 @@ describe("import content", () => {
     expect(JSON.stringify(parsed.document)).toContain('"text":"bold","marks":[{"type":"bold"}]');
   });
   it.each([
+    { prefix: "_".repeat(510), span: "**_bold italic_**" },
+    { prefix: "*".repeat(510), span: "__*bold italic*__" },
+    { prefix: "_".repeat(511), span: "\\**_bold italic_*" },
+  ])("keeps mixed openers intact at the density boundary: $span", ({ prefix, span }) => {
+    const nodes = markdownToDocument(`${prefix} ${span}`).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(nodes.map((node) => node.text ?? "").join("")).toBe(
+      `${prefix} ${span.startsWith("\\") ? "*" : ""}bold italic`,
+    );
+    const formatted = nodes.find((node) => node.text === "bold italic");
+    expect(formatted?.marks).toEqual(
+      expect.arrayContaining([{ type: "italic" }, ...(span.startsWith("\\") ? [] : [{ type: "bold" }])]),
+    );
+  });
+  it.each([
+    { prefix: "*".repeat(10_000) + "_", span: "**bold**" },
+    { prefix: "_".repeat(10_000) + "*", span: "__bold__" },
+    { prefix: "\\" + "*".repeat(10_000) + "_", span: "**bold**" },
+  ])("bounds oversized mixed opening runs while retaining nearby formatting: $span", ({ prefix, span }) => {
+    const nodes = markdownToDocument(`${prefix}${span}`).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(nodes.map((node) => node.text ?? "").join("")).toBe(`${prefix.replaceAll("\\", "")}bold`);
+    expect(nodes.at(-1)).toMatchObject({ text: "bold", marks: [{ type: "bold" }] });
+  });
+  it.each([
     { source: `${"*".repeat(513)}x*`, mark: "italic" },
     { source: `${"*".repeat(514)}x**`, mark: "bold" },
   ])("keeps $mark next to an oversized opening run", ({ source, mark }) => {
