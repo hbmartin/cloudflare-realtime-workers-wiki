@@ -8519,6 +8519,42 @@ describe("calm workspace task lists", () => {
     });
   }, 40_000);
 
+  it.each(["retry/1", "", "retry-1"])(
+    "handles archive operation header %j consistently for ordinary pages and task details",
+    async (operationId) => {
+      const installed = await bootstrap();
+      const list = await taskList(installed);
+      const createOperationId = crypto.randomUUID();
+      const created = await change(installed, list.id, {
+        title: "Archive with a malformed retry header",
+        expectedRevision: 1,
+        operationId: createOperationId,
+      });
+      const { detailPageId } = await created.json<{ detailPageId: string }>();
+      const ordinary = await createPage(installed.cookie);
+      for (const id of [ordinary.id, detailPageId]) {
+        const archived = await SELF.fetch(
+          authenticatedRequest(installed.cookie, `/api/pages/${id}`, {
+            method: "DELETE",
+            headers: { "x-notes-operation-id": operationId },
+          }),
+        );
+        expect(archived.status).toBe(200);
+        expect(await archived.json()).toMatchObject({ ok: true, pageIds: [id] });
+        expect(await env.DB.prepare("SELECT archived_at FROM pages WHERE id=?").bind(id).first()).toEqual({
+          archived_at: expect.any(Number),
+        });
+      }
+      const receipts = await env.DB.prepare(
+        "SELECT operation_id FROM task_mutation_receipts WHERE detail_page_id=? AND operation_id<>?",
+      )
+        .bind(detailPageId, createOperationId)
+        .all();
+      const generatedId = expect.stringMatching(/^[\w-]{1,100}$/);
+      expect(receipts.results).toEqual([{ operation_id: operationId === "retry-1" ? operationId : generatedId }]);
+    },
+  );
+
   it("archives and restores task details without detaching their row", async () => {
     const installed = await bootstrap();
     const list = await taskList(installed);

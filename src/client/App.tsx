@@ -4462,8 +4462,8 @@ function MovePageDialog({
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
-  const initialParentId = useRef(page.parentId);
-  const [parentId, setParentId] = useState(page.parentId ?? "");
+  const [chosenParentId, setChosenParentId] = useState<string>();
+  const parentId = chosenParentId ?? page.parentId ?? "";
   useEffect(() => {
     const dialog = ref.current;
     dialog?.showModal();
@@ -4480,6 +4480,7 @@ function MovePageDialog({
     }
     return true;
   });
+  const destinationAvailable = !parentId || eligible.some((candidate) => candidate.id === parentId);
   return (
     <dialog
       ref={ref}
@@ -4493,16 +4494,26 @@ function MovePageDialog({
       <form
         onSubmit={(event) => {
           event.preventDefault();
+          if (!destinationAvailable) return;
           const destination = parentId || null;
-          if (destination !== initialParentId.current) onMove(destination);
+          if (destination !== page.parentId) onMove(destination);
           onClose();
         }}
       >
         <h2>Move “{page.title}”</h2>
         <label>
           Destination
-          <select value={parentId} onChange={(event) => setParentId(event.target.value)}>
+          <select
+            value={parentId}
+            aria-describedby="move-destination-status"
+            onChange={(event) => setChosenParentId(event.target.value)}
+          >
             <option value="">Top level of this space</option>
+            {!destinationAvailable && (
+              <option value={parentId} disabled>
+                Selected destination (unavailable)
+              </option>
+            )}
             {eligible.map((candidate) => (
               <option key={candidate.id} value={candidate.id}>
                 {candidate.title}
@@ -4510,11 +4521,16 @@ function MovePageDialog({
             ))}
           </select>
         </label>
+        <output id="move-destination-status" className="muted" aria-live="polite">
+          {destinationAvailable ? "" : "That destination is no longer available. Choose another destination."}
+        </output>
         <div className="dialog-actions">
           <button type="button" onClick={onClose}>
             Cancel
           </button>
-          <button type="submit">Move page</button>
+          <button type="submit" disabled={!destinationAvailable}>
+            Move page
+          </button>
         </div>
       </form>
     </dialog>

@@ -271,10 +271,31 @@ describe("App error handling", () => {
     });
   });
 
-  it.each(["unchanged", "changed", "remote"])(
-    "only moves a page when the dialog destination changes (%s)",
-    async (scenario) => {
-      const changed = scenario === "changed";
+  it.each<{
+    name: string;
+    picked?: string;
+    remoteParent?: string;
+    removePicked?: boolean;
+    nextPicked?: string;
+    moveTo?: string | null;
+  }>([
+    { name: "unchanged" },
+    { name: "changed", picked: "destination", moveTo: "destination" },
+    { name: "remote", remoteParent: "destination" },
+    { name: "remote-top-level", remoteParent: "destination", nextPicked: "", moveTo: null },
+    { name: "draft-remote", picked: "destination", remoteParent: "other-destination", moveTo: "destination" },
+    { name: "draft-remote-same", picked: "destination", remoteParent: "destination" },
+    { name: "unavailable", picked: "destination", removePicked: true },
+    {
+      name: "replace-unavailable",
+      picked: "destination",
+      removePicked: true,
+      nextPicked: "other-destination",
+      moveTo: "other-destination",
+    },
+  ])(
+    "only moves a page when the dialog destination changes ($name)",
+    async ({ picked, remoteParent, removePicked = false, nextPicked, moveTo }) => {
       for (const method of ["showModal", "close"] as const) {
         const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, method);
         Object.defineProperty(HTMLDialogElement.prototype, method, {
@@ -289,10 +310,12 @@ describe("App error handling", () => {
         });
       }
       const destination = { ...page, id: "destination", title: "Destination", position: "b0" };
-      mockShellApi({ pages: [page, destination] });
+      const otherDestination = { ...destination, id: "other-destination", title: "Other destination", position: "b1" };
+      mockShellApi({ pages: [page, destination, otherDestination] });
       const shellApi = vi.mocked(api).getMockImplementation()!;
       vi.mocked(api).mockImplementation(async (path, init) => {
-        if (path === `/api/pages/${page.id}/move`) return { page: { ...page, parentId: destination.id, revision: 2 } };
+        if (path === `/api/pages/${page.id}/move`)
+          return { page: { ...page, parentId: JSON.parse(String(init?.body)).parentId, revision: 3 } };
         return shellApi(path, init);
       });
       render(<App />);
@@ -300,21 +323,32 @@ describe("App error handling", () => {
       fireEvent.click(screen.getByRole("button", { name: /Find a page or command/ }));
       fireEvent.click(await screen.findByRole("option", { name: /Move current page/ }));
       const dialog = screen.getByRole("dialog", { name: "Move Roadmap" });
-      if (scenario === "remote")
+      const select = within(dialog).getByLabelText("Destination");
+      if (picked !== undefined) fireEvent.change(select, { target: { value: picked } });
+      if (remoteParent !== undefined) {
         act(() =>
           dispatchWorkspaceEvent({
             type: "pages-upserted",
-            pages: [{ ...page, parentId: destination.id, revision: 2 }],
+            pages: [{ ...page, parentId: remoteParent, revision: 2 }],
           }),
         );
-      if (changed)
-        fireEvent.change(within(dialog).getByLabelText("Destination"), { target: { value: destination.id } });
-      fireEvent.click(within(dialog).getByRole("button", { name: "Move page" }));
-      expect(screen.queryByRole("dialog", { name: "Move Roadmap" })).toBeNull();
+      }
+      if (removePicked)
+        act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [destination.id], permanently: false }));
+      expect(select).toHaveValue(picked ?? remoteParent ?? "");
+      const submit = within(dialog).getByRole("button", { name: "Move page" });
+      expect(submit).toHaveProperty("disabled", removePicked);
+      expect(within(dialog).getByRole("status").textContent).toBe(
+        removePicked ? "That destination is no longer available. Choose another destination." : "",
+      );
+      if (nextPicked !== undefined) fireEvent.change(select, { target: { value: nextPicked } });
+      fireEvent.click(submit);
+      expect(screen.queryByRole("dialog", { name: "Move Roadmap" })).toBe(
+        removePicked && nextPicked === undefined ? dialog : null,
+      );
       const requests = vi.mocked(api).mock.calls.filter(([path]) => path === `/api/pages/${page.id}/move`);
-      expect(requests).toHaveLength(changed ? 1 : 0);
       expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual(
-        changed ? [{ parentId: destination.id, beforeId: null, afterId: null }] : [],
+        moveTo !== undefined ? [{ parentId: moveTo, beforeId: null, afterId: null }] : [],
       );
     },
   );
