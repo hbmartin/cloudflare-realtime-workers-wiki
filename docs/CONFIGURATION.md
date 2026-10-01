@@ -200,6 +200,14 @@ Producers that encounter the lease request an atomic rescan from its owner. If i
 remain at the cap, the owner queues a continuation; contended continuation deliveries back off, and the cron
 remains the recovery path if that queue send fails.
 
+Word (.docx) imports create one document page after preview and confirmation. Word exports are
+available for document pages and produce a single file without requiring Browser Rendering. They
+preserve rich text, nested lists, basic tables, and embedded PNG/JPEG/GIF images. Uploads are limited
+to 24 MiB; expanded archives and exported files are limited to 64 MiB, with a 24 MiB embedded-image
+budget. External images and attached files remain links. Word layout, merged/nested tables, and
+custom blocks may be simplified; the import preview or export job reports warnings. Headers,
+footers, precise pagination, review metadata, and offline Word operations are not preserved.
+
 PDF and portable HTML exports accept at most 64 accessible linked-diagram thumbnails and load them
 sequentially. PDF rejects more than 24 MiB of thumbnail bytes; portable HTML uses the export's 64 MiB
 artifact limit. Non-portable exports resolve diagram links in bounded query batches without loading thumbnails.

@@ -1,4 +1,5 @@
 import { enrollAccount } from "../../tests/helpers/security";
+import { docxDocument, docxPng } from "../../tests/helpers/docx";
 import { applyD1Migrations, createExecutionContext, env, reset, waitOnExecutionContext } from "cloudflare:test";
 import { beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import * as Y from "yjs";
@@ -12,6 +13,7 @@ import type { Env } from "./env";
 import { HttpError } from "./http";
 import { sidebarHiddenPageIds } from "./page-access";
 import { runImport } from "./importer";
+import { DOCX_MIME, readDocx, writeDocx } from "./docx";
 import {
   claimJobWorkflowRun,
   cleanupTemplateClone,
@@ -158,6 +160,204 @@ beforeEach(async () => {
 });
 
 describe("job execution", () => {
+  it("imports and exports a single DOCX page with verified images without Browser Rendering", async () => {
+    const installed = await bootstrap();
+    const importedTitle = "Word fixture 1234567890abcdef1234567890abcdef";
+    const bindings = bindingsWith({ WORKFLOW_INLINE: "true", BROWSER: undefined });
+    const fixture = await writeDocx(docxDocument(), "Source title", "http://example.test", async () => ({
+      bytes: docxPng,
+      mime: "image/png",
+    }));
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([fixture.bytes], `${importedTitle}.docx`, { type: DOCX_MIME }));
+    const uploadContext = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      bindings,
+      uploadContext,
+    );
+    expect(response.status).toBe(202);
+    const jobId = (await response.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(uploadContext);
+    const preview = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job;
+    expect(preview).toMatchObject({
+      status: "awaiting_confirmation",
+      result: { preview: { format: "docx", pages: 1, assets: 1 } },
+    });
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE title = ?").bind(importedTitle).first()).toBeNull();
+
+    const confirmContext = createExecutionContext();
+    const confirmed = await worker.fetch(
+      await importRequest(installed.cookie, `/api/imports/${jobId}/confirm`, { method: "POST" }),
+      bindings,
+      confirmContext,
+    );
+    expect(confirmed.status).toBe(202);
+    await waitOnExecutionContext(confirmContext);
+    const importedJob = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${jobId}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job;
+    expect(importedJob.status).toBe("succeeded");
+    const pageId = importedJob.result!.pageId!;
+    const page = await env.DB.prepare("SELECT title, kind, content_epoch FROM pages WHERE id = ?")
+      .bind(pageId)
+      .first<{ title: string; kind: string; content_epoch: number }>();
+    expect(page).toMatchObject({ title: importedTitle, kind: "document" });
+    const content = await env.DOCUMENT.getByName(`${pageId}~${page!.content_epoch}`).fetch(
+      new Request("https://document.internal/content", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+    );
+    const envelope = await content.json<{ document: unknown }>();
+    expect(JSON.stringify(envelope.document)).toContain('"type":"table"');
+    const attachment = await env.DB.prepare("SELECT id, r2_key FROM attachments WHERE page_id = ?")
+      .bind(pageId)
+      .first<{ id: string; r2_key: string }>();
+    expect(attachment).not.toBeNull();
+    expect(JSON.stringify(envelope.document)).toContain(`/api/attachments/${attachment!.id}`);
+    expect(new Uint8Array(await (await env.BUCKET.get(attachment!.r2_key))!.arrayBuffer())).toEqual(docxPng);
+
+    const exportContext = createExecutionContext();
+    const exported = await worker.fetch(
+      request(installed.cookie, `/api/pages/${pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "docx", portable: false }),
+      }),
+      bindings,
+      exportContext,
+    );
+    expect(exported.status).toBe(202);
+    const exportId = (await exported.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(exportContext);
+    const completed = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${exportId}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job;
+    expect(completed).toMatchObject({ status: "succeeded", hasDownload: true, warnings: [] });
+    const download = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${exportId}/download`),
+      env,
+      createExecutionContext(),
+    );
+    expect(download.headers.get("content-type")).toBe(DOCX_MIME);
+    expect(download.headers.get("content-disposition")).toContain(`${importedTitle}.docx`);
+    const roundTrip = await readDocx(new Uint8Array(await download.arrayBuffer()));
+    expect(roundTrip.entries.size).toBe(1);
+    expect(JSON.stringify(roundTrip.document)).toContain("Cell B");
+    expect(JSON.stringify(roundTrip.document)).toContain("Résumé 日本語");
+  });
+
+  it("keeps DOCX export scoped to document pages and existing authentication", async () => {
+    const installed = await bootstrap();
+    const post = (pageId: string, portable = false) =>
+      request(installed.cookie, `/api/pages/${pageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "docx", portable }),
+      });
+    expect((await worker.fetch(post(installed.pageId, true), env, createExecutionContext())).status).toBe(422);
+    for (const kind of ["table", "diagram"]) {
+      const response = await worker.fetch(
+        request(installed.cookie, "/api/pages", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ kind, title: "Unsupported" }),
+        }),
+        env,
+        createExecutionContext(),
+      );
+      const page = (await response.json<{ page: Page }>()).page;
+      expect((await worker.fetch(post(page.id), env, createExecutionContext())).status).toBe(422);
+    }
+    const anonymous = post(installed.pageId);
+    anonymous.headers.delete("cookie");
+    expect((await worker.fetch(anonymous, env, createExecutionContext())).status).toBe(401);
+    const backupOwnerId = crypto.randomUUID();
+    const timestamp = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES (?, 'Backup owner', ?, 1, ?, ?)",
+      ).bind(backupOwnerId, `docx-owner-${backupOwnerId}@example.test`, timestamp, timestamp),
+      env.DB.prepare(
+        "INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+      ).bind(installed.workspaceId, backupOwnerId, timestamp),
+      env.DB.prepare("UPDATE workspace_members SET role = 'viewer' WHERE workspace_id = ? AND user_id = ?").bind(
+        installed.workspaceId,
+        installed.userId,
+      ),
+    ]);
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File(["Word"], "denied.docx", { type: DOCX_MIME }));
+    expect(
+      (
+        await worker.fetch(
+          request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+          env,
+          createExecutionContext(),
+        )
+      ).status,
+    ).toBe(403);
+  });
+
+  it("cancels a DOCX preview and reinspects it on retry without publishing resources", async () => {
+    const installed = await bootstrap();
+    const fixture = await writeDocx(docxDocument(), "Cancel", "http://example.test", async () => ({
+      bytes: docxPng,
+      mime: "image/png",
+    }));
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([fixture.bytes], "cancel.docx", { type: DOCX_MIME }));
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      context,
+    );
+    const id = (await response.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(context);
+    const cancelContext = createExecutionContext();
+    expect(
+      (
+        await worker.fetch(
+          request(installed.cookie, `/api/jobs/${id}/cancel`, { method: "POST" }),
+          inlineBindings(),
+          cancelContext,
+        )
+      ).status,
+    ).toBe(200);
+    await waitOnExecutionContext(cancelContext);
+    expect(
+      await env.DB.prepare("SELECT id FROM pages WHERE import_job_id = ? OR title = 'cancel'").bind(id).first(),
+    ).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM attachments WHERE name LIKE 'image-%'").first()).toBeNull();
+    const retryContext = createExecutionContext();
+    const retried = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${id}/retry`, { method: "POST" }),
+      inlineBindings(),
+      retryContext,
+    );
+    expect(retried.status).toBe(202);
+    await waitOnExecutionContext(retryContext);
+    const job = (
+      await (
+        await worker.fetch(request(installed.cookie, `/api/jobs/${id}`), env, createExecutionContext())
+      ).json<{ job: Job }>()
+    ).job;
+    expect(job).toMatchObject({
+      status: "awaiting_confirmation",
+      result: { preview: { format: "docx", pages: 1, assets: 1 } },
+    });
+  });
+
   it("keeps staged job pages out of every public page and search surface", async () => {
     const installed = await bootstrap();
     const jobId = crypto.randomUUID();

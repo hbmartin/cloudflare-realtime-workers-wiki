@@ -51,6 +51,28 @@ afterEach(() => {
 });
 
 describe("ExportDialog", () => {
+  it("queues a single Word document without requiring Browser Rendering", async () => {
+    vi.mocked(api).mockImplementation(async (path) =>
+      path === "/api/integrations/status" ? { pdf: { available: false } } : { job },
+    );
+    const onQueued = vi.fn();
+    render(<ExportDialog page={page} onClose={vi.fn()} onQueued={onQueued} />);
+    fireEvent.click(screen.getByRole("radio", { name: /Word/ }));
+    expect(screen.queryByRole("checkbox", { name: /Include attachments/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Start export" }));
+    await waitFor(() => expect(onQueued).toHaveBeenCalledWith(job));
+    expect(api).toHaveBeenCalledWith(
+      `/api/pages/${page.id}/exports`,
+      expect.objectContaining({ body: JSON.stringify({ format: "docx", portable: false }) }),
+    );
+  });
+
+  it.each(["table", "diagram"] as const)("does not offer Word export for a %s page", (kind) => {
+    vi.mocked(api).mockResolvedValue({ pdf: { available: false } });
+    render(<ExportDialog page={{ ...page, kind }} onClose={vi.fn()} onQueued={vi.fn()} />);
+    expect(screen.queryByRole("radio", { name: /Word/ })).not.toBeInTheDocument();
+  });
+
   it("reports disabled PDF configuration and queues a portable HTML export", async () => {
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/integrations/status") return { pdf: { available: false } };

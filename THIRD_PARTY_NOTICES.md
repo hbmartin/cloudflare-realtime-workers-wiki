@@ -44,3 +44,16 @@ Copyright tldraw contributors. Source: <https://github.com/tldraw/tldraw-sync-cl
 Used as unmodified package dependencies under their published licenses. See `pnpm-lock.yaml` and each installed package for exact versions and notices.
 
 Outline was consulted only as a clean-room behavioral reference. No current Outline BSL source was copied. AFFiNE was consulted for architectural ideas; no AFFiNE branding or assets are included.
+
+## Mammoth, docx, and htmlparser2
+
+Mammoth is used for Word import under BSD-2-Clause. Copyright Michael Williamson.
+Source: <https://github.com/mwilliamson/mammoth.js>
+
+docx is used for Word export under MIT. Copyright Dolan and docx contributors.
+Source: <https://github.com/dolanmiu/docx>
+
+htmlparser2 is used for semantic HTML parsing under MIT. Copyright Chris Winberry
+and htmlparser2 contributors. Source: <https://github.com/fb55/htmlparser2>
+
+See each installed package for its complete license text and notices.

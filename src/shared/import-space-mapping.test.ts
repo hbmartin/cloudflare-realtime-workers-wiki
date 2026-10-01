@@ -29,6 +29,19 @@ describe("import option diagnostics", () => {
 });
 
 describe("single-page import parent", () => {
+  it("accepts DOCX options through preview confirmation", () => {
+    const options = requireImportOptions({
+      filename: "brief.docx",
+      format: "docx",
+      parentId: "parent",
+      confirmed: true,
+      previewId: "preview",
+      previewGroupKeys: ["Imported"],
+    });
+    expect(options.format).toBe("docx");
+    expect(hasCurrentImportConfirmation(options)).toBe(true);
+  });
+
   it("retains a parent while a Markdown import moves from inspection to confirmation", () => {
     const options = requireImportOptions({
       filename: "notes.md",

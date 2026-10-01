@@ -306,7 +306,7 @@ export type Job = {
 export type ImportPreview = {
   previewId?: string;
   groupingVersion?: number;
-  format: "markdown" | "html" | "notion_zip";
+  format: "markdown" | "html" | "notion_zip" | "docx";
   filename: string;
   pages: number;
   tables: number;
@@ -327,7 +327,7 @@ export type ImportPreview = {
   warnings: string[];
 };
 
-export type ExportFormat = "markdown" | "html" | "pdf" | "json" | "svg" | "png";
+export type ExportFormat = "markdown" | "html" | "pdf" | "json" | "svg" | "png" | "docx";
 
 export type SearchArchiveState = "active" | "archived" | "all";
 export type SearchSnippetSource = "title" | "tag" | "body" | "comment" | "attachment";

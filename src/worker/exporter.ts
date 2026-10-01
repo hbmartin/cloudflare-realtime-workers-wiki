@@ -1,3 +1,4 @@
+import { DOCX_MIME, writeDocx } from "./docx";
 import type { WorkflowStep } from "cloudflare:workers";
 import { tracing } from "cloudflare:workers";
 import { correlationHeaders, traced } from "./observability";
@@ -43,6 +44,7 @@ type LinkedDiagramAsset = {
   bytes?: Uint8Array;
 };
 type SerializedExport = {
+  document?: ProseMirrorJson;
   html: string;
   markdown?: string;
   json?: string;
@@ -61,8 +63,9 @@ function exportOptions(job: JobRow): ExportOptions {
   const options = jsonRecord(job.options_json);
   if (
     typeof options.pageId !== "string" ||
-    !["markdown", "html", "json", "svg", "png", "pdf"].includes(String(options.format)) ||
-    typeof options.portable !== "boolean"
+    !["markdown", "html", "json", "svg", "png", "pdf", "docx"].includes(String(options.format)) ||
+    typeof options.portable !== "boolean" ||
+    (options.format === "docx" && options.portable)
   ) {
     throw new Error("Export options are invalid.");
   }
@@ -79,7 +82,7 @@ function escapeMarkdownCell(value: string) {
 
 function fileStem(title: string) {
   const normalized = normalizeFilename(title)
-    .replace(/\.(md|html|json|svg|png|pdf|zip)$/i, "")
+    .replace(/\.(md|html|json|svg|png|pdf|docx|zip)$/i, "")
     .trim();
   return normalized || "Untitled";
 }
@@ -248,6 +251,7 @@ async function documentExport(
     },
   });
   return {
+    document: envelope.document,
     markdown: `# ${page.title.replaceAll("\n", " ")}\n\n${serialized.markdown}`,
     html: serialized.html
       .replace("<head>", `<head><title>${escapeHtml(page.title)}</title>`)
@@ -503,7 +507,39 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
     let bytes: Uint8Array;
     let contentType: string;
     let filename: string;
-    if (options.format === "pdf") {
+    let warnings: string[] = [];
+    if (options.format === "docx") {
+      if (page.kind !== "document" || !serialized.document)
+        throw new HttpError(422, "job_failed", "Word export is only available for document pages.");
+      const result = await writeDocx(serialized.document, page.title, env.BETTER_AUTH_URL, async (url) => {
+        await assertExportActive(env, job);
+        let pathname: string;
+        try {
+          const parsed = new URL(url, env.BETTER_AUTH_URL);
+          if (parsed.origin !== new URL(env.BETTER_AUTH_URL).origin) return null;
+          pathname = parsed.pathname;
+        } catch {
+          return null;
+        }
+        const id = /^\/api\/attachments\/([^/]+)$/.exec(pathname)?.[1];
+        if (!id) return null;
+        const attachment = await env.DB.prepare(
+          `SELECT id, r2_key, name, mime FROM attachments WHERE id = ? AND page_id = ?`,
+        )
+          .bind(id, page.id)
+          .first<ExportAttachment>();
+        if (!attachment || !["image/png", "image/jpeg", "image/gif"].includes(attachment.mime)) return null;
+        const asset = await env.BUCKET.get(attachment.r2_key);
+        if (!asset) return null;
+        if (asset.size > PDF_INLINE_ASSET_LIMIT)
+          throw new HttpError(413, "job_failed", "Embedded Word images exceed the 24 MiB limit.");
+        return { bytes: new Uint8Array(await asset.arrayBuffer()), mime: attachment.mime };
+      });
+      bytes = result.bytes;
+      warnings = result.warnings;
+      contentType = DOCX_MIME;
+      filename = `${fileStem(page.title)}.docx`;
+    } else if (options.format === "pdf") {
       if (!env.BROWSER) throw new Error("PDF export is not configured.");
       const response = await env.BROWSER.quickAction("pdf", {
         html: await browserExportHtml(env, job, page, serialized.html, diagramAssets),
@@ -575,7 +611,7 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
       httpMetadata: { contentType },
       customMetadata: { filename, pageId: page.id, jobId: job.id },
     });
-    return { outputKey, filename, byteLength: bytes.byteLength };
+    return { outputKey, filename, byteLength: bytes.byteLength, warnings };
   });
   await step.do("publish export", async () => {
     await assertExportActive(env, job);
@@ -587,7 +623,7 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
     )
       .bind(
         artifact.outputKey,
-        JSON.stringify({ warnings: [], filename: artifact.filename, byteLength: artifact.byteLength }),
+        JSON.stringify({ warnings: artifact.warnings, filename: artifact.filename, byteLength: artifact.byteLength }),
         timestamp + EXPORT_ARTIFACT_TTL_MS,
         timestamp,
         job.id,

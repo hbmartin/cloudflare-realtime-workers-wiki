@@ -23,7 +23,7 @@ export function requireImportOptions(options: Record<string, unknown>): ImportOp
   if (
     typeof options.filename !== "string" ||
     typeof options.format !== "string" ||
-    !["markdown", "html", "notion_zip"].includes(options.format) ||
+    !["markdown", "html", "notion_zip", "docx"].includes(options.format) ||
     typeof options.confirmed !== "boolean"
   )
     throw new Error("Import options are invalid.");

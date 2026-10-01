@@ -37,7 +37,7 @@ export function ImportDialog({
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (!file) {
-      setError("Choose a Markdown, HTML, or Notion ZIP file.");
+      setError("Choose a Markdown, HTML, Word (.docx), or Notion ZIP file.");
       return;
     }
     setBusy(true);
@@ -82,11 +82,12 @@ export function ImportDialog({
               id="import-file"
               type="file"
               required
-              accept=".md,.markdown,.html,.htm,.zip,text/markdown,text/html,application/zip"
+              accept=".md,.markdown,.html,.htm,.docx,.zip,text/markdown,text/html,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/zip"
               onChange={(event) => setFile(event.target.files?.[0] ?? null)}
             />
             <small>
-              Markdown and HTML create one page. Notion ZIP exports can include nested pages, databases, and assets.
+              Markdown, HTML, and Word (.docx) create one page. Notion ZIP exports can include nested pages, databases,
+              and assets.
             </small>
           </label>
           <label className="import-field" htmlFor="import-space">

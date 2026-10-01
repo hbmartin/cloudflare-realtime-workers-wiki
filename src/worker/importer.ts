@@ -1,3 +1,4 @@
+import { readDocx } from "./docx";
 import { tracing, type WorkflowStep } from "cloudflare:workers";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import {
@@ -779,13 +780,16 @@ async function notionBundle(job: JobRow, options: ImportOptions, bytes: Uint8Arr
 
 async function singlePageBundle(job: JobRow, options: ImportOptions, bytes: Uint8Array): Promise<ImportBundle> {
   assertPreviewGroups(options, ["Imported"]);
-  const source = new TextDecoder().decode(bytes);
+  const source = options.format === "docx" ? "" : new TextDecoder().decode(bytes);
   const html = options.format === "html" ? htmlToDocument(source) : null;
-  const parsed = html ?? markdownToDocument(source);
+  const docx = options.format === "docx" ? await readDocx(bytes) : null;
+  const parsed = docx ?? html ?? markdownToDocument(source);
   const importedTitle = html?.title ?? "";
   const title = options.title
     ? options.title.replaceAll("\0", "").trim() || "Untitled"
-    : cleanTitle(importedTitle || stem(options.filename));
+    : options.format === "docx"
+      ? stem(options.filename).replaceAll("\0", "").trim().slice(0, 200) || "Untitled"
+      : cleanTitle(importedTitle || stem(options.filename));
   const page: ImportPage = {
     source: options.filename,
     id: await stableId(job.id, "page", options.filename),
@@ -804,7 +808,7 @@ async function singlePageBundle(job: JobRow, options: ImportOptions, bytes: Uint
   };
   const issues = parsed.issues;
   const linkStats = { resolved: 0, unresolved: 0 };
-  await hydrateDocumentAssets(job, page, new Map(), new Map(), issues, linkStats);
+  await hydrateDocumentAssets(job, page, docx?.entries ?? new Map(), new Map(), issues, linkStats);
   const preview: ImportPreview = {
     format: options.format,
     filename: options.filename,
