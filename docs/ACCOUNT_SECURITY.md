@@ -30,6 +30,14 @@ pnpm security:reset person@example.com --remote --identity-verified
 
 Use `--local` for a local database. The command immediately revokes factors, sessions, trust, and recovery codes in a single database operation, and prints a one-time token that expires in 30 minutes. Deliver it privately. The user signs in with their existing password and uses “Use a recovery code or operator reset,” then enrolls again. Workspace owners cannot issue resets. This does not reset forgotten passwords or add email/SMS recovery.
 
+For a forgotten password when the user's other protection should remain active, verify identity outside the app, then run:
+
+```sh
+pnpm security:reset person@example.com --remote --identity-verified --password-only
+```
+
+Use `--local` for a local database. This mode immediately sets a random replacement password and prints it only after database success; deliver it privately. It updates an existing password credential only and refuses accounts with no password credential or more than one matching credential. Sessions, trusted browsers, passkeys, authenticator factors, recovery codes, and other security state remain unchanged. The old password stops working, and new password sign-ins still require the existing account protection. The replacement password has no expiration or forced-change requirement. Omitting `--password-only` retains the full account-protection reset described above.
+
 ## Deployment and rollback
 
 1. Complete `pnpm check` and `pnpm test:e2e` and preserve the database backup and `BETTER_AUTH_SECRET`. TOTP secrets are encrypted with this secret; losing it invalidates them.
