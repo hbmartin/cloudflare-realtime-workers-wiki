@@ -1,6 +1,6 @@
 # Phase 1 implementation evidence
 
-Baseline: `499af28`. Local verification: 28 September 2026. Production deployment has not been performed, so Phase 1 remains pending in the roadmap.
+Baseline: `499af28`. Local verification: 28 September 2026. The code shipped to production through automatic deployment after #201 merged on 29 September 2026, with `EXPANDED_EMBEDS_ENABLED=false`. Phase 1 stays pending until the live steps below pass.
 
 | Exit scenario                                                             | Evidence                                                                                     |
 | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
@@ -26,4 +26,4 @@ The implementation adapts provider normalization and iframe URL validation patte
 3. After the exit matrix passes on the deployed Worker, change the production setting to `EXPANDED_EMBEDS_ENABLED=true`, run `pnpm cf-typegen`, commit the config and generated type together, and deploy. The catalog code and CSP are already present; this step enables the expanded providers and previews. Recheck a preview, all provider origins, and the health endpoint.
 4. If a provider or proxy fails, set the flag to `false`, run `pnpm cf-typegen`, commit the config and generated type together, and redeploy. Open tabs retain their bootstrap flag until reloaded, so ask users to reload to stop expanded frames. Existing links and bookmark URLs remain readable. Delete expired cache entries and R2 objects with scheduled cleanup or purge the derived cache if its fetch policy changes.
 
-The owner-supplied roadmap files `docs/roadmap/README.md` and `docs/roadmap/01-editor-navigation-embeds.md` are currently untracked local documents and are deliberately excluded from this branch. Mark Phase 1 shipped in those files only after the live rollout is verified and the owner adds them to the repository.
+Status, 1 October 2026: the production deploy workflow applied migrations through step 1 and deployed with the flag off. Steps 2–4 still need live verification and are tracked in [README.md](README.md#round-1-release-closeout). The roadmap documents are now tracked in the repository. Mark Phase 1 shipped there once step 3 passes.

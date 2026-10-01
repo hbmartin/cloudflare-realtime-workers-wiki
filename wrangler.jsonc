@@ -1,5 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
+  // Preserve variables configured in the Cloudflare dashboard across deployments.
+  "keep_vars": true,
   // Deployment resource identifiers intentionally remain stable through the NoteFlare rebrand.
   "name": "cloudflare-realtime-notes",
   "main": "src/worker/index.ts",

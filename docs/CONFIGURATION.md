@@ -13,6 +13,9 @@ the repository.
 | `BETTER_AUTH_URL`         | `http://localhost:5173`              | The exact origin the installation is served from. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **The production environment must use its deployed HTTPS origin.**                                          |
 | `EXPANDED_EMBEDS_ENABLED` | local/E2E `true`, production `false` | Set to `true` to enable Loom, Google, Miro, Spotify, and CodePen frames and the link-preview action. The Worker exposes the flag in `/api/me`. Disabling it preserves stored links and the original YouTube, Vimeo, and Figma frames; `/v1` can round-trip expanded URLs as content while the client renders them as links. Regenerate binding types with `pnpm cf-typegen` after changing the committed value. |
 
+Release flags (`OFFLINE_EDITING_ENABLED`, `NOTION_MARKDOWN_WRITES_ENABLED`, `WORKFLOW_INLINE`) and owner settings are
+listed in [Flags and release controls](FLAGS.md).
+
 ## Secrets
 
 Set for deployment with `wrangler secret put --env production`. Never place these in `wrangler.jsonc`.
@@ -299,7 +302,7 @@ Use the sidebar's contextual creation menu to create a Document, Table, Task Lis
 
 Task lists use existing table rows and linked documents. **Edit tasks** acquires the table's exclusive lease; **Finish editing** releases it. Table and Board show the same assignee, status, and due date. **My Tasks** lists assignments across accessible spaces. Task descriptions and comments use normal document collaboration. Task property changes from My Tasks or Slack acquire a short lease and return an actionable conflict while any table editor holds the lease. Retry is explicit; metadata changes are never silently queued. Due-date filters currently use UTC. Anonymous public task-list shares show “Assigned” without exposing account names or IDs.
 
-`/notes new` opens document creation, `/notes task-list` creates a task list, `/notes task` creates a task, and `/notes tasks` opens My Tasks with edit controls. Message shortcuts capture one message or a thread into a document or task at an explicit destination, with source attribution. Document content is copied asynchronously with a visible retry action; repeated form delivery and copy retries use stable receipts. Rich editing opens NoteFlare. App Home also shows recent Inbox updates and assigned tasks. Existing channel discussion mirroring and public-share controls continue to apply to task detail documents.
+`/notes new` opens document creation, `/notes task-list` creates a task list, `/notes task` creates a task, and `/notes tasks` opens My Tasks with edit controls. Message shortcuts capture one message or a thread into a document or task at an explicit destination, with source attribution. Captured content is staged and published through the verified import Workflow, so a failed capture leaves no partial page; the Activities tray offers a retry, and repeated form delivery or Slack retries return the same capture receipt. Rich editing opens NoteFlare. App Home also shows recent Inbox updates and assigned tasks. Existing channel discussion mirroring and public-share controls continue to apply to task detail documents.
 
 Apply additive migration `0047_workspace_experience.sql` together with this release. Existing tables remain ordinary tables. Reimport the updated Slack manifest to expose the command hints; capture uses the existing channel/history permissions and requires current channel membership and verified identity. This release does not add external guest editing or simultaneous table editing.
 
