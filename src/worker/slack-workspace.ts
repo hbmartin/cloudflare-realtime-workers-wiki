@@ -1324,6 +1324,8 @@ async function deliverUnfurlAction(env: Env, receiptId: string, input: ActionInp
       channel_id: string;
       message_ts: string;
       url: string;
+      reference_kind: string;
+      share_link_id: string | null;
     }>();
   if (!reference) unavailable();
   if (reference.url !== input.unfurlUrl) unavailable();
@@ -1333,7 +1335,20 @@ async function deliverUnfurlAction(env: Env, receiptId: string, input: ActionInp
   } catch {
     unavailable();
   }
-  if (parsedUrl.origin !== origin(env) || parsedUrl.searchParams.get("page") !== reference.page_id) unavailable();
+  if (parsedUrl.origin !== origin(env)) unavailable();
+  if (reference.reference_kind === "share") {
+    const pinned = await env.DB.prepare(
+      "SELECT 1 FROM share_links WHERE id=? AND root_page_id=? AND url_key=? AND workspace_id=?",
+    )
+      .bind(
+        reference.share_link_id,
+        reference.page_id,
+        decodeURIComponent(parsedUrl.pathname.split("/")[2] ?? ""),
+        installation.workspace_id,
+      )
+      .first();
+    if (!pinned) unavailable();
+  } else if (parsedUrl.searchParams.get("page") !== reference.page_id) unavailable();
   const { member } = await verifiedMember(env, installation, input.slackUserId, input.identity);
   if (member.role !== "owner") unavailable();
   await validateChannel(env, installation, reference.channel_id);

@@ -250,6 +250,7 @@ function formatErrorMessages(errors: WorkspaceError[]) {
 }
 
 type ArchiveResponse = {
+  operationId: string | null;
   pageIds: string[];
   cleanupPending: boolean;
   pendingPageCount: number | null;
@@ -269,18 +270,23 @@ function archiveResponse(value: unknown, rootPageId: string): ArchiveResponse | 
   const response = value !== null && typeof value === "object" ? (value as Record<string, unknown>) : null;
   const uniquePageIds = responsePageIds(value, rootPageId, response?.replayed === true);
   if (!uniquePageIds) return null;
+  const operationId =
+    typeof response?.operationId === "string" && /^[\w-]{1,100}$/.test(response.operationId)
+      ? response.operationId
+      : null;
   if (response?.cleanupPending === undefined) {
-    return { pageIds: uniquePageIds, cleanupPending: false, pendingPageCount: 0 };
+    return { operationId, pageIds: uniquePageIds, cleanupPending: false, pendingPageCount: 0 };
   }
   if (typeof response.cleanupPending !== "boolean") return null;
   const pendingPageCount = response.pendingPageCount;
   if (response.cleanupPending && pendingPageCount === null) {
-    return { pageIds: uniquePageIds, cleanupPending: true, pendingPageCount: null };
+    return { operationId, pageIds: uniquePageIds, cleanupPending: true, pendingPageCount: null };
   }
   if (typeof pendingPageCount !== "number" || !Number.isSafeInteger(pendingPageCount) || pendingPageCount < 0)
     return null;
   if (response.cleanupPending !== pendingPageCount > 0) return null;
   return {
+    operationId,
     pageIds: uniquePageIds,
     cleanupPending: response.cleanupPending,
     pendingPageCount,
@@ -3332,6 +3338,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         { method: "DELETE", headers: { "x-notes-operation-id": removalOperationId } },
         (value) => archiveResponse(value, page.id),
       );
+      if (result.kind === "committed" && result.value?.operationId) removalOperationId = result.value.operationId;
       const pageAlreadyGone = result.kind === "rejected" && isPageNotFoundError(result.error);
       archiveOutcome =
         result.kind === "committed" || pageAlreadyGone
@@ -4268,7 +4275,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <RecentPages pages={pages} recentIds={recentIds} onSelect={navigateToPage} />
         ) : view === "activity" ? (
           member.features?.workspaceActivity ? (
-            <ActivityView spaces={spaces} pages={activePages} onSelect={navigateToPage} />
+            <ActivityView spaces={spaces} pages={pages} onSelect={navigateToPage} />
           ) : (
             <p>Workspace activity is not enabled.</p>
           )

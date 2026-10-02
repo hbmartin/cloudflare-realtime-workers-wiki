@@ -235,7 +235,7 @@ export type SlackChannelSubscription = {
   pageId: string | null;
   channelId: string;
   channelName: string;
-  eventTypes: ChannelEventType[];
+  eventTypes: Array<ChannelEventType | NotificationEventType>;
   digestTime: string;
   digestTimezone: string | null;
   digestOpenWork: boolean;

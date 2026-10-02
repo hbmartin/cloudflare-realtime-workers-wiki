@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "./api";
 import { ActivityView } from "./ActivityView";
+import type { Page } from "../shared/types";
 import type { ActivityItem, ActivityResponse } from "../shared/activity";
 vi.mock("./api", async (original) => ({ ...(await original<typeof import("./api")>()), api: vi.fn() }));
 const item: ActivityItem = {
@@ -33,6 +34,10 @@ describe("ActivityView", () => {
         : { items: [item], nextCursor: "more" },
     );
     const onSelect = vi.fn();
+    const existing = vi.mocked(api).getMockImplementation();
+    vi.mocked(api).mockImplementation((path, options) =>
+      path === "/api/pages/tree?archived=true" ? Promise.resolve({ pages: [] }) : existing!(path, options),
+    );
     render(<ActivityView spaces={[]} pages={[]} onSelect={onSelect} />);
     fireEvent.click(await screen.findByRole("button", { name: "Launch plan" }));
     expect(onSelect).toHaveBeenCalledWith("page");
@@ -50,6 +55,10 @@ describe("ActivityView", () => {
       ],
       nextCursor: null,
     }));
+    const existing = vi.mocked(api).getMockImplementation();
+    vi.mocked(api).mockImplementation((path, options) =>
+      path === "/api/pages/tree?archived=true" ? Promise.resolve({ pages: [] }) : existing!(path, options),
+    );
     render(<ActivityView spaces={[]} pages={[]} onSelect={vi.fn()} />);
     await screen.findByRole("region", { name: "Current open work" });
     expect(api).toHaveBeenCalledWith(expect.stringContaining("mapping=map"));
@@ -57,7 +66,39 @@ describe("ActivityView", () => {
     await waitFor(() =>
       expect(screen.getByRole("tab", { name: "Open work" })).toHaveAttribute("aria-selected", "true"),
     );
-    await screen.findByText(/No new activity · Owner · In progress/);
+    await waitFor(() =>
+      expect(screen.getByRole("region", { name: "Workspace activity" })).toHaveAttribute("aria-busy", "false"),
+    );
+    expect(screen.queryByRole("region", { name: "Current open work" })).not.toBeInTheDocument();
+    const feed = screen
+      .getByRole("region", { name: "Workspace activity" })
+      .querySelector(".activity-feed")! as HTMLElement;
+    expect(within(feed).getByRole("button", { name: "Unfinished task" })).toBeInTheDocument();
+    expect(within(feed).getByText(/No new activity · Owner · In progress/)).toBeInTheDocument();
+  });
+  it("offers pages from every accessible space and archived departure targets", async () => {
+    vi.mocked(api).mockImplementation(async (path) =>
+      path === "/api/pages/tree?archived=true"
+        ? {
+            pages: [
+              { id: "archived", spaceId: "other-space", title: "Archived planning", archivedAt: 1, isTemplate: false },
+            ],
+          }
+        : { items: [], nextCursor: null },
+    );
+    render(
+      <ActivityView
+        spaces={[]}
+        pages={[
+          { id: "other", spaceId: "other-space", title: "Other space", archivedAt: null, isTemplate: false } as Page,
+        ]}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("option", { name: "Other space" })).toBeInTheDocument();
+    await screen.findByRole("option", { name: "Archived planning (archived)" });
+    fireEvent.change(screen.getByLabelText("Page"), { target: { value: "archived" } });
+    await waitFor(() => expect(api).toHaveBeenCalledWith(expect.stringContaining("page=archived")));
   });
   it("ignores stale results when the user changes tabs", async () => {
     let resolveOld: (value: ActivityResponse) => void = () => {};
@@ -67,6 +108,10 @@ describe("ActivityView", () => {
         : new Promise<ActivityResponse>((resolve) => {
             resolveOld = resolve;
           }),
+    );
+    const existing = vi.mocked(api).getMockImplementation();
+    vi.mocked(api).mockImplementation((path, options) =>
+      path === "/api/pages/tree?archived=true" ? Promise.resolve({ pages: [] }) : existing!(path, options),
     );
     render(<ActivityView spaces={[]} pages={[]} onSelect={vi.fn()} />);
     await waitFor(() => expect(api).toHaveBeenCalled());
