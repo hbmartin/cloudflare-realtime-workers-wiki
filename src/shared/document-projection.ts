@@ -1,3 +1,4 @@
+import { collapseWhitespace as normalizeText, hasUrlControls } from "./text.ts";
 import type { ProseMirrorJson } from "./types";
 import { dateMentionFromProps, readableDateMention, type DateMention } from "./date-mentions.ts";
 
@@ -82,10 +83,6 @@ export function containsLinkedDiagramId(node: ProseMirrorJson, pageId: string): 
   return (node.content ?? []).some((child) => containsLinkedDiagramId(child, pageId));
 }
 
-function normalizeText(text: string) {
-  return text.replace(/\s+/g, " ").trim();
-}
-
 // CommonMark inline punctuation that would otherwise turn imported literals into
 // markup. `_` is deliberately absent: CommonMark does not emphasise intraword `_`,
 // so escaping it would mangle every snake_case identifier.
@@ -122,10 +119,7 @@ function escapeHtml(value: string) {
 
 function safeUrl(value: unknown) {
   if (typeof value !== "string") return null;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code <= 0x1f || code === 0x7f) return null;
-  }
+  if (hasUrlControls(value)) return null;
   try {
     const url = new URL(value, "https://notes.invalid");
     return ["http:", "https:", "mailto:"].includes(url.protocol) ? value : null;

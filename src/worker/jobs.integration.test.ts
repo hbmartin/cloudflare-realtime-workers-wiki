@@ -13,7 +13,8 @@ import type { Env } from "./env";
 import { HttpError } from "./http";
 import { sidebarHiddenPageIds } from "./page-access";
 import { runImport } from "./importer";
-import { DOCX_MIME, readDocx, writeDocx } from "./docx";
+import { DOCX_MIME } from "../shared/docx-metadata";
+import { readDocx, writeDocx } from "./docx";
 import {
   claimJobWorkflowRun,
   cleanupTemplateClone,

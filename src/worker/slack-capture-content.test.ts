@@ -183,3 +183,19 @@ describe("Slack capture Markdown", () => {
     expect(blocks[6]?.content?.[0]?.text).toContain("Ship");
   });
 });
+
+it("normalizes every Slack label and preserves URLs with whitespace-only labels", () => {
+  const markdown = captureMarkdown({
+    ...input,
+    messages: [
+      {
+        ...input.messages[0]!,
+        text: "<https://example.com| > <#C1|first\r\rsecond> <!subteam^S1|first\r\rsecond> <mailto:a@example.com|first\r\rsecond>",
+      },
+    ],
+  });
+  expect(markdown).toContain("[https://example\\.com/](<https://example.com/>)");
+  expect(markdown).not.toContain("\r");
+  expect(markdown).toContain("first second");
+  expect(JSON.stringify(markdownToDocument(markdown).document)).toContain("https://example.com/");
+});

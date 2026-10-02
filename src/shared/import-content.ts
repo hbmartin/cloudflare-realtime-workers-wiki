@@ -1,3 +1,4 @@
+import { hasUrlControls } from "./text.ts";
 import * as Y from "yjs";
 import { Lexer, Tokenizer, type Token } from "marked";
 import type { ColumnType, ProseMirrorJson } from "./types";
@@ -9,7 +10,7 @@ export type ImportedTable = {
 
 export type ImportIssue = { code: string; detail: string };
 
-const BLOCK_ATTRS = { backgroundColor: "default", textColor: "default", textAlignment: "left" };
+export const BLOCK_ATTRS = { backgroundColor: "default", textColor: "default", textAlignment: "left" };
 const SAFE_LINK_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
 function decodeHtml(value: string) {
@@ -41,10 +42,7 @@ function decodeHtml(value: string) {
 function safeLink(value: string) {
   const trimmed = decodeHtml(value.trim()).replaceAll("\\", "%5C");
   if (!trimmed) return null;
-  for (let index = 0; index < trimmed.length; index += 1) {
-    const code = trimmed.charCodeAt(index);
-    if (code < 32 || code === 127) return null;
-  }
+  if (hasUrlControls(trimmed)) return null;
   if (/^(?:\/|\.?\.\/|#)/.test(trimmed)) return trimmed;
   if (/^data:image\/(?:png|gif|jpeg|webp);base64,/i.test(trimmed)) return trimmed;
   if (!/^[a-z][a-z\d+.-]*:/i.test(trimmed)) return trimmed;
@@ -85,6 +83,19 @@ const INLINE_MARKUP_CHAR = /[!*_[\]`<&]/;
 const INLINE_SECTION_LIMIT = 8192;
 const INLINE_SCAN_LIMIT = 128;
 const INLINE_DELIMITER_LIMIT = 512;
+function openingDelimiter(text: string, index: number) {
+  const delimiter = text[index]!;
+  let begin = index,
+    end = index + 1;
+  while (begin > 0 && text[begin - 1] === delimiter) begin--;
+  while (end < text.length && text[end] === delimiter) end++;
+  const before = text[begin - 1] ?? " ",
+    after = text[end] ?? " ";
+  const left = !/\s/u.test(after) && (!/[\p{P}\p{S}]/u.test(after) || /\s|[\p{P}\p{S}]/u.test(before));
+  const right = !/\s/u.test(before) && (!/[\p{P}\p{S}]/u.test(before) || /\s|[\p{P}\p{S}]/u.test(after));
+  return left && (delimiter !== "_" || !right || /[\p{P}\p{S}]/u.test(before));
+}
+
 const INLINE_DELIMITERS = "*_`";
 
 function inlineMarkupOverflow(value: string, start = 0, end = value.length): number | null {
@@ -861,7 +872,12 @@ function boundedMarkdownInline(
       const delimiter = text[cut];
       if (delimiter && INLINE_DELIMITERS.includes(delimiter) && INLINE_DELIMITERS.includes(text[cut - 1] ?? " ")) {
         let boundary = cut;
-        while (boundary > start && INLINE_DELIMITERS.includes(text[boundary - 1]!)) boundary -= 1;
+        while (
+          boundary > start &&
+          INLINE_DELIMITERS.includes(text[boundary - 1]!) &&
+          openingDelimiter(text, boundary - 1)
+        )
+          boundary -= 1;
         if (trailingEscape(text, boundary, start)) boundary -= 1;
         if (boundary > start) cut = boundary;
         else {

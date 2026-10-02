@@ -1060,3 +1060,8 @@ describe("import content", () => {
     expect(breakOnly.document.content[0]!.content).toHaveLength(1);
   });
 });
+
+it("keeps a closing emphasis delimiter before the next opening delimiter at a dense section split", () => {
+  const result = markdownToDocument("a_".repeat(510) + " *foo*_bar_ tail");
+  expect(JSON.stringify(result.document)).toContain('"text":"foo","marks":[{"type":"italic"}]');
+});

@@ -1,3 +1,6 @@
+import { sanitizeXmlText } from "../shared/text";
+import { sha256Hex } from "../shared/import-integrity";
+import { inlineImageMime } from "./attachments";
 import { Buffer } from "node:buffer";
 import mammoth from "mammoth";
 import { DomUtils, parseDocument } from "htmlparser2";
@@ -14,6 +17,8 @@ import {
   TableCell,
   TableRow,
   TextRun,
+  Tab,
+  type IRunOptions,
   WidthType,
   type ParagraphChild,
 } from "docx";
@@ -24,7 +29,6 @@ import { readZip, ZipValidationError } from "../shared/zip";
 import { docxHtmlToDocument, safeDocxHref } from "./docx-html";
 import { HttpError } from "./http";
 
-export const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 export type DocxImage = { bytes: Uint8Array; mime: string };
 const IMAGE_TYPES: Record<string, "png" | "jpg" | "gif"> = {
   "image/png": "png",
@@ -77,63 +81,172 @@ function imageDimensions(bytes: Uint8Array, mime: string): { width: number; heig
   return width > 0 && height > 0 && width <= 100_000 && height <= 100_000 ? { width, height } : null;
 }
 
+const canonical = (path: string) => decodeURIComponent(new URL(path, "https://package.invalid/").pathname.slice(1));
+const clean = (node: ProseMirrorJson): ProseMirrorJson => ({
+  ...node,
+  ...(node.text === undefined ? {} : { text: sanitizeXmlText(node.text) }),
+  ...(node.attrs
+    ? {
+        attrs: Object.fromEntries(
+          Object.entries(node.attrs).map(([key, value]) => [
+            key,
+            typeof value === "string" ? sanitizeXmlText(value) : value,
+          ]),
+        ),
+      }
+    : {}),
+  ...(node.marks
+    ? {
+        marks: node.marks.map((mark) => ({
+          ...mark,
+          ...(mark.attrs
+            ? {
+                attrs: Object.fromEntries(
+                  Object.entries(mark.attrs).map(([key, value]) => [
+                    key,
+                    typeof value === "string" ? sanitizeXmlText(value) : value,
+                  ]),
+                ),
+              }
+            : {}),
+        })),
+      }
+    : {}),
+  ...(node.content ? { content: node.content.map(clean) } : {}),
+});
+const textRuns = (value: string, options: IRunOptions = {}) =>
+  sanitizeXmlText(value)
+    .split(/(\r\n|\r|\n|\t)/)
+    .filter(Boolean)
+    .map((part) =>
+      part === "\t"
+        ? new TextRun({ ...options, children: [new Tab()] })
+        : /^(\r\n|\r|\n)$/.test(part)
+          ? new TextRun({ ...options, break: 1 })
+          : new TextRun({ ...options, text: part }),
+    );
+
 export async function readDocx(bytes: Uint8Array) {
   let entries;
   try {
     entries = await readZip(bytes);
   } catch (error) {
     if (error instanceof ZipValidationError)
-      throw new HttpError(error.kind === "limit" ? 413 : 422, "invalid_docx", error.message);
+      throw new HttpError(
+        error.kind === "limit" ? 413 : 422,
+        "invalid_docx",
+        error.kind === "limit"
+          ? error.message
+          : "This is not a readable Word .docx file. Encrypted documents and older .doc files must be saved as an unencrypted .docx file in Word.",
+      );
     throw error;
   }
   const decoder = new TextDecoder();
   const byPath = new Map(entries.map((entry) => [entry.path, entry]));
-  const types = byPath.get("[Content_Types].xml");
-  if (
-    !types ||
-    !byPath.has("word/document.xml") ||
-    !decoder
-      .decode(types.bytes)
-      .includes("application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml") ||
-    entries.some((entry) => /vbaProject|macroEnabled/i.test(entry.path))
-  )
-    throw new HttpError(422, "invalid_docx", "The file is not a supported Word .docx document.");
   for (const entry of entries) {
     if (/\.(xml|rels)$/i.test(entry.path) && /<!\s*(DOCTYPE|ENTITY)\b/i.test(decoder.decode(entry.bytes)))
       throw new HttpError(422, "invalid_docx", "Word documents with XML entity declarations are not supported.");
   }
+
+  const packageRelationships = byPath.get("_rels/.rels");
+  const relations = packageRelationships
+    ? DomUtils.getElementsByTagName(
+        "Relationship",
+        parseDocument(decoder.decode(packageRelationships.bytes), { xmlMode: true }).children,
+      )
+    : [];
+  const candidates = relations
+    .filter(
+      (r) =>
+        r.attribs.Type === "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" &&
+        r.attribs.TargetMode !== "External",
+    )
+    .map((r) => canonical(r.attribs.Target!));
+  const mainPath = candidates.find((path) => byPath.has(path)) ?? "word/document.xml";
+  const types = byPath.get("[Content_Types].xml");
+  const overrides = types
+    ? DomUtils.getElementsByTagName("Override", parseDocument(decoder.decode(types.bytes), { xmlMode: true }).children)
+    : [];
+  if (
+    !byPath.has(mainPath) ||
+    !overrides.some(
+      (part) =>
+        canonical(part.attribs.PartName!) === mainPath &&
+        part.attribs.ContentType === "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml",
+    ) ||
+    entries.some((entry) => /vbaProject|macroEnabled/i.test(entry.path)) ||
+    (types && /macroEnabled/i.test(decoder.decode(types.bytes)))
+  )
+    throw new HttpError(
+      422,
+      "invalid_docx",
+      "The file is not a supported Word .docx document. Save an unencrypted .docx file in Word and try again.",
+    );
+  const directory = mainPath.includes("/") ? mainPath.slice(0, mainPath.lastIndexOf("/") + 1) : "";
+  const relationshipsPath = `${directory}_rels/${mainPath.slice(directory.length)}.rels`;
+  const mainXml = decoder.decode(byPath.get(mainPath)!.bytes);
+  const mainTree = parseDocument(mainXml, { xmlMode: true });
   const issues: ImportIssue[] = [];
   if (
     entries.some((entry) => /^word\/(?:header|footer|comments)/.test(entry.path)) ||
-    /<w:(?:cols|ins|del)\b/.test(decoder.decode(byPath.get("word/document.xml")!.bytes))
+    /<w:(?:ins|del)\b/.test(mainXml) ||
+    DomUtils.getElementsByTagName("w:cols", mainTree.children).some(
+      (cols) =>
+        Number(cols.attribs["w:num"] ?? 1) > 1 || DomUtils.getElementsByTagName("w:col", cols.children).length > 1,
+    )
   )
     issues.push({ code: "docx_word_layout_simplified", detail: "Word layout and review metadata are simplified." });
   const images = new Map<string, { path: string; bytes: Uint8Array }>();
   let imageBytes = 0;
+  const imageHashes = new Map<string, string>();
   let converted;
   try {
     converted = await mammoth.convertToHtml(
-      { buffer: Buffer.from(bytes) },
+      // Mammoth 1.13 accepts this localized file adapter. Every byte comes from
+      // readZip's validated entries; no second JSZip inflation or upload copy.
+      {
+        file: {
+          exists: (name: string) => byPath.has(canonical(name)),
+          read: async (name: string, encoding?: string) => {
+            const entry = byPath.get(canonical(name));
+            if (!entry) throw new Error("Missing DOCX part");
+            if (encoding === "base64")
+              return Buffer.from(entry.bytes.buffer, entry.bytes.byteOffset, entry.bytes.byteLength).toString("base64");
+            return encoding ? new TextDecoder(encoding).decode(entry.bytes) : entry.bytes;
+          },
+        },
+      } as unknown as Parameters<typeof mammoth.convertToHtml>[0],
       {
         includeEmbeddedStyleMap: false,
         externalFileAccess: false,
         ignoreEmptyParagraphs: false,
-        styleMap: ["u => u", "strike => s", "p[style-name='Quote'] => blockquote:fresh"],
+        styleMap: [
+          "u => u",
+          "strike => s",
+          "p[style-name='Quote'] => blockquote:fresh",
+          "p[style-name='Title'] => p:fresh",
+          "p[style-name='Code'] => pre:fresh",
+        ],
         convertImage: mammoth.images.imgElement(async (image) => {
-          const type = IMAGE_TYPES[image.contentType];
+          const mime = inlineImageMime(image.contentType);
+          const type = mime ? IMAGE_TYPES[mime] : null;
           if (!type) {
             issues.push({ code: "docx_unsupported_image", detail: image.contentType });
             return { src: "" };
           }
           const data = new Uint8Array(await image.readAsArrayBuffer());
-          imageBytes += data.byteLength;
-          if (imageBytes > MAX_IMAGE_BYTES)
-            throw new HttpError(413, "docx_images_too_large", "Embedded Word images exceed the 24 MiB limit.");
-          if (!imageDimensions(data, image.contentType)) {
+          const hash = `${mime}:${await sha256Hex(data)}`;
+          const existing = imageHashes.get(hash);
+          if (existing) return { src: existing };
+          if (!imageDimensions(data, mime!)) {
             issues.push({ code: "docx_invalid_image", detail: image.contentType });
             return { src: "" };
           }
+          imageBytes += data.byteLength;
+          if (imageBytes > MAX_IMAGE_BYTES)
+            throw new HttpError(413, "docx_images_too_large", "Embedded Word images exceed the 24 MiB limit.");
           const path = `docx-images/image-${images.size + 1}.${type}`;
+          imageHashes.set(hash, path);
           images.set(path, { path, bytes: data });
           return { src: path };
         }),
@@ -159,8 +272,23 @@ export async function readDocx(bytes: Uint8Array) {
   const parsed = docxHtmlToDocument(converted.value, new Set(images.keys()));
   // Mammoth cannot read linked images with external access disabled. Preserve
   // their URLs as links below the body rather than fetching or silently losing them.
-  const relationships = byPath.get("word/_rels/document.xml.rels");
-  const mainXml = decoder.decode(byPath.get("word/document.xml")!.bytes);
+  const marker = byPath.get("docProps/custom.xml");
+  const generatedTitle =
+    marker &&
+    DomUtils.getElementsByTagName(
+      "property",
+      parseDocument(decoder.decode(marker.bytes), { xmlMode: true }).children,
+    ).some((property) => property.attribs.name === "NoteFlareGeneratedTitle" && DomUtils.textContent(property) === "1");
+  const firstParagraph = DomUtils.getElementsByTagName("w:p", mainTree.children)[0];
+  if (
+    generatedTitle &&
+    firstParagraph &&
+    DomUtils.getElementsByTagName("w:pStyle", firstParagraph.children).some(
+      (style) => style.attribs["w:val"] === "Title",
+    )
+  )
+    parsed.document.content![0]!.content!.shift();
+  const relationships = byPath.get(relationshipsPath);
   const linkedIds = new Set(
     [...mainXml.matchAll(/\br:(?:link|embed)\s*=\s*["']([^"']+)["']/g)].map((match) => match[1]),
   );
@@ -186,6 +314,12 @@ export async function readDocx(bytes: Uint8Array) {
       issues.push({ code: "docx_external_image_link", detail: "Linked image preserved below the document body." });
     }
   }
+  if (!parsed.document.content![0]!.content!.length)
+    parsed.document.content![0]!.content!.push({
+      type: "blockContainer",
+      attrs: { id: "docx-empty" },
+      content: [{ type: "paragraph" }],
+    });
   return { document: parsed.document, issues: [...issues, ...parsed.issues], entries: images };
 }
 
@@ -206,6 +340,8 @@ export async function writeDocx(
   baseUrl: string,
   resolveImage: (url: string) => Promise<DocxImage | null>,
 ) {
+  document = clean(document);
+  title = sanitizeXmlText(title);
   const warnings = new Set<string>();
   const images = new Map<string, Promise<DocxImage | null>>();
   let imageBytes = 0;
@@ -231,8 +367,7 @@ export async function writeDocx(
       if (node.type === "hardBreak") return [new TextRun({ break: 1 })];
       if (node.type === "text" || ["mention", "dateMention", "inlineMath"].includes(node.type ?? "")) {
         const marks = new Set((node.marks ?? []).map((mark) => mark.type));
-        const run = new TextRun({
-          text: nodeText(node),
+        const content = textRuns(nodeText(node), {
           bold: marks.has("bold"),
           italics: marks.has("italic"),
           strike: marks.has("strike"),
@@ -241,14 +376,16 @@ export async function writeDocx(
         });
         const link = href(node.marks?.find((mark) => mark.type === "link")?.attrs?.href);
         if (node.type === "inlineMath") warnings.add("Math formulas are exported as source text.");
-        return [link ? new ExternalHyperlink({ link, children: [run] }) : run];
+        return link ? [new ExternalHyperlink({ link, children: content })] : content;
       }
       return runs(node.content ?? []);
     });
   }
   const linkParagraph = (label: string, url: unknown) => {
     const link = href(url);
-    return paragraph([link ? new ExternalHyperlink({ link, children: [new TextRun(label)] }) : new TextRun(label)]);
+    return paragraph([
+      link ? new ExternalHyperlink({ link, children: textRuns(label) }) : new TextRun(sanitizeXmlText(label)),
+    ]);
   };
   type WordBlock = Paragraph | Table;
   let orderedSequence = 0;
@@ -288,7 +425,9 @@ export async function writeDocx(
   async function block(node: ProseMirrorJson, depth: number, orderedReference?: string): Promise<WordBlock[]> {
     const children = node.content ?? [];
     const type = node.type ?? "unknown";
-    if (["doc", "blockGroup", "syncedBlockSource"].includes(type)) return sequence(children, depth);
+    if (["doc", "blockGroup", "syncedBlockSource", "columnList", "column"].includes(type))
+      return sequence(children, depth);
+    if (["tableOfContents", "breadcrumb"].includes(type)) return [];
     if (type === "blockContainer") {
       const output: WordBlock[] = [];
       const table = children.find((child) => child.type === "table");
@@ -355,15 +494,17 @@ export async function writeDocx(
             (row) =>
               new TableRow({
                 children: (row.content ?? []).map((cell) => {
-                  if (Number(cell.attrs?.colspan ?? 1) > 1 || Number(cell.attrs?.rowspan ?? 1) > 1)
-                    warnings.add("Merged table cells are exported as separate cells.");
                   const content = cell.content ?? [];
                   const parts = content.some((part) =>
                     ["tableParagraph", "paragraph", "tableContent"].includes(part.type ?? ""),
                   )
                     ? content.map((part) => paragraph(runs(part.content ?? [])))
                     : [paragraph(runs(content))];
-                  return new TableCell({ children: parts.length ? parts : [paragraph([])] });
+                  return new TableCell({
+                    children: parts.length ? parts : [paragraph([])],
+                    columnSpan: Math.min(256, Math.max(1, Number(cell.attrs?.colspan) || 1)),
+                    rowSpan: Math.min(rows.length, Math.max(1, Number(cell.attrs?.rowspan) || 1)),
+                  });
                 }),
               }),
           ),
@@ -390,7 +531,7 @@ export async function writeDocx(
             altText: { title: label, description: label, name: label },
           }),
         ]),
-        ...(node.attrs?.caption ? [paragraph([new TextRun(String(node.attrs.caption))])] : []),
+        ...(node.attrs?.caption ? [paragraph([new TextRun(sanitizeXmlText(String(node.attrs.caption)))])] : []),
       ];
     }
     if (type === "divider") return [new Paragraph({ thematicBreak: true })];
@@ -412,7 +553,7 @@ export async function writeDocx(
     if (type === "syncedBlockReference")
       return [linkParagraph("Synced content", `/?page=${encodeURIComponent(String(node.attrs?.sourcePageId ?? ""))}`)];
     if (type === "math" || type === "mermaid")
-      return [paragraph([new TextRun(String(node.attrs?.formula ?? node.attrs?.source ?? nodeText(node)))])];
+      return [paragraph(textRuns(String(node.attrs?.formula ?? node.attrs?.source ?? nodeText(node))))];
     if (children.length)
       return children.some((child) => child.type === "blockGroup" || child.type === "blockContainer")
         ? sequence(children, depth)
@@ -422,6 +563,7 @@ export async function writeDocx(
   const content = await sequence(document.content ?? []);
   const output = new Document({
     title,
+    customProperties: [{ name: "NoteFlareGeneratedTitle", value: "1" }],
     styles: { paragraphStyles: [{ id: "DocxCode", name: "Code", run: { font: "Courier New" } }] },
     numbering: { config: numbering },
     sections: [{ children: [new Paragraph({ text: title, heading: HeadingLevel.TITLE }), ...content] }],
