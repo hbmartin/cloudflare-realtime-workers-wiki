@@ -167,7 +167,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
       });
       if (result.error) throw new Error(result.error.message || "Slack identity linking failed.");
     } catch (cause) {
-      setError(apiErrorMessage(cause, "Verify a security factor, then connect Slack again."));
+      setError(apiErrorMessage(cause, "Slack identity could not be connected. Try again."));
       setBusy(false);
     }
   }

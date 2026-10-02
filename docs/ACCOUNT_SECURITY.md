@@ -4,6 +4,8 @@ Every owner, editor, and viewer enrolls an authenticator app or a passkey before
 
 Authenticator users enter a primary factor and a six-digit code. The primary factor is normally their password; a verified, session-bound Slack OpenID sign-in may replace password re-entry for ten minutes during TOTP setup or recovery. It never creates session assurance and never replaces TOTP, passkey, or recovery-code proof. Passkeys replace password entry and require the authenticator to verify a PIN or biometrics. The server checks the verified WebAuthn result, not just the requested browser options. Passkeys are bound to the hostname and exact origin of `BETTER_AUTH_URL`; use `localhost` for local testing, not an IP address. A production hostname change requires a passkey migration strategy or another enrolled factor.
 
+Connecting a personal Slack identity requires a live signed-in session, without enrollment or recent factor verification on the linking endpoint. Pending recovery-key handoffs must still be acknowledged first. The Settings screen and private workspace access continue to require account protection, and linking Slack does not create session assurance. Workspace Slack installation and reauthorization require an owner with normal workspace access.
+
 ## Sessions and trusted browsers
 
 The server stores assurance for each session. Enrollment flags alone cannot authorize a private request. Password-only sessions and outstanding authentication challenges cannot access the workspace or manage an already enrolled account. A verified factor is required within the last five minutes for security changes. Recovery codes must be saved before initial access.

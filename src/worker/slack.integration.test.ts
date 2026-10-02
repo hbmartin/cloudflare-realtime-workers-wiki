@@ -1,4 +1,4 @@
-import { enrollAccount, responseCookies } from "../../tests/helpers/security";
+import { enrollAccount, responseCookies, securityRequest } from "../../tests/helpers/security";
 import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext, Page, Space } from "../shared/types";
@@ -48,7 +48,7 @@ function request(cookie: string, path: string, init: RequestInit = {}) {
   return new Request(`http://example.test${path}`, { ...init, headers });
 }
 
-async function bootstrap() {
+async function bootstrapResponse() {
   const response = await SELF.fetch("http://example.test/api/install/bootstrap", {
     method: "POST",
     headers: { origin: "http://example.test", "content-type": "application/json" },
@@ -61,7 +61,11 @@ async function bootstrap() {
     }),
   });
   expect(response.status).toBe(200);
-  const cookie = await enrollAccount(response);
+  return response;
+}
+
+async function bootstrap() {
+  const cookie = await enrollAccount(await bootstrapResponse());
   const member = await (await SELF.fetch(request(cookie, "/api/me"))).json<ClientMemberContext>();
   const pages = await (await SELF.fetch(request(cookie, "/api/pages/tree"))).json<{ pages: Page[] }>();
   return { cookie, member, page: pages.pages[0]! };
@@ -135,6 +139,136 @@ afterEach(() => {
 });
 
 describe("Slack security and integration", () => {
+  describe("personal identity linking", () => {
+    beforeEach(() => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          Response.json({
+            issuer: "https://slack.com",
+            authorization_endpoint: "https://slack.com/openid/connect/authorize",
+            token_endpoint: "https://slack.com/api/openid.connect.token",
+            userinfo_endpoint: "https://slack.com/api/openid.connect.userInfo",
+            jwks_uri: "https://slack.com/openid/connect/keys",
+            id_token_signing_alg_values_supported: ["RS256"],
+          }),
+        ),
+      );
+    });
+
+    async function link(cookie: string, provider = "slack") {
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(
+        request(cookie, "/api/auth/link-social", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ provider, callbackURL: "/?view=settings&slack=verified", disableRedirect: true }),
+        }),
+        slackEnv(),
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+      return response;
+    }
+
+    it("starts linking without enrollment and does not grant workspace assurance", async () => {
+      const cookie = responseCookies(await bootstrapResponse());
+      const response = await link(cookie);
+      expect(response.status).toBe(200);
+      const { url } = await response.json<{ url: string }>();
+      expect(new URL(url).origin).toBe("https://slack.com");
+      expect(new URL(url).searchParams.get("state")).toBeTruthy();
+      expect(new URL(url).searchParams.get("code_challenge")).toBeTruthy();
+      expect(await env.DB.prepare("SELECT 1 FROM session_security").first()).toBeNull();
+      expect(await (await securityRequest(cookie, "/api/security/status")).json()).toMatchObject({
+        state: "enrollment_required",
+        fresh: false,
+      });
+      expect((await securityRequest(cookie, "/api/me")).status).toBe(401);
+      expect((await securityRequest(cookie, "/api/slack/oauth/start")).status).toBe(401);
+    });
+
+    it("allows older assurance only for Slack linking and preserves its verification time", async () => {
+      const { cookie } = await bootstrap();
+      const verifiedAt = Date.now() - 6 * 60_000;
+      await env.DB.prepare("UPDATE session_security SET verified_at = ?").bind(verifiedAt).run();
+      expect(await (await securityRequest(cookie, "/api/security/status")).json()).toMatchObject({
+        state: "ready",
+        fresh: false,
+      });
+      expect((await link(cookie)).status).toBe(200);
+      const otherProvider = await link(cookie, "google");
+      expect(otherProvider.status).toBe(403);
+      expect(await otherProvider.json()).toMatchObject({ code: "SECURITY_REQUIRED" });
+      const accountChange = await securityRequest(cookie, "/api/auth/update-user", { name: "Changed" });
+      expect(accountChange.status).toBe(403);
+      expect(await accountChange.json()).toMatchObject({ code: "SECURITY_REQUIRED" });
+      expect(await env.DB.prepare("SELECT verified_at FROM session_security").first()).toEqual({
+        verified_at: verifiedAt,
+      });
+    });
+
+    it("allows a trusted-browser session without fresh factor verification", async () => {
+      const { cookie } = await bootstrap();
+      const trusted = await securityRequest(cookie, "/api/security/trust", {});
+      expect(trusted.status).toBe(200);
+      const browserCookie = responseCookies(trusted);
+      const signIn = await securityRequest(browserCookie, "/api/auth/sign-in/email", {
+        email: "slack-owner@example.test",
+        password: "password123",
+      });
+      const pending = responseCookies(signIn, browserCookie);
+      const completed = await securityRequest(pending, "/api/security/complete-trust", {});
+      expect(completed.status).toBe(200);
+      const session = responseCookies(completed, pending);
+      expect(await (await securityRequest(session, "/api/security/status")).json()).toMatchObject({
+        state: "ready",
+        fresh: false,
+      });
+      expect((await link(session)).status).toBe(200);
+    });
+
+    it.each(["anonymous", "expired session"])("rejects %s requests", async (mode) => {
+      let cookie = "";
+      if (mode === "expired session") {
+        cookie = responseCookies(await bootstrapResponse());
+        await env.DB.prepare("UPDATE session SET expiresAt = ?")
+          .bind(new Date(Date.now() - 1).toISOString())
+          .run();
+      }
+      expect((await link(cookie)).status).toBe(401);
+    });
+
+    it("rejects a pending two-factor challenge without a live session", async () => {
+      await bootstrap();
+      const signIn = await securityRequest("", "/api/auth/sign-in/email", {
+        email: "slack-owner@example.test",
+        password: "password123",
+      });
+      expect(await signIn.clone().json()).toMatchObject({ twoFactorRedirect: true });
+      expect((await link(responseCookies(signIn))).status).toBe(401);
+    });
+
+    it("requires recovery-key acknowledgment before linking", async () => {
+      const { cookie } = await bootstrap();
+      const { codes, receipt } = await (
+        await securityRequest(cookie, "/api/security/recovery-codes", {})
+      ).json<{ codes: string[]; receipt: string }>();
+      expect((await securityRequest(cookie, "/api/security/acknowledge-codes", { receipt })).status).toBe(200);
+      const recovered = await securityRequest(cookie, "/api/security/recover", {
+        password: "password123",
+        code: codes[0],
+      });
+      expect(recovered.status).toBe(200);
+      const response = await link(responseCookies(recovered, cookie));
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({
+        code: "SECURITY_REQUIRED",
+        message: "Save your recovery resume key before continuing.",
+      });
+    });
+  });
+
   it("requires reauthorization when the connected bot token fails with complete scopes", async () => {
     const installed = await bootstrap();
     await installSlack(installed.member);

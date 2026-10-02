@@ -1213,6 +1213,8 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
               )
                 throw deny("Save your recovery resume key before continuing.");
             }
+            // Slack linking requires a live session through Better Auth's session middleware.
+            if (ctx.path === "/link-social" && ctx.body?.provider === "slack") return;
             if (ctx.path.startsWith("/security/")) return;
             if (ctx.path === "/two-factor/verify-totp") {
               const id = await requireIdentity(ctx);
