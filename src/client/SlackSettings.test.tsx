@@ -3,7 +3,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Page, Space } from "../shared/types";
-import { api } from "./api";
+import { api, authClient } from "./api";
 import { SlackSettings } from "./SlackSettings";
 import { CHANNEL_EVENT_TYPES } from "../shared/activity";
 
@@ -51,6 +51,25 @@ afterEach(() => {
 });
 
 describe("SlackSettings", () => {
+  it("starts personal identity linking and offers a retry after failure", async () => {
+    vi.mocked(api).mockResolvedValue({
+      available: true,
+      installation: { connected: true, teamName: "Product Slack", capabilities: { identity: { available: true } } },
+      linked: false,
+    });
+    vi.mocked(authClient.linkSocial).mockRejectedValueOnce(new Error("Network failure"));
+    render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
+    const connect = await screen.findByRole("button", { name: "Connect Slack identity" });
+    fireEvent.click(connect);
+    expect(await screen.findByText("Slack identity could not be connected. Try again.")).toBeInTheDocument();
+    expect(authClient.linkSocial).toHaveBeenCalledWith({
+      provider: "slack",
+      callbackURL: "/?view=settings&slack=verified",
+      errorCallbackURL: "/?view=settings&slackAuth=callback",
+    });
+    expect(connect).toBeEnabled();
+  });
+
   it("acknowledges a failure for an orphaned link using its encoded identifier", async () => {
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/slack/status") return { available: true, missing: [], installation: null, linked: false };
