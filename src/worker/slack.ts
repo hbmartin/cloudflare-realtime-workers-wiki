@@ -153,12 +153,17 @@ export const slackHasScopes = (scopes: string, required: readonly string[]): boo
 export const slackChannelError = (error: unknown): boolean =>
   error instanceof SlackApiError && CHANNEL_ERRORS.has(error.code);
 
-export async function recordSlackInstallationError(env: Env, installationId: string, error: SlackApiError) {
+export async function recordSlackInstallationError(
+  env: Env,
+  installationId: string,
+  error: SlackApiError,
+  generation?: number,
+) {
   const result = await env.DB.prepare(
     `UPDATE slack_installations SET auth_error=?, auth_error_at=COALESCE(auth_error_at,?)
-      WHERE id=? AND disconnected_at IS NULL AND credential_revision=?`,
+      WHERE id=? AND disconnected_at IS NULL AND credential_revision=? AND (? IS NULL OR generation=?)`,
   )
-    .bind(error.code, Date.now(), installationId, error.credentialRevision)
+    .bind(error.code, Date.now(), installationId, error.credentialRevision, generation ?? null, generation ?? null)
     .run();
   return result.meta.changes > 0;
 }
@@ -203,6 +208,7 @@ export type SlackApiContracts = {
       response_metadata?: { next_cursor?: string };
     };
   };
+  "files.delete": { input: { file: string }; output: Record<string, never> };
   "files.getUploadURLExternal": {
     input: { filename: string; length: number };
     output: { upload_url: string; file_id: string };

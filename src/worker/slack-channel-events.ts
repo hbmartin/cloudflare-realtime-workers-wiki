@@ -1,3 +1,4 @@
+import { definiteSlackRejection, invalidSlackDestination, recordDeliveryError } from "./slack-delivery";
 import { DeliveryInProgressError } from "./notifications";
 import type { Env } from "./env";
 import type { ChannelEventType } from "../shared/activity";
@@ -5,7 +6,7 @@ import { ACTIVITY_LABELS } from "../shared/activity";
 import { safeSlackText } from "./slack-blocks";
 import { round2Installation, validateMapping } from "./slack-channels";
 import { reconcileBotPost } from "./slack-digests";
-import { slackApi, SlackApiError, SlackRateLimitError, channelActivityActorAccessSql } from "./slack";
+import { slackApi, SlackRateLimitError, channelActivityActorAccessSql, type SlackInstallation } from "./slack";
 
 export async function deliverRound2ChannelEvent(env: Env, eventId: string, reconcileOnly = false) {
   const token = crypto.randomUUID();
@@ -24,9 +25,9 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
     return;
   }
   try {
-    const row =
-      await env.DB.prepare(`SELECT e.*,m.installation_id,m.channel_id,m.space_id mapping_space,m.page_id mapping_page,m.muted_at,m.snoozed_until,
-      m.notification_blocked_at,m.created_by,i.generation,p.title,p.space_id current_space,p.archived_at,p.import_job_id,p.is_template,actor.name actor_name,
+    const load = () =>
+      env.DB.prepare(`SELECT e.*,m.installation_id,m.channel_id,m.space_id mapping_space,m.page_id mapping_page,m.muted_at,m.snoozed_until,
+      m.notification_blocked_at,m.created_by,i.generation current_generation,e.installation_generation generation,e.delivery_channel_id,p.title,p.space_id current_space,p.archived_at,p.import_job_id,p.is_template,actor.name actor_name,
       ${channelActivityActorAccessSql.replace(/\bpage\./g, "p.").replaceAll("event.", "e.")} actor_access,
       EXISTS(SELECT 1 FROM slack_channel_subscriptions allowed WHERE allowed.installation_id=i.id AND allowed.channel_id=m.channel_id AND allowed.space_id=p.space_id
         AND (allowed.page_id IS NULL OR allowed.page_id=p.id) AND allowed.validation_state='valid') mapped,
@@ -39,7 +40,9 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
           attempted_at: number | null;
           installation_id: string;
           generation: number;
+          current_generation: number;
           channel_id: string;
+          delivery_channel_id: string;
           subscription_id: string;
           page_id: string;
           thread_id: string | null;
@@ -59,9 +62,17 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
           is_template: number;
           notification_blocked_at: number | null;
         }>();
+    let row = await load();
     if (!row || (reconcileOnly && !["sending", "blocked"].includes(row.round2_state))) return;
     const installation = await round2Installation(env, row.installation_id, row.generation);
-    if (!installation) return;
+    if (!installation) {
+      await env.DB.prepare(
+        `UPDATE slack_channel_events SET round2_state='retired',delivered_at=? WHERE id=? AND claim_token=? AND NOT EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)`,
+      )
+        .bind(Date.now(), eventId, token, row.installation_id, row.generation)
+        .run();
+      return;
+    }
     const id = `channel:${eventId}`;
     const finish = async (ts: string | null, state = "sent") =>
       env.DB.prepare(
@@ -70,13 +81,16 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
         .bind(state, ts, Date.now(), eventId, token)
         .run();
     if (row.round2_state === "sending" || reconcileOnly) {
-      const ts = await reconcileBotPost(env, installation, row.channel_id, id, row.attempted_at!);
+      const ts = await reconcileBotPost(env, installation, row.delivery_channel_id, id, row.attempted_at!);
       if (ts) await finish(ts);
       else
-        await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='blocked' WHERE id=?`).bind(eventId).run();
+        await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='blocked' WHERE id=? AND claim_token=?`)
+          .bind(eventId, token)
+          .run();
       return;
     }
     if (
+      row.delivery_channel_id !== row.channel_id ||
       !row.owner_valid ||
       row.muted_at ||
       (row.snoozed_until && row.snoozed_until > Date.now()) ||
@@ -86,6 +100,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       await finish(null, "retired");
       return;
     }
+    if (row.notification_blocked_at) return;
     const mirrored =
       row.thread_id &&
       (await env.DB.prepare(
@@ -98,9 +113,34 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       return;
     }
     if (!(await validateMapping(env, installation, row.subscription_id, row.channel_id))) {
+      const failure = await env.DB.prepare(
+        "SELECT validation_error FROM slack_channel_subscriptions WHERE id=? AND channel_id=?",
+      )
+        .bind(row.subscription_id, row.channel_id)
+        .first<{ validation_error: string | null }>();
+      if (
+        ["channel_not_found", "not_in_channel", "is_archived", "shared_channel", "unsupported_channel_type"].includes(
+          failure?.validation_error ?? "",
+        )
+      )
+        await finish(null, "retired");
+      return;
+    }
+    row = await load();
+    if (!row) return;
+    if (
+      row.current_generation !== installation.generation ||
+      row.channel_id !== row.delivery_channel_id ||
+      !row.owner_valid ||
+      row.import_job_id ||
+      row.is_template ||
+      row.muted_at ||
+      (row.snoozed_until && row.snoozed_until > Date.now())
+    ) {
       await finish(null, "retired");
       return;
     }
+    if (row.notification_blocked_at) return;
     const departure = row.archived_at !== null || row.current_space !== row.mapping_space;
     if (!row.actor_access && !departure) {
       await finish(null, "retired");
@@ -110,11 +150,12 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
     const title = available ? safeSlackText(row.title, 200) : "A page is no longer available";
     const actor = available ? safeSlackText(row.actor_name ?? "A collaborator", 80) : "A collaborator";
     const text = `${actor} · ${ACTIVITY_LABELS[row.event_type]} · ${title}`;
-    await env.DB.prepare(
+    const sending = await env.DB.prepare(
       `UPDATE slack_channel_events SET round2_state='sending',attempted_at=? WHERE id=? AND claim_token=?`,
     )
       .bind(Date.now(), eventId, token)
       .run();
+    if (!sending.meta.changes) throw new DeliveryInProgressError();
     try {
       const posted = await slackApi(env, installation, "chat.postMessage", {
         channel: row.channel_id,
@@ -135,16 +176,28 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       });
       await finish(posted.ts);
     } catch (error) {
-      if (error instanceof SlackRateLimitError)
-        await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='pending' WHERE id=?`).bind(eventId).run();
-      else if (
-        error instanceof SlackApiError &&
-        error.status < 500 &&
-        !["http_error", "invalid_response", "internal_error", "fatal_error"].includes(error.code)
-      )
+      await recordDeliveryError(env, installation, error, row.subscription_id, row.channel_id);
+      if (invalidSlackDestination(error)) {
         await finish(null, "retired");
+        return;
+      }
+      if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
+        await env.DB.prepare(
+          `UPDATE slack_channel_events SET round2_state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,
+        )
+          .bind(eventId, token)
+          .run();
+      }
       throw error;
     }
+  } catch (error) {
+    const installation = await env.DB.prepare(
+      "SELECT i.* FROM slack_installations i JOIN slack_channel_subscriptions m ON m.installation_id=i.id JOIN slack_channel_events e ON e.subscription_id=m.id WHERE e.id=? AND e.claim_token=? AND i.generation=e.installation_generation",
+    )
+      .bind(eventId, token)
+      .first<SlackInstallation>();
+    if (installation) await recordDeliveryError(env, installation, error);
+    throw error;
   } finally {
     await env.DB.prepare(
       `UPDATE slack_channel_events SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
