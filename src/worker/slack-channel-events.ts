@@ -1,4 +1,9 @@
-import { definiteSlackRejection, invalidSlackDestination, recordDeliveryError } from "./slack-delivery";
+import {
+  definiteSlackRejection,
+  invalidSlackDestination,
+  recordDeliveryError,
+  recordPermanentDeliveryFailure,
+} from "./slack-delivery";
 import { DeliveryInProgressError } from "./notifications";
 import type { Env } from "./env";
 import type { ChannelEventType } from "../shared/activity";
@@ -6,18 +11,26 @@ import { ACTIVITY_LABELS } from "../shared/activity";
 import { safeSlackText } from "./slack-blocks";
 import { round2Installation, validateMapping } from "./slack-channels";
 import { reconcileBotPost } from "./slack-digests";
-import { slackApi, SlackRateLimitError, channelActivityActorAccessSql, type SlackInstallation } from "./slack";
+import {
+  slackApi,
+  SlackApiError,
+  SlackRateLimitError,
+  channelActivityActorAccessSql,
+  type SlackInstallation,
+} from "./slack";
 
 export async function deliverRound2ChannelEvent(env: Env, eventId: string, reconcileOnly = false) {
   const token = crypto.randomUUID();
   const claim =
     await env.DB.prepare(`UPDATE slack_channel_events SET claim_token=?,claimed_at=? WHERE id=? AND delivered_at IS NULL
-    AND suppressed_at IS NULL AND round2_state IN ('pending','sending'${reconcileOnly ? ",'blocked'" : ""}) AND (claimed_at IS NULL OR claimed_at<?)`)
+    AND (suppressed_at IS NULL OR round2_state IN ('sending'${reconcileOnly ? ",'blocked'" : ""}))
+    AND round2_state IN ('pending','sending'${reconcileOnly ? ",'blocked'" : ""}) AND (claimed_at IS NULL OR claimed_at<?)`)
       .bind(token, Date.now(), eventId, Date.now() - 60_000)
       .run();
   if (!claim.meta.changes) {
     const live = await env.DB.prepare(
-      `SELECT 1 FROM slack_channel_events WHERE id=? AND round2_state IN ('pending','sending'${reconcileOnly ? ",'blocked'" : ""}) AND delivered_at IS NULL AND suppressed_at IS NULL`,
+      `SELECT 1 FROM slack_channel_events WHERE id=? AND round2_state IN ('pending','sending'${reconcileOnly ? ",'blocked'" : ""}) AND delivered_at IS NULL
+        AND (suppressed_at IS NULL OR round2_state IN ('sending'${reconcileOnly ? ",'blocked'" : ""}))`,
     )
       .bind(eventId)
       .first();
@@ -177,6 +190,11 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       await finish(posted.ts);
     } catch (error) {
       await recordDeliveryError(env, installation, error, row.subscription_id, row.channel_id);
+      if (error instanceof SlackApiError && error.code === "msg_too_long") {
+        await recordPermanentDeliveryFailure(env, installation, id, row.subscription_id, row.channel_id, error.code);
+        await finish(null, "retired");
+        return;
+      }
       if (invalidSlackDestination(error)) {
         await finish(null, "retired");
         return;

@@ -89,4 +89,57 @@ Standalone local Node runs used Vite's module runner to load the original `HEAD`
 | One paragraph with an 8,000-character opening run                    | 11.83              | 0.63              |
 | 64 paragraphs with 8,000-character opening runs (512,000 delimiters) | 1,134.79           | 42.21             |
 
+## Remaining review follow-up
+
+This local follow-up preserves the preceding commit's fixes, HTTP response shapes, component interfaces,
+database schema and every existing migration. Slack Connect page previews remain **deferred**; this change
+does not address the shared-channel preview finding. Bulk moves and archives still send one immediate,
+title-free summary for both cadences and stay out of scheduled digests.
+
+Final verification on 2026-10-02 after rebasing onto current `main`: **`pnpm check` passed**, with
+**1,518 unit tests passed** (one existing test skipped) and **1,024 Worker tests passed** across 20 files.
+Formatting, lint, middleware Semgrep checks,
+all TypeScript projects, both coverage gates, dead-code analysis, generated binding verification, production
+build and the Worker deployment dry run passed. Worker line coverage was **82.94%** and branch coverage
+was **71.66%**. An earlier coverage run hit five local runtime timeouts; all eight selected archive/comment
+cases passed on rerun, followed by the successful full gate. No test timeout or coverage threshold was changed.
+
+- Digests with 95 unchanged open pages produce one message. Unchanged open work fills unused first-message
+  slots only. Changed pages continue in ten-page partitions; frozen retries retain their selected pages and
+  eligible late events append change-only partitions. Scheduler ticks preserve pending backoff and counters.
+- Consumers and redrive share receipt classification. Suppressed unsent events complete recovery; live claims
+  and uncertain sends retain evidence. Paused/blocked work is excluded before the 50-receipt runnable limit.
+  Eight successful redrive enqueues exhaust retryable work, including duplicate continuation outbox rows for
+  the same receipt. Queue enqueue failures do not consume the budget. Confirmed current or legacy digest
+  progress resets it; acknowledgements and reauthorization preserve these receipt counters while legacy scope
+  recovery retains its existing reset. Exhaustion records
+  delivery health and retires unsent work. Suppressed uncertain channel sends reconcile without reposting.
+- Authentication remains installation-level. Missing scope pauses work without adding mapping blocks.
+  Reauthorization clears legacy scope blocks and unpauses affected queued work only with the scopes required
+  by enabled features. Thumbnails without upload scope remain paused rather than permanently failing. Validation
+  clears legacy message-size blocks and wakes eligible retained work, preserving unrelated blocks, mute and
+  snooze settings. Oversized channel, bulk and digest deliveries fail independently and record delivery health.
+- Each thumbnail attempt renders once and obtains a fresh allocation sized to those bytes. Rejected URLs
+  and uncertain completions replace stale private allocations under the artifact claim; abandoned files are
+  deleted best-effort. The existing flag gates, claim fencing and eight-attempt limit remain covered.
+- Ordinary archives and cross-space moves count active descendants for mutation classification. Archived
+  descendants still move where required. HTTP coverage distinguishes ordinary and genuine bulk operations,
+  verifies membership-completion enqueueing, and checks one sweep for archive/restore/task broadcasts.
+  Pure Activity/share/membership changes skip sweeps with both features disabled; notification producers
+  continue to sweep without Slack flags.
+- DOCX tables reject excess with `413 docx_tables_too_large` before cell or padding allocation: 256 logical
+  columns, 10,000 source rows per table, and 10,000 cumulative expanded cells, including flattened nested
+  tables. Exact bounds, merged/padded amplification, multiple tables, import-job errors and editor-schema
+  validity are covered. Consecutive Code-style paragraphs join with newlines and mark-free text; prose
+  separates code blocks. An independent read-only review found no remaining bypass or regression after the
+  nested-table guard was included; its checks included 1,000 bounded layout comparisons against HEAD.
+- Migration 0067 is unchanged. Guarded local/remote commands reproduce its first-ten-page assignments and
+  stop before any migration for duplicate event assignments. Eighteen guard tests cover overlapping and
+  non-colliding windows, bounds, legacy eligibility, empty/fresh/upgraded databases, malformed output and
+  query failures. The guard performs no repair. Deployment instructions require quiescing legacy scheduling
+  through this upgrade, and CLI deployment and CI both use the guarded command.
+
+All implementation and verification remain local. No production deployment, remote migration, feature
+activation or automatic legacy repair was performed. Live Slack/Word checks remain in the existing exit matrix.
+
 The original long-run fixture is essentially unchanged: bounded parsing already splits that workload, and other parsing work dominates. Runs within a section show the improvement from determining opening status once per homogeneous run. These local measurements do not establish live Worker CPU or memory usage.

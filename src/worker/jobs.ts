@@ -2045,10 +2045,19 @@ export async function consumeDeliveryMessage(
   const keepRound2 = async (topic: keyof typeof round2Receipts, id: string) => {
     const outcome = await round2DeliveryOutcome(env, topic, id);
     if (outcome === "completed") return false;
-    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=?`)
+    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?) WHERE id=?`)
       .bind(Date.now() + (outcome === "paused" || outcome === "uncertain" ? 30 * 60_000 : 60_000), outboxId)
       .run();
     message.ack();
+    return true;
+  };
+  const deferRound2 = async (topic: keyof typeof round2Receipts, id: string) => {
+    const outcome = await round2DeliveryOutcome(env, topic, id);
+    if (outcome === "retryable" || outcome === "uncertain") return false;
+    if (outcome === "completed") {
+      await env.DB.prepare("UPDATE outbox SET slack_redrive_due_at=NULL WHERE id=?").bind(outboxId).run();
+      message.ack();
+    } else await keepRound2(topic, id);
     return true;
   };
   const round2Failure = async (error: unknown) => {
@@ -2057,7 +2066,7 @@ export async function consumeDeliveryMessage(
       error instanceof DeliveryInProgressError ||
       (error instanceof SlackApiError && slackInstallationError(error))
     ) {
-      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=?`)
+      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?) WHERE id=?`)
         .bind(Date.now() + 60_000, outboxId)
         .run();
     } else throw error;
@@ -2239,6 +2248,7 @@ export async function consumeDeliveryMessage(
       message.ack();
       return "acknowledged";
     } // Preserve recovery markers during a release pause.
+    if (await deferRound2(row.topic, id)) return "acknowledged";
     try {
       if (row.topic === "slack_bulk") await deliverBulkSummary(env, id);
       else if (row.topic === "slack_digest") await deliverDigest(env, id);
@@ -2256,6 +2266,8 @@ export async function consumeDeliveryMessage(
       message.ack();
       return "acknowledged";
     }
+    if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" && (await deferRound2("slack_channel", eventId)))
+      return "acknowledged";
     try {
       if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await deliverRound2ChannelEvent(env, eventId);
       else await deliverSlackChannelEvent(env, eventId);

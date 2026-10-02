@@ -75,9 +75,9 @@ export async function deliverThumbnail(env: Env, id: string) {
         .run();
       return;
     }
-    // Completion without a checkpoint cannot be verified with the existing scopes.
-    // Allocate a replacement private file rather than completing the old ID twice.
-    if (row.upload_phase === "complete") {
+    // Each attempt renders new bytes, so its allocation must declare their size.
+    // An uncertain completion also gets a replacement rather than completing twice.
+    if (row.slack_file_id || row.upload_url) {
       const abandoned = row.slack_file_id;
       await env.DB.prepare(
         "UPDATE slack_file_artifacts SET slack_file_id=NULL,upload_url=NULL,upload_phase='prepare' WHERE id=? AND claim_token=?",
@@ -89,7 +89,9 @@ export async function deliverThumbnail(env: Env, id: string) {
       row.upload_url = null;
       if (abandoned) await slackApi(env, installation, "files.delete", { file: abandoned }).catch(() => undefined);
     }
-    if (!env.BROWSER || !slackHasScopes(installation.scopes, ["files:write"])) throw new Error("thumbnail_unavailable");
+    if (!slackHasScopes(installation.scopes, ["files:write"]))
+      throw new SlackApiError("files.getUploadURLExternal", "missing_scope", 200, installation.credential_revision);
+    if (!env.BROWSER) throw new Error("thumbnail_unavailable");
     const source = await env.BUCKET.get(row.thumbnail_r2_key);
     if (!source || source.size > 2 * 1024 * 1024) throw new Error("thumbnail_unavailable");
     const svg = new Uint8Array(await source.arrayBuffer());
@@ -113,13 +115,10 @@ export async function deliverThumbnail(env: Env, id: string) {
       .bind(row.page_id, row.content_epoch, row.content_sha256, installation.id, installation.generation)
       .first();
     if (!current) throw new Error("thumbnail_unavailable");
-    let upload =
-      row.slack_file_id && row.upload_url ? { file_id: row.slack_file_id, upload_url: row.upload_url } : null;
-    if (!upload)
-      upload = await slackApi(env, installation, "files.getUploadURLExternal", {
-        filename: "diagram.png",
-        length: png.byteLength,
-      });
+    const upload = await slackApi(env, installation, "files.getUploadURLExternal", {
+      filename: "diagram.png",
+      length: png.byteLength,
+    });
     await env.DB.prepare(
       `UPDATE slack_file_artifacts SET slack_file_id=?,upload_url=?,upload_phase='upload',updated_at=? WHERE id=? AND claim_token=?`,
     )

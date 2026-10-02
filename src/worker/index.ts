@@ -683,8 +683,12 @@ function sendWorkspaceEvent(
 }
 
 // Call only after mutations that can create Activity or share-refresh outbox work.
+function sweepMutationOutbox(c: Parameters<typeof sendWorkspaceEvent>[0]) {
+  if (c.env.WORKSPACE_ACTIVITY_ENABLED === "true" || c.env.SLACK_SHARE_REFRESH_ENABLED === "true")
+    c.executionCtx.waitUntil(sweepOutbox(c.env));
+}
 function sendMutationEvent(c: Parameters<typeof sendWorkspaceEvent>[0], workspaceId: string, event: WorkspaceEvent) {
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  sweepMutationOutbox(c);
   sendWorkspaceEvent(c, workspaceId, event);
 }
 
@@ -1538,6 +1542,7 @@ app.post("/api/invites/complete", async (c) => {
     ),
   ]);
   if (!result[2]!.results.length) throw new HttpError(409, "invite_invalid", "This invite is expired or already used.");
+  if (result[0]!.meta.changes) sweepMutationOutbox(c);
   return c.json({ success: true });
 });
 
@@ -1649,7 +1654,7 @@ app.patch("/api/members/:id", async (c) => {
     .bind(nextRole, member.workspace.id, targetId)
     .run();
   if (!result.meta.changes) throw new HttpError(404, "member_not_found", "Member not found.");
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  sweepMutationOutbox(c);
   return c.json({ ok: true });
 });
 
@@ -1672,7 +1677,7 @@ app.delete("/api/members/:id", async (c) => {
       targetId,
     ),
   ]);
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  sweepMutationOutbox(c);
   return c.json({ ok: true });
 });
 
@@ -3182,6 +3187,8 @@ app.post("/api/slack/channels/:id/repair-notifications", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   await repairSlackChannelNotifications(c.env, member, c.req.param("id"));
+  if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await reconcileRound2Mapping(c.env, c.req.param("id"));
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json({
     subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
   });
@@ -3623,7 +3630,7 @@ app.post("/api/pages/:pageId/share", async (c) => {
   requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   const body = await jsonBody(c.req.raw);
   const share = await createShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin, shareOptions(body));
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  sweepMutationOutbox(c);
   return c.json({ share }, 201);
 });
 
@@ -3633,7 +3640,7 @@ app.patch("/api/pages/:pageId/share", async (c) => {
   requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   const body = await jsonBody(c.req.raw);
   const share = await updateShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin, shareOptions(body));
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  sweepMutationOutbox(c);
   return c.json({ share });
 });
 
@@ -3642,7 +3649,7 @@ app.delete("/api/pages/:pageId/share", async (c) => {
   requireOwner(member);
   requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   await revokeShare(c.env, member, c.req.param("pageId"));
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  sweepMutationOutbox(c);
   return c.body(null, 204);
 });
 
@@ -4325,7 +4332,13 @@ app.post("/api/pages/:id/move-space", async (c) => {
   ) SELECT id FROM subtree`;
   const operationId = crypto.randomUUID();
   const results = await c.env.DB.batch<PageRow>([
-    activityMutationStart(c.env.DB, subtreeSql, [page.id], operationId, "move"),
+    activityMutationStart(
+      c.env.DB,
+      `${subtreeSql} WHERE id IN (SELECT id FROM pages WHERE archived_at IS NULL)`,
+      [page.id],
+      operationId,
+      "move",
+    ),
     c.env.DB.prepare(
       `UPDATE pages SET
          space_id = ?,
@@ -4498,7 +4511,7 @@ app.delete("/api/pages/:id", async (c) => {
     [
       activityMutationStart(
         c.env.DB,
-        "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree",
+        "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree WHERE id IN (SELECT id FROM pages WHERE archived_at IS NULL)",
         [page.id],
         effectiveOperationId,
         "archive",
@@ -4561,7 +4574,7 @@ app.delete("/api/pages/:id", async (c) => {
   });
   if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   if (page.is_task_list || archived?.results.some((item) => item.is_task_list))
-    sendMutationEvent(c, member.workspace.id, { type: "tasks-invalidated" });
+    sendWorkspaceEvent(c, member.workspace.id, { type: "tasks-invalidated" });
   const cleanup = await archiveCleanupAfterCommit(c.env, page.id, archiveOwnership, timestamp, "page_delete");
   return c.json(
     {
@@ -4703,7 +4716,7 @@ app.post("/api/pages/:id/restore", async (c) => {
   });
   if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   if (restored.results.some((item) => item.is_task_list))
-    sendMutationEvent(c, member.workspace.id, { type: "tasks-invalidated" });
+    sendWorkspaceEvent(c, member.workspace.id, { type: "tasks-invalidated" });
   return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
 });
 
@@ -5846,7 +5859,7 @@ app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
   if (body.archived !== true) return c.json(result);
   const pageIds = result.pageIds ?? [result.detailPageId];
   const operationId = typeof body.operationId === "string" ? body.operationId : "";
-  sendMutationEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false, operationId });
+  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false, operationId });
   const cleanup = await archiveCleanupAfterCommit(c.env, result.detailPageId, { operationId }, now(), "task_patch");
   return c.json({ ...result, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
 });

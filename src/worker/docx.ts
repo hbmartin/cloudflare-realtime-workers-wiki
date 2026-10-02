@@ -231,7 +231,7 @@ export async function readDocx(bytes: Uint8Array) {
           "strike => s",
           "p[style-name='Quote'] => blockquote:fresh",
           "p[style-name='Title'] => p:fresh",
-          "p[style-name='Code'] => pre:fresh",
+          "p[style-name='Code'] => pre:separator('\\n')",
         ],
         convertImage: mammoth.images.imgElement(async (image) => {
           const mime = inlineImageMime(image.contentType);

@@ -1,4 +1,4 @@
-import { retryableSlackError } from "./slack-delivery";
+import { retryableSlackError, wakeRound2Mapping } from "./slack-delivery";
 import { channelInvalidReason } from "./slack-schedule";
 import { validTimezone } from "../shared/date-mentions";
 import type { Env, MemberContext } from "./env";
@@ -22,11 +22,14 @@ export async function round2Installation(env: Env, id: string, generation?: numb
 export async function validateMapping(env: Env, installation: SlackInstallation, mappingId: string, channelId: string) {
   try {
     const channel = await validatedChannel(env, installation, channelId);
+    const prior = await env.DB.prepare("SELECT notification_blocked_at FROM slack_channel_subscriptions WHERE id=?")
+      .bind(mappingId)
+      .first<{ notification_blocked_at: number | null }>();
     const saved =
       await env.DB.prepare(`UPDATE slack_channel_subscriptions SET channel_name=?,channel_type=?,validation_state='valid',
       validation_error=NULL,bot_is_member=1,validated_at=?,
-      notification_blocked_at=CASE WHEN notification_error=validation_error THEN NULL ELSE notification_blocked_at END,
-      notification_error=CASE WHEN notification_error=validation_error THEN NULL ELSE notification_error END WHERE id=? AND installation_id=? AND channel_id=?
+      notification_blocked_at=CASE WHEN (notification_error=validation_error AND notification_error<>'missing_scope') OR notification_error='msg_too_long' THEN NULL ELSE notification_blocked_at END,
+      notification_error=CASE WHEN (notification_error=validation_error AND notification_error<>'missing_scope') OR notification_error='msg_too_long' THEN NULL ELSE notification_error END WHERE id=? AND installation_id=? AND channel_id=?
       AND EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)
       AND EXISTS(SELECT 1 FROM workspace_members wm JOIN slack_installations i ON i.workspace_id=wm.workspace_id WHERE i.id=installation_id AND wm.user_id=slack_channel_subscriptions.created_by AND wm.role='owner')`)
         .bind(
@@ -40,10 +43,12 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
           installation.generation,
         )
         .run();
+    if (saved.meta.changes && prior?.notification_blocked_at) await wakeRound2Mapping(env, mappingId);
     return saved.meta.changes > 0;
   } catch (error) {
     if (retryableSlackError(error)) throw error;
     if (!(error instanceof HttpError || error instanceof SlackApiError)) throw error;
+    if (error instanceof SlackApiError && error.code === "missing_scope") throw error;
     if (error instanceof SlackApiError && slackInstallationError(error)) {
       await recordSlackInstallationError(env, installation.id, error, installation.generation);
       return false;

@@ -247,6 +247,278 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("mutation classification and sweep scheduling", () => {
+  function trackedBindings(enabled = true) {
+    const claims: string[] = [];
+    const DB = new Proxy(env.DB, {
+      get(target, property, receiver) {
+        if (property === "prepare")
+          return (sql: string) => {
+            if (/UPDATE outbox_sweep_state\s+SET lease_token = \?/i.test(sql)) claims.push(sql);
+            return target.prepare(sql);
+          };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    const send = vi.fn().mockResolvedValue(undefined);
+    const bindings = {
+      ...slackEnv(),
+      DB,
+      DELIVERY_QUEUE: { send },
+      WORKSPACE_ACTIVITY_ENABLED: enabled ? "true" : "false",
+      SLACK_CHANNEL_VALIDATION_ENABLED: enabled ? "true" : "false",
+      SLACK_SHARE_REFRESH_ENABLED: enabled ? "true" : "false",
+      SLACK_DIGEST_DEFAULT_TIMEZONE: "America/Los_Angeles",
+    } as unknown as Env;
+    return { bindings, claims, send };
+  }
+
+  it.each([
+    { action: "archive", bulk: false },
+    { action: "move", bulk: false },
+    { action: "archive", bulk: true },
+    { action: "move", bulk: true },
+  ])(
+    "classifies $action with bulk=$bulk using active descendants and schedules one sweep",
+    async ({ action, bulk }) => {
+      const installed = await bootstrap();
+      await installSlack(installed.member);
+      const { bindings, claims } = trackedBindings();
+      await syncRound2Configuration(bindings);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          Response.json({ ok: true, channel: { id: "C123", name: "canonical", is_channel: true, is_member: true } }),
+        ),
+      );
+      await upsertSlackChannelSubscription(bindings, memberContext(installed.member), {
+        spaceId: installed.page.spaceId!,
+        pageId: null,
+        channelId: "C123",
+        channelName: "canonical",
+        cadence: "immediate",
+        eventTypes: ["page_archived", "page_moved"],
+      });
+      await env.DB.batch([
+        env.DB.prepare("UPDATE pages SET kind='table',is_task_list=1 WHERE id=?").bind(installed.page.id),
+        env.DB.prepare(
+          "INSERT INTO pages(id,workspace_id,space_id,parent_id,kind,position,title,created_by,updated_by,created_at,updated_at,archived_at) VALUES('old-trash',?,?,?,'table','a0','Old child',?,?,1,1,1)",
+        ).bind(
+          installed.member.workspace.id,
+          installed.page.spaceId,
+          installed.page.id,
+          installed.member.user.id,
+          installed.member.user.id,
+        ),
+        env.DB.prepare(
+          "INSERT INTO spaces(id,workspace_id,name,slug,position,created_by,created_at,updated_at) VALUES('destination',?,'Destination','destination','a1',?,1,1)",
+        ).bind(installed.member.workspace.id, installed.member.user.id),
+      ]);
+      if (bulk)
+        await env.DB.prepare(
+          "INSERT INTO pages(id,workspace_id,space_id,parent_id,kind,position,title,created_by,updated_by,created_at,updated_at) VALUES('active-child',?,?,?,'table','a1','Active child',?,?,1,1)",
+        )
+          .bind(
+            installed.member.workspace.id,
+            installed.page.spaceId,
+            installed.page.id,
+            installed.member.user.id,
+            installed.member.user.id,
+          )
+          .run();
+      const context = createExecutionContext();
+      const response = await worker.fetch(
+        request(installed.cookie, `/api/pages/${installed.page.id}${action === "move" ? "/move-space" : ""}`, {
+          method: action === "move" ? "POST" : "DELETE",
+          headers: { "content-type": "application/json" },
+          ...(action === "move" ? { body: JSON.stringify({ spaceId: "destination", parentId: null }) } : {}),
+        }),
+        bindings,
+        context,
+      );
+      expect(response.status).toBe(200);
+      await waitOnExecutionContext(context);
+      const type = action === "move" ? "page_moved" : "page_archived";
+      expect(
+        await env.DB.prepare("SELECT operation_bulk FROM workspace_activity WHERE page_id=? AND event_type=?")
+          .bind(installed.page.id, type)
+          .first(),
+      ).toEqual({ operation_bulk: bulk ? 1 : 0 });
+      expect(await env.DB.prepare("SELECT count(*) n FROM slack_bulk_receipts").first()).toEqual({ n: bulk ? 1 : 0 });
+      expect(claims).toHaveLength(1);
+      expect(await env.DB.prepare("SELECT space_id,archived_at FROM pages WHERE id='old-trash'").first()).toEqual({
+        space_id: action === "move" ? "destination" : installed.page.spaceId,
+        archived_at: 1,
+      });
+      let restoreStatus: number | undefined;
+      let restoreClaims: number | undefined;
+      if (action === "archive") {
+        claims.length = 0;
+        const restoreContext = createExecutionContext();
+        restoreStatus = (
+          await worker.fetch(
+            request(installed.cookie, `/api/pages/${installed.page.id}/restore`, { method: "POST" }),
+            bindings,
+            restoreContext,
+          )
+        ).status;
+        await waitOnExecutionContext(restoreContext);
+        restoreClaims = claims.length;
+      }
+      expect([restoreStatus, restoreClaims]).toEqual(action === "archive" ? [200, 1] : [undefined, undefined]);
+    },
+  );
+
+  it("sweeps share refreshes immediately when invite completion inserts membership", async () => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    const invitation = await SELF.fetch(
+      request(installed.cookie, "/api/invites", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ role: "viewer" }),
+      }),
+    );
+    const token = (await invitation.json<{ invite: { token: string } }>()).invite.token;
+    const accepted = await SELF.fetch("http://example.test/api/invites/accept", {
+      method: "POST",
+      headers: { origin: "http://example.test", "content-type": "application/json" },
+      body: JSON.stringify({ token, name: "New viewer", email: "new-viewer@example.test", password: "password123" }),
+    });
+    expect(accepted.status).toBe(200);
+    const cookie = await enrollAccount(accepted);
+    const viewer = (await env.DB.prepare("SELECT id FROM user WHERE email='new-viewer@example.test'").first<{
+      id: string;
+    }>())!;
+    const { bindings, claims, send } = trackedBindings();
+    await syncRound2Configuration(bindings);
+    await env.DB.prepare(
+      "INSERT INTO slack_share_references(id,installation_id,installation_generation,page_id,channel_id,message_ts,url,observed_user_id,reference_kind,created_at,updated_at) VALUES('invite-reference','slack-installation',1,?,'C123','123.456',?,?,'page',1,1)",
+    )
+      .bind(installed.page.id, `http://example.test/?page=${installed.page.id}`, viewer.id)
+      .run();
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(cookie, "/api/invites/complete", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token }),
+      }),
+      bindings,
+      context,
+    );
+    expect(response.status).toBe(200);
+    await waitOnExecutionContext(context);
+    expect(claims).toHaveLength(1);
+    const rows = (
+      await env.DB.prepare("SELECT id,enqueued_at FROM outbox WHERE topic='slack_share_refresh'").all<{
+        id: string;
+        enqueued_at: number | null;
+      }>()
+    ).results;
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row.enqueued_at).not.toBeNull();
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({ outboxId: row.id }));
+    }
+  });
+
+  it("skips pure mutation sweeps with Activity and shares disabled and still sweeps notification producers", async () => {
+    const installed = await bootstrap();
+    const { bindings, claims, send } = trackedBindings(false);
+    const editContext = createExecutionContext();
+    expect(
+      (
+        await worker.fetch(
+          request(installed.cookie, `/api/pages/${installed.page.id}`, {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ title: "Changed", revision: installed.page.revision }),
+          }),
+          bindings,
+          editContext,
+        )
+      ).status,
+    ).toBe(200);
+    await waitOnExecutionContext(editContext);
+    expect(claims).toHaveLength(0);
+    for (const method of ["POST", "PATCH", "DELETE"]) {
+      const shareContext = createExecutionContext();
+      const response = await worker.fetch(
+        request(installed.cookie, `/api/pages/${installed.page.id}/share`, {
+          method,
+          headers: { "content-type": "application/json" },
+          ...(method === "DELETE" ? {} : { body: JSON.stringify({ showToc: false }) }),
+        }),
+        bindings,
+        shareContext,
+      );
+      expect(response.status).toBe(method === "POST" ? 201 : method === "DELETE" ? 204 : 200);
+      await waitOnExecutionContext(shareContext);
+      expect(claims).toHaveLength(0);
+    }
+    const viewer = await inviteViewer(installed.cookie);
+    for (const method of ["PATCH", "DELETE"]) {
+      const membershipContext = createExecutionContext();
+      const response = await worker.fetch(
+        request(installed.cookie, `/api/members/${viewer.member.user.id}`, {
+          method,
+          headers: { "content-type": "application/json" },
+          ...(method === "DELETE" ? {} : { body: JSON.stringify({ role: "editor" }) }),
+        }),
+        bindings,
+        membershipContext,
+      );
+      expect(response.status).toBe(200);
+      await waitOnExecutionContext(membershipContext);
+      expect(claims).toHaveLength(0);
+    }
+    await env.DB.prepare(
+      "INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at) VALUES('ordinary-notification',?,'notification','{}',1,1)",
+    )
+      .bind(installed.member.workspace.id)
+      .run();
+    await env.DB.prepare("UPDATE pages SET kind='table',is_task_list=1 WHERE id=?").bind(installed.page.id).run();
+    await env.DB.prepare("INSERT INTO table_state(page_id) VALUES(?)").bind(installed.page.id).run();
+    const { taskListStatements } = await import("./tasks");
+    await env.DB.batch(taskListStatements(env.DB, installed.page.id));
+    const createContext = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, `/api/task-lists/${installed.page.id}/tasks`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          operationId: "notification-producer",
+          expectedRevision: 1,
+          title: "Task",
+          status: "todo",
+        }),
+      }),
+      bindings,
+      createContext,
+    );
+    expect(response.status).toBe(201);
+    await waitOnExecutionContext(createContext);
+    expect(claims).toHaveLength(1);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ outboxId: "ordinary-notification" }));
+    const task = await response.json<{ rowId: string }>();
+    claims.length = 0;
+    const archiveContext = createExecutionContext();
+    const archived = await worker.fetch(
+      request(installed.cookie, `/api/task-lists/${installed.page.id}/tasks/${task.rowId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ operationId: "notification-archive", expectedRevision: 2, archived: true }),
+      }),
+      bindings,
+      archiveContext,
+    );
+    expect(archived.status).toBe(200);
+    await waitOnExecutionContext(archiveContext);
+    expect(claims).toHaveLength(1);
+  });
+});
+
 describe("Slack security and integration", () => {
   describe("personal identity linking", () => {
     beforeEach(() => {

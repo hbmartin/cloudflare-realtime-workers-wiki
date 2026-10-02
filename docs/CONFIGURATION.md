@@ -201,7 +201,11 @@ Producers that encounter the lease request an atomic rescan from its owner. If i
 remain at the cap, the owner queues a continuation; contended continuation deliveries back off, and the cron
 remains the recovery path if that queue send fails.
 
-Word (.docx) imports create one document page after preview and confirmation. Word exports are
+Word (.docx) imports create one document page after preview and confirmation. Tables allow at most
+256 logical columns and 10,000 source rows each, with 10,000 expanded cells cumulatively across the
+document, including merged spans and padding. Oversized tables fail with `docx_tables_too_large`;
+they are not truncated. Consecutive Code-style paragraphs become one plain code block separated by newlines.
+Word exports are
 available for document pages and produce a single file without requiring Browser Rendering. They
 preserve rich text, nested lists, basic tables, and embedded PNG/JPEG/GIF images. Uploads are limited
 to 24 MiB; expanded archives and exported files are limited to 64 MiB, with a 24 MiB embedded-image
@@ -299,7 +303,14 @@ without proven provenance display “A collaborator.”
 Canonical thread roots offer Resolve/Reopen and page Watch/Unwatch. A page Unwatch also overrides a watched
 space. Workspace owners can Mute/Unmute or Snooze the mapping for 1, 8, or 24 hours. Unmute clears both mute
 and snooze; Snooze replaces an indefinite mute. These controls also appear in Slack Settings without requiring an
-active root. Wholly missed daily digest windows are dropped; uncertain sends remain available for reconciliation. Each digest message contains at most ten pages, and durable child receipts continue until the window is covered. Import publication retains Activity while suppressing channel posts. Multi-page moves/archives send one title-free summary per affected channel. Pending digests are discarded on mute or snooze, and unmute resumes with new events. Owners can create
+active root. Wholly missed daily digest windows are dropped; uncertain sends remain available for reconciliation.
+Each digest message contains at most ten pages. Unchanged open work fills unused slots in the first message
+only; later messages and late-event continuations contain qualifying changes. Retries preserve the first
+message's selected pages. Retryable delivery receipts allow eight successful redrive enqueues with backoff;
+confirmed digest-partition progress resets that budget. Paused destinations and uncertain sends preserve
+their evidence. Import publication retains Activity while suppressing channel posts. Multi-page moves/archives
+send one title-free summary immediately for both cadences, and their events are excluded from scheduled digests.
+Pending digests are discarded on mute or snooze, and unmute resumes with new events. Owners can create
 or view the current public share from a supported root or mapped page unfurl. The link is returned as a channel-level
 ephemeral to the acting user while they are active in Slack; an uncertain send is never blindly reposted. These actions
 recheck current identity, membership, mapping, and page permissions when delayed work runs; old buttons and

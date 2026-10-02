@@ -2,6 +2,7 @@ import {
   definiteSlackRejection,
   invalidSlackDestination,
   recordDeliveryError,
+  recordPermanentDeliveryFailure,
   retireObsoleteReceipt,
   thumbnailDeliveryEnabled,
 } from "./slack-delivery";
@@ -142,21 +143,28 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
         mapping.channel_id,
         timestamp,
       ),
-      env.DB.prepare(`UPDATE slack_digest_receipts SET state='pending' WHERE id=? AND state IN ('sent','skipped') AND coalesce(last_error,'')<>'legacy_reconciled'
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=?,slack_redrive_count=0
+        WHERE id='outbox:'||? AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND state IN ('sent','skipped'))
+        AND EXISTS(SELECT 1 FROM slack_channel_events e JOIN pages page ON page.id=e.page_id WHERE ${filter.sql})`).bind(
+        timestamp,
+        timestamp + 60_000,
+        id,
+        id,
+        ...filter.binds,
+      ),
+      env.DB.prepare(`UPDATE slack_digest_receipts SET state='pending' WHERE id=? AND state IN ('sent','skipped')
         AND EXISTS(SELECT 1 FROM slack_channel_events e JOIN pages page ON page.id=e.page_id WHERE ${filter.sql})`).bind(
         id,
         ...filter.binds,
       ),
-      env.DB.prepare(`INSERT OR IGNORE INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
-        SELECT 'outbox:'||r.id,i.workspace_id,'slack_digest',json_object('digestId',r.id),?,? FROM slack_digest_receipts r
+      env.DB.prepare(`INSERT OR IGNORE INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,slack_redrive_due_at)
+        SELECT 'outbox:'||r.id,i.workspace_id,'slack_digest',json_object('digestId',r.id),?,?,? FROM slack_digest_receipts r
         JOIN slack_installations i ON i.id=r.installation_id WHERE r.id=? AND r.state='pending'`).bind(
         timestamp,
         timestamp,
+        timestamp + 60_000,
         id,
       ),
-      env.DB.prepare(
-        `UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=? WHERE id='outbox:'||? AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND state='pending')`,
-      ).bind(timestamp, timestamp + 60_000, id, id),
     ]);
   }
 }
@@ -166,7 +174,7 @@ export async function digestPages(
   mapping: Mapping,
   receipt: DigestReceipt,
   installation: SlackInstallation,
-  message?: { page_ids_json: string; event_ids_json: string },
+  message?: { page_ids_json: string; event_ids_json: string; sequence?: number },
 ): Promise<DigestPage[]> {
   const threads = OPEN_THREAD_COUNT_SQL.replaceAll("p.", "page.");
   const status = TASK_STATUS_SQL.replaceAll("p.", "page.");
@@ -227,7 +235,15 @@ export async function digestPages(
       await attachThumbnail(env, item, installation, row.content_epoch);
     result.push(item);
   }
-  if (mapping.digest_open_work && result.length < 10) {
+  if (
+    mapping.digest_open_work &&
+    result.length < 10 &&
+    (message
+      ? (message.sequence ?? 0) === 0
+      : !(await env.DB.prepare("SELECT 1 FROM slack_digest_messages WHERE receipt_id=? LIMIT 1")
+          .bind(receipt.id)
+          .first()))
+  ) {
     const open =
       await env.DB.prepare(`SELECT page.id,page.title,page.plain_text,page.kind,page.content_epoch,${threads} unresolved_threads,${status} task_status
       FROM pages page WHERE page.space_id=? AND page.workspace_id=? AND (? IS NULL OR page.id=?) AND page.archived_at IS NULL
@@ -498,6 +514,8 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
           id,
           token,
         ),
+        env.DB.prepare(`UPDATE outbox SET slack_redrive_count=0 WHERE topic='slack_digest' AND json_extract(payload_json,'$.digestId')=?
+          AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(id, id, token),
       ]);
       await updateRoot("pending", ts);
       legacyReconciled = true;
@@ -520,6 +538,13 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
           state,
           ts,
           message.id,
+          id,
+          token,
+        ),
+        env.DB.prepare(`UPDATE outbox SET slack_redrive_count=0 WHERE topic='slack_digest' AND json_extract(payload_json,'$.digestId')=?
+          AND ?='sent' AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
+          id,
+          state,
           id,
           token,
         ),
@@ -601,20 +626,33 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
           await updateRoot("pending", posted.ts);
         } catch (error) {
           await recordDeliveryError(env, installation, error, mapping.id, mapping.channel_id);
-          if (invalidSlackDestination(error)) {
+          if (error instanceof SlackApiError && error.code === "msg_too_long") {
+            await recordPermanentDeliveryFailure(
+              env,
+              installation,
+              message.id,
+              mapping.id,
+              mapping.channel_id,
+              error.code,
+            );
             await finishMessage("retired", null);
-            await updateRoot("retired", null, error.code);
-            return;
+            await updateRoot("pending", null, error.code);
+          } else {
+            if (invalidSlackDestination(error)) {
+              await finishMessage("retired", null);
+              await updateRoot("retired", null, error.code);
+              return;
+            }
+            if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
+              await env.DB.prepare(
+                `UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,last_error=? WHERE id=? AND claim_token=?`,
+              )
+                .bind(error instanceof SlackApiError ? error.code : "rate_limited", message.id, token)
+                .run();
+              await updateRoot("pending");
+            }
+            throw error;
           }
-          if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
-            await env.DB.prepare(
-              `UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,last_error=? WHERE id=? AND claim_token=?`,
-            )
-              .bind(error instanceof SlackApiError ? error.code : "rate_limited", message.id, token)
-              .run();
-            await updateRoot("pending");
-          }
-          throw error;
         }
       }
     }

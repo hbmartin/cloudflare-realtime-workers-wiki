@@ -161,6 +161,66 @@ beforeEach(async () => {
 });
 
 describe("job execution", () => {
+  it("reports oversized DOCX tables during upload inspection without staging content or attachments", async () => {
+    const installed = await bootstrap();
+    const fixture = await writeDocx(
+      {
+        type: "doc",
+        content: [
+          {
+            type: "table",
+            content: [
+              {
+                type: "tableRow",
+                content: [
+                  {
+                    type: "tableCell",
+                    attrs: { colspan: 2 },
+                    content: [{ type: "tableParagraph", content: [{ type: "text", text: "Too wide" }] }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      "Oversized",
+      "http://example.test",
+      async () => null,
+    );
+    const parts = await readZip(fixture.bytes);
+    const document = parts.find((part) => part.path === "word/document.xml")!;
+    document.bytes = new TextEncoder().encode(
+      new TextDecoder().decode(document.bytes).replace('<w:gridSpan w:val="2"/>', '<w:gridSpan w:val="257"/>'),
+    );
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([createZip(parts)], "oversized.docx", { type: DOCX_MIME }));
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      context,
+    );
+    expect(response.status).toBe(202);
+    const id = (await response.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(context);
+    expect(
+      await env.DB.prepare("SELECT status,error_code,error_message FROM jobs WHERE id=?").bind(id).first(),
+    ).toEqual({
+      status: "failed",
+      error_code: "docx_tables_too_large",
+      error_message: expect.stringContaining("expanded-cell limits"),
+    });
+    expect(await env.DB.prepare("SELECT count(*) n FROM pages WHERE import_job_id=?").bind(id).first()).toEqual({
+      n: 0,
+    });
+    expect(
+      await env.DB.prepare("SELECT count(*) n FROM attachments WHERE workspace_id=?")
+        .bind(installed.workspaceId)
+        .first(),
+    ).toEqual({ n: 0 });
+  });
   it("imports and exports a single DOCX page with verified images without Browser Rendering", async () => {
     const installed = await bootstrap();
     const importedTitle = "Word fixture 1234567890abcdef1234567890abcdef";
