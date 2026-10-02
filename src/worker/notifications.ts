@@ -169,8 +169,8 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         `${prefix};`,
       ),
     database
-      .prepare(`INSERT OR IGNORE INTO workspace_activity(id,workspace_id,page_id,space_id,actor_id,thread_id,event_type,created_at)
-      SELECT ?,p.workspace_id,p.id,p.space_id,?,?,?,? FROM pages p WHERE p.id=? AND p.workspace_id=?
+      .prepare(`INSERT OR IGNORE INTO workspace_activity(id,workspace_id,page_id,space_id,actor_id,thread_id,event_type,created_at,slack_eligible)
+      SELECT ?,p.workspace_id,p.id,p.space_id,nullif(?,''),?,?,?,? FROM pages p WHERE p.id=? AND p.workspace_id=?
         AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0
         AND (? IS NULL OR p.content_epoch=?)
         AND ? IN ('mention','reply','thread_resolved','thread_reopened','page_edit')
@@ -181,6 +181,7 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         fanout.threadId,
         fanout.eventType,
         fanout.createdAt,
+        fanout.emitSlackChannel && (fanout.eventType !== "mention" || recipients.length > 0) ? 1 : 0,
         fanout.pageId,
         fanout.workspaceId,
         fanout.contentEpoch ?? null,

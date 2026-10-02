@@ -1,4 +1,6 @@
-import { DOCX_MIME } from "./docx";
+import { activityMutationStart, activityMutationEnd } from "./activity-mutations";
+import { DOCX_MIME } from "../shared/docx-metadata";
+import { EXPORT_CAPABILITIES } from "../shared/export-format";
 import { dueRound2Digests } from "./slack-digests";
 import { reconcileRound2Mapping } from "./slack-recovery";
 import { listActivity } from "./activity";
@@ -678,6 +680,12 @@ function sendWorkspaceEvent(
       );
     }),
   );
+}
+
+// Call only after mutations that can create Activity or share-refresh outbox work.
+function sendMutationEvent(c: Parameters<typeof sendWorkspaceEvent>[0], workspaceId: string, event: WorkspaceEvent) {
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  sendWorkspaceEvent(c, workspaceId, event);
 }
 
 function sendCommentMutationEvents(
@@ -1641,6 +1649,7 @@ app.patch("/api/members/:id", async (c) => {
     .bind(nextRole, member.workspace.id, targetId)
     .run();
   if (!result.meta.changes) throw new HttpError(404, "member_not_found", "Member not found.");
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json({ ok: true });
 });
 
@@ -1663,6 +1672,7 @@ app.delete("/api/members/:id", async (c) => {
       targetId,
     ),
   ]);
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json({ ok: true });
 });
 
@@ -1753,7 +1763,7 @@ app.patch("/api/spaces/:id", async (c) => {
   )
     .bind(name, description, icon, visibility, now(), space.id, member.workspace.id)
     .run();
-  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  sendMutationEvent(c, member.workspace.id, { type: "workspace-invalidated" });
   return c.json({ space: spaceJson(await spaceForMember(c.env, member, space.id), member) });
 });
 
@@ -1778,7 +1788,7 @@ app.put("/api/spaces/:id/members/:userId", async (c) => {
   )
     .bind(space.id, userId, grant, member.user.id, now())
     .run();
-  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  sendMutationEvent(c, member.workspace.id, { type: "workspace-invalidated" });
   return c.json({ ok: true });
 });
 
@@ -1789,7 +1799,7 @@ app.delete("/api/spaces/:id/members/:userId", async (c) => {
   await c.env.DB.prepare(`DELETE FROM space_members WHERE space_id = ? AND user_id = ?`)
     .bind(space.id, c.req.param("userId"))
     .run();
-  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  sendMutationEvent(c, member.workspace.id, { type: "workspace-invalidated" });
   return c.json({ ok: true });
 });
 
@@ -2881,7 +2891,6 @@ app.post("/api/slack/commands", async (c) => {
   };
   const rawBody = await beforeAck(c.req.raw.text());
   const verified = await beforeAck(verifySlackRequest(c.env, c.req.raw, rawBody));
-  await beforeAck(syncRound2Configuration(c.env));
   if (verified.duplicate) return c.json({ response_type: "ephemeral", text: "Request already handled." });
   const response = await beforeAck(
     handleSlackCommand(
@@ -2903,7 +2912,6 @@ app.post("/api/slack/commands", async (c) => {
 app.post("/api/slack/events", async (c) => {
   const rawBody = await c.req.raw.text();
   await verifySlackRequest(c.env, c.req.raw, rawBody);
-  await syncRound2Configuration(c.env);
   let payload: SlackEventPayload;
   try {
     payload = JSON.parse(rawBody) as SlackEventPayload;
@@ -2937,7 +2945,6 @@ app.post("/api/slack/interactions", async (c) => {
   };
   const rawBody = await beforeAck(() => c.req.raw.text());
   await beforeAck(() => verifySlackRequest(c.env, c.req.raw, rawBody));
-  await beforeAck(() => syncRound2Configuration(c.env));
   const form = new URLSearchParams(rawBody);
   let payload: SlackInteractionPayload;
   try {
@@ -2986,6 +2993,13 @@ app.get("/api/activity", async (c) => {
     }),
   );
 });
+app.post("/api/slack/configuration/sync", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const result = await syncRound2Configuration(c.env);
+  if (result?.activationError) throw new HttpError(409, "slack_activation_error", result.activationError);
+  return c.json({ ok: true, ...result });
+});
 app.get("/api/slack/channel-directory", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
@@ -3008,7 +3022,7 @@ app.patch("/api/slack/channels/:id", async (c) => {
   if (
     !Array.isArray(eventTypes) ||
     !eventTypes.length ||
-    eventTypes.some((t) => !CHANNEL_EVENT_TYPES.includes(t as ChannelEventType)) ||
+    eventTypes.some((t) => ![...CHANNEL_EVENT_TYPES, ...NOTIFICATION_EVENT_TYPES].includes(t)) ||
     new Set(eventTypes).size !== eventTypes.length
   )
     throw new HttpError(422, "invalid_slack_events", "Choose supported channel events.");
@@ -3022,7 +3036,7 @@ app.patch("/api/slack/channels/:id", async (c) => {
     body.pageId === undefined ? existing.pageId : body.pageId === null ? null : text(body.pageId, "pageId", 100);
   const channelId =
     body.channelId === undefined ? existing.channelId : text(body.channelId, "channelId", 30).toUpperCase();
-  if (!/^[CG][A-Z0-9]{1,29}$/.test(channelId))
+  if (channelId !== existing.channelId && !/^[CG][A-Z0-9]{1,29}$/.test(channelId))
     throw new HttpError(422, "invalid_slack_channel", "Choose a supported Slack channel.");
   await spaceForMember(c.env, member, spaceId);
   if (pageId && (await pageForMember(c.env, member, pageId)).space_id !== spaceId)
@@ -3191,20 +3205,17 @@ app.post("/api/pages/:id/exports", async (c) => {
   requireOrdinaryPage(page);
   const body = await jsonBody(c.req.raw);
   const format = text(body.format, "format", 20) as ExportFormat;
-  const allowedFormats: ExportFormat[] =
-    page.kind === "diagram"
-      ? ["json", "svg", "png", "pdf"]
-      : page.kind === "document"
-        ? ["markdown", "html", "pdf", "docx"]
-        : ["markdown", "html", "pdf"];
+  const allowedFormats = (Object.keys(EXPORT_CAPABILITIES) as ExportFormat[]).filter((candidate) =>
+    EXPORT_CAPABILITIES[candidate].kinds.includes(page.kind),
+  );
   if (!allowedFormats.includes(format)) {
     throw new HttpError(422, "invalid_export_format", `Choose ${allowedFormats.join(", ")}.`);
   }
   const portable = body.portable === true;
-  if ((format === "pdf" || format === "png" || format === "docx") && portable) {
+  if (!EXPORT_CAPABILITIES[format].portable && portable) {
     throw new HttpError(422, "invalid_export_options", "PDF, PNG, and Word exports are always a single file.");
   }
-  if ((format === "pdf" || format === "png") && !c.env.BROWSER) {
+  if (EXPORT_CAPABILITIES[format].browser && !c.env.BROWSER) {
     throw new HttpError(503, "browser_export_unavailable", "Browser exports are not configured for this installation.");
   }
   const job = await createJob(c.env, {
@@ -3363,7 +3374,7 @@ app.post("/api/pages", async (c) => {
     : (await readPageCreateReplay(c.env.DB, member.workspace.id, requested, requestHash, conflictMessage))?.[0];
   if (!created) throw new Error("The created page was not returned by its insert or its committed receipt.");
   const sidebarHidden = await sidebarHiddenPageIds(c.env, member.workspace.id, [created.id]);
-  sendWorkspaceEvent(c, member.workspace.id, {
+  sendMutationEvent(c, member.workspace.id, {
     type: "pages-upserted",
     pages: [created],
     ...(sidebarHidden.length ? { sidebarHiddenPageIds: sidebarHidden } : {}),
@@ -3524,7 +3535,7 @@ app.post("/api/pages/batch", async (c) => {
     member.workspace.id,
     createdPages.map((page) => page.id),
   );
-  sendWorkspaceEvent(c, member.workspace.id, {
+  sendMutationEvent(c, member.workspace.id, {
     type: "pages-upserted",
     pages: createdPages,
     ...(sidebarHidden.length ? { sidebarHiddenPageIds: sidebarHidden } : {}),
@@ -4045,7 +4056,7 @@ app.patch("/api/pages/:id", async (c) => {
     ...refreshPageSearchV2Statements(c.env.DB, page.id),
   ]);
   const updated = pageJson(await pageForMember(c.env, member, page.id));
-  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [updated] });
+  sendMutationEvent(c, member.workspace.id, { type: "pages-upserted", pages: [updated] });
   return c.json({ page: updated });
 });
 
@@ -4120,10 +4131,11 @@ app.post("/api/pages/:id/move", async (c) => {
   const position = generateJitteredKeyBetween(lower, upper);
   const timestamp = now();
   try {
-    const moveResultIndex = 0;
-    const receiptResultIndex = 2;
-    const pageStateResultIndex = 3;
+    const moveResultIndex = 1;
+    const receiptResultIndex = 3;
+    const pageStateResultIndex = 4;
     const statements = [
+      activityMutationStart(c.env.DB, "SELECT id FROM pages WHERE id=?", [page.id], operationId, "move"),
       c.env.DB.prepare(
         `UPDATE pages SET parent_id = ?, position = ?, revision = revision + 1, updated_by = ?, updated_at = ?
           WHERE id = ? AND workspace_id = ? AND archived_at IS NULL`,
@@ -4147,6 +4159,7 @@ app.post("/api/pages/:id/move", async (c) => {
                 CASE WHEN archived_at IS NULL THEN ${PAGE_MOVE_RECEIPT_PAGE_JSON_SQL} ELSE NULL END AS page_json
            FROM pages WHERE id = ? AND workspace_id = ?`,
       ).bind(page.id, member.workspace.id),
+      activityMutationEnd(c.env.DB, operationId),
     ];
     const results = await c.env.DB.batch<PageMoveBatchRow>(statements);
     if (results.length !== statements.length) {
@@ -4225,7 +4238,7 @@ app.post("/api/pages/:id/move", async (c) => {
         receiptError,
       );
     }
-    sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
+    sendMutationEvent(c, member.workspace.id, { type: "pages-upserted", pages: [moved] });
     return c.json({ page: moved, operationId, replayed: false });
   } catch (error) {
     const httpErrorCode = safeHttpErrorCode(error);
@@ -4250,7 +4263,7 @@ app.post("/api/pages/:id/move", async (c) => {
       }
     }
     if (committed) {
-      sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });
+      sendMutationEvent(c, member.workspace.id, { type: "pages-upserted", pages: [committed] });
       return c.json({ page: committed, operationId, replayed: true });
     }
     throw error;
@@ -4316,7 +4329,9 @@ app.post("/api/pages/:id/move-space", async (c) => {
   const subtreeSql = `WITH RECURSIVE subtree(id) AS (
     SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
   ) SELECT id FROM subtree`;
+  const operationId = crypto.randomUUID();
   const results = await c.env.DB.batch<PageRow>([
+    activityMutationStart(c.env.DB, subtreeSql, [page.id], operationId, "move"),
     c.env.DB.prepare(
       `UPDATE pages SET
          space_id = ?,
@@ -4328,10 +4343,11 @@ app.post("/api/pages/:id/move-space", async (c) => {
        WHERE workspace_id = ? AND id IN (${subtreeSql})`,
     ).bind(spaceId, page.id, parentId, page.id, position, member.user.id, timestamp, member.workspace.id, page.id),
     c.env.DB.prepare(`UPDATE page_search_v2 SET space_id = ? WHERE page_id IN (${subtreeSql})`).bind(spaceId, page.id),
+    activityMutationEnd(c.env.DB, operationId),
     c.env.DB.prepare(`SELECT * FROM pages WHERE id IN (${subtreeSql}) ORDER BY position, id`).bind(page.id),
   ]);
-  const moved = results[2]?.results.map(pageJson) ?? [];
-  sendWorkspaceEvent(c, member.workspace.id, { type: "workspace-invalidated" });
+  const moved = results[4]?.results.map(pageJson) ?? [];
+  sendMutationEvent(c, member.workspace.id, { type: "workspace-invalidated" });
   return c.json({ pages: moved });
 });
 
@@ -4450,7 +4466,7 @@ app.delete("/api/pages/:id", async (c) => {
       operationId: taskArchiveOperationId,
       forceRefresh: true,
     });
-    sendWorkspaceEvent(c, member.workspace.id, {
+    sendMutationEvent(c, member.workspace.id, {
       type: "pages-removed",
       pageIds,
       permanently: false,
@@ -4464,13 +4480,21 @@ app.delete("/api/pages/:id", async (c) => {
       "task_detail_delete",
     );
     return c.json(
-      { ok: true, pageIds, ...(result.replayed ? { replayed: true } : {}), ...cleanup },
+      {
+        ok: true,
+        operationId: taskArchiveOperationId,
+        pageIds,
+        ...(result.replayed ? { replayed: true } : {}),
+        ...cleanup,
+      },
       cleanup.cleanupPending ? 202 : 200,
     );
   }
   const timestamp = now();
   const archiveTimestamp = page.archived_at ?? timestamp;
-  const archiveOperationId = page.archived_at === null ? crypto.randomUUID() : (page.archive_operation_id ?? null);
+  const archiveOperationId =
+    page.archived_at === null ? (operationId ?? crypto.randomUUID()) : (page.archive_operation_id ?? null);
+  const effectiveOperationId = archiveOperationId ?? operationId ?? crypto.randomUUID();
   const archiveOwner = page.archived_at === null ? member.user.id : (page.archived_by ?? member.user.id);
   const archiveOwnership: ArchiveDisconnectOwnership = archiveOperationId
     ? { operationId: archiveOperationId }
@@ -4478,6 +4502,13 @@ app.delete("/api/pages/:id", async (c) => {
   const archived = await batchWithFinalResult<PageRow>(
     c.env.DB,
     [
+      activityMutationStart(
+        c.env.DB,
+        "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree",
+        [page.id],
+        effectiveOperationId,
+        "archive",
+      ),
       c.env.DB.prepare(
         `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
@@ -4519,6 +4550,7 @@ app.delete("/api/pages/:id", async (c) => {
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
       SELECT id FROM subtree
     )`).bind(page.id),
+      activityMutationEnd(c.env.DB, effectiveOperationId),
     ],
     c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
@@ -4527,19 +4559,20 @@ app.delete("/api/pages/:id", async (c) => {
     ).bind(page.id),
   );
   const pageIds = archived?.results.map((item) => item.id) ?? [page.id];
-  sendWorkspaceEvent(c, member.workspace.id, {
+  sendMutationEvent(c, member.workspace.id, {
     type: "pages-removed",
     pageIds,
     permanently: false,
-    ...(operationId ? { operationId } : {}),
+    operationId: effectiveOperationId,
   });
   if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   if (page.is_task_list || archived?.results.some((item) => item.is_task_list))
-    sendWorkspaceEvent(c, member.workspace.id, { type: "tasks-invalidated" });
+    sendMutationEvent(c, member.workspace.id, { type: "tasks-invalidated" });
   const cleanup = await archiveCleanupAfterCommit(c.env, page.id, archiveOwnership, timestamp, "page_delete");
   return c.json(
     {
       ok: true,
+      operationId: effectiveOperationId,
       pageIds,
       ...cleanup,
     },
@@ -4593,7 +4626,7 @@ app.post("/api/pages/:id/restore", async (c) => {
       member.workspace.id,
       restoredPages.map((item) => item.id),
     );
-    sendWorkspaceEvent(c, member.workspace.id, {
+    sendMutationEvent(c, member.workspace.id, {
       type: "pages-upserted",
       pages: restoredPages,
       restored: true,
@@ -4667,7 +4700,7 @@ app.post("/api/pages/:id/restore", async (c) => {
     member.workspace.id,
     restoredPages.map((item) => item.id),
   );
-  sendWorkspaceEvent(c, member.workspace.id, {
+  sendMutationEvent(c, member.workspace.id, {
     type: "pages-upserted",
     pages: restoredPages,
     restored: true,
@@ -4676,7 +4709,7 @@ app.post("/api/pages/:id/restore", async (c) => {
   });
   if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   if (restored.results.some((item) => item.is_task_list))
-    sendWorkspaceEvent(c, member.workspace.id, { type: "tasks-invalidated" });
+    sendMutationEvent(c, member.workspace.id, { type: "tasks-invalidated" });
   return c.json({ pages: restoredPages, sidebarHiddenPageIds: hidden });
 });
 
@@ -4780,7 +4813,7 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
     throw error;
   }
   const pageIds = subtree.results.map((item) => item.id);
-  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: true });
+  sendMutationEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: true });
   if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   c.executionCtx.waitUntil(
     processDeletionJob(c.env, jobId).catch((error) => {
@@ -5693,7 +5726,7 @@ app.post("/api/pages/:id/restore-version", async (c) => {
     throw new HttpError(503, "restore_failed", result.error ?? "The version could not be restored.");
   }
   const restored = pageJson(await pageForMember(c.env, member, page.id));
-  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-upserted", pages: [restored] });
+  sendMutationEvent(c, member.workspace.id, { type: "pages-upserted", pages: [restored] });
   return c.json({ pageId: page.id, contentEpoch: result.contentEpoch });
 });
 
@@ -5819,7 +5852,7 @@ app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
   if (body.archived !== true) return c.json(result);
   const pageIds = result.pageIds ?? [result.detailPageId];
   const operationId = typeof body.operationId === "string" ? body.operationId : "";
-  sendWorkspaceEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false, operationId });
+  sendMutationEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: false, operationId });
   const cleanup = await archiveCleanupAfterCommit(c.env, result.detailPageId, { operationId }, now(), "task_patch");
   return c.json({ ...result, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
 });
@@ -7116,12 +7149,6 @@ export default {
           durationMs: performance.now() - startedAt,
           ...(contentLength !== null && Number.isFinite(contentLength) ? { bytes: contentLength } : {}),
         });
-        if (
-          response.status < 400 &&
-          ["POST", "PUT", "PATCH", "DELETE"].includes(request.method) &&
-          (env.WORKSPACE_ACTIVITY_ENABLED === "true" || env.SLACK_SHARE_REFRESH_ENABLED === "true")
-        )
-          context.waitUntil(sweepOutbox(env));
         return new Response(response.body, {
           status: response.status,
           statusText: response.statusText,
@@ -7151,8 +7178,10 @@ export default {
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
         date_reminders: () => processDueDateReminders(env),
-        slack_digests: () =>
-          env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? dueRound2Digests(env) : sendDueSlackChannelDigests(env),
+        slack_digests: async () => {
+          if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await dueRound2Digests(env);
+          await sendDueSlackChannelDigests(env);
+        },
         slack_security_records: async () => {
           await env.DB.prepare("DELETE FROM workspace_activity WHERE created_at<?")
             .bind(Date.now() - 30 * 86400_000)

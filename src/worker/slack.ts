@@ -2411,6 +2411,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
       WHERE event.cadence = 'digest' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
         AND event.created_at < ? AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
         AND subscription.notification_blocked_at IS NULL
+        AND (?=0 OR subscription.round2_initialized=0)
         AND subscription.muted_at IS NULL
         AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
         AND page.archived_at IS NULL AND page.import_job_id IS NULL AND page.is_template = 0
@@ -2420,7 +2421,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
       GROUP BY event.subscription_id, subscription.installation_id
       ORDER BY MIN(event.created_at), event.subscription_id LIMIT 50`,
   )
-    .bind(cutoff, timestamp)
+    .bind(cutoff, env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0, timestamp)
     .all<{ subscription_id: string; installation_id: string }>();
   const rateLimitedInstallations = new Set<string>();
   for (const { subscription_id: subscriptionId, installation_id: installationId } of subscriptions.results) {

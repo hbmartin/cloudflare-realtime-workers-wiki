@@ -1,5 +1,6 @@
+import { deliverBulkSummary } from "./slack-bulk";
 import { deliverRound2ChannelEvent } from "./slack-channel-events";
-import { redriveRound2Outbox } from "./slack-recovery";
+import { redriveRound2Outbox, round2DeliveryOutcome, type round2Receipts } from "./slack-recovery";
 import { deliverDigest } from "./slack-digests";
 import { deliverShareRefresh } from "./slack-shares";
 import { deliverThumbnail } from "./slack-files";
@@ -1523,7 +1524,7 @@ async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: st
     await env.DB.prepare(`UPDATE outbox SET enqueued_at = ?, attempts = attempts + 1,
       last_error = CASE WHEN slack_scope_paused_at IS NULL THEN NULL ELSE last_error END,
       slack_redrive_due_at = CASE WHEN slack_scope_paused_at IS NOT NULL THEN NULL WHEN topic IN
-        ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl','slack_digest','slack_share_refresh','slack_file_upload')
+        ('slack_bulk','slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl','slack_digest','slack_share_refresh','slack_file_upload')
         THEN ? WHEN topic='slack_channel' AND (SELECT validation_enabled FROM round2_runtime WHERE id=1)=1 THEN ? ELSE NULL END WHERE id = ?`)
       .bind(now, now + SLACK_REDRIVE_STALE_MS, now + SLACK_REDRIVE_STALE_MS, outboxId)
       .run();
@@ -1567,7 +1568,10 @@ async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: st
 async function pauseSlackScopeOutbox(env: Env, outboxId: string) {
   const now = Date.now();
   await env.DB.prepare(`UPDATE outbox SET slack_scope_paused_at=COALESCE(slack_scope_paused_at,?),
-    enqueued_at=COALESCE(enqueued_at,?),slack_redrive_due_at=NULL,last_error='slack_scope_missing'
+    enqueued_at=COALESCE(enqueued_at,?),
+    slack_redrive_due_at=CASE WHEN topic IN ('slack_bulk','slack_digest','slack_share_refresh','slack_file_upload')
+      OR (topic='slack_channel' AND json_extract(payload_json,'$.eventId') LIKE 'activity:%')
+      THEN coalesce(slack_redrive_due_at,unixepoch('subsec')*1000+1800000) ELSE NULL END,last_error='slack_scope_missing'
     WHERE id=?`)
     .bind(now, now, outboxId)
     .run();
@@ -1716,7 +1720,7 @@ export async function redriveStaleSlackOutbox(env: Env) {
       outbox.slack_scope_paused_ms FROM outbox
     LEFT JOIN slack_thread_deliveries delivery ON outbox.topic='slack_thread_reply'
       AND delivery.id=json_extract(CASE WHEN json_valid(outbox.payload_json) THEN outbox.payload_json ELSE '{}' END,'$.deliveryId')
-    WHERE outbox.topic NOT IN ('slack_digest','slack_share_refresh','slack_file_upload')
+    WHERE outbox.topic NOT IN ('slack_bulk','slack_digest','slack_share_refresh','slack_file_upload')
       AND NOT (outbox.topic='slack_channel' AND (SELECT validation_enabled FROM round2_runtime WHERE id=1)=1)
       AND outbox.slack_redrive_due_at IS NOT NULL AND outbox.slack_redrive_due_at <= ?
       AND outbox.slack_scope_paused_at IS NULL
@@ -2036,6 +2040,28 @@ export async function consumeDeliveryMessage(
     message.ack();
     return "discarded";
   };
+  const keepRound2 = async (topic: keyof typeof round2Receipts, id: string) => {
+    const outcome = await round2DeliveryOutcome(env, topic, id);
+    if (outcome === "completed") return false;
+    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=?`)
+      .bind(Date.now() + (outcome === "paused" || outcome === "uncertain" ? 30 * 60_000 : 60_000), outboxId)
+      .run();
+    message.ack();
+    return true;
+  };
+  const round2Failure = async (error: unknown) => {
+    if (slackMissingScope(error)) await pauseSlackScopeOutbox(env, outboxId);
+    else if (
+      error instanceof DeliveryInProgressError ||
+      (error instanceof SlackApiError && slackInstallationError(error))
+    ) {
+      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=?`)
+        .bind(Date.now() + 60_000, outboxId)
+        .run();
+    } else throw error;
+    message.ack();
+    return "acknowledged" as const;
+  };
   const deferSlackView = async (): Promise<DeliveryMessageOutcome> => {
     const now = Date.now();
     await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL, available_at=?, slack_redrive_due_at=NULL
@@ -2186,41 +2212,56 @@ export async function consumeDeliveryMessage(
     await sweepOutbox(env);
   } else if (row.topic === "slack_share_response") {
     await deliverSlackShareResponse(env, payload);
-  } else if (row.topic === "slack_digest" || row.topic === "slack_share_refresh" || row.topic === "slack_file_upload") {
+  } else if (
+    row.topic === "slack_bulk" ||
+    row.topic === "slack_digest" ||
+    row.topic === "slack_share_refresh" ||
+    row.topic === "slack_file_upload"
+  ) {
     const id =
-      row.topic === "slack_digest"
-        ? payload.digestId
-        : row.topic === "slack_share_refresh"
-          ? payload.refreshId
-          : payload.artifactId;
+      row.topic === "slack_bulk"
+        ? payload.summaryId
+        : row.topic === "slack_digest"
+          ? payload.digestId
+          : row.topic === "slack_share_refresh"
+            ? payload.refreshId
+            : payload.artifactId;
     if (typeof id !== "string") return await rejectPayload("Slack round 2 delivery is invalid.");
     const enabled =
-      row.topic === "slack_digest"
+      row.topic === "slack_bulk" || row.topic === "slack_digest"
         ? env.SLACK_CHANNEL_VALIDATION_ENABLED === "true"
         : row.topic === "slack_share_refresh"
           ? env.SLACK_SHARE_REFRESH_ENABLED === "true"
-          : env.SLACK_RICH_DIGESTS_ENABLED === "true";
+          : env.SLACK_RICH_DIGESTS_ENABLED === "true" && env.SLACK_CHANNEL_VALIDATION_ENABLED === "true";
     if (!enabled) {
       message.ack();
       return "acknowledged";
     } // Preserve recovery markers during a release pause.
-    if (row.topic === "slack_digest") await deliverDigest(env, id);
-    else if (row.topic === "slack_share_refresh") await deliverShareRefresh(env, id);
-    else await deliverThumbnail(env, id);
+    try {
+      if (row.topic === "slack_bulk") await deliverBulkSummary(env, id);
+      else if (row.topic === "slack_digest") await deliverDigest(env, id);
+      else if (row.topic === "slack_share_refresh") await deliverShareRefresh(env, id);
+      else await deliverThumbnail(env, id);
+    } catch (error) {
+      return await round2Failure(error);
+    }
+    await sweepOutbox(env);
+    if (await keepRound2(row.topic, id)) return "acknowledged";
   } else if (row.topic === "slack_channel") {
     const eventId = payload.eventId;
     if (typeof eventId !== "string") return await rejectPayload("Slack channel outbox payload is invalid.");
+    if (env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true" && eventId.startsWith("activity:")) {
+      message.ack();
+      return "acknowledged";
+    }
     try {
       if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await deliverRound2ChannelEvent(env, eventId);
       else await deliverSlackChannelEvent(env, eventId);
     } catch (error) {
-      if (!(error instanceof SlackApiError && slackInstallationError(error))) throw error;
-      await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=? WHERE id=?`)
-        .bind(Date.now() + 60_000, outboxId)
-        .run();
-      message.ack();
-      return "acknowledged";
+      return await round2Failure(error);
     }
+    if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" && (await keepRound2("slack_channel", eventId)))
+      return "acknowledged";
   } else if (row.topic === "slack_controls_expire") {
     await deliverSlackControlsExpiry(env, payload);
     await sweepOutbox(env);

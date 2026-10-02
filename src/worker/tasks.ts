@@ -1,3 +1,4 @@
+import { activityMutationStart, activityMutationEnd } from "./activity-mutations";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import type { Env, MemberContext } from "./env";
 import { HttpError, sha256 } from "./http";
@@ -555,6 +556,10 @@ export async function mutateTask(
         ? refreshPageSearchV2SubtreeStatements(env.DB, detailId)
         : refreshPageSearchV2Statements(env.DB, detailId)),
     );
+    if (body.archived === true) {
+      statements.unshift(activityMutationStart(env.DB, TASK_DETAIL_SUBTREE_SQL, [detailId], operationId, "archive"));
+      statements.push(activityMutationEnd(env.DB, operationId));
+    }
     const receiptIndex = statements.length;
     statements.push(
       env.DB.prepare(
