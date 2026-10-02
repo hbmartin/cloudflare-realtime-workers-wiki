@@ -2,7 +2,7 @@ import { deliverBulkSummary } from "./slack-bulk";
 import { deliverDigest } from "./slack-digests";
 import { deliverShareRefresh } from "./slack-shares";
 import { deliverRound2ChannelEvent } from "./slack-channel-events";
-import type { DeliveryOutcome } from "./slack-delivery";
+import { thumbnailDeliveryEnabled, type DeliveryOutcome } from "./slack-delivery";
 import type { Env } from "./env";
 
 export const round2Receipts = {
@@ -38,13 +38,12 @@ export async function round2DeliveryOutcome(
 export async function redriveRound2Outbox(env: Env) {
   const rows = await env.DB.prepare(`SELECT id,topic,payload_json,slack_redrive_count FROM outbox
     WHERE topic IN ('slack_bulk','slack_channel','slack_digest','slack_share_refresh','slack_file_upload') AND slack_redrive_due_at<=?
-    AND slack_scope_paused_at IS NULL AND ((topic IN ('slack_bulk','slack_channel','slack_digest') AND ?=1) OR (topic='slack_share_refresh' AND ?=1) OR (topic='slack_file_upload' AND ?=1 AND ?=1)) ORDER BY slack_redrive_due_at,id LIMIT 50`)
+    AND slack_scope_paused_at IS NULL AND ((topic IN ('slack_bulk','slack_channel','slack_digest') AND ?=1) OR (topic='slack_share_refresh' AND ?=1) OR (topic='slack_file_upload' AND ?=1)) ORDER BY slack_redrive_due_at,id LIMIT 50`)
     .bind(
       Date.now(),
       env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0,
       env.SLACK_SHARE_REFRESH_ENABLED === "true" ? 1 : 0,
-      env.SLACK_RICH_DIGESTS_ENABLED === "true" ? 1 : 0,
-      env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0,
+      thumbnailDeliveryEnabled(env) ? 1 : 0,
     )
     .all<{ id: string; topic: keyof typeof round2Receipts; payload_json: string; slack_redrive_count: number }>();
   for (const row of rows.results) {
@@ -92,7 +91,7 @@ export async function redriveRound2Outbox(env: Env) {
       (["slack_bulk", "slack_digest", "slack_channel"].includes(row.topic) &&
         env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true") ||
       (row.topic === "slack_share_refresh" && env.SLACK_SHARE_REFRESH_ENABLED !== "true") ||
-      (row.topic === "slack_file_upload" && env.SLACK_RICH_DIGESTS_ENABLED !== "true")
+      (row.topic === "slack_file_upload" && !thumbnailDeliveryEnabled(env))
     )
       continue;
     try {

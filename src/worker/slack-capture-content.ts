@@ -45,7 +45,7 @@ function safeHttpsLink(value: string, slackOnly = false) {
 }
 
 function slackLabel(value: string, fallback = "") {
-  return escapeMarkdown(singleLine(slackEntity(value)) || fallback);
+  return escapeMarkdown(singleLine(slackEntity(value)) || singleLine(slackEntity(fallback)));
 }
 
 function link(value: string, href: string) {

@@ -16,7 +16,7 @@ deployment, Slack installation change, or production activation was performed.
 Related changes sometimes precede their consuming increment so later changes have their required schema and metadata.
 The cumulative branch is the implementation to review and release.
 
-## Local verification
+## Earlier local verification
 
 - The full `pnpm check` gate passed with 1,471 unit tests and 943 Worker tests against current `main`. It covers formatting, lint, middleware Semgrep rules/tests, all TypeScript projects, unit and
   Worker coverage, dead-code analysis, binding type generation, the production build and the Worker deployment dry run.
@@ -58,3 +58,35 @@ this implementation. Verify the Phase 9 live exit matrix with real Slack public/
 permission recovery, rate limits and lost responses, private diagram files, bulk summaries and multi-message daily
 windows. Check exported DOCX fixtures in Word and a compatible independent reader, and measure realistic Worker
 import memory/CPU. Retain the existing scopes and private thumbnail policy.
+
+## Accepted review follow-up
+
+The follow-up implements the 17 accepted findings without changing HTTP interfaces, database schemas or migration history. `ActivityView.archiveRefreshVersion` is the only component interface addition.
+
+The final follow-up `pnpm check` passed against the working tree on 2026-10-02: **1,482 unit tests passed** (one existing test skipped) and **979 Worker tests passed** across 20 files. Formatting, lint, middleware Semgrep rules/tests, all TypeScript projects, both coverage gates, dead-code analysis, generated Worker bindings, the production build and the Worker deployment dry run passed. The final focused authentication, HTTP mutation and thumbnail recovery run also passed all 23 selected cases. Worker line coverage was 82.49% and branch coverage was 71.41%.
+
+All work and checks were local. Production flags remain off; no remote migration, deployment or feature activation was performed.
+
+Bulk moves and archives retain the deliberate cadence exception: one summary sends immediately for both immediate and digest mappings. Their events remain in Activity and are excluded from scheduled digests. Existing bulk tests for both cadences and overlapping mappings remain in place.
+
+Regression coverage exercises:
+
+- Canonical channel names on unchanged destinations, legacy manual names, four installation authentication failures during delivery and validation followed by reauthorization, preservation of unrelated channel blocks, mute and snooze settings, and outbox enqueueing after share and mapping HTTP mutations, including a changed channel destination.
+- Shared digest eligibility for receipt reopening and page selection: access loss, bulk summaries, mirrored threads, templates, staged imports, mapping scope, cadence and reserved events. Sent and skipped receipts remain completed across repeated scheduler ticks; events remain recorded. An eligible late event recreates the outbox on the first tick and appends exactly one partition.
+- All eight thumbnail flag combinations across selection, consumption, redrive and delivery; disabled markers survive and recover after enabling. Expired obsolete uploads retire after disconnect or generation change, live claims survive, uncertain message receipts survive, and disabled uploads do not cause sweep continuation.
+- A task root archived after its child was independently archived; Activity choices after archive, restore and deletion; current-record precedence; superseded archive responses; preservation of the last successful list on failure; and a stale-activity test that waits for its actual deferred request.
+- Malformed DOCX relationship and content-type paths returning `422 invalid_docx`, all XML 1.0 invalid control ranges and lone surrogates, formatted code and hard breaks checked against the actual editor schema, distinct Slack label branches and imported link marks, and existing Notion URL policies using the shared control check.
+- Existing delimiter compatibility tests plus homogeneous, escaped and mixed runs up to 512 KiB, with text and nearby formatting assertions. Unit tests have no timing thresholds.
+
+### Delimiter benchmark
+
+Standalone local Node runs used Vite's module runner to load the original `HEAD` implementation and the working tree implementation, with warmup and the median of three samples. The original long-run workload was repeated; additional paragraphs exercised the opening-run boundary adjustment directly.
+
+| Workload                                                             | Before median (ms) | After median (ms) |
+| -------------------------------------------------------------------- | ------------------ | ----------------- |
+| One 512 KiB homogeneous run                                          | 554.57             | 548.69            |
+| One paragraph with a 4,000-character opening run                     | 6.08               | 0.52              |
+| One paragraph with an 8,000-character opening run                    | 11.83              | 0.63              |
+| 64 paragraphs with 8,000-character opening runs (512,000 delimiters) | 1,134.79           | 42.21             |
+
+The original long-run fixture is essentially unchanged: bounded parsing already splits that workload, and other parsing work dominates. Runs within a section show the improvement from determining opening status once per homogeneous run. These local measurements do not establish live Worker CPU or memory usage.

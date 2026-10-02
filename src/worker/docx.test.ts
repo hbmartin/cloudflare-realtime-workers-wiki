@@ -183,6 +183,18 @@ describe("DOCX conversion", () => {
     await expect(readDocx(createZip(entries))).rejects.toMatchObject({ code: "invalid_docx" });
   });
 
+  it.each(["_rels/.rels", "[Content_Types].xml"])("rejects malformed percent escapes in %s", async (path) => {
+    const output = await writeDocx({ type: "doc" }, "Invalid path", "https://notes.test", noImage);
+    for (const invalid of ["%", "%GG", "%E0%A4"]) {
+      const entries = await readZip(output.bytes);
+      const part = entries.find((entry) => entry.path === path)!;
+      part.bytes = new TextEncoder().encode(
+        new TextDecoder().decode(part.bytes).replaceAll("word/document.xml", `word/${invalid}.xml`),
+      );
+      await expect(readDocx(createZip(entries))).rejects.toMatchObject({ code: "invalid_docx", status: 422 });
+    }
+  });
+
   it("rejects encrypted and excessive expanded archives before conversion", async () => {
     for (const scenario of ["encrypted", "oversized"]) {
       const bytes = createZip([{ path: "word/document.xml", bytes: new Uint8Array([1]) }]);
@@ -215,7 +227,17 @@ describe("DOCX review regressions", () => {
           content: [
             {
               type: "column",
-              content: [{ type: "codeBlock", content: [{ type: "text", text: "one\n\ttwo\u0001\ufffe" }] }],
+              content: [
+                {
+                  type: "codeBlock",
+                  content: [
+                    {
+                      type: "text",
+                      text: `one\n\ttwo${Array.from({ length: 32 }, (_, code) => String.fromCharCode(code)).join("")}\ud800x\udfff\ufffe\uffff`,
+                    },
+                  ],
+                },
+              ],
             },
           ],
         },
@@ -230,14 +252,10 @@ describe("DOCX review regressions", () => {
     );
     expect(xml).toContain("<w:br/>");
     expect(xml).toContain("<w:tab/>");
-    expect(
-      Array.from(xml).some(
-        (character) =>
-          character.charCodeAt(0) < 9 ||
-          character === String.fromCharCode(0xfffe) ||
-          character === String.fromCharCode(0xffff),
-      ),
-    ).toBe(false);
+    // XML 1.0 forbids these controls and unpaired surrogates.
+    // eslint-disable-next-line no-control-regex
+    expect(xml).not.toMatch(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ud800-\udfff\ufffe\uffff]/u);
+    expect(xml).not.toContain("\ufffd");
     expect(xml).not.toContain("[column");
     expect(xml).not.toContain("[tableOfContents]");
     const imported = await readDocx(output.bytes);

@@ -3,6 +3,7 @@ import {
   invalidSlackDestination,
   recordDeliveryError,
   retireObsoleteReceipt,
+  thumbnailDeliveryEnabled,
 } from "./slack-delivery";
 import { logger } from "./observability";
 import { digestWindow } from "./slack-schedule";
@@ -69,6 +70,38 @@ function eligible(mapping: Mapping | null, now: number): boolean {
     (!mapping.snoozed_until || mapping.snoozed_until <= now),
   );
 }
+
+function digestEventFilter(
+  mapping: Mapping,
+  receipt: Pick<DigestReceipt, "window_start" | "window_end">,
+  message?: { event_ids_json: string },
+) {
+  return {
+    sql: `e.subscription_id=? AND e.cadence='digest' AND e.summary_id IS NULL AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
+      AND e.created_at>=? AND e.created_at<?
+      AND (? IS NULL OR e.id IN (SELECT value FROM json_each(?)))
+      AND (? IS NOT NULL OR NOT EXISTS(SELECT 1 FROM slack_digest_message_events reserved WHERE reserved.event_id=e.id))
+      AND NOT EXISTS(SELECT 1 FROM slack_thread_links l WHERE l.thread_id=e.thread_id AND l.installation_id=? AND l.channel_id=? AND l.state IN ('pending','active'))
+      AND (${channelActivityActorAccessSql.replaceAll("event.", "e.")} OR page.archived_at IS NOT NULL OR page.space_id<>?)
+      AND page.import_job_id IS NULL AND page.is_template=0
+      AND (page.space_id=? OR e.previous_space_id=?) AND (? IS NULL OR page.id=?)`,
+    binds: [
+      mapping.id,
+      receipt.window_start,
+      receipt.window_end,
+      message?.event_ids_json ?? null,
+      message?.event_ids_json ?? null,
+      message?.event_ids_json ?? null,
+      mapping.installation_id,
+      mapping.channel_id,
+      mapping.space_id,
+      mapping.space_id,
+      mapping.space_id,
+      mapping.page_id,
+      mapping.page_id,
+    ],
+  };
+}
 export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
   await revalidateMappings(env);
   const mappings =
@@ -96,6 +129,7 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
     }
     if (window.end <= Math.max(mapping.digest_not_before, mapping.snoozed_until ?? 0)) continue;
     const id = `digest:${mapping.installation_id}:${row.generation}:${mapping.id}:${window.end}`;
+    const filter = digestEventFilter(mapping, { window_start: window.start, window_end: window.end });
     await env.DB.batch([
       env.DB.prepare(`INSERT OR IGNORE INTO slack_digest_receipts(id,installation_id,installation_generation,subscription_id,window_start,window_end,channel_id,created_at)
         VALUES(?,?,?,?,?,?,?,?)`).bind(
@@ -108,6 +142,11 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
         mapping.channel_id,
         timestamp,
       ),
+      env.DB.prepare(`UPDATE slack_digest_receipts SET state='pending' WHERE id=? AND state IN ('sent','skipped') AND coalesce(last_error,'')<>'legacy_reconciled'
+        AND EXISTS(SELECT 1 FROM slack_channel_events e JOIN pages page ON page.id=e.page_id WHERE ${filter.sql})`).bind(
+        id,
+        ...filter.binds,
+      ),
       env.DB.prepare(`INSERT OR IGNORE INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
         SELECT 'outbox:'||r.id,i.workspace_id,'slack_digest',json_object('digestId',r.id),?,? FROM slack_digest_receipts r
         JOIN slack_installations i ON i.id=r.installation_id WHERE r.id=? AND r.state='pending'`).bind(
@@ -115,12 +154,6 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
         timestamp,
         id,
       ),
-    ]);
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE slack_digest_receipts SET state='pending' WHERE id=? AND state IN ('sent','skipped') AND coalesce(last_error,'')<>'legacy_reconciled'
-        AND EXISTS(SELECT 1 FROM slack_channel_events e WHERE e.subscription_id=slack_digest_receipts.subscription_id AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
-          AND e.created_at>=slack_digest_receipts.window_start AND e.created_at<slack_digest_receipts.window_end
-          AND NOT EXISTS(SELECT 1 FROM slack_digest_message_events used WHERE used.event_id=e.id))`).bind(id),
       env.DB.prepare(
         `UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=? WHERE id='outbox:'||? AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND state='pending')`,
       ).bind(timestamp, timestamp + 60_000, id, id),
@@ -137,6 +170,7 @@ export async function digestPages(
 ): Promise<DigestPage[]> {
   const threads = OPEN_THREAD_COUNT_SQL.replaceAll("p.", "page.");
   const status = TASK_STATUS_SQL.replaceAll("p.", "page.");
+  const filter = digestEventFilter(mapping, receipt, message);
   const rows =
     await env.DB.prepare(`SELECT page.id,page.title,page.plain_text,page.kind,page.content_epoch,page.archived_at,
     MAX(e.created_at) changed_at,${threads} unresolved_threads,${status} task_status,
@@ -146,32 +180,9 @@ export async function digestPages(
       AND (current_mapping.page_id IS NULL OR current_mapping.page_id=page.id) AND current_mapping.validation_state='valid') mapped,
     MIN(CASE WHEN ${channelActivityActorAccessSql.replaceAll("event.", "e.")} THEN 1 ELSE 0 END) actor_access
     FROM slack_channel_events e JOIN pages page ON page.id=e.page_id LEFT JOIN user actor ON actor.id=e.actor_id
-    WHERE e.subscription_id=? AND e.cadence='digest' AND e.summary_id IS NULL AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
-      AND e.created_at>=? AND e.created_at<?
-      AND (? IS NULL OR e.id IN (SELECT value FROM json_each(?)))
-      AND (? IS NOT NULL OR NOT EXISTS(SELECT 1 FROM slack_digest_message_events reserved WHERE reserved.event_id=e.id))
-      AND NOT EXISTS(SELECT 1 FROM slack_thread_links l WHERE l.thread_id=e.thread_id AND l.installation_id=? AND l.channel_id=? AND l.state IN ('pending','active'))
-      AND (${channelActivityActorAccessSql.replaceAll("event.", "e.")} OR page.archived_at IS NOT NULL OR page.space_id<>?)
-      AND page.import_job_id IS NULL AND page.is_template=0
-      AND (page.space_id=? OR e.previous_space_id=?) AND (? IS NULL OR page.id=?)
+    WHERE ${filter.sql}
     GROUP BY page.id ORDER BY changed_at DESC,page.id LIMIT 10`)
-      .bind(
-        installation.id,
-        mapping.channel_id,
-        mapping.id,
-        receipt.window_start,
-        receipt.window_end,
-        message?.event_ids_json ?? null,
-        message?.event_ids_json ?? null,
-        message?.event_ids_json ?? null,
-        installation.id,
-        mapping.channel_id,
-        mapping.space_id,
-        mapping.space_id,
-        mapping.space_id,
-        mapping.page_id,
-        mapping.page_id,
-      )
+      .bind(installation.id, mapping.channel_id, ...filter.binds)
       .all<{
         id: string;
         title: string;
@@ -269,12 +280,7 @@ export async function digestPages(
   return result.slice(0, 10);
 }
 async function attachThumbnail(env: Env, item: DigestPage, installation: SlackInstallation, epoch: number) {
-  if (
-    env.SLACK_RICH_DIGESTS_ENABLED !== "true" ||
-    env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true" ||
-    env.WORKSPACE_ACTIVITY_ENABLED !== "true"
-  )
-    return;
+  if (!thumbnailDeliveryEnabled(env)) return;
   const thumbnail = await env.DB.prepare(
     `SELECT thumbnail_hash,thumbnail_r2_key FROM diagram_projections WHERE page_id=? AND content_epoch=?`,
   )

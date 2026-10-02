@@ -847,10 +847,21 @@ describe("import content", () => {
     );
   });
   it.each([
+    { prefix: "*".repeat(4_000) + "_", span: "**bold**" },
+    { prefix: "_".repeat(8_000) + "*", span: "__bold__" },
     { prefix: "*".repeat(10_000) + "_", span: "**bold**" },
     { prefix: "_".repeat(10_000) + "*", span: "__bold__" },
     { prefix: "\\" + "*".repeat(10_000) + "_", span: "**bold**" },
   ])("bounds oversized mixed opening runs while retaining nearby formatting: $span", ({ prefix, span }) => {
+    const nodes = markdownToDocument(`${prefix}${span}`).document.content![0]!.content![0]!.content![0]!.content!;
+    expect(nodes.map((node) => node.text ?? "").join("")).toBe(`${prefix.replaceAll("\\", "")}bold`);
+    expect(nodes.at(-1)).toMatchObject({ text: "bold", marks: [{ type: "bold" }] });
+  });
+  it.each([
+    { name: "asterisks", prefix: "*".repeat(524_288) + "_", span: "**bold**" },
+    { name: "underscores", prefix: "_".repeat(524_288) + "*", span: "__bold__" },
+    { name: "escaped mixed run", prefix: "\\" + "*".repeat(262_144) + "_".repeat(262_144), span: "**bold**" },
+  ])("preserves text and nearby emphasis after a large $name run", ({ prefix, span }) => {
     const nodes = markdownToDocument(`${prefix}${span}`).document.content![0]!.content![0]!.content![0]!.content!;
     expect(nodes.map((node) => node.text ?? "").join("")).toBe(`${prefix.replaceAll("\\", "")}bold`);
     expect(nodes.at(-1)).toMatchObject({ text: "bold", marks: [{ type: "bold" }] });

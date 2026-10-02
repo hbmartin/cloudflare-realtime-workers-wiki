@@ -4275,7 +4275,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <RecentPages pages={pages} recentIds={recentIds} onSelect={navigateToPage} />
         ) : view === "activity" ? (
           member.features?.workspaceActivity ? (
-            <ActivityView spaces={spaces} pages={pages} onSelect={navigateToPage} />
+            <ActivityView
+              spaces={spaces}
+              pages={pages}
+              onSelect={navigateToPage}
+              archiveRefreshVersion={trashRefreshVersion}
+            />
           ) : (
             <p>Workspace activity is not enabled.</p>
           )

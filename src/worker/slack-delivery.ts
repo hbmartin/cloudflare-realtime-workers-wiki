@@ -9,6 +9,14 @@ import {
 
 export type DeliveryOutcome = "completed" | "paused" | "competing" | "retryable" | "uncertain";
 
+export function thumbnailDeliveryEnabled(env: Env) {
+  return (
+    env.SLACK_RICH_DIGESTS_ENABLED === "true" &&
+    env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" &&
+    env.WORKSPACE_ACTIVITY_ENABLED === "true"
+  );
+}
+
 // Only definite API rejections prove that no message was created. Transport and
 // malformed-response failures must retain the sending checkpoint for reconciliation.
 export function definiteSlackRejection(error: unknown): error is SlackApiError {
@@ -40,8 +48,10 @@ export async function recordDeliveryError(
   channelId?: string,
 ) {
   if (!(error instanceof SlackApiError)) return;
-  if (slackInstallationError(error))
+  if (slackInstallationError(error)) {
     await recordSlackInstallationError(env, installation.id, error, installation.generation);
+    return;
+  }
   if (mappingId && channelId && definiteSlackRejection(error)) {
     await env.DB.prepare(`UPDATE slack_channel_subscriptions SET notification_blocked_at=coalesce(notification_blocked_at,?),notification_error=?
       WHERE id=? AND installation_id=? AND channel_id=? AND EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)`)
@@ -66,7 +76,7 @@ export async function retireObsoleteReceipt(
 ) {
   const token = crypto.randomUUID();
   await env.DB.batch([
-    env.DB.prepare(`UPDATE ${table} SET claim_token=?,claimed_at=? WHERE id=? AND state='pending'
+    env.DB.prepare(`UPDATE ${table} SET claim_token=?,claimed_at=? WHERE id=? AND state IN ('pending'${table === "slack_file_artifacts" ? ",'uploading'" : ""})
       AND (claimed_at IS NULL OR claimed_at<?) AND NOT EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)`).bind(
       token,
       Date.now(),

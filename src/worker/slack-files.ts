@@ -1,17 +1,17 @@
 import { DeliveryInProgressError } from "./notifications";
-import { definiteSlackRejection, recordDeliveryError, retireObsoleteReceipt } from "./slack-delivery";
+import {
+  definiteSlackRejection,
+  recordDeliveryError,
+  retireObsoleteReceipt,
+  thumbnailDeliveryEnabled,
+} from "./slack-delivery";
 import { DIAGRAM_THUMBNAIL_HEIGHT, DIAGRAM_THUMBNAIL_WIDTH } from "../shared/diagram";
 import { round2Installation } from "./slack-channels";
 import { slackApi, SlackApiError, SlackRateLimitError, slackHasScopes } from "./slack";
 import type { Env } from "./env";
 
 export async function deliverThumbnail(env: Env, id: string) {
-  if (
-    env.SLACK_RICH_DIGESTS_ENABLED !== "true" ||
-    env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true" ||
-    env.WORKSPACE_ACTIVITY_ENABLED !== "true"
-  )
-    return;
+  if (!thumbnailDeliveryEnabled(env)) return;
   let row = await env.DB.prepare(`SELECT * FROM slack_file_artifacts WHERE id=?`).bind(id).first<{
     id: string;
     installation_id: string;

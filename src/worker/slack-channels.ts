@@ -44,8 +44,10 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
   } catch (error) {
     if (retryableSlackError(error)) throw error;
     if (!(error instanceof HttpError || error instanceof SlackApiError)) throw error;
-    if (error instanceof SlackApiError && slackInstallationError(error))
+    if (error instanceof SlackApiError && slackInstallationError(error)) {
       await recordSlackInstallationError(env, installation.id, error, installation.generation);
+      return false;
+    }
     await env.DB.prepare(`UPDATE slack_channel_subscriptions SET validation_state='invalid',validation_error=?,
       validated_at=?,bot_is_member=0,notification_blocked_at=?,notification_error=? WHERE id=? AND installation_id=? AND channel_id=?
       AND EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)`)

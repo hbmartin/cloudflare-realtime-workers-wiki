@@ -1,4 +1,5 @@
 import { Lexer, type Token, type Tokens } from "marked";
+import { hasUrlControls } from "./text";
 import type { ProseMirrorJson } from "./types";
 
 const BLOCK_ATTRS = { backgroundColor: "default", textColor: "default", textAlignment: "left" };
@@ -9,8 +10,7 @@ export const MAX_MARKDOWN_DELIMITERS = 4096;
 export class MarkdownWriteError extends Error {}
 
 function validHref(value: string) {
-  if (!value || Array.from(value).some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127))
-    throw new MarkdownWriteError("A Markdown link has an invalid URL.");
+  if (!value || hasUrlControls(value)) throw new MarkdownWriteError("A Markdown link has an invalid URL.");
   if (/^(?:\/|\.\.?\/|#)/.test(value)) return value;
   try {
     const parsed = new URL(value);

@@ -532,6 +532,11 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
       )
       .run();
     stored = true;
+    await env.DB.prepare(`UPDATE slack_channel_subscriptions SET notification_blocked_at=NULL,notification_error=NULL
+      WHERE notification_error IN (SELECT value FROM json_each(?)) AND installation_id IN
+        (SELECT id FROM slack_installations WHERE workspace_id=? AND disconnected_at IS NULL AND auth_error IS NULL)`)
+      .bind(JSON.stringify([...INSTALLATION_ERRORS]), member.workspace.id)
+      .run();
     await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',failure_reason=NULL,updated_at=?
       WHERE state='blocked' AND failure_reason LIKE 'reconciliation_%'
         AND link_id IN (SELECT link.id FROM slack_thread_links link
@@ -890,7 +895,7 @@ export async function upsertSlackChannelSubscription(
   if (!installation) throw new HttpError(409, "slack_not_connected", "Connect Slack before adding a channel.");
   const strict = env.SLACK_CHANNEL_VALIDATION_ENABLED === "true";
   const existing = await env.DB.prepare(
-    `SELECT id,channel_id,cadence,digest_timezone,digest_time,digest_open_work FROM slack_channel_subscriptions WHERE installation_id=?
+    `SELECT id,channel_id,channel_name,cadence,digest_timezone,digest_time,digest_open_work FROM slack_channel_subscriptions WHERE installation_id=?
       AND ((? IS NOT NULL AND id=?) OR (? IS NULL AND channel_id=? AND space_id=? AND ifnull(page_id,'')=ifnull(?,'')))`,
   )
     .bind(
@@ -905,6 +910,7 @@ export async function upsertSlackChannelSubscription(
     .first<{
       id: string;
       channel_id: string;
+      channel_name: string;
       cadence: string;
       digest_timezone: string | null;
       digest_time: string;
@@ -957,7 +963,7 @@ export async function upsertSlackChannelSubscription(
       input.spaceId,
       input.pageId,
       input.channelId,
-      channel?.name ?? input.channelName,
+      channel?.name ?? (strict && !changedDestination ? existing!.channel_name : input.channelName),
       JSON.stringify(input.eventTypes),
       input.cadence,
       member.user.id,

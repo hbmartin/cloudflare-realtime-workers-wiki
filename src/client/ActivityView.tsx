@@ -8,10 +8,12 @@ export function ActivityView({
   spaces,
   pages,
   onSelect,
+  archiveRefreshVersion = 0,
 }: {
   spaces: Space[];
   pages: Page[];
   onSelect: (id: string) => void;
+  archiveRefreshVersion?: number;
 }) {
   const [archivedPages, setArchivedPages] = useState<Page[]>([]);
   useEffect(() => {
@@ -24,8 +26,10 @@ export function ActivityView({
     return () => {
       active = false;
     };
-  }, []);
-  const choices = [...new Map([...pages, ...archivedPages].map((p) => [p.id, p])).values()];
+    // This version deliberately triggers a reload after trash mutations.
+    // eslint-disable-next-line react/exhaustive-effect-dependencies
+  }, [archiveRefreshVersion]);
+  const choices = [...new Map([...archivedPages, ...pages].map((p) => [p.id, p])).values()];
   const [mapping, setMapping] = useState(() => new URLSearchParams(location.search).get("mapping") ?? "");
   const [mode, setMode] = useState<"activity" | "open">("activity");
   const [space, setSpace] = useState("");

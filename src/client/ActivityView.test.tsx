@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "./api";
 import { ActivityView } from "./ActivityView";
@@ -114,10 +114,66 @@ describe("ActivityView", () => {
       path === "/api/pages/tree?archived=true" ? Promise.resolve({ pages: [] }) : existing!(path, options),
     );
     render(<ActivityView spaces={[]} pages={[]} onSelect={vi.fn()} />);
-    await waitFor(() => expect(api).toHaveBeenCalled());
+    await waitFor(() => expect(api).toHaveBeenCalledWith(expect.stringContaining("/api/activity?mode=activity")));
     fireEvent.click(screen.getByRole("tab", { name: "Open work" }));
     await screen.findByText("No open work.");
-    resolveOld({ items: [item], nextCursor: null });
+    await act(async () => resolveOld({ items: [item], nextCursor: null }));
     await waitFor(() => expect(screen.queryByRole("button", { name: "Launch plan" })).not.toBeInTheDocument());
+  });
+
+  it("refreshes archive, restore, and deletion choices and favors current pages", async () => {
+    const current = {
+      id: "page",
+      spaceId: "space",
+      title: "Current title",
+      archivedAt: null,
+      isTemplate: false,
+    } as Page;
+    let archived = [{ ...current, title: "Old title", archivedAt: 1 }];
+    vi.mocked(api).mockImplementation(async (path) =>
+      path === "/api/pages/tree?archived=true" ? { pages: archived } : { items: [], nextCursor: null },
+    );
+    const onSelect = vi.fn();
+    const { rerender } = render(<ActivityView spaces={[]} pages={[current]} onSelect={onSelect} />);
+    await screen.findByText("No activity in this period.");
+    expect(screen.getByRole("option", { name: "Current title" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Old title (archived)" })).not.toBeInTheDocument();
+    archived = [{ ...current, archivedAt: 2 }];
+    rerender(<ActivityView spaces={[]} pages={[]} onSelect={onSelect} archiveRefreshVersion={1} />);
+    await screen.findByRole("option", { name: "Current title (archived)" });
+    rerender(<ActivityView spaces={[]} pages={[current]} onSelect={onSelect} archiveRefreshVersion={2} />);
+    expect(screen.getByRole("option", { name: "Current title" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Current title (archived)" })).not.toBeInTheDocument();
+    archived = [];
+    rerender(<ActivityView spaces={[]} pages={[]} onSelect={onSelect} archiveRefreshVersion={3} />);
+    await waitFor(() =>
+      expect(screen.getAllByRole("option").some((option) => option.textContent?.includes("title"))).toBe(false),
+    );
+  });
+
+  it("ignores superseded archive responses and keeps the last list on refresh failure", async () => {
+    const old = { id: "old", title: "Old archive", spaceId: "space", archivedAt: 1, isTemplate: false } as Page;
+    const fresh = { ...old, id: "fresh", title: "Fresh archive" };
+    const pending: Array<(value: { pages: Page[] }) => void> = [];
+    let refresh = 0;
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path !== "/api/pages/tree?archived=true") return { items: [], nextCursor: null };
+      if (refresh++ === 0) return { pages: [old] };
+      if (refresh === 4) throw new Error("offline");
+      return new Promise<{ pages: Page[] }>((resolve) => pending.push(resolve));
+    });
+    const onSelect = vi.fn();
+    const { rerender } = render(<ActivityView spaces={[]} pages={[]} onSelect={onSelect} />);
+    await screen.findByRole("option", { name: "Old archive (archived)" });
+    rerender(<ActivityView spaces={[]} pages={[]} onSelect={onSelect} archiveRefreshVersion={1} />);
+    rerender(<ActivityView spaces={[]} pages={[]} onSelect={onSelect} archiveRefreshVersion={2} />);
+    await act(async () => pending[1]!({ pages: [fresh] }));
+    expect(screen.getByRole("option", { name: "Fresh archive (archived)" })).toBeInTheDocument();
+    await act(async () => pending[0]!({ pages: [old] }));
+    expect(screen.queryByRole("option", { name: "Old archive (archived)" })).not.toBeInTheDocument();
+    await act(async () =>
+      rerender(<ActivityView spaces={[]} pages={[]} onSelect={onSelect} archiveRefreshVersion={3} />),
+    );
+    expect(screen.getByRole("option", { name: "Fresh archive (archived)" })).toBeInTheDocument();
   });
 });

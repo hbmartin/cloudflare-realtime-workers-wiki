@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { captureMarkdown, MAX_CAPTURE_MARKDOWN_BYTES, MAX_CAPTURE_MESSAGES } from "./slack-capture-content";
 import { markdownToDocument } from "../shared/import-content";
+import type { ProseMirrorJson } from "../shared/types";
 
 const input = {
   title: "Launch decision",
@@ -190,12 +191,16 @@ it("normalizes every Slack label and preserves URLs with whitespace-only labels"
     messages: [
       {
         ...input.messages[0]!,
-        text: "<https://example.com| > <#C1|first\r\rsecond> <!subteam^S1|first\r\rsecond> <mailto:a@example.com|first\r\rsecond>",
+        text: "<https://example.com| > <#C1|channel\r\rlabel> <!subteam^S1|group\r\rlabel> <mailto:a@example.com|mail\r\rlabel> <bad\raddress| >",
       },
     ],
   });
   expect(markdown).toContain("[https://example\\.com/](<https://example.com/>)");
   expect(markdown).not.toContain("\r");
-  expect(markdown).toContain("first second");
-  expect(JSON.stringify(markdownToDocument(markdown).document)).toContain("https://example.com/");
+  expect(markdown).toContain("\\#channel label @group label mail label bad address");
+  const links = (node: ProseMirrorJson): string[] => [
+    ...(node.marks ?? []).flatMap((mark) => (mark.type === "link" ? [String(mark.attrs?.href)] : [])),
+    ...(node.content ?? []).flatMap(links),
+  ];
+  expect(links(markdownToDocument(markdown).document)).toContain("https://example.com/");
 });

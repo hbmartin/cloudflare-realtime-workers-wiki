@@ -5,6 +5,8 @@ import type { ClientMemberContext, Page, Space } from "../shared/types";
 import type { Env, MemberContext } from "./env";
 import worker from "./index";
 import { consumeDeliveryMessage } from "./jobs";
+import { syncRound2Configuration } from "./slack-channels";
+import { createShare } from "./shares";
 import { notificationFanoutStatements } from "./notifications";
 import {
   consumeSlackLink,
@@ -15,6 +17,7 @@ import {
   disconnectSlack,
   encryptSlackToken,
   finishSlackOAuth,
+  upsertSlackChannelSubscription,
   handleSlackCommand,
   handleSlackEvent,
   recordVerifiedSlackIdentity,
@@ -132,6 +135,112 @@ async function slackSignature(timestamp: number, body: string) {
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+});
+
+describe("Slack share-refresh HTTP enqueueing", () => {
+  it.each([
+    "share creation",
+    "share update",
+    "share revocation",
+    "mapping creation",
+    "mapping update",
+    "mapping destination change",
+    "mapping deletion",
+  ])("sweeps pending refreshes after %s", async (mutation) => {
+    const installed = await bootstrap();
+    await installSlack(installed.member);
+    await env.DB.prepare(
+      "UPDATE slack_installations SET scopes=scopes||',channels:read,groups:read' WHERE id='slack-installation'",
+    ).run();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) =>
+        Response.json({
+          ok: true,
+          channel: {
+            id: new URL(String(input)).searchParams.get("channel") ?? "C123",
+            name: "canonical",
+            is_channel: true,
+            is_member: true,
+            is_archived: false,
+          },
+        }),
+      ),
+    );
+    const send = vi.fn().mockResolvedValue(undefined);
+    const bindings = {
+      ...slackEnv(),
+      WORKSPACE_ACTIVITY_ENABLED: "true",
+      SLACK_CHANNEL_VALIDATION_ENABLED: "true",
+      SLACK_SHARE_REFRESH_ENABLED: "true",
+      SLACK_DIGEST_DEFAULT_TIMEZONE: "America/Los_Angeles",
+      DELIVERY_QUEUE: { send },
+    } as unknown as Env;
+    await syncRound2Configuration(bindings);
+    const input = {
+      spaceId: installed.page.spaceId!,
+      pageId: null,
+      channelId: "C123",
+      channelName: "canonical",
+      cadence: "immediate" as const,
+      eventTypes: ["page_created" as const],
+    };
+    const mapping =
+      mutation === "mapping creation"
+        ? null
+        : await upsertSlackChannelSubscription(bindings, memberContext(installed.member), input);
+    if (["share update", "share revocation"].includes(mutation))
+      await createShare(bindings, memberContext(installed.member), installed.page.id, "http://example.test", {});
+    await env.DB.prepare(`INSERT INTO slack_share_references(id,installation_id,installation_generation,page_id,channel_id,message_ts,url,observed_user_id,reference_kind,created_at,updated_at)
+      VALUES('tracked','slack-installation',1,?,'C123','123.456',?,?,'page',1,1)`)
+      .bind(installed.page.id, `http://example.test/?page=${installed.page.id}`, installed.member.user.id)
+      .run();
+    // Share options do not create a lifecycle revision themselves, but the route
+    // must also sweep pending work from a preceding availability change.
+    if (mutation === "share update")
+      await env.DB.prepare(
+        "UPDATE slack_share_references SET lifecycle_revision=lifecycle_revision+1 WHERE id='tracked'",
+      ).run();
+    const path = mutation.startsWith("share")
+      ? `/api/pages/${installed.page.id}/share`
+      : `/api/slack/channels${mutation === "mapping creation" ? "" : `/${mapping!.id}`}`;
+    const method = mutation.endsWith("creation")
+      ? "POST"
+      : mutation.endsWith("revocation") || mutation.endsWith("deletion")
+        ? "DELETE"
+        : "PATCH";
+    const body =
+      mutation === "mapping creation"
+        ? input
+        : mutation === "mapping update"
+          ? { pageId: installed.page.id }
+          : mutation === "mapping destination change"
+            ? { channelId: "C456" }
+            : { showToc: false };
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, path, {
+        method,
+        headers: { "content-type": "application/json" },
+        ...(method === "DELETE" ? {} : { body: JSON.stringify(body) }),
+      }),
+      bindings,
+      context,
+    );
+    expect(response.status).toBe(method === "POST" ? 201 : mutation === "share revocation" ? 204 : 200);
+    await waitOnExecutionContext(context);
+    const outbox = (
+      await env.DB.prepare("SELECT id,enqueued_at FROM outbox WHERE topic='slack_share_refresh'").all<{
+        id: string;
+        enqueued_at: number | null;
+      }>()
+    ).results;
+    expect(outbox.length).toBeGreaterThan(0);
+    for (const row of outbox) {
+      expect(row.enqueued_at).not.toBeNull();
+      expect(send).toHaveBeenCalledWith(expect.objectContaining({ outboxId: row.id }));
+    }
+  });
 });
 
 afterEach(() => {

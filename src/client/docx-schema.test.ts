@@ -5,6 +5,23 @@ import { notesSchema } from "./mentions";
 import { docxHtmlToDocument, safeDocxHref } from "../worker/docx-html";
 
 describe("DOCX HTML adapter", () => {
+  it.each([
+    "<pre><code>first<br>second\tline</code></pre>",
+    '<pre><strong>first</strong><br><a href="https://example.com"><em>second\tline</em></a></pre>',
+  ])("imports formatted code as schema-valid plain text: %s", (html) => {
+    const result = docxHtmlToDocument(html);
+    const editor = BlockNoteEditor.create({ schema: notesSchema });
+    try {
+      const parsed = editor.pmSchema.nodeFromJSON(result.document);
+      expect(() => parsed.check()).not.toThrow();
+      const code = parsed.firstChild!.firstChild!.firstChild!;
+      expect(code.type.name).toBe("codeBlock");
+      expect(code.textContent).toBe("first\nsecond\tline");
+      code.forEach((child) => expect(child.marks).toEqual([]));
+    } finally {
+      editor.unmount();
+    }
+  });
   it("creates valid blocks for the actual document editor schema", () => {
     const result = docxHtmlToDocument(
       `<h2>Heading</h2><p><strong><em><u><s>Rich</s></u></em></strong><br>text</p>

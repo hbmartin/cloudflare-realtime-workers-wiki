@@ -223,7 +223,19 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
           output.push(...images.map((image) => container(image)));
         }
       } else if (node.name === "pre")
-        output.push(...paragraphs(inline(node.children), "codeBlock", { language: "text" }));
+        output.push(
+          ...paragraphs(
+            inline(node.children).map((child) =>
+              child.type === "text"
+                ? { type: "text", text: child.text! }
+                : child.type === "hardBreak"
+                  ? { type: "text", text: "\n" }
+                  : child,
+            ),
+            "codeBlock",
+            { language: "text" },
+          ),
+        );
       else if (/^h[1-6]$/.test(node.name)) {
         output.push(
           ...paragraphs(inline(node.children), "heading", { level: Number(node.name[1]), isToggleable: false }),

@@ -94,6 +94,8 @@ API/MCP, task, import and template-copy publication; staged and failed publicati
 
 Import publication records per-page Activity without channel events. Ordinary API/MCP creation and template clones retain their notification behavior. Multi-page moves and archives produce one summary per affected installation generation/channel/operation, deduplicating overlapping mappings. Summaries contain the action, qualifying page count and Activity link without page titles. Canonical Activity remains per page, including initial task status and events without a known actor.
 
+Bulk moves and archives deliberately send their summary immediately for both immediate and digest mappings. This is an exception to the saved cadence. Their events remain in canonical Activity and are excluded from scheduled digests so the operation is not announced twice. Existing tests cover both cadences and overlapping mappings.
+
 Review and validate these increments against the deployed Worker separately:
 
 1. Channel validation/settings: directory, mapping updates by ID, operator timezone, saved schedules and health.

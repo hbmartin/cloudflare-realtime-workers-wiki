@@ -3041,23 +3041,23 @@ app.patch("/api/slack/channels/:id", async (c) => {
   await spaceForMember(c.env, member, spaceId);
   if (pageId && (await pageForMember(c.env, member, pageId)).space_id !== spaceId)
     throw new HttpError(422, "slack_page_space_mismatch", "The selected page does not belong to that space.");
-  return c.json({
-    subscription: await upsertSlackChannelSubscription(c.env, member, {
-      ...existing,
-      mappingId: existing.id,
-      spaceId,
-      pageId,
-      channelId,
-      cadence,
-      eventTypes: eventTypes as ChannelEventType[],
-      digestTime: body.digestTime === undefined ? existing.digestTime : text(body.digestTime, "digestTime", 5),
-      digestTimezone:
-        body.digestTimezone === undefined
-          ? (existing.digestTimezone ?? undefined)
-          : text(body.digestTimezone, "digestTimezone", 100),
-      digestOpenWork: body.digestOpenWork === undefined ? existing.digestOpenWork : (body.digestOpenWork as boolean),
-    }),
+  const subscription = await upsertSlackChannelSubscription(c.env, member, {
+    ...existing,
+    mappingId: existing.id,
+    spaceId,
+    pageId,
+    channelId,
+    cadence,
+    eventTypes: eventTypes as ChannelEventType[],
+    digestTime: body.digestTime === undefined ? existing.digestTime : text(body.digestTime, "digestTime", 5),
+    digestTimezone:
+      body.digestTimezone === undefined
+        ? (existing.digestTimezone ?? undefined)
+        : text(body.digestTimezone, "digestTimezone", 100),
+    digestOpenWork: body.digestOpenWork === undefined ? existing.digestOpenWork : (body.digestOpenWork as boolean),
   });
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json({ subscription });
 });
 app.get("/api/slack/channels", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
@@ -3134,24 +3134,19 @@ app.post("/api/slack/channels", async (c) => {
       throw new HttpError(422, "slack_page_space_mismatch", "The selected page does not belong to that space.");
     }
   }
-  return c.json(
-    {
-      subscription: await upsertSlackChannelSubscription(c.env, member, {
-        spaceId,
-        pageId,
-        channelId,
-        channelName,
-        eventTypes,
-        cadence,
-        ...(body.digestTime === undefined ? {} : { digestTime: text(body.digestTime, "digestTime", 5) }),
-        ...(body.digestTimezone === undefined
-          ? {}
-          : { digestTimezone: text(body.digestTimezone, "digestTimezone", 100) }),
-        ...(typeof body.digestOpenWork === "boolean" ? { digestOpenWork: body.digestOpenWork } : {}),
-      }),
-    },
-    201,
-  );
+  const subscription = await upsertSlackChannelSubscription(c.env, member, {
+    spaceId,
+    pageId,
+    channelId,
+    channelName,
+    eventTypes,
+    cadence,
+    ...(body.digestTime === undefined ? {} : { digestTime: text(body.digestTime, "digestTime", 5) }),
+    ...(body.digestTimezone === undefined ? {} : { digestTimezone: text(body.digestTimezone, "digestTimezone", 100) }),
+    ...(typeof body.digestOpenWork === "boolean" ? { digestOpenWork: body.digestOpenWork } : {}),
+  });
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json({ subscription }, 201);
 });
 
 app.patch("/api/slack/channels/:id/mirror", async (c) => {
@@ -3196,6 +3191,7 @@ app.delete("/api/slack/channels/:id", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   await deleteSlackChannelSubscription(c.env, member, c.req.param("id"));
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json({ ok: true });
 });
 
@@ -3626,12 +3622,9 @@ app.post("/api/pages/:pageId/share", async (c) => {
   requireOwner(member);
   requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   const body = await jsonBody(c.req.raw);
-  return c.json(
-    {
-      share: await createShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin, shareOptions(body)),
-    },
-    201,
-  );
+  const share = await createShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin, shareOptions(body));
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json({ share }, 201);
 });
 
 app.patch("/api/pages/:pageId/share", async (c) => {
@@ -3639,9 +3632,9 @@ app.patch("/api/pages/:pageId/share", async (c) => {
   requireOwner(member);
   requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   const body = await jsonBody(c.req.raw);
-  return c.json({
-    share: await updateShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin, shareOptions(body)),
-  });
+  const share = await updateShare(c.env, member, c.req.param("pageId"), new URL(c.req.url).origin, shareOptions(body));
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json({ share });
 });
 
 app.delete("/api/pages/:pageId/share", async (c) => {
@@ -3649,6 +3642,7 @@ app.delete("/api/pages/:pageId/share", async (c) => {
   requireOwner(member);
   requireOrdinaryPage(await pageForMember(c.env, member, c.req.param("pageId")));
   await revokeShare(c.env, member, c.req.param("pageId"));
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.body(null, 204);
 });
 

@@ -83,7 +83,7 @@ const INLINE_MARKUP_CHAR = /[!*_[\]`<&]/;
 const INLINE_SECTION_LIMIT = 8192;
 const INLINE_SCAN_LIMIT = 128;
 const INLINE_DELIMITER_LIMIT = 512;
-function openingDelimiter(text: string, index: number) {
+function delimiterRun(text: string, index: number) {
   const delimiter = text[index]!;
   let begin = index,
     end = index + 1;
@@ -93,7 +93,7 @@ function openingDelimiter(text: string, index: number) {
     after = text[end] ?? " ";
   const left = !/\s/u.test(after) && (!/[\p{P}\p{S}]/u.test(after) || /\s|[\p{P}\p{S}]/u.test(before));
   const right = !/\s/u.test(before) && (!/[\p{P}\p{S}]/u.test(before) || /\s|[\p{P}\p{S}]/u.test(after));
-  return left && (delimiter !== "_" || !right || /[\p{P}\p{S}]/u.test(before));
+  return { begin, opening: left && (delimiter !== "_" || !right || /[\p{P}\p{S}]/u.test(before)) };
 }
 
 const INLINE_DELIMITERS = "*_`";
@@ -872,12 +872,11 @@ function boundedMarkdownInline(
       const delimiter = text[cut];
       if (delimiter && INLINE_DELIMITERS.includes(delimiter) && INLINE_DELIMITERS.includes(text[cut - 1] ?? " ")) {
         let boundary = cut;
-        while (
-          boundary > start &&
-          INLINE_DELIMITERS.includes(text[boundary - 1]!) &&
-          openingDelimiter(text, boundary - 1)
-        )
-          boundary -= 1;
+        while (boundary > start && INLINE_DELIMITERS.includes(text[boundary - 1]!)) {
+          const run = delimiterRun(text, boundary - 1);
+          if (!run.opening) break;
+          boundary = Math.max(start, run.begin);
+        }
         if (trailingEscape(text, boundary, start)) boundary -= 1;
         if (boundary > start) cut = boundary;
         else {
