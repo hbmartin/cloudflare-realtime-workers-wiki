@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import { docxDocument, docxImages, docxPng } from "../../tests/helpers/docx";
 import { projectDocument } from "../shared/document-projection";
 import { createZip, readZip } from "../shared/zip";
+import { docxHtmlToDocument } from "./docx-html";
+import type { ProseMirrorJson } from "../shared/types";
 import { readDocx, writeDocx } from "./docx";
 
 const noImage = async () => null;
@@ -67,7 +69,7 @@ describe("DOCX conversion", () => {
 
   it("supports a blank document", async () => {
     const output = await writeDocx({ type: "doc", content: [] }, "Blank", "https://notes.test", noImage);
-    expect(projectDocument((await readDocx(output.bytes)).document).plainText).toContain("Blank");
+    expect(projectDocument((await readDocx(output.bytes)).document).plainText).toBe("");
   });
 
   it("preserves linked Word images as links without fetching them", async () => {
@@ -197,4 +199,161 @@ describe("DOCX conversion", () => {
       });
     }
   });
+});
+
+const descendants = (node: ProseMirrorJson, type: string): ProseMirrorJson[] => [
+  ...(node.type === type ? [node] : []),
+  ...(node.content ?? []).flatMap((child) => descendants(child, type)),
+];
+describe("DOCX review regressions", () => {
+  it("emits Word breaks and tabs, strips invalid XML text, and omits empty layout placeholders", async () => {
+    const source = {
+      type: "doc",
+      content: [
+        {
+          type: "columnList",
+          content: [
+            {
+              type: "column",
+              content: [{ type: "codeBlock", content: [{ type: "text", text: "one\n\ttwo\u0001\ufffe" }] }],
+            },
+          ],
+        },
+        { type: "tableOfContents" },
+        { type: "breadcrumb" },
+        { type: "mermaid", attrs: { source: "a\nb\tc" } },
+      ],
+    };
+    const output = await writeDocx(source, "Title\u0000", "https://notes.test", noImage);
+    const xml = new TextDecoder().decode(
+      (await readZip(output.bytes)).find((e) => e.path === "word/document.xml")!.bytes,
+    );
+    expect(xml).toContain("<w:br/>");
+    expect(xml).toContain("<w:tab/>");
+    expect(
+      Array.from(xml).some(
+        (character) =>
+          character.charCodeAt(0) < 9 ||
+          character === String.fromCharCode(0xfffe) ||
+          character === String.fromCharCode(0xffff),
+      ),
+    ).toBe(false);
+    expect(xml).not.toContain("[column");
+    expect(xml).not.toContain("[tableOfContents]");
+    const imported = await readDocx(output.bytes);
+    expect(JSON.stringify(imported.document)).toContain('"type":"codeBlock"');
+    expect(imported.issues.filter((i) => i.code === "docx_conversion_warning")).toEqual([]);
+  });
+  it("removes our generated title and retains an external Title paragraph and single-column layout", async () => {
+    const output = await writeDocx(
+      { type: "doc", content: [{ type: "paragraph", content: [{ type: "text", text: "Body" }] }] },
+      "Export title",
+      "https://notes.test",
+      noImage,
+    );
+    const ours = await readDocx(output.bytes);
+    expect(projectDocument(ours.document).plainText).toBe("Body");
+    expect(ours.issues.some((i) => i.code === "docx_word_layout_simplified")).toBe(false);
+    const parts = await readZip(output.bytes);
+    const external = await readDocx(createZip(parts.filter((p) => p.path !== "docProps/custom.xml")));
+    expect(projectDocument(external.document).plainText).toContain("Export title");
+    expect(external.issues.some((i) => i.code === "docx_conversion_warning")).toBe(false);
+  });
+  it("resolves an alternate main part for conversion, content validation, and review warnings", async () => {
+    const output = await writeDocx(docxDocument(), "Alternate", "https://notes.test", async () => ({
+      bytes: docxPng,
+      mime: "image/png",
+    }));
+    const parts = await readZip(output.bytes);
+    for (const part of parts) {
+      if (part.path === "word/document.xml") part.path = "word/main.xml";
+      if (part.path === "word/_rels/document.xml.rels") part.path = "word/_rels/main.xml.rels";
+      if (part.path === "_rels/.rels" || part.path === "[Content_Types].xml")
+        part.bytes = new TextEncoder().encode(
+          new TextDecoder().decode(part.bytes).replaceAll("word/document.xml", "word/main.xml"),
+        );
+    }
+    const main = parts.find((p) => p.path === "word/main.xml")!;
+    main.bytes = new TextEncoder().encode(
+      new TextDecoder().decode(main.bytes).replace("<w:sectPr>", '<w:sectPr><w:cols w:num="2"/>'),
+    );
+    const result = await readDocx(createZip(parts));
+    expect(projectDocument(result.document).plainText).toContain("Résumé 日本語");
+    expect(result.entries.size).toBe(1);
+    expect(result.issues.some((i) => i.code === "docx_word_layout_simplified")).toBe(true);
+  });
+  it("deduplicates repeated image assets", async () => {
+    const output = await writeDocx(
+      {
+        type: "doc",
+        content: Array.from({ length: 12 }, () => ({ type: "image", attrs: { url: "/api/attachments/image" } })),
+      },
+      "Repeated",
+      "https://notes.test",
+      async () => ({ bytes: docxPng, mime: "image/png" }),
+    );
+    const result = await readDocx(output.bytes);
+    expect(descendants(result.document, "image")).toHaveLength(12);
+    expect(result.entries.size).toBe(1);
+  });
+  it("preserves Word spans and expands imports into aligned continuation cells", async () => {
+    const cell = (text: string, attrs = {}) => ({
+      type: "tableCell",
+      attrs,
+      content: [{ type: "tableParagraph", content: [{ type: "text", text }] }],
+    });
+    const output = await writeDocx(
+      {
+        type: "doc",
+        content: [
+          {
+            type: "table",
+            content: [
+              { type: "tableRow", content: [cell("A", { rowspan: 2, colspan: 2 }), cell("B")] },
+              { type: "tableRow", content: [cell("C")] },
+            ],
+          },
+        ],
+      },
+      "Merged",
+      "https://notes.test",
+      noImage,
+    );
+    const xml = new TextDecoder().decode(
+      (await readZip(output.bytes)).find((e) => e.path === "word/document.xml")!.bytes,
+    );
+    expect(xml).toContain('<w:gridSpan w:val="2"/>');
+    expect(xml).toContain('<w:vMerge w:val="restart"/>');
+    const table = descendants((await readDocx(output.bytes)).document, "table")[0]!;
+    expect(table.content!.map((row) => row.content!.map((part) => projectDocument(part).plainText))).toEqual([
+      ["A", "", "B"],
+      ["", "", "C"],
+    ]);
+  });
+  it("keeps list images, continuation text, and nested lists under their original bullet in reading order", () => {
+    const result = docxHtmlToDocument(
+      '<ul><li>Before<img src="asset"/>After<ul><li>Nested</li></ul>Tail</li><li>Second</li></ul>',
+      new Set(["asset"]),
+    );
+    const roots = result.document.content![0]!.content!;
+    expect(roots).toHaveLength(2);
+    expect(roots[0]!.content![0]!.type).toBe("bulletListItem");
+    const children = roots[0]!.content![1]!.content!;
+    expect(children.map((child) => child.content![0]!.type)).toEqual([
+      "image",
+      "paragraph",
+      "bulletListItem",
+      "paragraph",
+    ]);
+    expect(projectDocument(roots[0]!).plainText).toMatch(/Before[\s\S]*After[\s\S]*Nested[\s\S]*Tail/);
+  });
+  it.each([new Uint8Array([0xd0, 0xcf, 0x11, 0xe0]), new TextEncoder().encode("old .doc")])(
+    "explains unsupported Word containers",
+    async (bytes) => {
+      await expect(readDocx(bytes)).rejects.toMatchObject({
+        status: 422,
+        message: expect.stringContaining("unencrypted .docx"),
+      });
+    },
+  );
 });

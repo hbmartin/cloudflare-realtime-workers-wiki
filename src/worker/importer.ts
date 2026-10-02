@@ -1,4 +1,4 @@
-import { readDocx } from "./docx";
+import { activityMutationStart, activityMutationEnd } from "./activity-mutations";
 import { tracing, type WorkflowStep } from "cloudflare:workers";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import {
@@ -782,7 +782,7 @@ async function singlePageBundle(job: JobRow, options: ImportOptions, bytes: Uint
   assertPreviewGroups(options, ["Imported"]);
   const source = options.format === "docx" ? "" : new TextDecoder().decode(bytes);
   const html = options.format === "html" ? htmlToDocument(source) : null;
-  const docx = options.format === "docx" ? await readDocx(bytes) : null;
+  const docx = options.format === "docx" ? await (await import("./docx")).readDocx(bytes) : null;
   const parsed = docx ?? html ?? markdownToDocument(source);
   const importedTitle = html?.title ?? "";
   const title = options.title
@@ -1360,6 +1360,14 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
         })),
       ),
     ),
+    activityMutationStart(
+      env.DB,
+      "SELECT id FROM pages WHERE id IN (SELECT value FROM json_each(?))",
+      [pageIds],
+      job.id,
+      "import",
+      false,
+    ),
     publishPages,
     ...(task && taskRowId && publishedRootId
       ? [
@@ -1446,6 +1454,7 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
           captureFeedbackStatement(env.DB, options.captureId, "succeeded", timestamp),
         ]
       : []),
+    activityMutationEnd(env.DB, job.id),
     env.DB.prepare(
       `UPDATE jobs SET status = 'succeeded', progress_current = 7, progress_total = 7,
         progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
@@ -1475,7 +1484,7 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
       publishedRootId ?? "",
     ),
   ]);
-  if (committed[1]?.meta.changes !== bundle.pages.length) {
+  if (committed[2]?.meta.changes !== bundle.pages.length) {
     const staged = await env.DB.prepare(`SELECT COUNT(*) count FROM pages WHERE import_job_id=? AND content_epoch=?`)
       .bind(job.id, job.attempt)
       .first<{ count: number }>();

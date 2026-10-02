@@ -1,4 +1,5 @@
-import { DOCX_MIME, writeDocx } from "./docx";
+import { DOCX_MIME } from "../shared/docx-metadata";
+import { EXPORT_CAPABILITIES } from "../shared/export-format";
 import type { WorkflowStep } from "cloudflare:workers";
 import { tracing } from "cloudflare:workers";
 import { correlationHeaders, traced } from "./observability";
@@ -63,9 +64,9 @@ function exportOptions(job: JobRow): ExportOptions {
   const options = jsonRecord(job.options_json);
   if (
     typeof options.pageId !== "string" ||
-    !["markdown", "html", "json", "svg", "png", "pdf", "docx"].includes(String(options.format)) ||
+    !Object.hasOwn(EXPORT_CAPABILITIES, String(options.format)) ||
     typeof options.portable !== "boolean" ||
-    (options.format === "docx" && options.portable)
+    (!EXPORT_CAPABILITIES[options.format as ExportFormat].portable && options.portable)
   ) {
     throw new Error("Export options are invalid.");
   }
@@ -226,6 +227,7 @@ async function documentExport(
   thumbnailByteLimit: number | null,
   requestedBy: string,
   includeLinkedDiagramThumbnails: boolean,
+  serialize = true,
 ): Promise<SerializedExport> {
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request("https://document.internal/content", {
@@ -237,6 +239,7 @@ async function documentExport(
   if (envelope.pageId !== page.id || envelope.contentEpoch !== page.content_epoch) {
     throw new Error("The document projection did not match the requested page.");
   }
+  if (!serialize) return { document: envelope.document, html: "", linkedDiagramAssets: [] };
   const diagramAssets = includeLinkedDiagramThumbnails
     ? await linkedDiagramAssets(env, job, page, envelope.document, thumbnailByteLimit, requestedBy)
     : [];
@@ -485,6 +488,8 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
       .bind(options.pageId, job.workspace_id, job.space_id)
       .first<ExportPage>();
     if (!page) throw new HttpError(409, "job_failed", "The page is no longer available for export.");
+    if (!EXPORT_CAPABILITIES[options.format].kinds.includes(page.kind))
+      throw new HttpError(422, "job_failed", "That format is not available for this page kind.");
     const serialized =
       page.kind === "document"
         ? await documentExport(
@@ -498,6 +503,7 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
                 : null,
             job.requested_by,
             options.format === "html" || options.format === "pdf",
+            options.format !== "docx",
           )
         : page.kind === "diagram"
           ? await diagramExport(env, page)
@@ -511,6 +517,7 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
     if (options.format === "docx") {
       if (page.kind !== "document" || !serialized.document)
         throw new HttpError(422, "job_failed", "Word export is only available for document pages.");
+      const { writeDocx } = await import("./docx");
       const result = await writeDocx(serialized.document, page.title, env.BETTER_AUTH_URL, async (url) => {
         await assertExportActive(env, job);
         let pathname: string;
@@ -528,12 +535,14 @@ async function runExportObserved(env: Env, job: JobRow, step: Pick<WorkflowStep,
         )
           .bind(id, page.id)
           .first<ExportAttachment>();
-        if (!attachment || !["image/png", "image/jpeg", "image/gif"].includes(attachment.mime)) return null;
+        if (!attachment) return null;
+        const mime = inlineImageMime(attachment.mime);
+        if (!mime || !["image/png", "image/jpeg", "image/gif"].includes(mime)) return null;
         const asset = await env.BUCKET.get(attachment.r2_key);
         if (!asset) return null;
         if (asset.size > PDF_INLINE_ASSET_LIMIT)
           throw new HttpError(413, "job_failed", "Embedded Word images exceed the 24 MiB limit.");
-        return { bytes: new Uint8Array(await asset.arrayBuffer()), mime: attachment.mime };
+        return { bytes: new Uint8Array(await asset.arrayBuffer()), mime };
       });
       bytes = result.bytes;
       warnings = result.warnings;

@@ -5,6 +5,8 @@ import { CHANNEL_EVENT_TYPES } from "../../src/shared/activity";
 
 test("workspace Activity records mutations and shows current open work without Slack", async ({ page }) => {
   await signInOwner(page);
+  const activation = await page.request.post("/api/slack/configuration/sync");
+  expect(activation.ok(), await activation.text()).toBe(true);
   const title = `Activity regression ${Date.now()}`;
   const created = await page.request.post("/api/pages", { data: { kind: "document", title } });
   expect(created.status()).toBe(201);
@@ -26,13 +28,51 @@ test("workspace Activity records mutations and shows current open work without S
   await expect(activity.getByRole("button", { name: title, exact: true }).first()).toBeVisible();
   await activity.getByRole("combobox", { name: "Page", exact: true }).selectOption(result.page.id);
   await activity.getByRole("tab", { name: "Open work", exact: true }).click();
-  await expect(activity.getByRole("button", { name: title, exact: true })).toHaveCount(1);
+  await expect(activity).toHaveAttribute("aria-busy", "false");
+  await expect(activity.getByRole("tab", { name: "Open work", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(activity.getByRole("list").getByRole("button", { name: title, exact: true })).toHaveCount(1);
   await expect(activity.getByRole("button", { name: title, exact: true })).toBeVisible();
   await expect(activity).toContainText("1 unresolved threads");
   const audit = await new AxeBuilder({ page }).include(".activity-view").analyze();
   expect(audit.violations.filter((v) => v.impact === "serious" || v.impact === "critical")).toEqual([]);
   await activity.getByRole("button", { name: title, exact: true }).click();
   await expect(page.getByLabel("Page title")).toHaveValue(title);
+});
+
+test("Activity filters include accessible pages in another space and archived departures", async ({ page }) => {
+  await signInOwner(page);
+  const activation = await page.request.post("/api/slack/configuration/sync");
+  expect(activation.ok(), await activation.text()).toBe(true);
+  const suffix = Date.now();
+  const createdSpace = await page.request.post("/api/spaces", { data: { name: `Activity space ${suffix}` } });
+  expect(createdSpace.status()).toBe(201);
+  const { space } = (await createdSpace.json()) as { space: { id: string } };
+  const create = async (title: string) => {
+    const response = await page.request.post("/api/pages", { data: { kind: "document", title, spaceId: space.id } });
+    expect(response.status()).toBe(201);
+    return ((await response.json()) as { page: { id: string } }).page;
+  };
+  const activeTitle = `Active departure ${suffix}`;
+  const archivedTitle = `Archived departure ${suffix}`;
+  await create(activeTitle);
+  const archived = await create(archivedTitle);
+  const removed = await page.request.delete(`/api/pages/${archived.id}`);
+  expect(removed.ok(), await removed.text()).toBe(true);
+  await page.reload();
+  if (test.info().project.name === "mobile-chromium")
+    await page.getByRole("button", { name: "Open navigation", exact: true }).click();
+  await page.getByRole("button", { name: "Activity", exact: true }).click();
+  const activity = page.getByRole("region", { name: "Workspace activity" });
+  const choices = activity.getByRole("combobox", { name: "Page", exact: true });
+  await expect(choices.getByRole("option", { name: activeTitle, exact: true })).toBeAttached();
+  await expect(choices.getByRole("option", { name: `${archivedTitle} (archived)`, exact: true })).toBeAttached();
+  await activity.getByRole("combobox", { name: "Space", exact: true }).selectOption(space.id);
+  await choices.selectOption(archived.id);
+  await activity.getByRole("combobox", { name: "Event", exact: true }).selectOption("page_archived");
+  await expect(activity).toHaveAttribute("aria-busy", "false");
+  await expect(activity.getByRole("list").getByRole("button", { name: archivedTitle, exact: true })).toHaveCount(1);
+  await expect(activity.getByRole("list").getByRole("button", { name: archivedTitle, exact: true })).toBeDisabled();
+  await expect(activity.getByRole("list")).toContainText("Page archived");
 });
 
 test("Slack owners find later-page channels and edit daily mapping settings", async ({ page }) => {
@@ -110,7 +150,7 @@ test("Slack owners find later-page channels and edit daily mapping settings", as
   await editor.getByLabel("Include unresolved comments and unfinished tasks").uncheck();
   await editor.getByRole("button", { name: "Save mapping settings" }).click();
   await expect.poll(() => updated).toMatchObject({ digestTime: "17:45", digestOpenWork: false });
-  await expect(slack).toContainText("Muted until you unmute this mapping.");
+  await expect(slack.getByRole("combobox", { name: "Slack channel", exact: true })).toHaveValue("");
   const audit = await new AxeBuilder({ page }).include(".slack-settings").analyze();
   expect(audit.violations.filter((v) => v.impact === "serious" || v.impact === "critical")).toEqual([]);
 });

@@ -13,6 +13,19 @@ export function ActivityView({
   pages: Page[];
   onSelect: (id: string) => void;
 }) {
+  const [archivedPages, setArchivedPages] = useState<Page[]>([]);
+  useEffect(() => {
+    let active = true;
+    void api<{ pages: Page[] }>("/api/pages/tree?archived=true")
+      .then((result) => {
+        if (active && Array.isArray(result.pages)) setArchivedPages(result.pages);
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
+  const choices = [...new Map([...pages, ...archivedPages].map((p) => [p.id, p])).values()];
   const [mapping, setMapping] = useState(() => new URLSearchParams(location.search).get("mapping") ?? "");
   const [mode, setMode] = useState<"activity" | "open">("activity");
   const [space, setSpace] = useState("");
@@ -86,7 +99,7 @@ export function ActivityView({
     );
   }
   return (
-    <section className="activity-view" aria-label="Workspace activity">
+    <section className="activity-view" aria-label="Workspace activity" aria-busy={busy}>
       <h1>Activity</h1>
       {mapping && (
         <p>
@@ -133,11 +146,12 @@ export function ActivityView({
           Page
           <select value={page} onChange={(e) => setPage(e.target.value)}>
             <option value="">All pages</option>
-            {pages
+            {choices
               .filter((p) => !p.isTemplate && (!space || p.spaceId === space))
               .map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.title}
+                  {p.archivedAt !== null ? " (archived)" : ""}
                 </option>
               ))}
           </select>

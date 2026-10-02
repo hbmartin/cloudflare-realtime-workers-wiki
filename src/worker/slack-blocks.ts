@@ -8,6 +8,7 @@ import { TASK_STATUS_LABELS, type TaskStatus } from "../shared/tasks";
 
 export type DigestPage = {
   pageId: string;
+  eventIds?: string[];
   title: string;
   excerpt: string;
   actors: string[];

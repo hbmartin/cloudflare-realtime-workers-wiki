@@ -4360,6 +4360,7 @@ describe("Worker integration", () => {
     );
     expect(archived.status).toBe(200);
     expect(await archived.json()).toEqual({
+      operationId: expect.any(String),
       ok: true,
       pageIds: [installed.pageId],
       cleanupPending: false,
@@ -4413,6 +4414,7 @@ describe("Worker integration", () => {
       pendingPageIdsTruncated: boolean;
     }>();
     expect({ ...firstBody, pageIds: [...firstBody.pageIds].sort() }).toEqual({
+      operationId: expect.any(String),
       ok: true,
       pageIds: [installed.pageId, child.id].sort(),
       cleanupPending: false,
@@ -4432,6 +4434,7 @@ describe("Worker integration", () => {
       pendingPageIdsTruncated: boolean;
     }>();
     expect({ ...repeatedBody, pageIds: [...repeatedBody.pageIds].sort() }).toEqual({
+      operationId: expect.any(String),
       ok: true,
       pageIds: [installed.pageId, child.id].sort(),
       cleanupPending: false,
@@ -4464,6 +4467,7 @@ describe("Worker integration", () => {
 
     expect(repeated.status).toBe(202);
     expect(await repeated.json()).toEqual({
+      operationId: expect.any(String),
       ok: true,
       pageIds: [installed.pageId],
       cleanupPending: true,
@@ -4720,6 +4724,7 @@ describe("Worker integration", () => {
       );
       expect(archived.status).toBe(202);
       expect(await archived.json()).toEqual({
+        operationId: expect.any(String),
         ok: true,
         pageIds: [installed.pageId],
         cleanupPending: true,
@@ -4745,6 +4750,7 @@ describe("Worker integration", () => {
       );
       expect(repeated.status).toBe(202);
       expect(await repeated.json()).toEqual({
+        operationId: expect.any(String),
         ok: true,
         pageIds: [installed.pageId],
         cleanupPending: true,
@@ -6062,7 +6068,7 @@ describe("Worker integration", () => {
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
-      const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
+      const receipt = results[3]?.results[0] as { page_id?: string } | undefined;
       if (receipt?.page_id !== installed.pageId) return false;
       results.length = 0;
       return true;
@@ -6113,7 +6119,7 @@ describe("Worker integration", () => {
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
     const mutateError = new Error("Move batch mutator failed");
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
-      const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
+      const receipt = results[3]?.results[0] as { page_id?: string } | undefined;
       if (receipt?.page_id !== installed.pageId) return false;
       results.length = 0;
       throw mutateError;
@@ -6158,7 +6164,7 @@ describe("Worker integration", () => {
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, async (results, uninterceptedDatabase) => {
-      const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
+      const receipt = results[3]?.results[0] as { page_id?: string } | undefined;
       if (receipt?.page_id !== installed.pageId) return false;
       await uninterceptedDatabase
         .prepare(`DELETE FROM page_move_receipts WHERE workspace_id = ? AND operation_id = ?`)
@@ -6209,7 +6215,7 @@ describe("Worker integration", () => {
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
-      const receipt = results[2]?.results[0] as { page_id?: string } | undefined;
+      const receipt = results[3]?.results[0] as { page_id?: string } | undefined;
       if (receipt?.page_id !== installed.pageId) return false;
       results.length = 0;
       return true;
@@ -6267,7 +6273,7 @@ describe("Worker integration", () => {
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
-      const moveResult = results[0];
+      const moveResult = results[1];
       if (!moveResult) return false;
       moveResult.meta.changes = 0;
       return true;
@@ -6315,7 +6321,7 @@ describe("Worker integration", () => {
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
-      const receipt = results[2]?.results[0] as { response_json?: string } | undefined;
+      const receipt = results[3]?.results[0] as { response_json?: string } | undefined;
       if (!receipt?.response_json) return false;
       receipt.response_json = "{";
       return true;
@@ -6370,8 +6376,8 @@ describe("Worker integration", () => {
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
-      const receipt = results[2]?.results[0] as { response_json?: string } | undefined;
-      const pageState = results[3]?.results[0] as { page_json?: string } | undefined;
+      const receipt = results[3]?.results[0] as { response_json?: string } | undefined;
+      const pageState = results[4]?.results[0] as { page_json?: string } | undefined;
       if (!receipt?.response_json || !pageState?.page_json) return false;
       receipt.response_json = "{";
       pageState.page_json = "{";
@@ -6421,9 +6427,9 @@ describe("Worker integration", () => {
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
-      const receipt = results[2]?.results[0] as { response_json?: string } | undefined;
-      if (!receipt?.response_json || !results[3]) return false;
-      results[3] = { ...results[3], results: [] };
+      const receipt = results[3]?.results[0] as { response_json?: string } | undefined;
+      if (!receipt?.response_json || !results[4]) return false;
+      results[4] = { ...results[4], results: [] };
       return true;
     });
     const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -6460,7 +6466,7 @@ describe("Worker integration", () => {
     const operationId = crypto.randomUUID();
     const delivered: Array<{ workspaceId: string; event: WorkspaceEvent }> = [];
     const intercepted = envMutatingNextMoveBatchResult(env, delivered, (results) => {
-      const receipt = results[2]?.results[0] as { request_hash?: string } | undefined;
+      const receipt = results[3]?.results[0] as { request_hash?: string } | undefined;
       if (!receipt?.request_hash) return false;
       receipt.request_hash = "conflicting-request-hash";
       return true;
@@ -8602,8 +8608,22 @@ describe("calm workspace task lists", () => {
       );
       await waitOnExecutionContext(context);
       expect(response.status).toBe(200);
-      expect(await response.json()).toMatchObject({ ok: true, pageIds: [detailPageId] });
+      expect(await response.json()).toMatchObject({ ok: true, operationId, pageIds: [detailPageId] });
     }
+    await env.DB.prepare("UPDATE pages SET archived_at=NULL,archived_by=NULL,archive_operation_id=NULL WHERE id=?")
+      .bind(detailPageId)
+      .run();
+    const context = createExecutionContext();
+    const replay = await worker.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${detailPageId}`, {
+        method: "DELETE",
+        headers: { "x-notes-operation-id": operationId },
+      }),
+      envWithCapturedWorkspaceEvents(env, events),
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(await replay.json()).toMatchObject({ ok: true, operationId, replayed: true, pageIds: [] });
     expect(events.filter(({ event }) => event.type === "pages-removed").map(({ event }) => event)).toEqual([
       { type: "pages-removed", pageIds: [detailPageId], permanently: false, operationId },
       { type: "pages-removed", pageIds: [detailPageId], permanently: false, operationId },

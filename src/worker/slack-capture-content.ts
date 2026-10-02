@@ -1,3 +1,4 @@
+import { collapseWhitespace as singleLine } from "../shared/text";
 import { HttpError } from "./http";
 import type { SlackHistoryMessage } from "./slack";
 
@@ -28,10 +29,6 @@ function escapeMarkdown(value: string) {
   return value.replace(/[\s\S]/gu, (character) => (MARKDOWN_SPECIAL.has(character) ? `\\${character}` : character));
 }
 
-function singleLine(value: string) {
-  return value.replace(/\s+/gu, " ").trim();
-}
-
 function slackEntity(value: string) {
   return value.replace(/&(?:amp|lt|gt);/g, (entity) => ({ "&amp;": "&", "&lt;": "<", "&gt;": ">" })[entity]!);
 }
@@ -47,8 +44,12 @@ function safeHttpsLink(value: string, slackOnly = false) {
   }
 }
 
-function link(label: string, href: string) {
-  return `[${escapeMarkdown(singleLine(label))}](<${href.replaceAll(">", "%3E")}>)`;
+function slackLabel(value: string, fallback = "") {
+  return escapeMarkdown(singleLine(slackEntity(value)) || fallback);
+}
+
+function link(value: string, href: string) {
+  return `[${slackLabel(value, href)}](<${href.replaceAll(">", "%3E")}>)`;
 }
 
 function messageText(value: string) {
@@ -58,12 +59,12 @@ function messageText(value: string) {
     pieces.push(escapeMarkdown(slackEntity(value.slice(offset, match.index))));
     const token = match[1]!;
     if (token.startsWith("@")) pieces.push("@Slack member");
-    else if (token.startsWith("#")) pieces.push(escapeMarkdown(`#${token.split("|")[1] ?? "channel"}`));
-    else if (token.startsWith("!")) pieces.push(escapeMarkdown(`@${token.split("|")[1] ?? "Slack group"}`));
+    else if (token.startsWith("#")) pieces.push(slackLabel(`#${token.split("|")[1] ?? "channel"}`));
+    else if (token.startsWith("!")) pieces.push(slackLabel(`@${token.split("|")[1] ?? "Slack group"}`));
     else {
       const [address, label] = token.split("|", 2);
       const href = safeHttpsLink(slackEntity(address ?? ""));
-      pieces.push(href ? link(slackEntity(label ?? address ?? ""), href) : escapeMarkdown(slackEntity(label ?? token)));
+      pieces.push(href ? link(label ?? address ?? "", href) : slackLabel(label ?? token, address ?? token));
     }
     offset = match.index! + match[0].length;
   }

@@ -1,3 +1,4 @@
+import { createShare, revokeShare } from "./shares";
 import { acceptSlackProductInteraction, openSlackProduct } from "./slack-product";
 import {
   authorizeSlackCaptureJobRetry,
@@ -2059,18 +2060,21 @@ describe("interactive Slack workspace", () => {
         `SELECT COUNT(*) count FROM share_links WHERE root_page_id = 'page' AND revoked_at IS NULL`,
       ).first(),
     ).toEqual({ count: 1 });
-    await handleSlackEvent(runtime(), {
-      type: "event_callback",
-      event_id: "Ev-share",
-      team_id: "T123",
-      event: {
-        type: "link_shared",
-        user: "UOWNER",
-        channel: "CSPACE",
-        message_ts: "1700000700.000001",
-        links: [{ url: "http://example.test/?page=page" }],
+    await handleSlackEvent(
+      { ...runtime(), SLACK_SHARE_REFRESH_ENABLED: "true" },
+      {
+        type: "event_callback",
+        event_id: "Ev-share",
+        team_id: "T123",
+        event: {
+          type: "link_shared",
+          user: "UOWNER",
+          channel: "CSPACE",
+          message_ts: "1700000700.000001",
+          links: [{ url: "http://example.test/?page=page" }],
+        },
       },
-    });
+    );
     expect(
       await env.DB.prepare(`SELECT slack_redrive_due_at IS NOT NULL scheduled FROM outbox
       WHERE topic='slack_unfurl'`).first(),
@@ -2098,6 +2102,58 @@ describe("interactive Slack workspace", () => {
     expect(
       await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(receipt!.id).first(),
     ).toEqual({ outcome: "accepted" });
+  });
+  it("privately replaces a revoked pinned share without changing its public reference", async () => {
+    await activeThread();
+    const refreshEnv = { ...runtime(), SLACK_SHARE_REFRESH_ENABLED: "true" } as Env;
+    const old = await createShare(refreshEnv, owner, "page", "http://example.test", {});
+    await handleSlackEvent(refreshEnv, {
+      type: "event_callback",
+      event_id: "revoked-action",
+      team_id: "T123",
+      event: {
+        type: "link_shared",
+        user: "UOWNER",
+        channel: "CSPACE",
+        message_ts: "1700000700.000001",
+        links: [{ url: old.url }],
+      },
+    });
+    await revokeShare(refreshEnv, owner, "page");
+    const ref = (await env.DB.prepare(
+      "SELECT id,share_link_id FROM slack_share_references WHERE reference_kind='share'",
+    ).first<{ id: string; share_link_id: string }>())!;
+    await acceptSlackWorkspaceInteraction(refreshEnv, {
+      type: "block_actions",
+      team: { id: "T123" },
+      user: { id: "UOWNER" },
+      container: { channel_id: "CSPACE", message_ts: "1700000700.000001", app_unfurl_url: old.url },
+      app_unfurl: { app_unfurl_url: old.url },
+      actions: [{ action_id: "noteflare_unfurl_share_create", action_ts: "1700000909.000001", value: ref.id }],
+    });
+    const receipt = (await env.DB.prepare(
+      "SELECT id FROM slack_interaction_receipts WHERE callback_id='noteflare_unfurl_share_create'",
+    ).first<{ id: string }>())!;
+    await deliverSlackWorkspaceAction(refreshEnv, receipt.id);
+    expect(
+      await env.DB.prepare("SELECT outcome FROM slack_interaction_receipts WHERE id=?").bind(receipt.id).first(),
+    ).toEqual({ outcome: "accepted" });
+    expect(
+      await env.DB.prepare("SELECT share_link_id FROM slack_share_references WHERE id=?").bind(ref.id).first(),
+    ).toEqual({ share_link_id: ref.share_link_id });
+    expect(
+      await env.DB.prepare("SELECT revoked_at IS NOT NULL revoked FROM share_links WHERE id=?")
+        .bind(ref.share_link_id)
+        .first(),
+    ).toEqual({ revoked: 1 });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) n FROM share_links WHERE root_page_id='page' AND revoked_at IS NULL",
+      ).first(),
+    ).toEqual({ n: 1 });
+    expect(await env.DB.prepare("SELECT count(*) n FROM outbox WHERE topic='slack_share_response'").first()).toEqual({
+      n: 1,
+    });
   });
   it("defers an unfurl through auth failure and redrives it after reauthorization", async () => {
     await env.DB.batch([

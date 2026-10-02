@@ -1,5 +1,6 @@
+import { hasUrlControls } from "../shared/text";
 import { DomUtils, ElementType, parseDocument } from "htmlparser2";
-import type { ImportIssue } from "../shared/import-content";
+import { BLOCK_ATTRS, type ImportIssue } from "../shared/import-content";
 import type { ProseMirrorJson } from "../shared/types";
 
 type HtmlNode = ReturnType<typeof parseDocument>["children"][number];
@@ -7,7 +8,6 @@ type HtmlElement = ReturnType<typeof DomUtils.getElementsByTagName>[number];
 function isTag(node: HtmlNode): node is HtmlElement {
   return "attribs" in node;
 }
-const BLOCK_ATTRS = { backgroundColor: "default", textColor: "default", textAlignment: "left" };
 
 const text = (value: string, marks: ProseMirrorJson["marks"] = []): ProseMirrorJson[] =>
   value ? [{ type: "text", text: value, ...(marks.length ? { marks } : {}) }] : [];
@@ -15,14 +15,19 @@ const text = (value: string, marks: ProseMirrorJson["marks"] = []): ProseMirrorJ
 export function safeDocxHref(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const href = value.trim();
-  if (!href || Array.from(href).some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127 || char === "\\"))
-    return null;
+  if (!href || hasUrlControls(href) || href.includes("\\")) return null;
   try {
     return ["http:", "https:", "mailto:"].includes(new URL(href, "https://docx.invalid").protocol) ? href : null;
   } catch {
     return null;
   }
 }
+
+const empty = (): ProseMirrorJson => ({
+  type: "tableCell",
+  attrs: { colspan: 1, rowspan: 1, colwidth: null },
+  content: [{ type: "tableParagraph", attrs: { ...BLOCK_ATTRS } }],
+});
 
 // Mammoth's semantic HTML needs a tree parser: the general HTML importer flattens
 // nested lists and tables. This adapter only handles DOCX conversion output.
@@ -130,11 +135,33 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
       if (node.name === "ul" || node.name === "ol") {
         for (const item of node.children.filter((child) => isTag(child) && child.name === "li")) {
           if (!isTag(item)) continue;
-          const nested = item.children.filter((child) => isTag(child) && ["ul", "ol"].includes(child.name));
-          const own = paragraphs(inline(item.children), node.name === "ol" ? "numberedListItem" : "bulletListItem");
-          const children = blocks(nested, depth + 1);
-          if (children.length) own[0]!.content!.push({ type: "blockGroup", content: children });
-          output.push(...own);
+          const root = container({
+            type: node.name === "ol" ? "numberedListItem" : "bulletListItem",
+            attrs: { ...BLOCK_ATTRS },
+          });
+          const continuation: ProseMirrorJson[] = [];
+          let first = true,
+            pending: HtmlNode[] = [];
+          const flush = () => {
+            if (!pending.length) return;
+            const parts = paragraphs(inline(pending));
+            if (first && parts[0]?.content?.[0]?.type === "paragraph") {
+              root.content![0]!.content = parts.shift()!.content![0]!.content ?? [];
+            }
+            continuation.push(...parts);
+            pending = [];
+            first = false;
+          };
+          for (const child of item.children) {
+            if (isTag(child) && ["ul", "ol"].includes(child.name)) {
+              flush();
+              first = false;
+              continuation.push(...blocks([child], depth + 1));
+            } else pending.push(child);
+          }
+          flush();
+          if (continuation.length) root.content!.push({ type: "blockGroup", content: continuation });
+          output.push(root);
         }
       } else if (node.name === "table") {
         const rows = DomUtils.getElementsByTagName("tr", node.children).filter((row) => {
@@ -146,46 +173,58 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
           return parent === node;
         });
         const images: ProseMirrorJson[] = [];
-        const converted = rows.map((row): ProseMirrorJson => ({
-          type: "tableRow",
-          content: row.children
-            .filter((cell) => isTag(cell) && ["td", "th"].includes(cell.name))
-            .map((cell): ProseMirrorJson => {
-              if (!isTag(cell)) throw new Error("Invalid table cell");
-              if (
-                Number(cell.attribs.colspan || 1) > 1 ||
-                Number(cell.attribs.rowspan || 1) > 1 ||
-                DomUtils.getElementsByTagName("table", cell.children).length ||
-                DomUtils.getElementsByTagName("ul", cell.children).length ||
-                DomUtils.getElementsByTagName("ol", cell.children).length
-              )
-                issues.push({ code: "docx_table_simplified", detail: "Merged or nested table cell" });
-              const content = inline(cell.children, [], 0, true);
-              images.push(...content.filter((child) => child.type === "image"));
-              const own = content.filter((child) => child.type !== "image");
-              return {
-                type: cell.name === "th" ? "tableHeader" : "tableCell",
-                attrs: { colspan: 1, rowspan: 1, colwidth: null },
-                content: [
-                  { type: "tableParagraph", attrs: { ...BLOCK_ATTRS }, ...(own.length ? { content: own } : {}) },
-                ],
-              };
-            }),
-        }));
+        const grid: ProseMirrorJson[][] = Array.from({ length: rows.length }, () => []);
+        rows.forEach((row, rowIndex) => {
+          let column = 0;
+          for (const cell of row.children.filter((child) => isTag(child) && ["td", "th"].includes(child.name))) {
+            if (!isTag(cell)) throw new Error("Invalid table cell");
+            if (
+              Number(cell.attribs.colspan || 1) > 1 ||
+              Number(cell.attribs.rowspan || 1) > 1 ||
+              DomUtils.getElementsByTagName("table", cell.children).length ||
+              DomUtils.getElementsByTagName("ul", cell.children).length ||
+              DomUtils.getElementsByTagName("ol", cell.children).length
+            )
+              issues.push({ code: "docx_table_simplified", detail: "Merged or nested table cell" });
+            const content = inline(cell.children, [], 0, true);
+            images.push(...content.filter((child) => child.type === "image"));
+            const own = content.filter((child) => child.type !== "image");
+            while (grid[rowIndex]![column]) column++;
+            const colspan = Math.min(256, Math.max(1, Number.parseInt(cell.attribs.colspan || "1", 10) || 1));
+            const rowspan = Math.min(
+              rows.length - rowIndex,
+              Math.max(1, Number.parseInt(cell.attribs.rowspan || "1", 10) || 1),
+            );
+            while (Array.from({ length: colspan }, (_, i) => grid[rowIndex]![column + i]).some(Boolean)) column++;
+            grid[rowIndex]![column] = {
+              type: cell.name === "th" ? "tableHeader" : "tableCell",
+              attrs: { colspan: 1, rowspan: 1, colwidth: null },
+              content: [{ type: "tableParagraph", attrs: { ...BLOCK_ATTRS }, ...(own.length ? { content: own } : {}) }],
+            };
+            for (let r = 0; r < rowspan; r++)
+              for (let c = 0; c < colspan; c++) if (r || c) grid[rowIndex + r]![column + c] = empty();
+            column += colspan;
+          }
+        });
+        const converted = grid.map((content) => ({ type: "tableRow", content }));
         const width = Math.max(0, ...converted.map((row) => row.content!.length));
-        for (const row of converted)
+        for (const row of converted) {
+          for (let col = 0; col < width; col++) row.content![col] ??= empty();
           while (row.content!.length < width)
             row.content!.push({
               type: "tableCell",
               attrs: { colspan: 1, rowspan: 1, colwidth: null },
               content: [{ type: "tableParagraph", attrs: { ...BLOCK_ATTRS } }],
             });
+        }
         if (width) output.push(container({ type: "table", attrs: { ...BLOCK_ATTRS }, content: converted }));
         if (images.length) {
           issues.push({ code: "docx_table_images_moved", detail: "Images moved below their table" });
           output.push(...images.map((image) => container(image)));
         }
-      } else if (/^h[1-6]$/.test(node.name)) {
+      } else if (node.name === "pre")
+        output.push(...paragraphs(inline(node.children), "codeBlock", { language: "text" }));
+      else if (/^h[1-6]$/.test(node.name)) {
         output.push(
           ...paragraphs(inline(node.children), "heading", { level: Number(node.name[1]), isToggleable: false }),
         );

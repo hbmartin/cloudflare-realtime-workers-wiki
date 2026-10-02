@@ -1,3 +1,4 @@
+import { collapseWhitespace as normalized } from "./text.ts";
 import * as Y from "yjs";
 import {
   DIAGRAM_NODE_TYPES,
@@ -210,10 +211,6 @@ export function diagramEdgeMap(edge: DiagramEdge) {
   return result;
 }
 
-function normalized(value: string) {
-  return value.replace(/\s+/g, " ").trim();
-}
-
 function excerpt(node: DiagramNode, label: string) {
   return normalized([node.label, node.notes, label].filter(Boolean).join(" — ")).slice(0, 240);
 }
@@ -364,7 +361,7 @@ function shapeMarkup(node: DiagramNode, assetHref?: (assetId: string) => string 
 function nodeLabel(node: DiagramNode) {
   if (!node.label) return "";
   const { text: textColor } = PALETTE[node.color];
-  const value = node.label.replace(/\s+/g, " ").trim().slice(0, 100);
+  const value = normalized(node.label).slice(0, 100);
   const midpoint = compact(node.x + node.width / 2);
   const baseline = compact(node.y + node.height / 2 + 5);
   return `<text x="${midpoint}" y="${baseline}" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="600" fill="${textColor}">${escapeXml(value)}</text>`;

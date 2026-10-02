@@ -174,7 +174,7 @@ test("offers safe paste choices and keeps the link when preview fetch fails", as
 test("does not overwrite a changed paragraph from a stale paste choice", async ({ page }) => {
   await signInOwner(page);
   await createDocument(page);
-  const notice = page.locator('output[aria-live="polite"]');
+  const notice = page.locator(".document-paper").getByRole("status", { name: "Paste status" });
   await expect(notice).toHaveCount(1);
   await expect(notice).toHaveText("");
   const originalNotice = await notice.elementHandle();

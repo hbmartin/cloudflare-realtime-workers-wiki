@@ -1813,7 +1813,7 @@ function CollaborativeEditor({
               </button>
             </fieldset>
           )}
-          <output className="muted" aria-live="polite">
+          <output className="muted" aria-live="polite" aria-label="Paste status">
             {pasteNotice}
           </output>
           {dateInsert && (

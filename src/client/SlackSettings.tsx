@@ -51,6 +51,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
   >([]);
   const [error, setError] = useState(initialSlackOAuthError);
   const [notice, setNotice] = useState("");
+  const [pickerVersion, setPickerVersion] = useState(0);
   const [busy, setBusy] = useState(() => new URLSearchParams(window.location.search).has("slackLink"));
   const [currentTime, setCurrentTime] = useState(() => Date.now());
   const [snoozeHours, setSnoozeHours] = useState<Record<string, "" | "1" | "8" | "24">>({});
@@ -201,6 +202,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
         }),
       });
       form.reset();
+      setPickerVersion((value) => value + 1);
       setNotice("Slack channel mapping saved.");
       await load();
     } catch (cause) {
@@ -407,7 +409,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                 </select>
               </label>
               {status?.round2?.channels ? (
-                <SlackChannelPicker />
+                <SlackChannelPicker key={pickerVersion} />
               ) : (
                 <>
                   <label>
@@ -663,7 +665,10 @@ function SlackMappingEditor({
           digestTime: String(data.get("digestTime")),
           ...(data.get("digestTimezone") ? { digestTimezone: String(data.get("digestTimezone")) } : {}),
           digestOpenWork: data.has("digestOpenWork"),
-          eventTypes: CHANNEL_EVENT_TYPES.filter((t) => data.has(`event:${t}`)),
+          eventTypes: [
+            ...CHANNEL_EVENT_TYPES.filter((t) => data.has(`event:${t}`)),
+            ...subscription.eventTypes.filter((t) => !(CHANNEL_EVENT_TYPES as readonly string[]).includes(t)),
+          ],
         }),
       });
       await onSaved();

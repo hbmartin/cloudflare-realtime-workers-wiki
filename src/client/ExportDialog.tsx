@@ -1,3 +1,4 @@
+import { EXPORT_CAPABILITIES } from "../shared/export-format";
 import { useEffect, useState, type FormEvent } from "react";
 import type { ExportFormat, Job, Page } from "../shared/types";
 import { api, apiErrorMessage, json } from "./api";
@@ -44,7 +45,7 @@ export function ExportDialog({
     try {
       const result = await api<{ job: Job }>(`/api/pages/${encodeURIComponent(page.id)}/exports`, {
         method: "POST",
-        body: json({ format, portable: format === "pdf" || format === "png" || format === "docx" ? false : portable }),
+        body: json({ format, portable: EXPORT_CAPABILITIES[format].portable && portable }),
       });
       onQueued(result.job);
     } catch (cause) {
