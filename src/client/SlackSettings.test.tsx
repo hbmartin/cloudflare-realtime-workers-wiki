@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Page, Space } from "../shared/types";
 import { api } from "./api";
 import { SlackSettings } from "./SlackSettings";
+import { CHANNEL_EVENT_TYPES } from "../shared/activity";
 
 vi.mock("./api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./api")>()),
@@ -145,6 +146,52 @@ describe("SlackSettings", () => {
       expect.objectContaining({ method: "POST", body: '{"token":"single-use-token"}' }),
     );
     expect(window.location.search).toBe("?view=settings");
+  });
+
+  it("creates a daily mapping with the operator timezone, lifecycle events, and open work", async () => {
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/slack/status")
+        return {
+          available: true,
+          missing: [],
+          linked: true,
+          installation: {
+            connected: true,
+            teamId: "T123",
+            teamName: "Product Slack",
+            botUserId: "B123",
+            scopes: [],
+            createdAt: 1,
+            updatedAt: 1,
+          },
+          round2: { channels: true, shares: false, richDigests: false, defaultTimezone: "America/Los_Angeles" },
+        };
+      if (path === "/api/slack/channel-directory")
+        return { channels: [{ id: "C123", name: "canonical-notes", private: true }], nextCursor: null };
+      if (path === "/api/slack/channels")
+        return init?.method === "POST" ? { subscription: { id: "mapping" } } : { subscriptions: [] };
+      if (path === "/api/slack/delivery-health") return { orphanedFailures: [] };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    await screen.findByRole("option", { name: "Private #canonical-notes" });
+    fireEvent.change(screen.getByLabelText("Slack channel"), { target: { value: "C123" } });
+    fireEvent.change(screen.getByLabelText("Cadence"), { target: { value: "digest" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save channel mapping" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith("/api/slack/channels", expect.objectContaining({ method: "POST" })),
+    );
+    const saved = vi
+      .mocked(api)
+      .mock.calls.find(([path, init]) => path === "/api/slack/channels" && init?.method === "POST");
+    expect(JSON.parse(String(saved?.[1]?.body))).toMatchObject({
+      channelId: "C123",
+      cadence: "digest",
+      digestTime: "09:00",
+      digestTimezone: "America/Los_Angeles",
+      digestOpenWork: true,
+      eventTypes: [...CHANNEL_EVENT_TYPES],
+    });
   });
 
   it("distinguishes legacy identity migration and bot reauthorization health", async () => {
@@ -338,7 +385,7 @@ describe("Slack thread mirror controls", () => {
   it("shows uncertain delivery health while allowing the owner to disable mirroring", async () => {
     setupMirror("verified", true, 2);
     render(<SlackSettings owner spaces={[space]} pages={[page]} />);
-    expect(await screen.findByText(/2 thread deliveries need reconciliation/)).toBeInTheDocument();
+    expect(await screen.findByText(/2 deliveries need reconciliation/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Disable thread mirror for #product" })).toBeEnabled();
   });
   it("shows mute state and lets an owner unmute without an active root", async () => {

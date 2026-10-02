@@ -1,4 +1,9 @@
 import { DOCX_MIME } from "./docx";
+import { dueRound2Digests } from "./slack-digests";
+import { reconcileRound2Mapping } from "./slack-recovery";
+import { listActivity } from "./activity";
+import { CHANNEL_EVENT_TYPES, type ChannelEventType } from "../shared/activity";
+import { channelDirectory, syncRound2Configuration, revalidateMappings } from "./slack-channels";
 import { acceptSlackProductInteraction, openSlackProduct } from "./slack-product";
 import { authorizeSlackCaptureJobRetry } from "./slack-capture";
 import { taskListStatements, listTasks, mutateTask, taskAssignees } from "./tasks";
@@ -1552,6 +1557,7 @@ app.get("/api/me", async (c) => {
     features: {
       expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true",
       offlineEditing: c.env.OFFLINE_EDITING_ENABLED === "true",
+      workspaceActivity: c.env.WORKSPACE_ACTIVITY_ENABLED === "true",
     },
   };
   return c.json(context);
@@ -2875,6 +2881,7 @@ app.post("/api/slack/commands", async (c) => {
   };
   const rawBody = await beforeAck(c.req.raw.text());
   const verified = await beforeAck(verifySlackRequest(c.env, c.req.raw, rawBody));
+  await beforeAck(syncRound2Configuration(c.env));
   if (verified.duplicate) return c.json({ response_type: "ephemeral", text: "Request already handled." });
   const response = await beforeAck(
     handleSlackCommand(
@@ -2896,6 +2903,7 @@ app.post("/api/slack/commands", async (c) => {
 app.post("/api/slack/events", async (c) => {
   const rawBody = await c.req.raw.text();
   await verifySlackRequest(c.env, c.req.raw, rawBody);
+  await syncRound2Configuration(c.env);
   let payload: SlackEventPayload;
   try {
     payload = JSON.parse(rawBody) as SlackEventPayload;
@@ -2929,6 +2937,7 @@ app.post("/api/slack/interactions", async (c) => {
   };
   const rawBody = await beforeAck(() => c.req.raw.text());
   await beforeAck(() => verifySlackRequest(c.env, c.req.raw, rawBody));
+  await beforeAck(() => syncRound2Configuration(c.env));
   const form = new URLSearchParams(rawBody);
   let payload: SlackInteractionPayload;
   try {
@@ -2963,6 +2972,79 @@ app.post("/api/slack/interactions", async (c) => {
   return c.json({ ok: true });
 });
 
+app.get("/api/activity", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json(
+    await listActivity(c.env, member, {
+      mode: c.req.query("mode"),
+      spaceId: c.req.query("space"),
+      pageId: c.req.query("page"),
+      eventType: c.req.query("event"),
+      mappingId: c.req.query("mapping"),
+      cursor: c.req.query("cursor"),
+      from: c.req.query("from"),
+    }),
+  );
+});
+app.get("/api/slack/channel-directory", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  return c.json(await channelDirectory(c.env, member, c.req.query("cursor")));
+});
+app.post("/api/slack/channels/validate", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const report = await revalidateMappings(c.env, true, member.workspace.id);
+  const owned = new Set((await listSlackChannelSubscriptions(c.env, member)).map((m) => m.id));
+  return c.json({ report: report.filter((r) => owned.has(r.id)), dryRun: true });
+});
+app.patch("/api/slack/channels/:id", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const existing = (await listSlackChannelSubscriptions(c.env, member)).find((m) => m.id === c.req.param("id"));
+  if (!existing) throw new HttpError(404, "mapping_unavailable", "This channel mapping is unavailable.");
+  const body = await jsonBody(c.req.raw);
+  const eventTypes = body.eventTypes ?? existing.eventTypes;
+  if (
+    !Array.isArray(eventTypes) ||
+    !eventTypes.length ||
+    eventTypes.some((t) => !CHANNEL_EVENT_TYPES.includes(t as ChannelEventType)) ||
+    new Set(eventTypes).size !== eventTypes.length
+  )
+    throw new HttpError(422, "invalid_slack_events", "Choose supported channel events.");
+  const cadence = body.cadence ?? existing.cadence;
+  if (cadence !== "digest" && cadence !== "immediate")
+    throw new HttpError(422, "invalid_slack_cadence", "Choose a cadence.");
+  if (body.digestOpenWork !== undefined && typeof body.digestOpenWork !== "boolean")
+    throw new HttpError(422, "invalid_digest_open_work", "Choose whether to include open work.");
+  const spaceId = body.spaceId === undefined ? existing.spaceId : text(body.spaceId, "spaceId", 100);
+  const pageId =
+    body.pageId === undefined ? existing.pageId : body.pageId === null ? null : text(body.pageId, "pageId", 100);
+  const channelId =
+    body.channelId === undefined ? existing.channelId : text(body.channelId, "channelId", 30).toUpperCase();
+  if (!/^[CG][A-Z0-9]{1,29}$/.test(channelId))
+    throw new HttpError(422, "invalid_slack_channel", "Choose a supported Slack channel.");
+  await spaceForMember(c.env, member, spaceId);
+  if (pageId && (await pageForMember(c.env, member, pageId)).space_id !== spaceId)
+    throw new HttpError(422, "slack_page_space_mismatch", "The selected page does not belong to that space.");
+  return c.json({
+    subscription: await upsertSlackChannelSubscription(c.env, member, {
+      ...existing,
+      mappingId: existing.id,
+      spaceId,
+      pageId,
+      channelId,
+      cadence,
+      eventTypes: eventTypes as ChannelEventType[],
+      digestTime: body.digestTime === undefined ? existing.digestTime : text(body.digestTime, "digestTime", 5),
+      digestTimezone:
+        body.digestTimezone === undefined
+          ? (existing.digestTimezone ?? undefined)
+          : text(body.digestTimezone, "digestTimezone", 100),
+      digestOpenWork: body.digestOpenWork === undefined ? existing.digestOpenWork : (body.digestOpenWork as boolean),
+    }),
+  });
+});
 app.get("/api/slack/channels", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
@@ -2985,7 +3067,10 @@ app.post("/api/slack/delivery-health/:id/acknowledge", async (c) => {
 app.post("/api/slack/channels/:id/verify-recovery", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
-  await verifySlackMirrorRecovery(c.env, member, c.req.param("id"));
+  const mapping = (await listSlackChannelSubscriptions(c.env, member)).find((m) => m.id === c.req.param("id"));
+  if (!mapping) throw new HttpError(404, "mapping_unavailable", "This mapping is unavailable.");
+  if (mapping.mirrorEnabled) await verifySlackMirrorRecovery(c.env, member, mapping.id);
+  if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await reconcileRound2Mapping(c.env, mapping.id);
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json({ ok: true });
 });
@@ -3000,16 +3085,29 @@ app.post("/api/slack/channels", async (c) => {
   if (!/^[CDG][A-Z0-9]{1,29}$/.test(channelId)) {
     throw new HttpError(422, "invalid_slack_channel", "Enter a valid Slack channel ID.");
   }
-  const channelName = text(body.channelName, "channelName", 100).replace(/^#/, "");
+  const channelName = text(body.channelName ?? channelId, "channelName", 100).replace(/^#/, "");
   const cadence = text(body.cadence, "cadence", 20);
   if (cadence !== "immediate" && cadence !== "digest") {
     throw new HttpError(422, "invalid_slack_cadence", "Slack cadence must be immediate or digest.");
   }
+  if (body.eventTypes === undefined && c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true")
+    body.eventTypes = [...CHANNEL_EVENT_TYPES];
+  if (body.digestOpenWork !== undefined && typeof body.digestOpenWork !== "boolean")
+    throw new HttpError(422, "invalid_digest_open_work", "Choose whether to include open work.");
   if (!Array.isArray(body.eventTypes) || !body.eventTypes.length) {
     throw new HttpError(422, "invalid_slack_events", "Choose at least one Slack event.");
   }
-  const eventTypes = body.eventTypes.map((value) => text(value, "eventType", 40) as NotificationEventType);
-  if (eventTypes.some((value) => !NOTIFICATION_EVENT_TYPES.includes(value))) {
+  const eventTypes = body.eventTypes.map(
+    (value) => text(value, "eventType", 40) as ChannelEventType | NotificationEventType,
+  );
+  if (
+    eventTypes.some(
+      (value) =>
+        !(c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? CHANNEL_EVENT_TYPES : NOTIFICATION_EVENT_TYPES).includes(
+          value as never,
+        ),
+    )
+  ) {
     throw new HttpError(422, "invalid_slack_events", "A Slack event type is invalid.");
   }
   if (new Set(eventTypes).size !== eventTypes.length) {
@@ -3031,6 +3129,11 @@ app.post("/api/slack/channels", async (c) => {
         channelName,
         eventTypes,
         cadence,
+        ...(body.digestTime === undefined ? {} : { digestTime: text(body.digestTime, "digestTime", 5) }),
+        ...(body.digestTimezone === undefined
+          ? {}
+          : { digestTimezone: text(body.digestTimezone, "digestTimezone", 100) }),
+        ...(typeof body.digestOpenWork === "boolean" ? { digestOpenWork: body.digestOpenWork } : {}),
       }),
     },
     201,
@@ -7013,6 +7116,12 @@ export default {
           durationMs: performance.now() - startedAt,
           ...(contentLength !== null && Number.isFinite(contentLength) ? { bytes: contentLength } : {}),
         });
+        if (
+          response.status < 400 &&
+          ["POST", "PUT", "PATCH", "DELETE"].includes(request.method) &&
+          (env.WORKSPACE_ACTIVITY_ENABLED === "true" || env.SLACK_SHARE_REFRESH_ENABLED === "true")
+        )
+          context.waitUntil(sweepOutbox(env));
         return new Response(response.body, {
           status: response.status,
           statusText: response.statusText,
@@ -7025,6 +7134,7 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env, context: ExecutionContext) {
     const correlationId = crypto.randomUUID();
     return withObservabilityContext(env, { trigger: "scheduled", correlationId }, async () => {
+      await syncRound2Configuration(env);
       const runners: Record<ScheduledTaskName, ScheduledTask["run"]> = {
         archive_disconnects: () => processDueArchiveDisconnects(env),
         deletion_jobs: () => processDueDeletionJobs(env),
@@ -7041,8 +7151,14 @@ export default {
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
         date_reminders: () => processDueDateReminders(env),
-        slack_digests: () => sendDueSlackChannelDigests(env),
-        slack_security_records: () => pruneSlackSecurityRecords(env),
+        slack_digests: () =>
+          env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? dueRound2Digests(env) : sendDueSlackChannelDigests(env),
+        slack_security_records: async () => {
+          await env.DB.prepare("DELETE FROM workspace_activity WHERE created_at<?")
+            .bind(Date.now() - 30 * 86400_000)
+            .run();
+          await pruneSlackSecurityRecords(env);
+        },
         webhook_history: () => pruneWebhookHistory(env),
         security_state: () => pruneSecurityState(env),
         oauth_security_records: () => pruneOAuthSecurityRecords(env),

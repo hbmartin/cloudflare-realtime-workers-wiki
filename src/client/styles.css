@@ -4315,3 +4315,48 @@ a:focus-visible,
     border-bottom: 1px solid var(--line);
   }
 }
+
+.activity-view {
+  max-width: 960px;
+  padding: 24px;
+  margin: 0 auto;
+}
+.activity-view [role="tablist"] {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+.activity-view [aria-selected="true"] {
+  font-weight: 700;
+  border-color: var(--accent);
+}
+.activity-feed {
+  list-style: none;
+  padding: 0;
+}
+.activity-feed > li {
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line);
+}
+.activity-feed > li > button {
+  font-size: 1rem;
+  font-weight: 600;
+}
+.activity-feed p {
+  margin: 8px 0;
+  overflow-wrap: anywhere;
+}
+.activity-feed time {
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
+.slack-channel-list details form {
+  display: grid;
+  gap: 12px;
+  padding: 12px 0;
+}
+.slack-channel-list details fieldset {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}

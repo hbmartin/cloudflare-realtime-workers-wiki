@@ -1,3 +1,8 @@
+import { deliverRound2ChannelEvent } from "./slack-channel-events";
+import { redriveRound2Outbox } from "./slack-recovery";
+import { deliverDigest } from "./slack-digests";
+import { deliverShareRefresh } from "./slack-shares";
+import { deliverThumbnail } from "./slack-files";
 import { deliverSlackProductCopy } from "./slack-product";
 import {
   captureFeedbackStatement,
@@ -1518,9 +1523,9 @@ async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: st
     await env.DB.prepare(`UPDATE outbox SET enqueued_at = ?, attempts = attempts + 1,
       last_error = CASE WHEN slack_scope_paused_at IS NULL THEN NULL ELSE last_error END,
       slack_redrive_due_at = CASE WHEN slack_scope_paused_at IS NOT NULL THEN NULL WHEN topic IN
-        ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl')
-        THEN ? ELSE NULL END WHERE id = ?`)
-      .bind(now, now + SLACK_REDRIVE_STALE_MS, outboxId)
+        ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl','slack_digest','slack_share_refresh','slack_file_upload')
+        THEN ? WHEN topic='slack_channel' AND (SELECT validation_enabled FROM round2_runtime WHERE id=1)=1 THEN ? ELSE NULL END WHERE id = ?`)
+      .bind(now, now + SLACK_REDRIVE_STALE_MS, now + SLACK_REDRIVE_STALE_MS, outboxId)
       .run();
   } catch (error) {
     const failed = await env.DB.prepare(
@@ -1698,6 +1703,7 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
 // Queue retries are bounded. Requeue only receipt-backed work that is still
 // pending; delivery handlers provide the idempotency and uncertain-send fence.
 export async function redriveStaleSlackOutbox(env: Env) {
+  await redriveRound2Outbox(env);
   const now = Date.now();
   await env.DB.prepare(`UPDATE slack_interaction_receipts
     SET response_delivery_state = 'blocked', response_delivery_error = 'send_unconfirmed'
@@ -1710,7 +1716,9 @@ export async function redriveStaleSlackOutbox(env: Env) {
       outbox.slack_scope_paused_ms FROM outbox
     LEFT JOIN slack_thread_deliveries delivery ON outbox.topic='slack_thread_reply'
       AND delivery.id=json_extract(CASE WHEN json_valid(outbox.payload_json) THEN outbox.payload_json ELSE '{}' END,'$.deliveryId')
-    WHERE outbox.slack_redrive_due_at IS NOT NULL AND outbox.slack_redrive_due_at <= ?
+    WHERE outbox.topic NOT IN ('slack_digest','slack_share_refresh','slack_file_upload')
+      AND NOT (outbox.topic='slack_channel' AND (SELECT validation_enabled FROM round2_runtime WHERE id=1)=1)
+      AND outbox.slack_redrive_due_at IS NOT NULL AND outbox.slack_redrive_due_at <= ?
       AND outbox.slack_scope_paused_at IS NULL
       AND (delivery.id IS NULL OR delivery.state<>'pending' OR EXISTS
         (SELECT 1 FROM slack_thread_delivery_runnable runnable WHERE runnable.id=delivery.id))
@@ -2178,11 +2186,33 @@ export async function consumeDeliveryMessage(
     await sweepOutbox(env);
   } else if (row.topic === "slack_share_response") {
     await deliverSlackShareResponse(env, payload);
+  } else if (row.topic === "slack_digest" || row.topic === "slack_share_refresh" || row.topic === "slack_file_upload") {
+    const id =
+      row.topic === "slack_digest"
+        ? payload.digestId
+        : row.topic === "slack_share_refresh"
+          ? payload.refreshId
+          : payload.artifactId;
+    if (typeof id !== "string") return await rejectPayload("Slack round 2 delivery is invalid.");
+    const enabled =
+      row.topic === "slack_digest"
+        ? env.SLACK_CHANNEL_VALIDATION_ENABLED === "true"
+        : row.topic === "slack_share_refresh"
+          ? env.SLACK_SHARE_REFRESH_ENABLED === "true"
+          : env.SLACK_RICH_DIGESTS_ENABLED === "true";
+    if (!enabled) {
+      message.ack();
+      return "acknowledged";
+    } // Preserve recovery markers during a release pause.
+    if (row.topic === "slack_digest") await deliverDigest(env, id);
+    else if (row.topic === "slack_share_refresh") await deliverShareRefresh(env, id);
+    else await deliverThumbnail(env, id);
   } else if (row.topic === "slack_channel") {
     const eventId = payload.eventId;
     if (typeof eventId !== "string") return await rejectPayload("Slack channel outbox payload is invalid.");
     try {
-      await deliverSlackChannelEvent(env, eventId);
+      if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await deliverRound2ChannelEvent(env, eventId);
+      else await deliverSlackChannelEvent(env, eventId);
     } catch (error) {
       if (!(error instanceof SlackApiError && slackInstallationError(error))) throw error;
       await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=? WHERE id=?`)

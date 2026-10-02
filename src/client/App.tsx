@@ -1,3 +1,4 @@
+import { ActivityView } from "./ActivityView";
 import { TasksView } from "./TasksView";
 import { ActionMenu, Icon, RecentPages, readPreference, savePreference } from "./WorkspaceUI";
 import { CommandPalette, type AppCommand, type PaletteMode } from "./CommandPalette";
@@ -1573,11 +1574,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [view, setView] = useState<
-    "pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings"
+    "pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings" | "activity"
   >(() => {
     const requested = startupNavigation.current!.view;
-    return requested && ["search", "home", "tasks", "mentions", "templates", "trash", "settings"].includes(requested)
-      ? (requested as "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings")
+    return requested &&
+      ["search", "home", "tasks", "mentions", "templates", "trash", "settings", "activity"].includes(requested)
+      ? (requested as "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings" | "activity")
       : startupNavigation.current!.pageId
         ? "pages"
         : "home";
@@ -3528,7 +3530,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     refreshTrash();
     setView("trash");
   }
-  function showView(next: "search" | "home" | "tasks" | "mentions" | "templates" | "settings") {
+  function showView(next: "search" | "home" | "tasks" | "mentions" | "templates" | "settings" | "activity") {
     cancelPendingSelection();
     if (next === "templates") void loadOrganization();
     setView(next);
@@ -3918,6 +3920,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               <Icon name="tasks" />
               My Tasks
             </button>
+            {member.features?.workspaceActivity && (
+              <button className={view === "activity" ? "active" : ""} onClick={() => showView("activity")}>
+                Activity
+              </button>
+            )}
             <button className={view === "search" ? "active" : ""} onClick={() => showView("search")}>
               <Icon name="search" /> Search
             </button>
@@ -4114,8 +4121,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             ☰
           </button>
           <div className="breadcrumbs">
-            {view === "home" || view === "tasks" || view === "search" ? (
-              <span>{view === "home" ? "Home" : view === "tasks" ? "My Tasks" : "Search"}</span>
+            {view === "home" || view === "tasks" || view === "search" || view === "activity" ? (
+              <span>
+                {view === "home" ? "Home" : view === "tasks" ? "My Tasks" : view === "activity" ? "Activity" : "Search"}
+              </span>
             ) : (
               breadcrumbs.map((page, index) => (
                 <span key={page.id}>
@@ -4257,6 +4266,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           />
         ) : view === "home" ? (
           <RecentPages pages={pages} recentIds={recentIds} onSelect={navigateToPage} />
+        ) : view === "activity" ? (
+          member.features?.workspaceActivity ? (
+            <ActivityView spaces={spaces} pages={activePages} onSelect={navigateToPage} />
+          ) : (
+            <p>Workspace activity is not enabled.</p>
+          )
         ) : view === "search" ? (
           <SearchView spaces={spaces} tags={tags} onSelect={navigateToPage} />
         ) : view === "mentions" ? (

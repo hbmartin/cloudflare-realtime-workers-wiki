@@ -36,6 +36,11 @@ export interface AppBindings {
   EXPANDED_EMBEDS_ENABLED?: "true" | "false";
   NOTION_MARKDOWN_WRITES_ENABLED?: "true" | "false";
   OFFLINE_EDITING_ENABLED?: "true" | "false";
+  WORKSPACE_ACTIVITY_ENABLED?: "true" | "false";
+  SLACK_CHANNEL_VALIDATION_ENABLED?: "true" | "false";
+  SLACK_SHARE_REFRESH_ENABLED?: "true" | "false";
+  SLACK_RICH_DIGESTS_ENABLED?: "true" | "false";
+  SLACK_DIGEST_DEFAULT_TIMEZONE?: string;
   OBSERVABILITY_PROBE_TOKEN?: string;
 }
 
@@ -45,7 +50,15 @@ declare global {
   namespace Cloudflare {
     interface Env extends Omit<
       AppBindings,
-      "BROWSER" | "EXPANDED_EMBEDS_ENABLED" | "NOTION_MARKDOWN_WRITES_ENABLED" | "OFFLINE_EDITING_ENABLED"
+      | "BROWSER"
+      | "EXPANDED_EMBEDS_ENABLED"
+      | "NOTION_MARKDOWN_WRITES_ENABLED"
+      | "OFFLINE_EDITING_ENABLED"
+      | "WORKSPACE_ACTIVITY_ENABLED"
+      | "SLACK_CHANNEL_VALIDATION_ENABLED"
+      | "SLACK_SHARE_REFRESH_ENABLED"
+      | "SLACK_RICH_DIGESTS_ENABLED"
+      | "SLACK_DIGEST_DEFAULT_TIMEZONE"
     > {}
   }
 }

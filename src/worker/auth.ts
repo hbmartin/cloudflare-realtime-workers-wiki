@@ -1,3 +1,4 @@
+import { syncRound2Configuration } from "./slack-channels";
 import { betterAuth } from "better-auth";
 import type { GenericEndpointContext } from "@better-auth/core";
 import { passkey } from "@better-auth/passkey";
@@ -362,6 +363,7 @@ async function getMember(request: Request, env: Env): Promise<MemberContext | nu
 export async function requireMember(request: Request, env: Env) {
   const member = await getMember(request, env);
   if (!member) throw new HttpError(401, "unauthorized", "Sign in to continue.");
+  await syncRound2Configuration(env);
   return member;
 }
 

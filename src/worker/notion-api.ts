@@ -1,3 +1,4 @@
+import { syncRound2Configuration } from "./slack-channels";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { Hono, type Context } from "hono";
 import {
@@ -195,6 +196,7 @@ registerMetricMiddleware(notionApi, "*", async (c, next) => {
   const principal = await authenticateIntegration(c.req.raw, c.env);
   c.set("principal", principal);
   await enforceApiRateLimits(c.env.API_BURST_LIMIT, c.env.API_MINUTE_LIMIT, principal.integrationId);
+  await syncRound2Configuration(c.env);
   await next();
 });
 
