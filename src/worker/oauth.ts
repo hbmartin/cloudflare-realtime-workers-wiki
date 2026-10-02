@@ -289,20 +289,20 @@ async function boundedRequestText(request: Request, max: number) {
 
 async function metadataClient(env: Env, clientId: string) {
   let current = publicClientUrl(clientId);
-  const existing = await env.DB.prepare("SELECT 1 FROM oauth_clients WHERE client_id=?").bind(clientId).first();
-  if (!existing) {
+  const inspection = await env.DB.prepare(
+    "SELECT EXISTS(SELECT 1 FROM oauth_clients WHERE client_id=?) existing,(SELECT COUNT(*) FROM oauth_clients) count",
+  )
+    .bind(clientId)
+    .first<{ existing: number; count: number }>();
+  if (!inspection!.existing) {
     const rate = await clientRegistrationRate(env);
     if (!rate.allowed)
       throw new HttpError(429, "slow_down", "Client metadata requests are temporarily rate limited.", {
         retryAfter: rate.retryAfter,
       });
   }
-  const capacity = await env.DB.prepare(
-    "SELECT 1 available WHERE EXISTS (SELECT 1 FROM oauth_clients WHERE client_id=?) OR (SELECT COUNT(*) FROM oauth_clients)<?",
-  )
-    .bind(clientId, MAX_CLIENTS)
-    .first();
-  if (!capacity) throw new HttpError(503, "temporarily_unavailable", "OAuth client registration is at capacity.");
+  if (!inspection!.existing && inspection!.count >= MAX_CLIENTS)
+    throw new HttpError(503, "temporarily_unavailable", "OAuth client registration is at capacity.");
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10_000);
   try {

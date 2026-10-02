@@ -66,7 +66,6 @@ These capabilities have no switch of their own. Each one turns on when its prere
 
 These flags are proposed by Round 2 plans and do not exist yet:
 
-- `SLACK_RICH_DIGESTS_ENABLED`, from [Phase 9](roadmap/09-slack-digests-shares.md).
 - `SLACK_OPS_ALERTS_ENABLED`, from [Phase 10](roadmap/10-operations-incidents.md).
 - `slack_operations_destinations.enabled`. The column exists from migration `0035` but nothing reads it yet.
 
@@ -77,7 +76,11 @@ Add every new flag to this file in the PR that introduces it.
 Before setting strict validation to true, an owner calls `POST /api/slack/channels/validate` for a read-only report of
 all mappings in their workspace. Resolve shared/unsupported/unjoined channels and missing scopes. Set the deployment
 variable `SLACK_DIGEST_DEFAULT_TIMEZONE` to a valid IANA timezone before migration/activation. The initial migration
-persists 09:00 in that zone; subsequent operator-default changes affect new mappings only.
+persists 09:00 in that zone; subsequent operator-default changes affect new mappings only. Apply forward migration
+`0067_review_delivery.sql`, then call owner-only `POST /api/slack/configuration/sync` to initialize eligible mappings.
+Scheduled maintenance also synchronizes configuration. Authentication and Slack acknowledgment requests do not.
+A missing or invalid default produces a clear activation error; existing saved schedules remain intact and
+uninitialized mappings continue legacy digest delivery.
 
 Enable and validate increments in order: strict channel settings, Activity/feed, share refresh, rich digests/images.
 Workspace activity and strict validation must both be enabled before rich digests. Each increment requires the

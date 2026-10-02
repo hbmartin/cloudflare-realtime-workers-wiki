@@ -92,7 +92,7 @@ function authorizationParams(clientId: string, redirectUri = "http://127.0.0.1:3
 
 async function exhaustRate(key: string, count: number) {
   await env.DB.prepare("INSERT INTO rateLimit(id,key,count,lastRequest) VALUES (?,?,?,?)")
-    .bind(crypto.randomUUID(), key, count, Math.floor(Date.now() / 60_000) * 60_000)
+    .bind(crypto.randomUUID(), key, count, (Math.floor(Date.now() / 60_000) + 1) * 60_000)
     .run();
 }
 

@@ -9,8 +9,8 @@ Phase 10. This document incorporates the approved product interview decisions.
 
 Owners choose canonical Slack channel names through a searchable, paginated directory. Search follows every directory
 page. Only joined, unarchived public/private channels qualify; shared channels, DMs and group DMs are rejected,
-including existing mappings. Validation runs on create/update, immediately before delivery, and every 15 minutes.
-Settings explains validation failures. Successful revalidation resumes delivery without changing mute, snooze or
+when choosing new destinations. Settings-only edits retain unchanged legacy DM destinations and event selections. Validation runs on new destinations, immediately before delivery, and for stale mappings every 15 minutes.
+Settings explains validation failures. Successful revalidation clears matching validation blocks; posting-permission blocks require explicit recovery. Neither changes mute, snooze or
 mirror opt-in. The directory uses the existing `channels:read` and `groups:read` scopes.
 
 Every digest mapping stores a daily time, IANA timezone and open-work toggle. The operator must supply a valid
@@ -21,7 +21,7 @@ the time. Local-time resolution chooses the earlier repeated occurrence or first
 
 A digest covers the interval between the previous and latest scheduled boundaries. Older missed windows are dropped;
 there is no catch-up delivery. Mute/snooze prevents channel delivery and discards activity during the pause. Canonical
-workspace activity remains available.
+workspace activity remains available. Uninitialized mappings retain legacy 09:00 UTC digest scheduling until configuration sync succeeds; initialized mappings keep their saved timezone when the deployment default becomes invalid. Uncertain older posts retain their original delivery IDs for reconciliation.
 
 Channel selections are separate from personal notification preferences. The existing five selections—mentions,
 replies, resolved threads, reopened threads and edits—gain page creation, moves, archives and task status changes.
@@ -44,12 +44,12 @@ no permission: every request rechecks workspace membership and current space/pag
 
 Read current D1 projections at delivery and group qualifying events by page. Display a page link, distinct actor names
 without pings, change types, current task status, unresolved-thread count and a current plain-text excerpt. Bounds are
-240 excerpt characters, five actors plus an additional-actor count, and ten pages in one message. Escaping and output
+240 excerpt characters, five actors plus an additional-actor count, and at most ten pages per message. Additional messages cover all qualifying changes in the daily window. Durable child receipts freeze each partition and its exact event membership; one queue attempt sends one partition. Late eligible events append partitions without changing completed messages. Escaping and output
 bounds keep sections and the aggregate message within Slack limits. Changed pages sort by newest qualifying event,
 then page ID; unchanged open work sorts by unresolved-thread count, then page ID.
 
 Open-work reminders default on and include unchanged pages with unresolved comments or tasks in To do/In progress,
-marked “No new activity.” Nothing qualifying means no message. Archived/moved-out pages get departure notices;
+marked “No new activity.” SQL bounds each open-work selection and excludes pages already represented anywhere in that window. Nothing qualifying means no message. Archived/moved-out pages get departure notices;
 authorization controls whether their current title can appear. Departure notices omit excerpts and thumbnails.
 Every digest ends with the Activity continuation link.
 
@@ -57,7 +57,7 @@ Eligible diagram projection changes prepare thumbnails asynchronously. Read priv
 through `BROWSER`, privately upload with typed `files.getUploadURLExternal`/`files.completeUploadExternal`, and render
 ready images through `slack_file.id`. Cache identity includes installation generation, page, content epoch and
 projection content hash, allowing multiple revisions in an epoch. A missing/failed upload sends text immediately.
-Never edit a posted digest later to add an image or expose an R2 URL.
+Upload phases retain allocated file IDs through retries, use bounded attempts, and best-effort delete abandoned private files after uncertain completion. No additional Slack scopes are requested. Never edit a posted digest later to add an image or expose an R2 URL.
 
 ## Share lifecycle and recovery
 
@@ -72,7 +72,7 @@ Serialize refresh effects per message and reread current state before rendering.
 owner-only share action. Revoked previews retain authorized title/excerpt, explicitly state revocation, remove active
 public URLs and offer owner-only Create share. Unavailable previews are generic and have no actions; cleanup is
 allowed after mapping removal or owner demotion while the bot can still access the channel. Direct old public URLs
-remain pinned to the revoked share after a replacement is created; page links may show the replacement.
+remain pinned to the revoked share after a replacement is created; page links may show the replacement. Owners can create a replacement privately from a revoked pinned public URL; the original reference and public URL remain revoked. Ordinary authorized unfurls do not require bot membership solely to show a preview. Re-observation invalidates rendering evidence; tracked-preview suppression applies only while refresh is enabled.
 
 Repeated [`chat.unfurl`](https://docs.slack.dev/reference/methods/chat.unfurl/) updates attachments; never use
 `chat.update` on user-authored messages. A permanent unfurl rejection for an existing accessible message posts one
@@ -90,7 +90,9 @@ destinations.
 Migration `0066_slack_round2.sql` adds canonical activity, saved schedules, digest receipts, share refresh snapshots,
 reference lifecycle metadata, thumbnail revision keys and transactional triggers. Source comments/edits retain stable
 operation identifiers and existing epoch/transaction guards. Lifecycle triggers cover successful browser, Slack,
-API/MCP, task, import and template-copy publication; staged and failed publication emit nothing.
+API/MCP, task, import and template-copy publication; staged and failed publication emit nothing. Forward migration `0067_review_delivery.sql` preserves existing artifacts and historical completed receipts, adds per-message digest receipts, and carries transaction-scoped operation context through lifecycle triggers.
+
+Import publication records per-page Activity without channel events. Ordinary API/MCP creation and template clones retain their notification behavior. Multi-page moves and archives produce one summary per affected installation generation/channel/operation, deduplicating overlapping mappings. Summaries contain the action, qualifying page count and Activity link without page titles. Canonical Activity remains per page, including initial task status and events without a known actor.
 
 Review and validate these increments against the deployed Worker separately:
 
@@ -114,7 +116,7 @@ each.
 Release controls are `WORKSPACE_ACTIVITY_ENABLED`, `SLACK_CHANNEL_VALIDATION_ENABLED`,
 `SLACK_SHARE_REFRESH_ENABLED` and `SLACK_RICH_DIGESTS_ENABLED`, initially off in production. Before activating strict
 validation, an owner runs `POST /api/slack/channels/validate` for a read-only backfill report and resolves rejected
-channels/scopes. Configure the timezone before schedule migration. Enable workspace activity and strict validation
+channels/scopes. Configure the timezone before schedule migration, then call owner-only `POST /api/slack/configuration/sync` and check its result. Scheduled maintenance also synchronizes configuration. Sign-in and Slack acknowledgments do not perform configuration writes. Enable workspace activity and strict validation
 before rich digests. Share refresh can be enabled separately. Turning rich digests off removes image rendering while
 retaining grouped text, scheduling, validation and receipts. Release-paused queued work preserves recovery markers.
 See [Flags](../FLAGS.md) and [Configuration](../CONFIGURATION.md).
@@ -122,7 +124,8 @@ See [Flags](../FLAGS.md) and [Configuration](../CONFIGURATION.md).
 ## Exit matrix
 
 Local automated coverage is in `slack-round2.integration.test.ts`, the Activity/picker client tests and
-`tests/e2e/slack-round2.spec.ts`. These do not replace the live Slack/Worker matrix.
+`tests/e2e/slack-round2.spec.ts`. See the [review-fix evidence](09-review-fixes-evidence.md) for the five increments,
+local gate results, bundle verification and DOCX memory measurements. These do not replace the live Slack/Worker matrix.
 
 | Scenario                                                                                    | Required result                                                                                             |
 | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
