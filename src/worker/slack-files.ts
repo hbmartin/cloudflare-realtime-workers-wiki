@@ -75,6 +75,11 @@ export async function deliverThumbnail(env: Env, id: string) {
         .run();
       return;
     }
+    if (!env.BROWSER) throw new Error("thumbnail_unavailable");
+    if (!slackHasScopes(installation.scopes, ["files:write"]))
+      throw new SlackApiError("files.getUploadURLExternal", "missing_scope", 200, installation.credential_revision, [
+        "files:write",
+      ]);
     // Each attempt renders new bytes, so its allocation must declare their size.
     // An uncertain completion also gets a replacement rather than completing twice.
     if (row.slack_file_id || row.upload_url) {
@@ -89,9 +94,6 @@ export async function deliverThumbnail(env: Env, id: string) {
       row.upload_url = null;
       if (abandoned) await slackApi(env, installation, "files.delete", { file: abandoned }).catch(() => undefined);
     }
-    if (!slackHasScopes(installation.scopes, ["files:write"]))
-      throw new SlackApiError("files.getUploadURLExternal", "missing_scope", 200, installation.credential_revision);
-    if (!env.BROWSER) throw new Error("thumbnail_unavailable");
     const source = await env.BUCKET.get(row.thumbnail_r2_key);
     if (!source || source.size > 2 * 1024 * 1024) throw new Error("thumbnail_unavailable");
     const svg = new Uint8Array(await source.arrayBuffer());

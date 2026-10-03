@@ -199,6 +199,18 @@ read-only queries and never repairs data. Export D1 and investigate reported rec
 Already-upgraded databases and fresh databases without legacy receipt tables skip the collision query.
 Existing migrations, including 0067, remain unchanged. Direct Wrangler migration application bypasses this guard.
 
+Apply the additive `0068_slack_recovery.sql` before deploying this recovery update. It adds guarded virtual
+receipt identities, indexes for receipt/retry and deadline lookups, separate claim rechecks, paused-operation
+scope requirements, and channel-validation scope-failure bookkeeping. Existing history and payloads remain
+intact. Production migration, deployment and feature activation are separate release actions.
+
+The wrapper allows 60 seconds for migration listing and defaults to 300,000 ms **per preflight query**.
+For a slower legacy database, pass `--preflight-timeout-ms` with a positive integer, for example
+`pnpm db:remote --preflight-timeout-ms 600000` (or the same option with `pnpm db:local`). The wrapper reports
+the failing stage and identifies `ETIMEDOUT` distinctly. Migration application inherits interactive output and
+has no wrapper deadline, including time spent at Wrangler's confirmation prompt. Existing CI/job deadlines
+still apply. The collision guard and quiescing requirements above remain in force.
+
 For OAuth and MCP releases, apply `0062_oauth_mcp.sql`, `0063_oauth_staged_receipt_index.sql`,
 `0064_oauth_cleanup_indexes.sql`, and `0065_mcp_workspace_generation.sql` in order before
 deploying this Worker. Migration `0065` adds a workspace consent generation and a pending-code

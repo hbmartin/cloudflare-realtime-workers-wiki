@@ -14,10 +14,15 @@ function tableLimit() {
     "Word tables exceed the supported row, column, or expanded-cell limits.",
   );
 }
-function tableSpan(value: string | undefined, maximum: number) {
-  const parsed = Number(value ?? 1);
-  if (!Number.isFinite(parsed) || parsed > maximum) throw tableLimit();
-  return Math.max(1, Math.trunc(parsed));
+function tableSpan(value: string | undefined, maximum: number, clamp = false) {
+  const source = value?.trim() ?? "";
+  if (/^[+-]?Infinity$/i.test(source)) throw tableLimit();
+  const numeric = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(source);
+  const parsed = numeric ? Number(source) : 1;
+  if (!Number.isFinite(parsed)) throw tableLimit();
+  const span = Math.max(1, Math.trunc(parsed));
+  if (!clamp && span > maximum) throw tableLimit();
+  return Math.min(maximum, span);
 }
 
 type HtmlNode = ReturnType<typeof parseDocument>["children"][number];
@@ -52,6 +57,7 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
   const issues: ImportIssue[] = [];
   let sequence = 0;
   let expandedTableCells = 0;
+  let sourceTableRows = 0;
   const container = (block: ProseMirrorJson, children: ProseMirrorJson[] = []): ProseMirrorJson => ({
     type: "blockContainer",
     attrs: { id: `docx-${++sequence}` },
@@ -78,7 +84,8 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
       }
       return parent === table;
     });
-    if (rows.length > TABLE_MAX_ROWS) throw tableLimit();
+    sourceTableRows += rows.length;
+    if (sourceTableRows > TABLE_MAX_ROWS) throw tableLimit();
     const occupied = new Set<number>();
     const cells = [];
     let width = 0;
@@ -87,7 +94,12 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
       for (const cell of row.children.filter((child) => isTag(child) && ["td", "th"].includes(child.name))) {
         if (!isTag(cell)) throw new Error("Invalid table cell");
         const colspan = tableSpan(cell.attribs.colspan, TABLE_MAX_COLUMNS);
-        const rowspan = tableSpan(cell.attribs.rowspan, rows.length - rowIndex);
+        const rowspan = tableSpan(cell.attribs.rowspan, rows.length - rowIndex, true);
+        if (
+          (cell.attribs.colspan !== undefined && Number(cell.attribs.colspan) !== colspan) ||
+          (cell.attribs.rowspan !== undefined && Number(cell.attribs.rowspan) !== rowspan)
+        )
+          issues.push({ code: "docx_table_simplified", detail: "Invalid or truncated table span" });
         while (
           Array.from({ length: colspan }, (_, i) => occupied.has(rowIndex * TABLE_MAX_COLUMNS + column + i)).some(
             Boolean,

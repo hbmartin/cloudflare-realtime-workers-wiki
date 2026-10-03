@@ -9,13 +9,7 @@ import {
 
 export type DeliveryOutcome = "completed" | "paused" | "competing" | "retryable" | "uncertain";
 
-export function thumbnailDeliveryEnabled(env: Env) {
-  return (
-    env.SLACK_RICH_DIGESTS_ENABLED === "true" &&
-    env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" &&
-    env.WORKSPACE_ACTIVITY_ENABLED === "true"
-  );
-}
+export { thumbnailDeliveryEnabled } from "./slack-delivery-contracts";
 
 // Only definite API rejections prove that no message was created. Transport and
 // malformed-response failures must retain the sending checkpoint for reconciliation.
@@ -80,15 +74,15 @@ export async function recordPermanentDeliveryFailure(
 
 export async function wakeRound2Mapping(env: Env, mappingId: string) {
   const now = Date.now();
-  await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
+  await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL
     WHERE slack_scope_paused_at IS NULL AND EXISTS(SELECT 1 FROM slack_channel_subscriptions m
       JOIN slack_installations i ON i.id=m.installation_id WHERE m.id=? AND m.notification_blocked_at IS NULL
       AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=? AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND (
-      (topic='slack_channel' AND EXISTS(SELECT 1 FROM slack_channel_events r WHERE r.id=json_extract(payload_json,'$.eventId') AND r.subscription_id=m.id AND r.round2_state='pending' AND r.suppressed_at IS NULL AND r.delivered_at IS NULL AND coalesce(r.claimed_at,0)<?)) OR
-      (topic='slack_digest' AND EXISTS(SELECT 1 FROM slack_digest_receipts r WHERE r.id=json_extract(payload_json,'$.digestId') AND r.subscription_id=m.id AND r.state='pending' AND coalesce(r.claimed_at,0)<? AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state IN ('sending','blocked')))) OR
-      (topic='slack_bulk' AND EXISTS(SELECT 1 FROM slack_bulk_receipts r WHERE r.id=json_extract(payload_json,'$.summaryId') AND r.installation_id=i.id AND r.channel_id=m.channel_id AND r.state='pending' AND coalesce(r.claimed_at,0)<?)) OR
-      (topic='slack_share_refresh' AND EXISTS(SELECT 1 FROM slack_share_refreshes r WHERE r.id=json_extract(payload_json,'$.refreshId') AND r.installation_id=i.id AND r.channel_id=m.channel_id AND r.state='pending' AND coalesce(r.claimed_at,0)<?)) OR
-      (topic='slack_file_upload' AND EXISTS(SELECT 1 FROM slack_file_artifacts r JOIN pages p ON p.id=r.page_id WHERE r.id=json_extract(payload_json,'$.artifactId') AND r.installation_id=i.id AND p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) AND r.state='pending' AND coalesce(r.claimed_at,0)<?))))`)
+      (topic='slack_channel' AND EXISTS(SELECT 1 FROM slack_channel_events r WHERE r.id=slack_round2_receipt_id AND r.subscription_id=m.id AND r.round2_state='pending' AND r.suppressed_at IS NULL AND r.delivered_at IS NULL AND coalesce(r.claimed_at,0)<?)) OR
+      (topic='slack_digest' AND EXISTS(SELECT 1 FROM slack_digest_receipts r WHERE r.id=slack_round2_receipt_id AND r.subscription_id=m.id AND r.state='pending' AND coalesce(r.claimed_at,0)<? AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state IN ('sending','blocked')))) OR
+      (topic='slack_bulk' AND EXISTS(SELECT 1 FROM slack_bulk_receipts r WHERE r.id=slack_round2_receipt_id AND r.installation_id=i.id AND r.channel_id=m.channel_id AND r.state='pending' AND coalesce(r.claimed_at,0)<?)) OR
+      (topic='slack_share_refresh' AND EXISTS(SELECT 1 FROM slack_share_refreshes r WHERE r.id=slack_round2_receipt_id AND r.installation_id=i.id AND r.channel_id=m.channel_id AND r.state='pending' AND coalesce(r.claimed_at,0)<?)) OR
+      (topic='slack_file_upload' AND EXISTS(SELECT 1 FROM slack_file_artifacts r JOIN pages p ON p.id=r.page_id WHERE r.id=slack_round2_receipt_id AND r.installation_id=i.id AND p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) AND r.state='pending' AND coalesce(r.claimed_at,0)<?))))`)
     .bind(now, mappingId, now, now - 60_000, now - 60_000, now - 60_000, now - 60_000, now - 60_000)
     .run();
 }

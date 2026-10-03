@@ -78,6 +78,11 @@ function digestEventFilter(
   message?: { event_ids_json: string },
 ) {
   return {
+    selection: `MIN(CASE WHEN ${channelActivityActorAccessSql.replaceAll("event.", "e.")} THEN 1 ELSE 0 END) actor_access,
+      EXISTS(SELECT 1 FROM slack_channel_subscriptions current_mapping WHERE current_mapping.installation_id=?
+        AND current_mapping.channel_id=? AND current_mapping.space_id=page.space_id
+        AND (current_mapping.page_id IS NULL OR current_mapping.page_id=page.id) AND current_mapping.validation_state='valid') mapped`,
+    eligibility: "actor_access=1 OR page.archived_at IS NOT NULL OR mapped=0",
     sql: `e.subscription_id=? AND e.cadence='digest' AND e.summary_id IS NULL AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
       AND e.created_at>=? AND e.created_at<?
       AND (? IS NULL OR e.id IN (SELECT value FROM json_each(?)))
@@ -87,6 +92,8 @@ function digestEventFilter(
       AND page.import_job_id IS NULL AND page.is_template=0
       AND (page.space_id=? OR e.previous_space_id=?) AND (? IS NULL OR page.id=?)`,
     binds: [
+      mapping.installation_id,
+      mapping.channel_id,
       mapping.id,
       receipt.window_start,
       receipt.window_end,
@@ -131,6 +138,7 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
     if (window.end <= Math.max(mapping.digest_not_before, mapping.snoozed_until ?? 0)) continue;
     const id = `digest:${mapping.installation_id}:${row.generation}:${mapping.id}:${window.end}`;
     const filter = digestEventFilter(mapping, { window_start: window.start, window_end: window.end });
+    const reopenToken = crypto.randomUUID();
     await env.DB.batch([
       env.DB.prepare(`INSERT OR IGNORE INTO slack_digest_receipts(id,installation_id,installation_generation,subscription_id,window_start,window_end,channel_id,created_at)
         VALUES(?,?,?,?,?,?,?,?)`).bind(
@@ -143,19 +151,24 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
         mapping.channel_id,
         timestamp,
       ),
-      env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=?,slack_redrive_count=0
-        WHERE id='outbox:'||? AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND state IN ('sent','skipped'))
-        AND EXISTS(SELECT 1 FROM slack_channel_events e JOIN pages page ON page.id=e.page_id WHERE ${filter.sql})`).bind(
+      env.DB.prepare(`UPDATE slack_digest_receipts SET state='pending',claim_token=?,claimed_at=?
+        WHERE id=? AND state IN ('sent','skipped') AND (claimed_at IS NULL OR claimed_at<?)
+        AND EXISTS(SELECT ${filter.selection} FROM slack_channel_events e JOIN pages page ON page.id=e.page_id
+          WHERE ${filter.sql} GROUP BY page.id HAVING ${filter.eligibility}) RETURNING id`).bind(
+        reopenToken,
+        timestamp,
+        id,
+        timestamp - 60_000,
+        ...filter.binds,
+      ),
+      env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=?,slack_claim_recheck_at=NULL,slack_redrive_count=0
+        WHERE topic='slack_digest' AND slack_round2_receipt_id=?
+        AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
         timestamp,
         timestamp + 60_000,
         id,
         id,
-        ...filter.binds,
-      ),
-      env.DB.prepare(`UPDATE slack_digest_receipts SET state='pending' WHERE id=? AND state IN ('sent','skipped')
-        AND EXISTS(SELECT 1 FROM slack_channel_events e JOIN pages page ON page.id=e.page_id WHERE ${filter.sql})`).bind(
-        id,
-        ...filter.binds,
+        reopenToken,
       ),
       env.DB.prepare(`INSERT OR IGNORE INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,slack_redrive_due_at)
         SELECT 'outbox:'||r.id,i.workspace_id,'slack_digest',json_object('digestId',r.id),?,?,? FROM slack_digest_receipts r
@@ -165,6 +178,9 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
         timestamp + 60_000,
         id,
       ),
+      env.DB.prepare(
+        "UPDATE slack_digest_receipts SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?",
+      ).bind(id, reopenToken),
     ]);
   }
 }
@@ -183,14 +199,11 @@ export async function digestPages(
     await env.DB.prepare(`SELECT page.id,page.title,page.plain_text,page.kind,page.content_epoch,page.archived_at,
     MAX(e.created_at) changed_at,${threads} unresolved_threads,${status} task_status,
     json_group_array(json_object('eventId',e.id,'id',e.actor_id,'name',actor.name,'type',e.event_type)) events,
-    EXISTS(SELECT 1 FROM slack_channel_subscriptions current_mapping WHERE current_mapping.installation_id=?
-      AND current_mapping.channel_id=? AND current_mapping.space_id=page.space_id
-      AND (current_mapping.page_id IS NULL OR current_mapping.page_id=page.id) AND current_mapping.validation_state='valid') mapped,
-    MIN(CASE WHEN ${channelActivityActorAccessSql.replaceAll("event.", "e.")} THEN 1 ELSE 0 END) actor_access
+    ${filter.selection}
     FROM slack_channel_events e JOIN pages page ON page.id=e.page_id LEFT JOIN user actor ON actor.id=e.actor_id
     WHERE ${filter.sql}
-    GROUP BY page.id ORDER BY changed_at DESC,page.id LIMIT 10`)
-      .bind(installation.id, mapping.channel_id, ...filter.binds)
+    GROUP BY page.id HAVING ${filter.eligibility} ORDER BY changed_at DESC,page.id LIMIT 10`)
+      .bind(...filter.binds)
       .all<{
         id: string;
         title: string;
@@ -208,7 +221,6 @@ export async function digestPages(
   const result: DigestPage[] = [];
   for (const row of rows.results) {
     const departure = row.archived_at !== null || !row.mapped;
-    if (!row.actor_access && !departure) continue;
     const available = Boolean(row.mapped && row.actor_access);
     const events = JSON.parse(row.events) as Array<{
       eventId: string;
@@ -514,7 +526,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
           id,
           token,
         ),
-        env.DB.prepare(`UPDATE outbox SET slack_redrive_count=0 WHERE topic='slack_digest' AND json_extract(payload_json,'$.digestId')=?
+        env.DB.prepare(`UPDATE outbox SET slack_redrive_count=0 WHERE topic='slack_digest' AND slack_round2_receipt_id=?
           AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(id, id, token),
       ]);
       await updateRoot("pending", ts);
@@ -541,7 +553,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
           id,
           token,
         ),
-        env.DB.prepare(`UPDATE outbox SET slack_redrive_count=0 WHERE topic='slack_digest' AND json_extract(payload_json,'$.digestId')=?
+        env.DB.prepare(`UPDATE outbox SET slack_redrive_count=0 WHERE topic='slack_digest' AND slack_round2_receipt_id=?
           AND ?='sent' AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
           id,
           state,
@@ -630,7 +642,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
             await recordPermanentDeliveryFailure(
               env,
               installation,
-              message.id,
+              message.sequence === 0 ? id : message.id,
               mapping.id,
               mapping.channel_id,
               error.code,

@@ -202,9 +202,11 @@ remain at the cap, the owner queues a continuation; contended continuation deliv
 remains the recovery path if that queue send fails.
 
 Word (.docx) imports create one document page after preview and confirmation. Tables allow at most
-256 logical columns and 10,000 source rows each, with 10,000 expanded cells cumulatively across the
-document, including merged spans and padding. Oversized tables fail with `docx_tables_too_large`;
-they are not truncated. Consecutive Code-style paragraphs become one plain code block separated by newlines.
+256 logical columns, 10,000 cumulative source rows, and 10,000 cumulative expanded cells across the
+document, including empty/nested tables, merged spans and padding. Malformed span text and nonpositive
+spans become 1; finite fractions truncate and rowspans clamp to the remaining source rows. Simplifications
+appear in import issues. Excessive column/cell expansion, numeric overflow and infinity fail with
+`docx_tables_too_large`. Consecutive Code-style paragraphs become one plain code block separated by newlines.
 Word exports are
 available for document pages and produce a single file without requiring Browser Rendering. They
 preserve rich text, nested lists, basic tables, and embedded PNG/JPEG/GIF images. Uploads are limited
@@ -316,7 +318,27 @@ ephemeral to the acting user while they are active in Slack; an uncertain send i
 recheck current identity, membership, mapping, and page permissions when delayed work runs; old buttons and
 saved modal state do not grant access. Owners may create a replacement share privately from a revoked pinned reference; its old public URL stays revoked.
 
-For Round 2 activation, apply forward migration `0067_review_delivery.sql`, configure `SLACK_DIGEST_DEFAULT_TIMEZONE`, run the channel-validation dry run, and call owner-only `POST /api/slack/configuration/sync`. The cron also synchronizes release configuration; authentication and Slack acknowledgment paths do not. The sync endpoint reports missing/invalid activation defaults. Channel revalidation preserves delivery permission blocks until explicit recovery establishes permission. Production release flags remain off until deployment and the live exit matrix are separately verified.
+For Round 2 activation, apply forward migrations through `0068_slack_recovery.sql`, configure `SLACK_DIGEST_DEFAULT_TIMEZONE`, run the channel-validation dry run, and call owner-only `POST /api/slack/configuration/sync`. The cron also synchronizes release configuration; authentication and Slack acknowledgment paths do not. The sync endpoint reports missing/invalid activation defaults. Channel revalidation preserves delivery permission blocks until explicit recovery establishes permission. Production release flags remain off until deployment and the live exit matrix are separately verified.
+
+Reauthorization resumes each scope-paused operation only when its required permissions are present.
+Text notifications can resume without `files:write`; mirroring retains all mirror permissions and unfurls
+retain `links:write` regardless of the share-refresh flag. Round 2 retry budgets survive reauthorization.
+Channel-validation scope failures retain the channel state and are cached until credentials or the
+destination change. Thumbnail delivery checks Browser Rendering before upload permissions; an absent
+binding fails the artifact, while a missing upload scope preserves its existing file allocation and pauses that job.
+
+Notification repair returns success once the configuration is saved and wakes eligible pending work.
+Verification of older uncertain deliveries runs in the background. If Slack limits that verification or another
+worker owns the claim, the older delivery stays unresolved and protected from duplicate posting. Owners
+can use **Verify and resume delivery** to retry verification; no automatic verification workflow is added.
+
+Each Round 2 recovery pass on the existing 15-minute cron examines at most 200 indexed outbox candidates
+and attempts to enqueue at most 50 distinct receipts, ordered by effective deadline and ID. Examined paused
+or blocked work moves 30 minutes forward without changing evidence or retry counts. Explicit recovery
+wakes eligible work immediately. Claim rechecks have separate deadlines so a crashed claim can recover
+on the next maintenance pass despite a long delivery backoff. Invalid payloads retain their rows and record
+`invalid_round2_payload` with recovery deadlines cleared. Large backlogs may need several passes; delivery
+history is retained and no recovery continuations or cron-frequency changes are introduced.
 
 ## Documents, task lists, and Slack capture
 

@@ -1,4 +1,4 @@
-import { activityMutationStart, activityMutationEnd } from "./activity-mutations";
+import { activityMutationStart, activityMutationEnd, activePageSelectionSql } from "./activity-mutations";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import type { Env, MemberContext } from "./env";
 import { HttpError, sha256 } from "./http";
@@ -560,7 +560,7 @@ export async function mutateTask(
       statements.unshift(
         activityMutationStart(
           env.DB,
-          `SELECT id FROM pages WHERE id IN (${TASK_DETAIL_SUBTREE_SQL}) AND archived_at IS NULL`,
+          activePageSelectionSql(`SELECT id FROM pages WHERE id IN (${TASK_DETAIL_SUBTREE_SQL})`),
           [detailId],
           operationId,
           "archive",

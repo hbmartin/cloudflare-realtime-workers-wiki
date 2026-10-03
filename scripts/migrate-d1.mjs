@@ -24,26 +24,42 @@ SELECT c.event_id,c.receipt_count,count(*) OVER () collision_count,
     (SELECT receipt_id FROM assignments a WHERE a.event_id=c.event_id ORDER BY receipt_id LIMIT 10)) receipts_json
 FROM collisions c ORDER BY c.event_id LIMIT 20;`;
 
-function queryRows(result) {
-  if (result.status !== 0) throw new Error("Wrangler migration preflight query failed.");
+function checkResult(result, stage) {
+  if (result.error?.code === "ETIMEDOUT")
+    throw new Error(`Wrangler ${stage} timed out${result.signal ? ` (${result.signal})` : ""}.`);
+  if (result.status !== 0)
+    throw new Error(`Wrangler ${stage} failed.${result.stderr?.trim() ? ` ${result.stderr.trim()}` : ""}`);
+}
+
+function queryRows(result, stage) {
+  checkResult(result, stage);
   let value;
   try {
     value = JSON.parse(result.stdout);
   } catch {
-    throw new Error("Wrangler returned malformed preflight JSON.");
+    throw new Error(`Wrangler ${stage} returned malformed JSON.`);
   }
   if (
     !Array.isArray(value) ||
     !value.length ||
     value.some((entry) => !entry || entry.success !== true || !Array.isArray(entry.results))
   )
-    throw new Error("Wrangler returned an invalid preflight result.");
+    throw new Error(`Wrangler ${stage} returned an invalid result.`);
   return value.flatMap((entry) => entry.results);
 }
 
 export function main(argv, execute) {
   try {
     const args = [...argv];
+    let preflightTimeoutMs = 300_000;
+    const timeoutOption = args.indexOf("--preflight-timeout-ms");
+    if (timeoutOption !== -1) {
+      const value = args[timeoutOption + 1];
+      if (!/^\d+$/.test(value ?? "") || !Number.isSafeInteger(Number(value)) || Number(value) <= 0)
+        throw new Error("--preflight-timeout-ms requires a positive integer.");
+      preflightTimeoutMs = Number(value);
+      args.splice(timeoutOption, 2);
+    }
     if (args.filter((arg) => arg === "--local" || arg === "--remote").length !== 1)
       throw new Error("Choose --local or --remote.");
     for (let i = 0; i < args.length; i++) {
@@ -51,18 +67,26 @@ export function main(argv, execute) {
         if (!args[++i] || args[i].startsWith("--")) throw new Error("Missing migration option value.");
       } else if (!["--local", "--remote"].includes(args[i])) throw new Error(`Unknown migration option: ${args[i]}`);
     }
-    const listing = execute(["d1", "migrations", "list", "DB", ...args]);
-    if (listing.status !== 0) throw new Error("Wrangler migration listing failed.");
+    const listing = execute(["d1", "migrations", "list", "DB", ...args], { timeout: 60_000, stdio: "pipe" });
+    checkResult(listing, "migration listing");
     const pending = parsePendingMigrations(listing.stdout);
     if (pending.includes("0067_review_delivery.sql")) {
-      const query = (sql) => queryRows(execute(["d1", "execute", "DB", ...args, "--json", "--command", sql]));
+      const query = (sql, stage) =>
+        queryRows(
+          execute(["d1", "execute", "DB", ...args, "--json", "--command", sql], {
+            timeout: preflightTimeoutMs,
+            stdio: "pipe",
+          }),
+          stage,
+        );
       const schema = query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('slack_digest_receipts','slack_channel_events');",
+        "migration schema preflight",
       );
       if (schema.some((row) => !row || typeof row.name !== "string"))
         throw new Error("Invalid preflight schema result.");
       if (schema.length === 2) {
-        const collisions = query(digestCollisionSql);
+        const collisions = query(digestCollisionSql, "digest collision preflight");
         if (
           collisions.some(
             (row) =>
@@ -106,9 +130,9 @@ export function main(argv, execute) {
         throw new Error("Legacy digest schema is incomplete; refusing to apply migrations.");
       }
     }
-    const applied = execute(["d1", "migrations", "apply", "DB", ...args]);
+    const applied = execute(["d1", "migrations", "apply", "DB", ...args], { stdio: "inherit" });
     if (applied.stdout) console.log(applied.stdout);
-    if (applied.status !== 0) throw new Error("Wrangler migration application failed.");
+    checkResult(applied, "migration application");
     return 0;
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
@@ -120,11 +144,10 @@ if (typeof import.meta.main !== "boolean")
   throw new Error("This script requires a Node.js runtime with import.meta.main support.");
 if (import.meta.main) {
   const wrangler = createRequire(import.meta.url).resolve("wrangler");
-  process.exitCode = main(process.argv.slice(2), (args) =>
+  process.exitCode = main(process.argv.slice(2), (args, options) =>
     spawnSync(process.execPath, [wrangler, ...args], {
       encoding: "utf8",
-      timeout: args[1] === "migrations" && args[2] === "apply" ? 300_000 : 60_000,
-      stdio: args[2] === "apply" ? "inherit" : "pipe",
+      ...options,
     }),
   );
 }

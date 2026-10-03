@@ -1,4 +1,5 @@
-import { activityMutationStart, activityMutationEnd } from "./activity-mutations";
+import { wakeRound2Mapping } from "./slack-delivery";
+import { activityMutationStart, activityMutationEnd, activePageSelectionSql } from "./activity-mutations";
 import { DOCX_MIME } from "../shared/docx-metadata";
 import { EXPORT_CAPABILITIES } from "../shared/export-format";
 import { dueRound2Digests } from "./slack-digests";
@@ -3187,8 +3188,24 @@ app.post("/api/slack/channels/:id/repair-notifications", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   await repairSlackChannelNotifications(c.env, member, c.req.param("id"));
-  if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await reconcileRound2Mapping(c.env, c.req.param("id"));
-  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await wakeRound2Mapping(c.env, c.req.param("id"));
+  c.executionCtx.waitUntil(
+    (async () => {
+      try {
+        if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await reconcileRound2Mapping(c.env, c.req.param("id"));
+      } catch (error) {
+        logger.warn(
+          "slack.repair.reconciliation_pending",
+          "slack",
+          "Repair saved; older deliveries still need verification.",
+          { mappingId: c.req.param("id") },
+          error,
+        );
+      } finally {
+        await sweepOutbox(c.env);
+      }
+    })(),
+  );
   return c.json({
     subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
   });
@@ -4332,13 +4349,7 @@ app.post("/api/pages/:id/move-space", async (c) => {
   ) SELECT id FROM subtree`;
   const operationId = crypto.randomUUID();
   const results = await c.env.DB.batch<PageRow>([
-    activityMutationStart(
-      c.env.DB,
-      `${subtreeSql} WHERE id IN (SELECT id FROM pages WHERE archived_at IS NULL)`,
-      [page.id],
-      operationId,
-      "move",
-    ),
+    activityMutationStart(c.env.DB, activePageSelectionSql(subtreeSql), [page.id], operationId, "move"),
     c.env.DB.prepare(
       `UPDATE pages SET
          space_id = ?,
@@ -4511,7 +4522,9 @@ app.delete("/api/pages/:id", async (c) => {
     [
       activityMutationStart(
         c.env.DB,
-        "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree WHERE id IN (SELECT id FROM pages WHERE archived_at IS NULL)",
+        activePageSelectionSql(
+          "WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id) SELECT id FROM subtree",
+        ),
         [page.id],
         effectiveOperationId,
         "archive",

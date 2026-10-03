@@ -236,7 +236,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
     setError("");
     try {
       await api(`/api/slack/channels/${encodeURIComponent(subscription.id)}/repair-notifications`, { method: "POST" });
-      setNotice("Channel access verified. New notifications will resume.");
+      setNotice("Repair saved. New notifications can resume; older deliveries may still need verification.");
       await load();
     } catch (cause) {
       setError(apiErrorMessage(cause, "Channel access could not be verified."));

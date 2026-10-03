@@ -10,6 +10,38 @@ import { readDocx, writeDocx } from "./docx";
 const noImage = async () => null;
 
 describe("DOCX conversion", () => {
+  it.each(["foo", "auto", "2x", "0", "-2", "1.9", "NaN"])(
+    "simplifies small malformed or nonpositive spans: %s",
+    (span) => {
+      const result = docxHtmlToDocument(`<table><tr><td colspan="${span}" rowspan="${span}">Cell</td></tr></table>`);
+      expect(descendants(result.document, "tableCell")).toHaveLength(1);
+      expect(result.issues).toContainEqual(expect.objectContaining({ code: "docx_table_simplified" }));
+    },
+  );
+  it("truncates finite fractions and clamps rowspans to the source rows", () => {
+    const result = docxHtmlToDocument('<table><tr><td colspan="2.9" rowspan="99999">Cell</td></tr><tr></tr></table>');
+    const rows = descendants(result.document, "tableRow");
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row.content?.length === 2)).toBe(true);
+    expect(result.issues).toContainEqual(expect.objectContaining({ code: "docx_table_simplified" }));
+  });
+  it.each(["Infinity", "-Infinity", "1e400", "9".repeat(400)])("rejects numeric row overflow: %s", (span) => {
+    expect(() => docxHtmlToDocument(`<table><tr><td rowspan="${span}">Cell</td></tr></table>`)).toThrow(
+      expect.objectContaining({ status: 413, code: "docx_tables_too_large" }),
+    );
+  });
+  it.each([
+    `<table>${"<tr></tr>".repeat(5000)}</table>`.repeat(2) + "<table><tr></tr></table>",
+    `<table><tr><td><table>${"<tr></tr>".repeat(10000)}</table></td></tr></table>`,
+  ])("counts empty and nested source rows toward the document budget %#", (html) => {
+    expect(() => docxHtmlToDocument(html)).toThrow(
+      expect.objectContaining({ status: 413, code: "docx_tables_too_large" }),
+    );
+  });
+  it("accepts exactly 10000 empty source rows across tables", () => {
+    const result = docxHtmlToDocument(`<table>${"<tr></tr>".repeat(5000)}</table>`.repeat(2));
+    expect(result.document).toBeDefined();
+  });
   it.each([
     `<table><tr><td colspan="257">Wide</td></tr></table>`,
     `<table><tr><td colspan="1e+21">Wide</td></tr></table>`,
@@ -29,6 +61,7 @@ describe("DOCX conversion", () => {
 
   it.each([
     ["<table><tr><td colspan=256>Wide</td></tr></table>", 256],
+    ["<table><tr><td colspan=256.9>Wide</td></tr></table>", 256],
     [`<table>${"<tr><td>Row</td></tr>".repeat(10_000)}</table>`, 10_000],
     [`<table>${"<tr><td colspan=100>Row</td></tr>".repeat(50)}</table>`.repeat(2), 10_000],
   ])("accepts exact table bounds %#", (html, count) => {

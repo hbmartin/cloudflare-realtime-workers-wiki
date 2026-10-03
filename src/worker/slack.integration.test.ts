@@ -7,7 +7,7 @@ import worker from "./index";
 import { consumeDeliveryMessage } from "./jobs";
 import { syncRound2Configuration } from "./slack-channels";
 import { createShare } from "./shares";
-import { notificationFanoutStatements } from "./notifications";
+import { notificationFanoutStatements, DeliveryInProgressError } from "./notifications";
 import {
   consumeSlackLink,
   createSlackOAuthUrl,
@@ -138,6 +138,89 @@ beforeEach(async () => {
 });
 
 describe("Slack share-refresh HTTP enqueueing", () => {
+  it.each(["rate limit", "competing claim"])(
+    "returns a saved repair and sweeps safe work after a reconciliation %s",
+    async (failure) => {
+      const installed = await bootstrap();
+      await installSlack(installed.member);
+      await env.DB.prepare("UPDATE slack_installations SET generation=1 WHERE id='slack-installation'").run();
+      const send = vi.fn();
+      const testEnv: Env = {
+        ...slackEnv(),
+        SLACK_CHANNEL_VALIDATION_ENABLED: "true",
+        WORKSPACE_ACTIVITY_ENABLED: "true",
+        SLACK_DIGEST_DEFAULT_TIMEZONE: "America/Chicago",
+        DELIVERY_QUEUE: { send } as unknown as Env["DELIVERY_QUEUE"],
+      };
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const method = new URL(
+          typeof input === "string" ? input : input instanceof URL ? input.href : input.url,
+        ).pathname
+          .split("/")
+          .at(-1);
+        if (method === "openid-configuration")
+          return Response.json({
+            issuer: "https://slack.com",
+            jwks_uri: "https://slack.com/openid/connect/keys",
+            authorization_endpoint: "https://slack.com/openid/connect/authorize",
+            token_endpoint: "https://slack.com/api/openid.connect.token",
+            userinfo_endpoint: "https://slack.com/api/openid.connect.userInfo",
+          });
+        if (method === "conversations.info")
+          return Response.json({ ok: true, channel: { id: "C123", name: "notes", is_channel: true, is_member: true } });
+        if (method === "conversations.history") {
+          if (failure === "competing claim") throw new DeliveryInProgressError();
+          return new Response("limited", { status: 429, headers: { "Retry-After": "45" } });
+        }
+        throw new Error(`Unexpected Slack method ${method}`);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      await syncRound2Configuration(testEnv);
+      const m = await upsertSlackChannelSubscription(testEnv, memberContext(installed.member), {
+        spaceId: installed.page.spaceId!,
+        pageId: null,
+        channelId: "C123",
+        channelName: "notes",
+        eventTypes: ["page_edit"],
+        cadence: "digest",
+      });
+      await env.DB.batch([
+        env.DB.prepare(
+          "UPDATE slack_channel_subscriptions SET notification_blocked_at=1,notification_error='no_permission' WHERE id=?",
+        ).bind(m.id),
+        env.DB.prepare(`INSERT INTO slack_digest_receipts(id,installation_id,installation_generation,subscription_id,window_start,window_end,channel_id,state,attempted_at,created_at)
+        VALUES('older','slack-installation',1,?,0,1,'C123','sending',1,1),('safe','slack-installation',1,?,1,2,'C123','pending',NULL,1)`).bind(
+          m.id,
+          m.id,
+        ),
+        env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_redrive_due_at)
+        VALUES('older-outbox',?,'slack_digest','{"digestId":"older"}',1,1,1,9999999999999),('safe-outbox',?,'slack_digest','{"digestId":"safe"}',1,1,1,9999999999999)`).bind(
+          installed.member.workspace.id,
+          installed.member.workspace.id,
+        ),
+      ]);
+      const context = createExecutionContext();
+      const response = await worker.fetch(
+        request(installed.cookie, `/api/slack/channels/${m.id}/repair-notifications`, { method: "POST" }),
+        testEnv,
+        context,
+      );
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ subscription: { id: m.id, notificationBlockedAt: null } });
+      await waitOnExecutionContext(context);
+      expect(
+        await env.DB.prepare("SELECT notification_blocked_at FROM slack_channel_subscriptions WHERE id=?")
+          .bind(m.id)
+          .first(),
+      ).toEqual({ notification_blocked_at: null });
+      expect(
+        await env.DB.prepare("SELECT state,attempted_at FROM slack_digest_receipts WHERE id='older'").first(),
+      ).toEqual({ state: "sending", attempted_at: 1 });
+      expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ outboxId: "safe-outbox" }));
+      expect(fetchMock.mock.calls.some(([input]) => String(input).includes("conversations.history"))).toBe(true);
+      expect(fetchMock.mock.calls.some(([input]) => String(input).includes("chat.postMessage"))).toBe(false);
+    },
+  );
   it.each([
     "share creation",
     "share update",
