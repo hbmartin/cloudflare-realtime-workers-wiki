@@ -18,3 +18,8 @@ export function activityMutationStart(
 export function activityMutationEnd(database: Env["DB"], operationId: string) {
   return database.prepare("DELETE FROM activity_mutation_context WHERE operation_id=?").bind(operationId);
 }
+
+// Mutation classification counts active pages while the mutation may still include archived descendants.
+export function activePageSelectionSql(selection: string) {
+  return `SELECT id FROM (${selection}) WHERE id IN (SELECT id FROM pages WHERE archived_at IS NULL)`;
+}

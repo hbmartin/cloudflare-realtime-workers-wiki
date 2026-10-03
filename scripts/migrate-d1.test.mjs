@@ -20,6 +20,59 @@ function legacy() {
   return { db, execute };
 }
 describe("0067 migration deployment guard", () => {
+  it.each([undefined, "450000"])(
+    "gives each preflight its own budget and leaves application interactive: %s",
+    (timeout) => {
+      const { db, execute } = legacy();
+      try {
+        expect(main(["--remote", ...(timeout ? ["--preflight-timeout-ms", timeout] : [])], execute)).toBe(0);
+        expect(execute.mock.calls[0][1]).toEqual({ timeout: 60000, stdio: "pipe" });
+        for (const [args, options] of execute.mock.calls.filter(([commandArgs]) => commandArgs[1] === "execute")) {
+          expect(args).not.toContain("--preflight-timeout-ms");
+          expect(options).toEqual({ timeout: Number(timeout ?? 300000), stdio: "pipe" });
+        }
+        expect(execute.mock.calls.at(-1)[1]).toEqual({ stdio: "inherit" });
+      } finally {
+        db.close();
+      }
+    },
+  );
+  it.each(["0", "-1", "1.5", "abc", "Infinity", "9007199254740992", undefined])(
+    "rejects invalid preflight budgets: %s",
+    (value) => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const execute = vi.fn();
+      expect(main(["--local", "--preflight-timeout-ms", ...(value === undefined ? [] : [value])], execute)).toBe(1);
+      expect(execute).not.toHaveBeenCalled();
+      expect(console.error).toHaveBeenCalledWith(expect.stringContaining("--preflight-timeout-ms"));
+    },
+  );
+  it.each(["migration listing", "migration schema preflight", "digest collision preflight", "migration application"])(
+    "reports the failing stage: %s",
+    (stage) => {
+      const { db, execute } = legacy();
+      try {
+        const original = execute.getMockImplementation();
+        execute.mockImplementation((args, options) => {
+          const current =
+            args[2] === "list"
+              ? "migration listing"
+              : args[2] === "apply"
+                ? "migration application"
+                : args.at(-1) === digestCollisionSql
+                  ? "digest collision preflight"
+                  : "migration schema preflight";
+          return current === stage
+            ? { status: null, error: { code: "ETIMEDOUT" }, signal: "SIGTERM" }
+            : original(args, options);
+        });
+        expect(main(["--local"], execute)).toBe(1);
+        expect(console.error).toHaveBeenCalledWith(expect.stringContaining(`${stage} timed out`));
+      } finally {
+        db.close();
+      }
+    },
+  );
   it("rejects duplicate assignments before applying migrations and preserves data", () => {
     const { db, execute } = legacy();
     try {

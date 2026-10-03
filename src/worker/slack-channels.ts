@@ -20,6 +20,12 @@ export async function round2Installation(env: Env, id: string, generation?: numb
     .first<SlackInstallation>();
 }
 export async function validateMapping(env: Env, installation: SlackInstallation, mappingId: string, channelId: string) {
+  const cached = await env.DB.prepare(`SELECT validation_scope_error_revision FROM slack_channel_subscriptions
+    WHERE id=? AND installation_id=? AND channel_id=?`)
+    .bind(mappingId, installation.id, channelId)
+    .first<{ validation_scope_error_revision: number | null }>();
+  if (cached?.validation_scope_error_revision === installation.credential_revision)
+    throw new SlackApiError("conversations.info", "missing_scope", 200, installation.credential_revision);
   try {
     const channel = await validatedChannel(env, installation, channelId);
     const prior = await env.DB.prepare("SELECT notification_blocked_at FROM slack_channel_subscriptions WHERE id=?")
@@ -27,10 +33,10 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
       .first<{ notification_blocked_at: number | null }>();
     const saved =
       await env.DB.prepare(`UPDATE slack_channel_subscriptions SET channel_name=?,channel_type=?,validation_state='valid',
-      validation_error=NULL,bot_is_member=1,validated_at=?,
+      validation_error=NULL,validation_scope_error_revision=NULL,bot_is_member=1,validated_at=?,
       notification_blocked_at=CASE WHEN (notification_error=validation_error AND notification_error<>'missing_scope') OR notification_error='msg_too_long' THEN NULL ELSE notification_blocked_at END,
       notification_error=CASE WHEN (notification_error=validation_error AND notification_error<>'missing_scope') OR notification_error='msg_too_long' THEN NULL ELSE notification_error END WHERE id=? AND installation_id=? AND channel_id=?
-      AND EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)
+      AND EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND credential_revision=? AND disconnected_at IS NULL)
       AND EXISTS(SELECT 1 FROM workspace_members wm JOIN slack_installations i ON i.workspace_id=wm.workspace_id WHERE i.id=installation_id AND wm.user_id=slack_channel_subscriptions.created_by AND wm.role='owner')`)
         .bind(
           channel.name,
@@ -41,6 +47,7 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
           channelId,
           installation.id,
           installation.generation,
+          installation.credential_revision,
         )
         .run();
     if (saved.meta.changes && prior?.notification_blocked_at) await wakeRound2Mapping(env, mappingId);
@@ -48,14 +55,30 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
   } catch (error) {
     if (retryableSlackError(error)) throw error;
     if (!(error instanceof HttpError || error instanceof SlackApiError)) throw error;
-    if (error instanceof SlackApiError && error.code === "missing_scope") throw error;
+    if (error instanceof SlackApiError && error.code === "missing_scope") {
+      await env.DB.prepare(`UPDATE slack_channel_subscriptions SET validation_error='missing_scope',validated_at=?,validation_scope_error_revision=?
+        WHERE id=? AND installation_id=? AND channel_id=? AND EXISTS(SELECT 1 FROM slack_installations
+          WHERE id=? AND generation=? AND credential_revision=? AND disconnected_at IS NULL)`)
+        .bind(
+          Date.now(),
+          error.credentialRevision,
+          mappingId,
+          installation.id,
+          channelId,
+          installation.id,
+          installation.generation,
+          error.credentialRevision,
+        )
+        .run();
+      throw error;
+    }
     if (error instanceof SlackApiError && slackInstallationError(error)) {
       await recordSlackInstallationError(env, installation.id, error, installation.generation);
       return false;
     }
     await env.DB.prepare(`UPDATE slack_channel_subscriptions SET validation_state='invalid',validation_error=?,
       validated_at=?,bot_is_member=0,notification_blocked_at=?,notification_error=? WHERE id=? AND installation_id=? AND channel_id=?
-      AND EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)`)
+      AND EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND credential_revision=? AND disconnected_at IS NULL)`)
       .bind(
         error.code,
         Date.now(),
@@ -66,6 +89,7 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
         channelId,
         installation.id,
         installation.generation,
+        installation.credential_revision,
       )
       .run();
     return false;
@@ -157,8 +181,15 @@ export async function revalidateMappings(env: Env, dryRun = false, workspaceId?:
   if (env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true" && !dryRun) return [];
   const rows =
     await env.DB.prepare(`SELECT m.id,m.installation_id,m.channel_id,i.auth_error FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
-    WHERE i.disconnected_at IS NULL AND (i.auth_error IS NULL OR ?=1) AND (? IS NULL OR i.workspace_id=?) AND (?=1 OR coalesce(m.validated_at,0)<?) ORDER BY coalesce(m.validated_at,0),m.id`)
-      .bind(dryRun ? 1 : 0, workspaceId ?? null, workspaceId ?? null, dryRun ? 1 : 0, Date.now() - 15 * 60_000)
+    WHERE i.disconnected_at IS NULL AND (i.auth_error IS NULL OR ?=1) AND (? IS NULL OR i.workspace_id=?) AND (?=1 OR (m.validation_scope_error_revision IS NULL OR m.validation_scope_error_revision<>i.credential_revision)) AND (?=1 OR coalesce(m.validated_at,0)<? OR m.validation_scope_error_revision<>i.credential_revision) ORDER BY coalesce(m.validated_at,0),m.id`)
+      .bind(
+        dryRun ? 1 : 0,
+        workspaceId ?? null,
+        workspaceId ?? null,
+        dryRun ? 1 : 0,
+        dryRun ? 1 : 0,
+        Date.now() - 15 * 60_000,
+      )
       .all<{ id: string; installation_id: string; channel_id: string; auth_error: string | null }>();
   const report: Array<{ id: string; valid: boolean; reason: string | null }> = [];
   const limited = new Set<string>();

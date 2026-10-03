@@ -27,6 +27,29 @@ afterEach(() => {
   history.replaceState(null, "", "/");
 });
 describe("ActivityView", () => {
+  it("lists live choices first in source order and favors their current records", async () => {
+    const current = { id: "live-b", title: "Live B", spaceId: "space", archivedAt: null, isTemplate: false } as Page;
+    vi.mocked(api).mockImplementation(async (path) =>
+      path === "/api/pages/tree?archived=true"
+        ? {
+            pages: [
+              { ...current, id: "archive-b", title: "Archive B", archivedAt: 1 },
+              { ...current, title: "Old B", archivedAt: 1 },
+              { ...current, id: "archive-a", title: "Archive A", archivedAt: 1 },
+            ],
+          }
+        : { items: [], nextCursor: null },
+    );
+    render(
+      <ActivityView spaces={[]} pages={[current, { ...current, id: "live-a", title: "Live A" }]} onSelect={vi.fn()} />,
+    );
+    await screen.findByRole("option", { name: "Archive A (archived)" });
+    expect(
+      within(screen.getByLabelText("Page"))
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["All pages", "Live B", "Live A", "Archive B (archived)", "Archive A (archived)"]);
+  });
   it("loads seven-day history and cursor pagination without a Slack installation", async () => {
     vi.mocked(api).mockImplementation(async (path) =>
       path.includes("cursor=")

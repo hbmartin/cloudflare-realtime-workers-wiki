@@ -2,10 +2,87 @@ import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Env } from "./env";
 import { createAuth } from "./auth";
+import { redriveRound2Outbox } from "./slack-recovery";
 
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("upgrades guarded receipt identities and uses bounded deadline indexes across large history", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0068"),
+    );
+    await env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Notes',1)").run();
+    const examples = [
+      ["slack_digest", '{"digestId":"digest"}', "digest"],
+      ["slack_bulk", '{"summaryId":"bulk"}', "bulk"],
+      ["slack_channel", '{"eventId":"channel"}', "channel"],
+      ["slack_share_refresh", '{"refreshId":"share"}', "share"],
+      ["slack_file_upload", '{"artifactId":"file"}', "file"],
+      ["slack_digest", "not JSON", null],
+      ["slack_digest", '{"digestId":3}', null],
+      ["slack_digest", '{"eventId":"wrong-key"}', null],
+    ];
+    await env.DB.batch(
+      examples.map(([topic, payload], n) =>
+        env.DB.prepare(
+          "INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_redrive_due_at,slack_redrive_count) VALUES(?,'workspace',?,?,1,1,1,1,7)",
+        ).bind(`example-${n}`, topic, payload),
+      ),
+    );
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    const rows = (
+      await env.DB.prepare(
+        "SELECT payload_json,slack_round2_receipt_id,slack_redrive_count,slack_scope_required_json FROM outbox ORDER BY id",
+      ).all()
+    ).results;
+    expect(rows).toEqual(
+      examples.map(([, payload, id]) => ({
+        payload_json: payload,
+        slack_round2_receipt_id: id,
+        slack_redrive_count: 7,
+        slack_scope_required_json: null,
+      })),
+    );
+    await env.DB.prepare(`WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<20000)
+      INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at)
+      SELECT 'history:'||n,'workspace','slack_digest',json_object('digestId','history:'||n),1,1,1 FROM history`).run();
+    const queries: string[] = [];
+    const database = {
+      prepare(sql: string) {
+        queries.push(sql);
+        return env.DB.prepare(sql);
+      },
+      batch: env.DB.batch.bind(env.DB),
+    } as Env["DB"];
+    await redriveRound2Outbox({
+      ...env,
+      DB: database,
+      SLACK_CHANNEL_VALIDATION_ENABLED: "true",
+      SLACK_SHARE_REFRESH_ENABLED: "true",
+      SLACK_RICH_DIGESTS_ENABLED: "true",
+      WORKSPACE_ACTIVITY_ENABLED: "true",
+    } as unknown as Env);
+    const plan = (
+      await env.DB.prepare(`EXPLAIN QUERY PLAN ${queries[0]}`).bind(Date.now(), Date.now()).all<{ detail: string }>()
+    ).results
+      .map((row) => row.detail)
+      .join("\n");
+    expect(plan).toContain("idx_outbox_round2_due");
+    expect(plan).toContain("idx_outbox_round2_claim_due");
+    expect(plan).not.toContain("SCAN outbox");
+    const receiptPlan = (
+      await env.DB.prepare(
+        "EXPLAIN QUERY PLAN SELECT max(slack_redrive_count) FROM outbox WHERE topic='slack_digest' AND slack_round2_receipt_id='digest'",
+      ).all<{ detail: string }>()
+    ).results
+      .map((row) => row.detail)
+      .join("\n");
+    expect(receiptPlan).toContain("idx_outbox_round2_receipt");
+    expect(await env.DB.prepare("SELECT count(*) n FROM outbox WHERE id LIKE 'history:%'").first()).toEqual({
+      n: 20000,
+    });
+  });
   it("upgrades and replays the MCP workspace generation migration without reviving grants or altering content", async () => {
     await applyD1Migrations(
       env.DB,

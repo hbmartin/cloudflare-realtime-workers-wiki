@@ -14,15 +14,15 @@ import { HttpError } from "./http";
 import { safeSlackText, unfurlBlocks } from "./slack-blocks";
 import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
 
+import {
+  SLACK_MIRROR_SCOPES,
+  ROUND2_OUTBOX_SQL,
+  ROUND2_NON_CHANNEL_TOPICS_SQL,
+  SLACK_PAUSED_SCOPES_SQL,
+  slackDeliveryScopes,
+} from "./slack-delivery-contracts";
+export { SLACK_MIRROR_SCOPES } from "./slack-delivery-contracts";
 export const SLACK_REDRIVE_STALE_MS = 30 * 60_000;
-export const SLACK_MIRROR_SCOPES = [
-  "chat:write",
-  "channels:read",
-  "groups:read",
-  "channels:history",
-  "groups:history",
-  "users:read",
-] as const;
 
 const OAUTH_STATE_TTL_MS = 10 * 60_000;
 const LINK_TOKEN_TTL_MS = 10 * 60_000;
@@ -128,6 +128,7 @@ export class SlackApiError extends Error {
     readonly code: string,
     readonly status: number,
     readonly credentialRevision = 0,
+    readonly neededScopes: readonly string[] = [],
   ) {
     super(`Slack ${method} failed.`);
     this.name = "SlackApiError";
@@ -338,20 +339,6 @@ export function slackScopeHealth(scopes: string | readonly string[]) {
   return { required, granted, missing, reauthorizationRequired: missing.length > 0, capabilities };
 }
 
-function deliveryScopes(env: Env) {
-  const scopes: string[] = ["chat:write"];
-  if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") scopes.push(...SLACK_MIRROR_SCOPES);
-  if (env.SLACK_SHARE_REFRESH_ENABLED === "true")
-    scopes.push("links:read", "links:write", "channels:read", "groups:read");
-  if (
-    env.SLACK_RICH_DIGESTS_ENABLED === "true" &&
-    env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" &&
-    env.WORKSPACE_ACTIVITY_ENABLED === "true"
-  )
-    scopes.push("files:write");
-  return scopes;
-}
-
 function configured(env: Env) {
   return Boolean(
     env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET && env.SLACK_SIGNING_SECRET && env.SLACK_TOKEN_ENCRYPTION_KEY,
@@ -546,16 +533,28 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
       )
       .run();
     stored = true;
+    const grantedScopes = JSON.stringify(normalizeScopes(result.scope ?? ""));
+    const notificationScopes = JSON.stringify(
+      slackDeliveryScopes(env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? "slack_digest" : "slack_channel"),
+    );
     await env.DB.prepare(`UPDATE slack_channel_subscriptions SET notification_blocked_at=NULL,notification_error=NULL
-      WHERE notification_error IN (SELECT value FROM json_each(?)) AND installation_id IN
-        (SELECT id FROM slack_installations WHERE workspace_id=? AND disconnected_at IS NULL AND auth_error IS NULL)`)
+      WHERE installation_id IN (SELECT id FROM slack_installations WHERE workspace_id=? AND disconnected_at IS NULL AND auth_error IS NULL)
+      AND (notification_error IN (SELECT value FROM json_each(?)) OR (notification_error='missing_scope' AND NOT EXISTS(
+        SELECT value FROM json_each(CASE WHEN mirror_enabled=1 THEN ? ELSE ? END) required
+        WHERE required.value NOT IN (SELECT value FROM json_each(?)))))`)
       .bind(
-        JSON.stringify([
-          ...INSTALLATION_ERRORS,
-          ...(slackHasScopes(result.scope ?? "", deliveryScopes(env)) ? ["missing_scope"] : []),
-        ]),
         member.workspace.id,
+        JSON.stringify([...INSTALLATION_ERRORS]),
+        JSON.stringify(SLACK_MIRROR_SCOPES),
+        notificationScopes,
+        grantedScopes,
       )
+      .run();
+    await env.DB.prepare(`UPDATE slack_channel_subscriptions SET
+      validation_error=CASE WHEN validation_scope_error_revision IS NOT NULL AND validation_error='missing_scope' THEN NULL ELSE validation_error END,
+      validated_at=CASE WHEN validation_scope_error_revision IS NOT NULL THEN NULL ELSE validated_at END,
+      validation_scope_error_revision=NULL WHERE installation_id IN (SELECT id FROM slack_installations WHERE workspace_id=?)`)
+      .bind(member.workspace.id)
       .run();
     await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',failure_reason=NULL,updated_at=?
       WHERE state='blocked' AND failure_reason LIKE 'reconciliation_%'
@@ -563,27 +562,26 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
           JOIN slack_installations installation ON installation.id=link.installation_id
           JOIN slack_channel_subscriptions mapping ON mapping.id=link.subscription_id
           WHERE installation.workspace_id=? AND installation.disconnected_at IS NULL
-            AND link.state IN ('pending','active') AND mapping.mirror_enabled=1)`)
-      .bind(timestamp, member.workspace.id)
+            AND link.state IN ('pending','active') AND mapping.mirror_enabled=1)
+        AND NOT EXISTS(SELECT value FROM json_each(?) required WHERE required.value NOT IN (SELECT value FROM json_each(?)))`)
+      .bind(timestamp, member.workspace.id, JSON.stringify(SLACK_MIRROR_SCOPES), grantedScopes)
       .run();
     await env.DB.prepare(`UPDATE outbox SET
       slack_scope_paused_ms=slack_scope_paused_ms+MAX(0,?-slack_scope_paused_at),
-      slack_scope_paused_at=NULL,slack_redrive_count=CASE WHEN topic IN
-        ('slack_bulk','slack_digest','slack_share_refresh','slack_file_upload') OR
-        (topic='slack_channel' AND json_extract(payload_json,'$.eventId') LIKE 'activity:%') THEN slack_redrive_count ELSE 0 END,
-      enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
-      WHERE workspace_id=? AND slack_scope_paused_at IS NOT NULL AND (?=1 OR NOT (topic IN
-        ('slack_bulk','slack_digest','slack_share_refresh','slack_file_upload') OR
-        (topic='slack_channel' AND json_extract(payload_json,'$.eventId') LIKE 'activity:%')))`)
-      .bind(timestamp, timestamp, member.workspace.id, slackHasScopes(result.scope ?? "", deliveryScopes(env)) ? 1 : 0)
+      slack_scope_paused_at=NULL,slack_scope_required_json=NULL,
+      slack_redrive_count=CASE WHEN ${ROUND2_OUTBOX_SQL} THEN slack_redrive_count ELSE 0 END,
+      enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL
+      WHERE workspace_id=? AND slack_scope_paused_at IS NOT NULL AND NOT EXISTS(
+        SELECT value FROM json_each(${SLACK_PAUSED_SCOPES_SQL}) required WHERE required.value NOT IN (SELECT value FROM json_each(?)))`)
+      .bind(timestamp, timestamp, member.workspace.id, grantedScopes)
       .run();
     await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
       WHERE workspace_id=? AND slack_scope_paused_at IS NULL AND
-        ((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl','slack_bulk','slack_digest','slack_share_refresh','slack_file_upload')
+        (((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl') OR topic IN (${ROUND2_NON_CHANNEL_TOPICS_SQL}))
           AND (slack_redrive_due_at IS NOT NULL OR id IN
             (SELECT 'outbox:' || d.id FROM slack_thread_deliveries d WHERE d.state='sending')))
         OR (topic='slack_channel' AND EXISTS (SELECT 1 FROM slack_channel_events event
-          WHERE event.id=json_extract(outbox.payload_json,'$.eventId')
+          WHERE event.id=outbox.slack_round2_receipt_id
             AND event.delivered_at IS NULL AND event.suppressed_at IS NULL)))`)
       .bind(timestamp, member.workspace.id)
       .run();
@@ -971,6 +969,7 @@ export async function upsertSlackChannelSubscription(
        space_id=excluded.space_id,page_id=excluded.page_id,event_types_json = excluded.event_types_json, cadence = excluded.cadence,
        validation_state=CASE WHEN channel_id<>excluded.channel_id THEN 'unvalidated' ELSE validation_state END,
        validation_error=CASE WHEN channel_id<>excluded.channel_id THEN NULL ELSE validation_error END,
+       validation_scope_error_revision=CASE WHEN channel_id<>excluded.channel_id THEN NULL ELSE validation_scope_error_revision END,
        notification_error=CASE WHEN channel_id<>excluded.channel_id THEN NULL ELSE notification_error END,
        notification_blocked_at=CASE WHEN channel_id<>excluded.channel_id THEN NULL ELSE notification_blocked_at END,
        validated_at=CASE WHEN channel_id<>excluded.channel_id THEN NULL ELSE validated_at END,
@@ -1522,6 +1521,7 @@ export async function slackApi<Method extends SlackApiMethod>(
       typeof result.error === "string" ? result.error : "http_error",
       response.status,
       credentialRevision,
+      typeof result.needed === "string" ? normalizeScopes(result.needed) : [],
     );
   }
   const { ok: _ok, error: _error, ...body } = result;

@@ -29,7 +29,10 @@ export function ActivityView({
     // This version deliberately triggers a reload after trash mutations.
     // eslint-disable-next-line react/exhaustive-effect-dependencies
   }, [archiveRefreshVersion]);
-  const choices = [...new Map([...archivedPages, ...pages].map((p) => [p.id, p])).values()];
+  const currentIds = new Set(pages.map((p) => p.id));
+  const choices = [
+    ...new Map([...pages, ...archivedPages.filter((p) => !currentIds.has(p.id))].map((p) => [p.id, p])).values(),
+  ];
   const [mapping, setMapping] = useState(() => new URLSearchParams(location.search).get("mapping") ?? "");
   const [mode, setMode] = useState<"activity" | "open">("activity");
   const [space, setSpace] = useState("");
