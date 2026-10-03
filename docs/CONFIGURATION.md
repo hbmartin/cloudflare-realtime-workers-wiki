@@ -318,13 +318,13 @@ ephemeral to the acting user while they are active in Slack; an uncertain send i
 recheck current identity, membership, mapping, and page permissions when delayed work runs; old buttons and
 saved modal state do not grant access. Owners may create a replacement share privately from a revoked pinned reference; its old public URL stays revoked.
 
-For Round 2 activation, apply forward migrations through `0068_slack_recovery.sql`, configure `SLACK_DIGEST_DEFAULT_TIMEZONE`, run the channel-validation dry run, and call owner-only `POST /api/slack/configuration/sync`. The cron also synchronizes release configuration; authentication and Slack acknowledgment paths do not. The sync endpoint reports missing/invalid activation defaults. Channel revalidation preserves delivery permission blocks until explicit recovery establishes permission. Production release flags remain off until deployment and the live exit matrix are separately verified.
+For Round 2 activation, apply forward migrations through `0069_slack_file_cleanup.sql`, configure `SLACK_DIGEST_DEFAULT_TIMEZONE`, run the channel-validation dry run, and call owner-only `POST /api/slack/configuration/sync`. The cron also synchronizes release configuration; authentication and Slack acknowledgment paths do not. The sync endpoint reports missing/invalid activation defaults. Channel revalidation preserves delivery permission blocks until explicit recovery establishes permission. Production release flags remain off until deployment and the live exit matrix are separately verified.
 
 Reauthorization resumes each scope-paused operation only when its required permissions are present.
 Text notifications can resume without `files:write`; mirroring retains all mirror permissions and unfurls
 retain `links:write` regardless of the share-refresh flag. Round 2 retry budgets survive reauthorization.
 Channel-validation scope failures retain the channel state and are cached until credentials or the
-destination change. Thumbnail delivery checks Browser Rendering before upload permissions; an absent
+destination change or an explicit repair proves access. Thumbnail delivery checks Browser Rendering before upload permissions; an absent
 binding fails the artifact, while a missing upload scope preserves its existing file allocation and pauses that job.
 
 Notification repair returns success once the configuration is saved and wakes eligible pending work.
@@ -339,6 +339,35 @@ wakes eligible work immediately. Claim rechecks have separate deadlines so a cra
 on the next maintenance pass despite a long delivery backoff. Invalid payloads retain their rows and record
 `invalid_round2_payload` with recovery deadlines cleared. Large backlogs may need several passes; delivery
 history is retained and no recovery continuations or cron-frequency changes are introduced.
+
+Paused outbox permissions use cumulative clauses with alternatives inside each clause. Conversation
+read/history permissions follow the affected channel type; mirror permissions remain cumulative.
+Reauthorization resumes only eligible jobs and preserves Round 2 retry budgets. Settings and Slack
+unmute controls, snooze expiry, and successful authentication recovery wake safe pending receipts;
+healthy token rotation preserves ordinary backoff. Bulk receipts participate in delivery verification.
+
+Abandoned thumbnail allocations are recorded in `slack_file_cleanup_jobs` before their artifact ID is
+cleared or the artifact is retired/deleted. Successfully uploaded files are excluded. Cleanup does not
+require `BROWSER` or enabled thumbnail flags, but needs `files:write` and credentials for the saved Slack
+team/bot identity. The initial deletion counts toward a maximum of **two total deletion attempts**.
+Credential/scope prechecks spend no attempt. A failed first dispatch retries no sooner than 15 minutes,
+respecting longer Slack retry delays; each cron pass examines at most 25 due cleanup jobs.
+Reauthorization can resume paused cleanup but never resets its attempt budget.
+
+Permanent failures, exhausted attempts, and unverifiable ownership appear in Slack delivery health as
+thumbnail cleanup failures. Clearing that notice acknowledges it without restarting cleanup. Operators
+can inspect `id`, `file_id`, `team_id`, `bot_user_id`, `attempt_count`, and `last_error` in the cleanup ledger,
+then remove the file using the owning Slack identity or confirm its absence in Slack. `file_not_found`
+does not prove deletion because Slack also returns it for inaccessible files. Keep the ledger record;
+manual remediation does not grant another automatic attempt or require a new owner retry workflow.
+To inspect manual-attention records in the D1 console, run:
+
+```sql
+SELECT id, file_id, team_id, bot_user_id, attempt_count, last_error
+FROM slack_file_cleanup_jobs
+WHERE state = 'failed'
+ORDER BY updated_at, id;
+```
 
 ## Documents, task lists, and Slack capture
 

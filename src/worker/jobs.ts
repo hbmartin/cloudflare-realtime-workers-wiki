@@ -4,8 +4,9 @@ import { redriveRound2Outbox, round2DeliveryStatus, type round2Receipts } from "
 import { deliverDigest } from "./slack-digests";
 import { deliverShareRefresh } from "./slack-shares";
 import { deliverThumbnail } from "./slack-files";
+import { StaleSlackValidationError } from "./slack-channels";
 import { thumbnailDeliveryEnabled } from "./slack-delivery";
-import { ROUND2_OUTBOX_SQL, slackDeliveryScopes } from "./slack-delivery-contracts";
+import { ROUND2_OUTBOX_SQL, slackScopeRequirements } from "./slack-delivery-contracts";
 import { deliverSlackProductCopy } from "./slack-product";
 import {
   captureFeedbackStatement,
@@ -1567,20 +1568,13 @@ async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: st
   }
 }
 
-async function pauseSlackScopeOutbox(env: Env, outboxId: string, error: unknown) {
+async function pauseSlackScopeOutbox(env: Env, outboxId: string, topic: string, error: unknown) {
   const now = Date.now();
-  const row = await env.DB.prepare("SELECT topic FROM outbox WHERE id=?").bind(outboxId).first<{ topic: string }>();
-  if (!row) return;
-  const scopes = [
-    ...new Set([
-      ...(error instanceof SlackApiError && error.neededScopes.length
-        ? error.neededScopes
-        : slackDeliveryScopes(row.topic, error instanceof SlackApiError ? error.method : undefined)),
-      ...(["slack_thread_reply", "slack_inbound_reply", "slack_thread_action", "slack_unfurl"].includes(row.topic)
-        ? slackDeliveryScopes(row.topic)
-        : []),
-    ]),
-  ];
+  const scopes = slackScopeRequirements(
+    topic,
+    error instanceof SlackApiError ? error.method : undefined,
+    error instanceof SlackApiError ? error.neededScopes : [],
+  );
   await env.DB.prepare(`UPDATE outbox SET slack_scope_paused_at=COALESCE(slack_scope_paused_at,?),slack_scope_required_json=?,
     enqueued_at=COALESCE(enqueued_at,?),slack_claim_recheck_at=NULL,
     slack_redrive_due_at=CASE WHEN ${ROUND2_OUTBOX_SQL} THEN coalesce(slack_redrive_due_at,?+1800000) ELSE NULL END,last_error='slack_scope_missing'
@@ -2102,7 +2096,11 @@ export async function consumeDeliveryMessage(
     return true;
   };
   const round2Failure = async (error: unknown) => {
-    if (slackMissingScope(error)) await pauseSlackScopeOutbox(env, outboxId, error);
+    if (error instanceof StaleSlackValidationError) {
+      message.retry({ delaySeconds: 2 });
+      return "retried" as const;
+    }
+    if (slackMissingScope(error)) await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
     else if (error instanceof DeliveryInProgressError) {
       await env.DB.prepare("UPDATE outbox SET slack_claim_recheck_at=? WHERE id=?")
         .bind(Date.now() + 60_000, outboxId)
@@ -2153,7 +2151,7 @@ export async function consumeDeliveryMessage(
       await deliverSlackThread(env, payload.deliveryId);
     } catch (error) {
       if (error instanceof HttpError && error.code === "slack_mirror_missing_scope") {
-        await pauseSlackScopeOutbox(env, outboxId, error);
+        await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
         message.ack();
         return "acknowledged";
       }
@@ -2186,7 +2184,7 @@ export async function consumeDeliveryMessage(
       await deliverSlackMutation(env, payload.receiptId, row.topic === "slack_thread_action");
     } catch (error) {
       if (error instanceof HttpError && error.code === "slack_mirror_missing_scope") {
-        await pauseSlackScopeOutbox(env, outboxId, error);
+        await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
         message.ack();
         return "acknowledged";
       }
@@ -2328,7 +2326,7 @@ export async function consumeDeliveryMessage(
       await deliverSlackUnfurl(env, unfurlId, outboxId);
     } catch (error) {
       if (slackMissingScope(error)) {
-        await pauseSlackScopeOutbox(env, outboxId, error);
+        await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
         message.ack();
         return "acknowledged";
       }

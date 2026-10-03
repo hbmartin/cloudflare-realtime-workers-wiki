@@ -531,7 +531,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       <p>{subscription.waitingDeliveries} thread replies are waiting their turn.</p>
                     )}
                     {Boolean(subscription.failedDeliveries) && (
-                      <output>{subscription.failedDeliveries} thread deliveries failed.</output>
+                      <output>{subscription.failedDeliveries} deliveries failed.</output>
                     )}
                   </div>
                   {Boolean(subscription.blockedDeliveries) && (
@@ -624,7 +624,9 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
         orphanedFailures.map((group) => (
           <article key={group.id}>
             <output>
-              {group.failedDeliveries} delivery failures for removed mapping #{group.channelName}.
+              {group.id.startsWith("slack-file-cleanup:")
+                ? `${group.failedDeliveries} thumbnail cleanup ${group.failedDeliveries === 1 ? "failure needs" : "failures need"} manual attention.`
+                : `${group.failedDeliveries} delivery failures for removed mapping #${group.channelName}.`}
             </output>
             <button
               disabled={busy}
