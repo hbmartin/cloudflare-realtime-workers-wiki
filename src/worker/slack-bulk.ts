@@ -6,9 +6,10 @@ import {
   definiteSlackRejection,
   invalidSlackDestination,
   recordDeliveryError,
+  recordPermanentDeliveryFailure,
   retireObsoleteReceipt,
 } from "./slack-delivery";
-import { slackApi, SlackRateLimitError, channelActivityActorAccessSql } from "./slack";
+import { slackApi, SlackApiError, SlackRateLimitError, channelActivityActorAccessSql } from "./slack";
 
 type Summary = {
   id: string;
@@ -117,6 +118,18 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
       await finish("sent", posted.ts);
     } catch (error) {
       await recordDeliveryError(env, installation, error, events.results[0]!.mapping_id, row.channel_id);
+      if (error instanceof SlackApiError && error.code === "msg_too_long") {
+        await recordPermanentDeliveryFailure(
+          env,
+          installation,
+          id,
+          events.results[0]!.mapping_id,
+          row.channel_id,
+          error.code,
+        );
+        await finish("retired");
+        return;
+      }
       if (invalidSlackDestination(error)) {
         await finish("retired");
         return;

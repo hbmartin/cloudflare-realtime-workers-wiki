@@ -1,5 +1,6 @@
 import { serializeMarkdownNode, type DocumentSerializationOptions } from "./document-projection";
 import { documentBlocks, notionBlockRegistry, type NotionBlock } from "./notion-blocks";
+import { hasUrlControls } from "./text";
 import type { ProseMirrorJson } from "./types";
 
 export type MarkdownBlockSpan = { internalId: string; from: number; to: number };
@@ -60,11 +61,7 @@ function representable(block: NotionBlock, options: DocumentSerializationOptions
     return false;
   if (MEDIA_TYPES.has(block.type)) {
     const url = block.node.attrs?.url;
-    if (
-      typeof url === "string" &&
-      Array.from(url).some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)
-    )
-      return false;
+    if (typeof url === "string" && hasUrlControls(url)) return false;
     if (typeof url === "string" && options.mediaHref?.(url) === null) return false;
     if (typeof url === "string" && url.startsWith("/api/attachments/") && !options.mediaHref) return false;
   }

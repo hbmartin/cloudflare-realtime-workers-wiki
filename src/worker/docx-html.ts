@@ -2,6 +2,23 @@ import { hasUrlControls } from "../shared/text";
 import { DomUtils, ElementType, parseDocument } from "htmlparser2";
 import { BLOCK_ATTRS, type ImportIssue } from "../shared/import-content";
 import type { ProseMirrorJson } from "../shared/types";
+import { HttpError } from "./http";
+
+const TABLE_MAX_COLUMNS = 256;
+const TABLE_MAX_ROWS = 10_000;
+const DOCUMENT_MAX_TABLE_CELLS = 10_000;
+function tableLimit() {
+  return new HttpError(
+    413,
+    "docx_tables_too_large",
+    "Word tables exceed the supported row, column, or expanded-cell limits.",
+  );
+}
+function tableSpan(value: string | undefined, maximum: number) {
+  const parsed = Number(value ?? 1);
+  if (!Number.isFinite(parsed) || parsed > maximum) throw tableLimit();
+  return Math.max(1, Math.trunc(parsed));
+}
 
 type HtmlNode = ReturnType<typeof parseDocument>["children"][number];
 type HtmlElement = ReturnType<typeof DomUtils.getElementsByTagName>[number];
@@ -34,11 +51,63 @@ const empty = (): ProseMirrorJson => ({
 export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<string> = new Set()) {
   const issues: ImportIssue[] = [];
   let sequence = 0;
+  let expandedTableCells = 0;
   const container = (block: ProseMirrorJson, children: ProseMirrorJson[] = []): ProseMirrorJson => ({
     type: "blockContainer",
     attrs: { id: `docx-${++sequence}` },
     content: [block, ...(children.length ? [{ type: "blockGroup", content: children }] : [])],
   });
+
+  const parsed = parseDocument(html);
+  // Check every source table, including tables whose contents are later flattened.
+  // Reserve the full rectangular footprint before allocating cells or row padding.
+  const layouts = new Map<
+    HtmlElement,
+    {
+      rows: HtmlElement[];
+      width: number;
+      cells: { cell: HtmlElement; row: number; column: number; colspan: number; rowspan: number }[];
+    }
+  >();
+  for (const table of DomUtils.getElementsByTagName("table", parsed.children)) {
+    const rows = DomUtils.getElementsByTagName("tr", table.children).filter((row) => {
+      let parent = row.parent;
+      while (parent && parent !== table) {
+        if (isTag(parent) && parent.name === "table") return false;
+        parent = parent.parent;
+      }
+      return parent === table;
+    });
+    if (rows.length > TABLE_MAX_ROWS) throw tableLimit();
+    const occupied = new Set<number>();
+    const cells = [];
+    let width = 0;
+    for (const [rowIndex, row] of rows.entries()) {
+      let column = 0;
+      for (const cell of row.children.filter((child) => isTag(child) && ["td", "th"].includes(child.name))) {
+        if (!isTag(cell)) throw new Error("Invalid table cell");
+        const colspan = tableSpan(cell.attribs.colspan, TABLE_MAX_COLUMNS);
+        const rowspan = tableSpan(cell.attribs.rowspan, rows.length - rowIndex);
+        while (
+          Array.from({ length: colspan }, (_, i) => occupied.has(rowIndex * TABLE_MAX_COLUMNS + column + i)).some(
+            Boolean,
+          )
+        ) {
+          column++;
+          if (column + colspan > TABLE_MAX_COLUMNS) throw tableLimit();
+        }
+        width = Math.max(width, column + colspan);
+        if (width > TABLE_MAX_COLUMNS || expandedTableCells + rows.length * width > DOCUMENT_MAX_TABLE_CELLS)
+          throw tableLimit();
+        for (let r = 0; r < rowspan; r++)
+          for (let c = 0; c < colspan; c++) occupied.add((rowIndex + r) * TABLE_MAX_COLUMNS + column + c);
+        cells.push({ cell, row: rowIndex, column, colspan, rowspan });
+        column += colspan;
+      }
+    }
+    expandedTableCells += rows.length * width;
+    layouts.set(table, { rows, width, cells });
+  }
 
   function inline(
     nodes: HtmlNode[],
@@ -164,58 +233,32 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
           output.push(root);
         }
       } else if (node.name === "table") {
-        const rows = DomUtils.getElementsByTagName("tr", node.children).filter((row) => {
-          let parent = row.parent;
-          while (parent && parent !== node) {
-            if (isTag(parent) && parent.name === "table") return false;
-            parent = parent.parent;
-          }
-          return parent === node;
-        });
+        const { rows, width, cells } = layouts.get(node)!;
         const images: ProseMirrorJson[] = [];
         const grid: ProseMirrorJson[][] = Array.from({ length: rows.length }, () => []);
-        rows.forEach((row, rowIndex) => {
-          let column = 0;
-          for (const cell of row.children.filter((child) => isTag(child) && ["td", "th"].includes(child.name))) {
-            if (!isTag(cell)) throw new Error("Invalid table cell");
-            if (
-              Number(cell.attribs.colspan || 1) > 1 ||
-              Number(cell.attribs.rowspan || 1) > 1 ||
-              DomUtils.getElementsByTagName("table", cell.children).length ||
-              DomUtils.getElementsByTagName("ul", cell.children).length ||
-              DomUtils.getElementsByTagName("ol", cell.children).length
-            )
-              issues.push({ code: "docx_table_simplified", detail: "Merged or nested table cell" });
-            const content = inline(cell.children, [], 0, true);
-            images.push(...content.filter((child) => child.type === "image"));
-            const own = content.filter((child) => child.type !== "image");
-            while (grid[rowIndex]![column]) column++;
-            const colspan = Math.min(256, Math.max(1, Number.parseInt(cell.attribs.colspan || "1", 10) || 1));
-            const rowspan = Math.min(
-              rows.length - rowIndex,
-              Math.max(1, Number.parseInt(cell.attribs.rowspan || "1", 10) || 1),
-            );
-            while (Array.from({ length: colspan }, (_, i) => grid[rowIndex]![column + i]).some(Boolean)) column++;
-            grid[rowIndex]![column] = {
-              type: cell.name === "th" ? "tableHeader" : "tableCell",
-              attrs: { colspan: 1, rowspan: 1, colwidth: null },
-              content: [{ type: "tableParagraph", attrs: { ...BLOCK_ATTRS }, ...(own.length ? { content: own } : {}) }],
-            };
-            for (let r = 0; r < rowspan; r++)
-              for (let c = 0; c < colspan; c++) if (r || c) grid[rowIndex + r]![column + c] = empty();
-            column += colspan;
-          }
-        });
+        for (const { cell, row: rowIndex, column, colspan, rowspan } of cells) {
+          if (
+            Number(cell.attribs.colspan || 1) > 1 ||
+            Number(cell.attribs.rowspan || 1) > 1 ||
+            DomUtils.getElementsByTagName("table", cell.children).length ||
+            DomUtils.getElementsByTagName("ul", cell.children).length ||
+            DomUtils.getElementsByTagName("ol", cell.children).length
+          )
+            issues.push({ code: "docx_table_simplified", detail: "Merged or nested table cell" });
+          const content = inline(cell.children, [], 0, true);
+          images.push(...content.filter((child) => child.type === "image"));
+          const own = content.filter((child) => child.type !== "image");
+          grid[rowIndex]![column] = {
+            type: cell.name === "th" ? "tableHeader" : "tableCell",
+            attrs: { colspan: 1, rowspan: 1, colwidth: null },
+            content: [{ type: "tableParagraph", attrs: { ...BLOCK_ATTRS }, ...(own.length ? { content: own } : {}) }],
+          };
+          for (let r = 0; r < rowspan; r++)
+            for (let c = 0; c < colspan; c++) if (r || c) grid[rowIndex + r]![column + c] = empty();
+        }
         const converted = grid.map((content) => ({ type: "tableRow", content }));
-        const width = Math.max(0, ...converted.map((row) => row.content!.length));
         for (const row of converted) {
           for (let col = 0; col < width; col++) row.content![col] ??= empty();
-          while (row.content!.length < width)
-            row.content!.push({
-              type: "tableCell",
-              attrs: { colspan: 1, rowspan: 1, colwidth: null },
-              content: [{ type: "tableParagraph", attrs: { ...BLOCK_ATTRS } }],
-            });
         }
         if (width) output.push(container({ type: "table", attrs: { ...BLOCK_ATTRS }, content: converted }));
         if (images.length) {
@@ -223,7 +266,19 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
           output.push(...images.map((image) => container(image)));
         }
       } else if (node.name === "pre")
-        output.push(...paragraphs(inline(node.children), "codeBlock", { language: "text" }));
+        output.push(
+          ...paragraphs(
+            inline(node.children).map((child) =>
+              child.type === "text"
+                ? { type: "text", text: child.text! }
+                : child.type === "hardBreak"
+                  ? { type: "text", text: "\n" }
+                  : child,
+            ),
+            "codeBlock",
+            { language: "text" },
+          ),
+        );
       else if (/^h[1-6]$/.test(node.name)) {
         output.push(
           ...paragraphs(inline(node.children), "heading", { level: Number(node.name[1]), isToggleable: false }),
@@ -237,7 +292,7 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
     return output;
   }
 
-  const content = blocks(parseDocument(html).children);
+  const content = blocks(parsed.children);
   const document: ProseMirrorJson = {
     type: "doc",
     content: [{ type: "blockGroup", content: content.length ? content : paragraphs([]) }],

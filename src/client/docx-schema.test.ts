@@ -1,10 +1,64 @@
 // @vitest-environment jsdom
 import { BlockNoteEditor } from "@blocknote/core";
-import { describe, expect, it } from "vitest";
+import { Blob as NodeBlob } from "node:buffer";
+import { describe, expect, it, vi } from "vitest";
 import { notesSchema } from "./mentions";
 import { docxHtmlToDocument, safeDocxHref } from "../worker/docx-html";
+import { readDocx, writeDocx } from "../worker/docx";
 
 describe("DOCX HTML adapter", () => {
+  it("imports consecutive formatted Word code paragraphs as one schema-valid code block", async () => {
+    const fixture = await writeDocx(
+      {
+        type: "doc",
+        content: ["first", "second"].map((text) => ({
+          type: "codeBlock",
+          content: [{ type: "text", text, marks: [{ type: "bold" }] }],
+        })),
+      },
+      "Code",
+      "https://notes.test",
+      async () => null,
+    );
+    // jsdom's Blob lacks the streaming ZIP API supplied by browsers and Workers.
+    vi.stubGlobal("Blob", NodeBlob);
+    let result;
+    try {
+      result = await readDocx(new Uint8Array(fixture.bytes));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    const editor = BlockNoteEditor.create({ schema: notesSchema });
+    try {
+      const parsed = editor.pmSchema.nodeFromJSON(result.document);
+      parsed.check();
+      const codes: (typeof parsed)[] = [];
+      parsed.descendants((node) => {
+        if (node.type.name === "codeBlock") codes.push(node);
+      });
+      expect(codes.map((node) => node.textContent)).toEqual(["first\nsecond"]);
+      for (const code of codes) code.forEach((child) => expect(child.marks).toEqual([]));
+    } finally {
+      editor.unmount();
+    }
+  });
+  it.each([
+    "<pre><code>first<br>second\tline</code></pre>",
+    '<pre><strong>first</strong><br><a href="https://example.com"><em>second\tline</em></a></pre>',
+  ])("imports formatted code as schema-valid plain text: %s", (html) => {
+    const result = docxHtmlToDocument(html);
+    const editor = BlockNoteEditor.create({ schema: notesSchema });
+    try {
+      const parsed = editor.pmSchema.nodeFromJSON(result.document);
+      expect(() => parsed.check()).not.toThrow();
+      const code = parsed.firstChild!.firstChild!.firstChild!;
+      expect(code.type.name).toBe("codeBlock");
+      expect(code.textContent).toBe("first\nsecond\tline");
+      code.forEach((child) => expect(child.marks).toEqual([]));
+    } finally {
+      editor.unmount();
+    }
+  });
   it("creates valid blocks for the actual document editor schema", () => {
     const result = docxHtmlToDocument(
       `<h2>Heading</h2><p><strong><em><u><s>Rich</s></u></em></strong><br>text</p>

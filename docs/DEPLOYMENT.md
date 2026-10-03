@@ -189,6 +189,16 @@ hand. Before upgrading an existing installation, take a D1 export and stop any r
 then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
 new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
 
+Before an older database applies `0067_review_delivery.sql`, quiesce legacy digest scheduling and keep it
+quiesced through migration application and the Worker rollout. `pnpm db:local` and `pnpm db:remote` run
+`scripts/migrate-d1.mjs`, which checks the exact first-ten-page event assignments that 0067 will backfill.
+CLI deployment and CI both use the guarded remote command. Overlapping pending receipts that assign the
+same event stop the command before any migration is applied, with a collision count and at most 20 event
+samples and 10 receipt IDs per sample. IDs are limited to 200 characters in the report. The guard performs
+read-only queries and never repairs data. Export D1 and investigate reported receipt windows before retrying.
+Already-upgraded databases and fresh databases without legacy receipt tables skip the collision query.
+Existing migrations, including 0067, remain unchanged. Direct Wrangler migration application bypasses this guard.
+
 For OAuth and MCP releases, apply `0062_oauth_mcp.sql`, `0063_oauth_staged_receipt_index.sql`,
 `0064_oauth_cleanup_indexes.sql`, and `0065_mcp_workspace_generation.sql` in order before
 deploying this Worker. Migration `0065` adds a workspace consent generation and a pending-code

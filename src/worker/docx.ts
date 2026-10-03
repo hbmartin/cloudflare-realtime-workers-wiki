@@ -81,7 +81,13 @@ function imageDimensions(bytes: Uint8Array, mime: string): { width: number; heig
   return width > 0 && height > 0 && width <= 100_000 && height <= 100_000 ? { width, height } : null;
 }
 
-const canonical = (path: string) => decodeURIComponent(new URL(path, "https://package.invalid/").pathname.slice(1));
+function canonical(path: string) {
+  try {
+    return decodeURIComponent(new URL(path, "https://package.invalid/").pathname.slice(1));
+  } catch {
+    throw new HttpError(422, "invalid_docx", "The Word document contains an invalid package part path.");
+  }
+}
 const clean = (node: ProseMirrorJson): ProseMirrorJson => ({
   ...node,
   ...(node.text === undefined ? {} : { text: sanitizeXmlText(node.text) }),
@@ -225,7 +231,7 @@ export async function readDocx(bytes: Uint8Array) {
           "strike => s",
           "p[style-name='Quote'] => blockquote:fresh",
           "p[style-name='Title'] => p:fresh",
-          "p[style-name='Code'] => pre:fresh",
+          "p[style-name='Code'] => pre:separator('\\n')",
         ],
         convertImage: mammoth.images.imgElement(async (image) => {
           const mime = inlineImageMime(image.contentType);

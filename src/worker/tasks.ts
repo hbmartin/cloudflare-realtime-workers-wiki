@@ -557,7 +557,15 @@ export async function mutateTask(
         : refreshPageSearchV2Statements(env.DB, detailId)),
     );
     if (body.archived === true) {
-      statements.unshift(activityMutationStart(env.DB, TASK_DETAIL_SUBTREE_SQL, [detailId], operationId, "archive"));
+      statements.unshift(
+        activityMutationStart(
+          env.DB,
+          `SELECT id FROM pages WHERE id IN (${TASK_DETAIL_SUBTREE_SQL}) AND archived_at IS NULL`,
+          [detailId],
+          operationId,
+          "archive",
+        ),
+      );
       statements.push(activityMutationEnd(env.DB, operationId));
     }
     const receiptIndex = statements.length;

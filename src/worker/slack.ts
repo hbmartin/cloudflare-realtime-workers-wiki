@@ -338,6 +338,20 @@ export function slackScopeHealth(scopes: string | readonly string[]) {
   return { required, granted, missing, reauthorizationRequired: missing.length > 0, capabilities };
 }
 
+function deliveryScopes(env: Env) {
+  const scopes: string[] = ["chat:write"];
+  if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") scopes.push(...SLACK_MIRROR_SCOPES);
+  if (env.SLACK_SHARE_REFRESH_ENABLED === "true")
+    scopes.push("links:read", "links:write", "channels:read", "groups:read");
+  if (
+    env.SLACK_RICH_DIGESTS_ENABLED === "true" &&
+    env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" &&
+    env.WORKSPACE_ACTIVITY_ENABLED === "true"
+  )
+    scopes.push("files:write");
+  return scopes;
+}
+
 function configured(env: Env) {
   return Boolean(
     env.SLACK_CLIENT_ID && env.SLACK_CLIENT_SECRET && env.SLACK_SIGNING_SECRET && env.SLACK_TOKEN_ENCRYPTION_KEY,
@@ -532,6 +546,17 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
       )
       .run();
     stored = true;
+    await env.DB.prepare(`UPDATE slack_channel_subscriptions SET notification_blocked_at=NULL,notification_error=NULL
+      WHERE notification_error IN (SELECT value FROM json_each(?)) AND installation_id IN
+        (SELECT id FROM slack_installations WHERE workspace_id=? AND disconnected_at IS NULL AND auth_error IS NULL)`)
+      .bind(
+        JSON.stringify([
+          ...INSTALLATION_ERRORS,
+          ...(slackHasScopes(result.scope ?? "", deliveryScopes(env)) ? ["missing_scope"] : []),
+        ]),
+        member.workspace.id,
+      )
+      .run();
     await env.DB.prepare(`UPDATE slack_thread_deliveries SET state='sending',failure_reason=NULL,updated_at=?
       WHERE state='blocked' AND failure_reason LIKE 'reconciliation_%'
         AND link_id IN (SELECT link.id FROM slack_thread_links link
@@ -543,14 +568,18 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
       .run();
     await env.DB.prepare(`UPDATE outbox SET
       slack_scope_paused_ms=slack_scope_paused_ms+MAX(0,?-slack_scope_paused_at),
-      slack_scope_paused_at=NULL,slack_redrive_count=0,
+      slack_scope_paused_at=NULL,slack_redrive_count=CASE WHEN topic IN
+        ('slack_bulk','slack_digest','slack_share_refresh','slack_file_upload') OR
+        (topic='slack_channel' AND json_extract(payload_json,'$.eventId') LIKE 'activity:%') THEN slack_redrive_count ELSE 0 END,
       enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
-      WHERE workspace_id=? AND slack_scope_paused_at IS NOT NULL`)
-      .bind(timestamp, timestamp, member.workspace.id)
+      WHERE workspace_id=? AND slack_scope_paused_at IS NOT NULL AND (?=1 OR NOT (topic IN
+        ('slack_bulk','slack_digest','slack_share_refresh','slack_file_upload') OR
+        (topic='slack_channel' AND json_extract(payload_json,'$.eventId') LIKE 'activity:%')))`)
+      .bind(timestamp, timestamp, member.workspace.id, slackHasScopes(result.scope ?? "", deliveryScopes(env)) ? 1 : 0)
       .run();
     await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
-      WHERE workspace_id=? AND
-        ((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl')
+      WHERE workspace_id=? AND slack_scope_paused_at IS NULL AND
+        ((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl','slack_bulk','slack_digest','slack_share_refresh','slack_file_upload')
           AND (slack_redrive_due_at IS NOT NULL OR id IN
             (SELECT 'outbox:' || d.id FROM slack_thread_deliveries d WHERE d.state='sending')))
         OR (topic='slack_channel' AND EXISTS (SELECT 1 FROM slack_channel_events event
@@ -890,7 +919,7 @@ export async function upsertSlackChannelSubscription(
   if (!installation) throw new HttpError(409, "slack_not_connected", "Connect Slack before adding a channel.");
   const strict = env.SLACK_CHANNEL_VALIDATION_ENABLED === "true";
   const existing = await env.DB.prepare(
-    `SELECT id,channel_id,cadence,digest_timezone,digest_time,digest_open_work FROM slack_channel_subscriptions WHERE installation_id=?
+    `SELECT id,channel_id,channel_name,cadence,digest_timezone,digest_time,digest_open_work FROM slack_channel_subscriptions WHERE installation_id=?
       AND ((? IS NOT NULL AND id=?) OR (? IS NULL AND channel_id=? AND space_id=? AND ifnull(page_id,'')=ifnull(?,'')))`,
   )
     .bind(
@@ -905,6 +934,7 @@ export async function upsertSlackChannelSubscription(
     .first<{
       id: string;
       channel_id: string;
+      channel_name: string;
       cadence: string;
       digest_timezone: string | null;
       digest_time: string;
@@ -957,7 +987,7 @@ export async function upsertSlackChannelSubscription(
       input.spaceId,
       input.pageId,
       input.channelId,
-      channel?.name ?? input.channelName,
+      channel?.name ?? (strict && !changedDestination ? existing!.channel_name : input.channelName),
       JSON.stringify(input.eventTypes),
       input.cadence,
       member.user.id,
@@ -2194,7 +2224,6 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
     if (
       env.SLACK_SHARE_REFRESH_ENABLED !== "true" ||
       !page.actionable ||
-      (page.kind === "diagram" && env.SLACK_SHARE_REFRESH_ENABLED !== "true") ||
       !/^[CG][A-Z0-9]+$/.test(payload.event.channel)
     ) {
       unfurls[link.url] = {

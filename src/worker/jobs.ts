@@ -4,6 +4,7 @@ import { redriveRound2Outbox, round2DeliveryOutcome, type round2Receipts } from 
 import { deliverDigest } from "./slack-digests";
 import { deliverShareRefresh } from "./slack-shares";
 import { deliverThumbnail } from "./slack-files";
+import { thumbnailDeliveryEnabled } from "./slack-delivery";
 import { deliverSlackProductCopy } from "./slack-product";
 import {
   captureFeedbackStatement,
@@ -1659,9 +1660,10 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
       if (!(await renewLease("before-batch"))) return "lease-lost";
       const rows = await env.DB.prepare(
         `SELECT id, correlation_id FROM outbox WHERE enqueued_at IS NULL AND slack_scope_paused_at IS NULL AND available_at <= ?
+          AND (topic<>'slack_file_upload' OR ?=1)
           ORDER BY available_at, created_at, id LIMIT ?`,
       )
-        .bind(Date.now(), OUTBOX_SWEEP_BATCH_SIZE)
+        .bind(Date.now(), thumbnailDeliveryEnabled(env) ? 1 : 0, OUTBOX_SWEEP_BATCH_SIZE)
         .all<{ id: string; correlation_id: string | null }>();
       for (const row of rows.results) {
         if (!(await renewLease("before-row"))) return "lease-lost";
@@ -1683,9 +1685,9 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
       }
     }
     const remaining = await env.DB.prepare(
-      `SELECT 1 pending FROM outbox WHERE enqueued_at IS NULL AND slack_scope_paused_at IS NULL AND available_at <= ? LIMIT 1`,
+      `SELECT 1 pending FROM outbox WHERE enqueued_at IS NULL AND slack_scope_paused_at IS NULL AND available_at <= ? AND (topic<>'slack_file_upload' OR ?=1) LIMIT 1`,
     )
-      .bind(Date.now())
+      .bind(Date.now(), thumbnailDeliveryEnabled(env) ? 1 : 0)
       .first<{ pending: number }>();
     if (!remaining && (await releaseIfIdle())) return "completed";
     logger.warn("outbox.sweep.capped", "outbox", "Outbox sweep cap reached; scheduling continuation.", {
@@ -2043,10 +2045,19 @@ export async function consumeDeliveryMessage(
   const keepRound2 = async (topic: keyof typeof round2Receipts, id: string) => {
     const outcome = await round2DeliveryOutcome(env, topic, id);
     if (outcome === "completed") return false;
-    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=?`)
+    await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?) WHERE id=?`)
       .bind(Date.now() + (outcome === "paused" || outcome === "uncertain" ? 30 * 60_000 : 60_000), outboxId)
       .run();
     message.ack();
+    return true;
+  };
+  const deferRound2 = async (topic: keyof typeof round2Receipts, id: string) => {
+    const outcome = await round2DeliveryOutcome(env, topic, id);
+    if (outcome === "retryable" || outcome === "uncertain") return false;
+    if (outcome === "completed") {
+      await env.DB.prepare("UPDATE outbox SET slack_redrive_due_at=NULL WHERE id=?").bind(outboxId).run();
+      message.ack();
+    } else await keepRound2(topic, id);
     return true;
   };
   const round2Failure = async (error: unknown) => {
@@ -2055,7 +2066,7 @@ export async function consumeDeliveryMessage(
       error instanceof DeliveryInProgressError ||
       (error instanceof SlackApiError && slackInstallationError(error))
     ) {
-      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=? WHERE id=?`)
+      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?) WHERE id=?`)
         .bind(Date.now() + 60_000, outboxId)
         .run();
     } else throw error;
@@ -2232,11 +2243,12 @@ export async function consumeDeliveryMessage(
         ? env.SLACK_CHANNEL_VALIDATION_ENABLED === "true"
         : row.topic === "slack_share_refresh"
           ? env.SLACK_SHARE_REFRESH_ENABLED === "true"
-          : env.SLACK_RICH_DIGESTS_ENABLED === "true" && env.SLACK_CHANNEL_VALIDATION_ENABLED === "true";
+          : thumbnailDeliveryEnabled(env);
     if (!enabled) {
       message.ack();
       return "acknowledged";
     } // Preserve recovery markers during a release pause.
+    if (await deferRound2(row.topic, id)) return "acknowledged";
     try {
       if (row.topic === "slack_bulk") await deliverBulkSummary(env, id);
       else if (row.topic === "slack_digest") await deliverDigest(env, id);
@@ -2254,6 +2266,8 @@ export async function consumeDeliveryMessage(
       message.ack();
       return "acknowledged";
     }
+    if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" && (await deferRound2("slack_channel", eventId)))
+      return "acknowledged";
     try {
       if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await deliverRound2ChannelEvent(env, eventId);
       else await deliverSlackChannelEvent(env, eventId);

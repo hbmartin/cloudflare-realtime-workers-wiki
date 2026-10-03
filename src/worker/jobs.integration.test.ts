@@ -161,6 +161,66 @@ beforeEach(async () => {
 });
 
 describe("job execution", () => {
+  it("reports oversized DOCX tables during upload inspection without staging content or attachments", async () => {
+    const installed = await bootstrap();
+    const fixture = await writeDocx(
+      {
+        type: "doc",
+        content: [
+          {
+            type: "table",
+            content: [
+              {
+                type: "tableRow",
+                content: [
+                  {
+                    type: "tableCell",
+                    attrs: { colspan: 2 },
+                    content: [{ type: "tableParagraph", content: [{ type: "text", text: "Too wide" }] }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      "Oversized",
+      "http://example.test",
+      async () => null,
+    );
+    const parts = await readZip(fixture.bytes);
+    const document = parts.find((part) => part.path === "word/document.xml")!;
+    document.bytes = new TextEncoder().encode(
+      new TextDecoder().decode(document.bytes).replace('<w:gridSpan w:val="2"/>', '<w:gridSpan w:val="257"/>'),
+    );
+    const upload = new FormData();
+    upload.set("spaceId", `${installed.workspaceId}-general`);
+    upload.set("file", new File([createZip(parts)], "oversized.docx", { type: DOCX_MIME }));
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/import-uploads", { method: "POST", body: upload }),
+      inlineBindings(),
+      context,
+    );
+    expect(response.status).toBe(202);
+    const id = (await response.json<{ job: Job }>()).job.id;
+    await waitOnExecutionContext(context);
+    expect(
+      await env.DB.prepare("SELECT status,error_code,error_message FROM jobs WHERE id=?").bind(id).first(),
+    ).toEqual({
+      status: "failed",
+      error_code: "docx_tables_too_large",
+      error_message: expect.stringContaining("expanded-cell limits"),
+    });
+    expect(await env.DB.prepare("SELECT count(*) n FROM pages WHERE import_job_id=?").bind(id).first()).toEqual({
+      n: 0,
+    });
+    expect(
+      await env.DB.prepare("SELECT count(*) n FROM attachments WHERE workspace_id=?")
+        .bind(installed.workspaceId)
+        .first(),
+    ).toEqual({ n: 0 });
+  });
   it("imports and exports a single DOCX page with verified images without Browser Rendering", async () => {
     const installed = await bootstrap();
     const importedTitle = "Word fixture 1234567890abcdef1234567890abcdef";
@@ -4691,6 +4751,38 @@ describe("job execution", () => {
 });
 
 describe("delivery outbox", () => {
+  it("does not schedule sweep continuations for disabled thumbnails after a full sweep", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.now();
+    await env.DB.batch(
+      Array.from({ length: 250 }, (_, index) =>
+        env.DB.prepare(`INSERT INTO outbox
+      (id,workspace_id,topic,payload_json,available_at,created_at) VALUES(?,?,'notification','{}',?,?)`).bind(
+          `sweep-${index}`,
+          installed.workspaceId,
+          timestamp - 1,
+          timestamp,
+        ),
+      ),
+    );
+    await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,slack_redrive_due_at)
+      VALUES('disabled-thumbnail',?,'slack_file_upload','{"artifactId":"pending"}',?,?,1)`)
+      .bind(installed.workspaceId, timestamp - 1, timestamp + 1)
+      .run();
+    const send = vi.fn().mockResolvedValue(undefined);
+    const bindings = bindingsWith({
+      DELIVERY_QUEUE: { send },
+      SLACK_RICH_DIGESTS_ENABLED: "true",
+      SLACK_CHANNEL_VALIDATION_ENABLED: "true",
+      WORKSPACE_ACTIVITY_ENABLED: "false",
+    });
+    await expect(sweepOutbox(bindings)).resolves.toBe("completed");
+    expect(send).toHaveBeenCalledTimes(250);
+    expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ sweep: true }));
+    expect(
+      await env.DB.prepare("SELECT enqueued_at,slack_redrive_due_at FROM outbox WHERE id='disabled-thumbnail'").first(),
+    ).toEqual({ enqueued_at: null, slack_redrive_due_at: 1 });
+  });
   it("allows only one sweep to run while the singleton lease is held", async () => {
     const installed = await bootstrap();
     const timestamp = Date.now();

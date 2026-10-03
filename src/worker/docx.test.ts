@@ -10,6 +10,94 @@ import { readDocx, writeDocx } from "./docx";
 const noImage = async () => null;
 
 describe("DOCX conversion", () => {
+  it.each([
+    `<table><tr><td colspan="257">Wide</td></tr></table>`,
+    `<table><tr><td colspan="1e+21">Wide</td></tr></table>`,
+    `<table><tr><td colspan="Infinity">Wide</td></tr></table>`,
+    `<table><tr><td><table><tr><td colspan="257">Nested</td></tr></table></td></tr></table>`,
+    `<table><tr><td><table>${"<tr><td>Nested</td></tr>".repeat(10_001)}</table></td></tr></table>`,
+    `<table><tr><td colspan="256" rowspan="2">Wide</td></tr><tr><td>Overflow</td></tr></table>`,
+    `<table>${"<tr><td>Row</td></tr>".repeat(10_001)}</table>`,
+    `<table>${"<tr><td>Row</td></tr>".repeat(99)}<tr><td colspan="101">Padding</td></tr></table>`,
+    `<table>${"<tr><td colspan=100>Row</td></tr>".repeat(50)}</table>`.repeat(2) +
+      "<table><tr><td>Extra</td></tr></table>",
+  ])("rejects excessive table expansion before materializing its cells %#", (html) => {
+    expect(() => docxHtmlToDocument(html)).toThrow(
+      expect.objectContaining({ status: 413, code: "docx_tables_too_large" }),
+    );
+  });
+
+  it.each([
+    ["<table><tr><td colspan=256>Wide</td></tr></table>", 256],
+    [`<table>${"<tr><td>Row</td></tr>".repeat(10_000)}</table>`, 10_000],
+    [`<table>${"<tr><td colspan=100>Row</td></tr>".repeat(50)}</table>`.repeat(2), 10_000],
+  ])("accepts exact table bounds %#", (html, count) => {
+    const tables = descendants(docxHtmlToDocument(String(html)).document, "table");
+    expect(tables.reduce((sum, table) => sum + table.content!.reduce((n, row) => n + row.content!.length, 0), 0)).toBe(
+      count,
+    );
+  });
+
+  it.each(["257", "1000000000000000000000", "9".repeat(400)])(
+    "rejects oversized spans through Mammoth: %s",
+    async (span) => {
+      const fixture = await writeDocx(
+        {
+          type: "doc",
+          content: [
+            {
+              type: "table",
+              content: [
+                {
+                  type: "tableRow",
+                  content: [
+                    {
+                      type: "tableCell",
+                      attrs: { colspan: 2 },
+                      content: [{ type: "tableParagraph", content: [{ type: "text", text: "Wide" }] }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        "Table",
+        "https://notes.test",
+        noImage,
+      );
+      const parts = await readZip(fixture.bytes);
+      const document = parts.find((part) => part.path === "word/document.xml")!;
+      document.bytes = new TextEncoder().encode(
+        new TextDecoder().decode(document.bytes).replace('<w:gridSpan w:val="2"/>', `<w:gridSpan w:val="${span}"/>`),
+      );
+      await expect(readDocx(createZip(parts))).rejects.toMatchObject({ status: 413, code: "docx_tables_too_large" });
+    },
+  );
+
+  it("joins consecutive Code paragraphs and separates them across ordinary prose", async () => {
+    const block = (type: string, text: string) => ({
+      type,
+      content: [{ type: "text", text, marks: [{ type: "bold" }] }],
+    });
+    const fixture = await writeDocx(
+      {
+        type: "doc",
+        content: [
+          block("codeBlock", "first"),
+          block("codeBlock", "second"),
+          block("paragraph", "Prose"),
+          block("codeBlock", "third"),
+        ],
+      },
+      "Code",
+      "https://notes.test",
+      noImage,
+    );
+    const codes = descendants((await readDocx(fixture.bytes)).document, "codeBlock");
+    expect(codes.map((code) => code.content!.map((node) => node.text).join(""))).toEqual(["first\nsecond", "third"]);
+    for (const code of codes) expect(code.content!.every((node) => !node.marks?.length)).toBe(true);
+  });
   it("reads a fixture produced independently with python-docx", async () => {
     const bytes = await readFile(new URL("../../tests/fixtures/docx/rich-text.docx", import.meta.url));
     const imported = await readDocx(bytes);
@@ -183,6 +271,18 @@ describe("DOCX conversion", () => {
     await expect(readDocx(createZip(entries))).rejects.toMatchObject({ code: "invalid_docx" });
   });
 
+  it.each(["_rels/.rels", "[Content_Types].xml"])("rejects malformed percent escapes in %s", async (path) => {
+    const output = await writeDocx({ type: "doc" }, "Invalid path", "https://notes.test", noImage);
+    for (const invalid of ["%", "%GG", "%E0%A4"]) {
+      const entries = await readZip(output.bytes);
+      const part = entries.find((entry) => entry.path === path)!;
+      part.bytes = new TextEncoder().encode(
+        new TextDecoder().decode(part.bytes).replaceAll("word/document.xml", `word/${invalid}.xml`),
+      );
+      await expect(readDocx(createZip(entries))).rejects.toMatchObject({ code: "invalid_docx", status: 422 });
+    }
+  });
+
   it("rejects encrypted and excessive expanded archives before conversion", async () => {
     for (const scenario of ["encrypted", "oversized"]) {
       const bytes = createZip([{ path: "word/document.xml", bytes: new Uint8Array([1]) }]);
@@ -215,7 +315,17 @@ describe("DOCX review regressions", () => {
           content: [
             {
               type: "column",
-              content: [{ type: "codeBlock", content: [{ type: "text", text: "one\n\ttwo\u0001\ufffe" }] }],
+              content: [
+                {
+                  type: "codeBlock",
+                  content: [
+                    {
+                      type: "text",
+                      text: `one\n\ttwo${Array.from({ length: 32 }, (_, code) => String.fromCharCode(code)).join("")}\ud800x\udfff\ufffe\uffff`,
+                    },
+                  ],
+                },
+              ],
             },
           ],
         },
@@ -230,14 +340,10 @@ describe("DOCX review regressions", () => {
     );
     expect(xml).toContain("<w:br/>");
     expect(xml).toContain("<w:tab/>");
-    expect(
-      Array.from(xml).some(
-        (character) =>
-          character.charCodeAt(0) < 9 ||
-          character === String.fromCharCode(0xfffe) ||
-          character === String.fromCharCode(0xffff),
-      ),
-    ).toBe(false);
+    // XML 1.0 forbids these controls and unpaired surrogates.
+    // eslint-disable-next-line no-control-regex
+    expect(xml).not.toMatch(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ud800-\udfff\ufffe\uffff]/u);
+    expect(xml).not.toContain("\ufffd");
     expect(xml).not.toContain("[column");
     expect(xml).not.toContain("[tableOfContents]");
     const imported = await readDocx(output.bytes);
