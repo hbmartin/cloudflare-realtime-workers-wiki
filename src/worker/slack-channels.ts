@@ -82,7 +82,12 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
       throw error;
     }
     if (error instanceof SlackApiError && slackInstallationError(error)) {
-      if (!(await recordSlackInstallationError(env, installation.id, error, installation.generation)))
+      if (
+        !(await recordSlackInstallationError(env, installation.id, error, installation.generation, {
+          sql: `EXISTS(SELECT 1 FROM slack_channel_subscriptions WHERE ${fence})`,
+          binds: fenceBinds(),
+        }))
+      )
         throw new StaleSlackValidationError();
       throw error;
     }

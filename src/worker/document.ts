@@ -1072,7 +1072,9 @@ export class Document extends YServer {
           WHERE product_session.id=? AND product_session.result_page_id=?
             AND json_extract(product_session.identity_json,'$.userId')=member.user_id
             AND destination.archived_at IS NULL AND destination.import_job_id IS NULL
-            AND (member.role='owner' OR (member.role='editor' AND (space.visibility='workspace' OR space_member.role='editor')))
+            AND (member.role='owner' OR (member.role='editor'
+              AND (space.visibility='workspace' OR space_member.user_id IS NOT NULL)
+              AND coalesce(space_member.role,'editor')='editor'))
             AND ${SLACK_PRODUCT_SESSION_ACCESS_SQL}`)
           .bind(body.actorId, body.slackProductSessionId, this.ids.pageId)
           .first();

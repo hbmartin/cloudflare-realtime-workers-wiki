@@ -1504,6 +1504,75 @@ describe("Slack security and integration", () => {
     });
   });
 
+  it.each(["pending", "delivered", "retired"])(
+    "guards revoked-identity unfurl retirement for a concurrently %s row",
+    async (state) => {
+      const installed = await bootstrap();
+      await installSlack(installed.member);
+      const now = Date.now();
+      await env.DB.batch([
+        env.DB.prepare(`INSERT INTO slack_unfurls(id,installation_id,workspace_id,user_id,channel_id,message_ts,unfurls_json,created_at)
+        VALUES('revoked-identity','slack-installation',?,?,'C0123456789','1700000000.000100','{}',?)`).bind(
+          installed.member.workspace.id,
+          installed.member.user.id,
+          now,
+        ),
+        env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at) VALUES
+        ('outbox:revoked',?,'slack_unfurl',json_object('unfurlId','revoked-identity'),?,?),
+        ('outbox:duplicate-revoked',?,'slack_unfurl',json_object('unfurlId','revoked-identity'),?,?)`).bind(
+          installed.member.workspace.id,
+          now,
+          now,
+          installed.member.workspace.id,
+          now,
+          now,
+        ),
+      ]);
+      const db = new Proxy(env.DB, {
+        get(target, key) {
+          if (key === "batch")
+            return async (statements: D1PreparedStatement[]) => {
+              if (state === "delivered")
+                await env.DB.prepare("UPDATE slack_unfurls SET delivered_at=123 WHERE id='revoked-identity'").run();
+              if (state === "retired")
+                await env.DB.prepare(
+                  "UPDATE slack_unfurls SET retired_at=123,retirement_reason='prior_reason' WHERE id='revoked-identity'",
+                ).run();
+              return target.batch(statements);
+            };
+          const value: unknown = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const remote = vi.fn();
+      vi.stubGlobal("fetch", remote);
+      await deliverSlackUnfurl({ ...slackEnv(), DB: db }, "revoked-identity", "outbox:revoked");
+      expect(remote).not.toHaveBeenCalled();
+      const retirementTimestamp = expect.any(Number);
+      expect(
+        await env.DB.prepare(
+          "SELECT delivered_at,retired_at,retirement_reason FROM slack_unfurls WHERE id='revoked-identity'",
+        ).first(),
+      ).toEqual(
+        state === "pending"
+          ? { delivered_at: null, retired_at: retirementTimestamp, retirement_reason: "slack_identity_revoked" }
+          : state === "delivered"
+            ? { delivered_at: 123, retired_at: null, retirement_reason: null }
+            : { delivered_at: null, retired_at: 123, retirement_reason: "prior_reason" },
+      );
+      expect(
+        (
+          await env.DB.prepare(
+            "SELECT id,last_error FROM outbox WHERE id IN ('outbox:revoked','outbox:duplicate-revoked') ORDER BY id",
+          ).all()
+        ).results,
+      ).toEqual([
+        { id: "outbox:duplicate-revoked", last_error: null },
+        { id: "outbox:revoked", last_error: "slack_unfurl_slack_identity_revoked" },
+      ]);
+    },
+  );
+
   it("records retirement against only the exact consumed unfurl outbox row", async () => {
     const installed = await bootstrap();
     await installSlack(installed.member);

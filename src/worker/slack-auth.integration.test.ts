@@ -5,6 +5,7 @@ import { bytesToBase64Url } from "../shared/security";
 import worker from "./index";
 import type { Env } from "./env";
 import { encryptSlackToken } from "./slack";
+import { disconnectSlackIdentity } from "./slack-identity";
 
 const configured = () =>
   ({
@@ -148,6 +149,169 @@ const callback = (flow: { state: string; cookie: string }) =>
   auth(flow.cookie, `/callback/slack?state=${encodeURIComponent(flow.state)}&code=test-code`);
 
 describe("Slack OAuth authorization boundaries", () => {
+  it.each([false, true])(
+    "rejects authorization lost during identity validation with existing link %s",
+    async (relink) => {
+      const { cookie, user, workspace } = await account();
+      if (relink) await callback(await start(cookie));
+      await env.DB.prepare(`INSERT INTO invites(id,workspace_id,token_hash,role,expires_at,created_by,created_at,claimed_email,claim_token,claim_expires_at)
+      VALUES('unrelated',?,'unrelated-token','editor',?, ?,1,'invitee@example.test','reservation',?)`)
+        .bind(workspace, Date.now() + 60_000, user, Date.now() + 60_000)
+        .run();
+      const invite = await env.DB.prepare("SELECT * FROM invites WHERE id='unrelated'").first();
+      const links = await env.DB.prepare("SELECT * FROM slack_user_links").all();
+      const accounts = await env.DB.prepare("SELECT * FROM account WHERE providerId='slack'").all();
+      const flow = await start(cookie);
+      const remote = vi.mocked(fetch).getMockImplementation()!;
+      vi.mocked(fetch).mockImplementation(async (input, init) => {
+        if (String(input).includes("users.info"))
+          await env.DB.prepare("UPDATE session_security SET verified_at=?")
+            .bind(Date.now() - 6 * 60_000)
+            .run();
+        return remote(input, init);
+      });
+      expect((await callback(flow)).headers.get("location")).toContain("error=SECURITY_REQUIRED");
+      expect((await env.DB.prepare("SELECT * FROM slack_user_links").all()).results).toEqual(links.results);
+      expect((await env.DB.prepare("SELECT * FROM account WHERE providerId='slack'").all()).results).toEqual(
+        accounts.results,
+      );
+      expect(await env.DB.prepare("SELECT 1 FROM slack_primary_factor_proofs").first()).toBeNull();
+      expect(await env.DB.prepare("SELECT * FROM invites WHERE id='unrelated'").first()).toEqual(invite);
+    },
+  );
+
+  it.each(["totp", "passkey", "trust"])("disconnects using an older unexpired %s proof", async (method) => {
+    const { cookie, user, workspace } = await account();
+    await callback(await start(cookie));
+    const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?").bind(user).first<{ id: string }>())!;
+    const oauth = (await env.DB.prepare("SELECT id FROM account WHERE providerId='slack'").first<{ id: string }>())!;
+    const now = Date.now();
+    if (method === "trust")
+      await env.DB.prepare(`INSERT INTO trusted_browsers(id,token_hash,user_id,generation,created_at,expires_at,name)
+        VALUES('trusted','trusted-token',?,0,?,?,'Test browser')`)
+        .bind(user, now, now + 60_000)
+        .run();
+    await env.DB.prepare(
+      "UPDATE session_security SET method=?,verified_at=?,expires_at=?,trust_id=? WHERE session_id=?",
+    )
+      .bind(method, now - 6 * 60_000, now + 60_000, method === "trust" ? "trusted" : null, session.id)
+      .run();
+    await env.DB.prepare(`INSERT INTO slack_primary_factor_proofs(session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at,security_generation,authentication_source)
+      VALUES(?,?,?,'T123','UOWNER',?,?,0,'sign_in')`)
+      .bind(session.id, user, oauth.id, now, now + 60_000)
+      .run();
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      new Request("http://example.test/api/slack/identity", {
+        method: "DELETE",
+        headers: { cookie, origin: "http://example.test" },
+      }),
+      configured(),
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(response.status).toBe(200);
+    expect(await env.DB.prepare("SELECT 1 FROM slack_user_links").first()).toBeNull();
+    expect(await env.DB.prepare("SELECT 1 FROM slack_primary_factor_proofs").first()).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM account WHERE providerId='slack'").first()).toEqual(oauth);
+    await expect(disconnectSlackIdentity(configured(), user, session.id, workspace)).resolves.toBe(0);
+  });
+
+  it.each([
+    "expired session",
+    "revoked session",
+    "expired proof",
+    "revoked trust",
+    "expired trust",
+    "wrong trust owner",
+    "wrong trust generation",
+    "unprotected account",
+  ])("rejects disconnect with %s", async (mode) => {
+    const { cookie, user, workspace } = await account();
+    await callback(await start(cookie));
+    const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?").bind(user).first<{ id: string }>())!;
+    if (mode === "expired session")
+      await env.DB.prepare("UPDATE session SET expiresAt=?").bind(new Date(0).toISOString()).run();
+    if (mode === "revoked session") await env.DB.prepare("DELETE FROM session").run();
+    if (mode === "expired proof") await env.DB.prepare("UPDATE session_security SET expires_at=0").run();
+    if (mode === "unprotected account") await env.DB.prepare("UPDATE account_security SET codes_saved=0").run();
+    if (mode.includes("trust")) {
+      await env.DB.prepare("UPDATE session_security SET method='trust',trust_id='trusted'").run();
+      if (mode !== "revoked trust") {
+        if (mode === "wrong trust owner")
+          await env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+            VALUES('other-user','Other user','other-user@example.test',1,1)`).run();
+        await env.DB.prepare(`INSERT INTO trusted_browsers(id,token_hash,user_id,generation,created_at,expires_at,name)
+            VALUES('trusted','trusted-token',?,?,1,?,'Test browser')`)
+          .bind(
+            mode === "wrong trust owner" ? "other-user" : user,
+            mode === "wrong trust generation" ? 1 : 0,
+            mode === "expired trust" ? 0 : Date.now() + 60_000,
+          )
+          .run();
+      }
+    }
+    await expect(disconnectSlackIdentity(configured(), user, session.id, workspace)).rejects.toMatchObject({
+      status: 403,
+      code: "SECURITY_REQUIRED",
+    });
+    expect(await env.DB.prepare("SELECT 1 FROM slack_user_links").first()).not.toBeNull();
+  });
+
+  it("disconnects links only in the requested workspace", async () => {
+    const { cookie, user, workspace } = await account();
+    await callback(await start(cookie));
+    const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?").bind(user).first<{ id: string }>())!;
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('other-workspace','Other workspace',1)"),
+      env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('other-workspace',?,'owner',1)",
+      ).bind(user),
+      env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at)
+        VALUES('other-installation','other-workspace','TOTHER','Other Slack','UBOT','unused','users:read',?,1,1)`).bind(
+        user,
+      ),
+      env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,security_generation)
+        VALUES('other-installation',?,'UOTHER',1,0)`).bind(user),
+    ]);
+    await expect(disconnectSlackIdentity(configured(), user, session.id, workspace)).resolves.toBe(1);
+    expect(
+      (await env.DB.prepare("SELECT installation_id FROM slack_user_links WHERE user_id=?").bind(user).all()).results,
+    ).toEqual([{ installation_id: "other-installation" }]);
+  });
+
+  it.each(["session revoked", "generation changed"])("reports a guarded disconnect no-op after %s", async (mode) => {
+    const { cookie, user, workspace } = await account();
+    await callback(await start(cookie));
+    const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?").bind(user).first<{ id: string }>())!;
+    const db = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            if (mode === "session revoked")
+              await env.DB.prepare("DELETE FROM session WHERE id=?").bind(session.id).run();
+            else {
+              await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?")
+                .bind(user)
+                .run();
+              // A newly connected link must survive the stale revocation request.
+              await env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,security_generation)
+              VALUES('installation',?,'UNEWER',?,1)`)
+                .bind(user, Date.now())
+                .run();
+            }
+            return target.batch(statements);
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(
+      disconnectSlackIdentity({ ...configured(), DB: db }, user, session.id, workspace),
+    ).rejects.toMatchObject({ status: 409, code: "slack_link_changed" });
+    expect(await env.DB.prepare("SELECT 1 FROM slack_user_links WHERE user_id=?").bind(user).first()).not.toBeNull();
+  });
+
   it("completes linking and relinking without creating a primary proof or changing assurance", async () => {
     const { cookie, user } = await account();
     const assurance = await env.DB.prepare("SELECT * FROM session_security").first();

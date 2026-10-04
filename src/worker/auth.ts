@@ -202,13 +202,12 @@ export function createAuth(env: Env, allowRegistration = false) {
         const linkedUserId = typeof state?.link?.userId === "string" ? state.link.userId : null;
         try {
           const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
+          const permit = source.action === "link-account" ? slackLinkContext(state?.serverContext?.slackLink) : null;
           if (source.action === "link-account") {
-            const permit = slackLinkContext(state?.serverContext?.slackLink);
             const current = await getSessionFromCtx(ctx, { disableRefresh: true });
             if (!permit || !current || current.user.id !== linkedUserId)
               throw new HttpError(401, "UNAUTHORIZED", "Sign in again before connecting Slack.");
             await checkSlackLinkAuthorization(env, permit, current.user.id, current.session.id);
-            policy.notesSlackLink = permit;
           } else {
             policy.notesSlackAuthenticationSource = source.action === "create-user" ? "sign_up" : "sign_in";
           }
@@ -231,15 +230,10 @@ export function createAuth(env: Env, allowRegistration = false) {
               errorDescription: "Sign in normally, then connect Slack from Settings.",
             };
           }
+          if (permit) await checkSlackLinkAuthorization(env, permit, permit.userId, permit.sessionId);
+          if (permit) policy.notesSlackLink = permit;
           policy.notesSlackIdentity = identity;
           if (invite) policy.notesSlackInvite = invite;
-          if (policy.notesSlackLink)
-            await checkSlackLinkAuthorization(
-              env,
-              policy.notesSlackLink,
-              policy.notesSlackLink.userId,
-              policy.notesSlackLink.sessionId,
-            );
         } catch (error) {
           if (error instanceof HttpError) return { error: error.code, errorDescription: error.message };
           return {

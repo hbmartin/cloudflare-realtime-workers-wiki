@@ -166,12 +166,22 @@ export async function recordSlackInstallationError(
   installationId: string,
   error: SlackApiError,
   generation?: number,
+  condition?: { sql: string; binds: (string | number | null)[] },
 ) {
   const result = await env.DB.prepare(
     `UPDATE slack_installations SET auth_error=?, auth_error_at=COALESCE(auth_error_at,?)
-      WHERE id=? AND disconnected_at IS NULL AND credential_revision=? AND (? IS NULL OR generation=?)`,
+      WHERE id=? AND disconnected_at IS NULL AND credential_revision=? AND (? IS NULL OR generation=?)
+        ${condition ? `AND (${condition.sql})` : ""}`,
   )
-    .bind(error.code, Date.now(), installationId, error.credentialRevision, generation ?? null, generation ?? null)
+    .bind(
+      error.code,
+      Date.now(),
+      installationId,
+      error.credentialRevision,
+      generation ?? null,
+      generation ?? null,
+      ...(condition?.binds ?? []),
+    )
     .run();
   return result.meta.changes > 0;
 }
@@ -2435,7 +2445,12 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
   return { ok: true };
 }
 
-async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_message_ts", outboxId: string) {
+async function retireSlackUnfurl(
+  env: Env,
+  unfurlId: string,
+  reason: "missing_message_ts" | "slack_identity_revoked",
+  outboxId: string,
+) {
   const timestamp = Date.now();
   await env.DB.batch([
     env.DB.prepare(
@@ -2481,9 +2496,7 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
       .bind(unfurlId)
       .first();
   if (!authorized) {
-    await env.DB.prepare("UPDATE slack_unfurls SET retired_at=?,retirement_reason='slack_identity_revoked' WHERE id=?")
-      .bind(Date.now(), unfurlId)
-      .run();
+    await retireSlackUnfurl(env, unfurlId, "slack_identity_revoked", outboxId);
     return;
   }
   const stored = JSON.parse(row.unfurls_json) as Record<string, unknown>;

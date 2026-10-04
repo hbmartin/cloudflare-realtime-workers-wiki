@@ -263,9 +263,7 @@ describe("channel validation and scheduling", () => {
         .first();
       expect(accepted).toMatchObject({ validation_revision: before!.validation_revision + 1, validated_at: now });
       release();
-      await expect(older).rejects.toBeInstanceOf(
-        olderResult === "invalid_auth" ? SlackApiError : StaleSlackValidationError,
-      );
+      await expect(older).rejects.toBeInstanceOf(StaleSlackValidationError);
       expect(
         await env.DB.prepare(
           "SELECT validation_revision,validation_state,validation_error,validated_at,notification_error FROM slack_channel_subscriptions WHERE id=?",
@@ -275,34 +273,80 @@ describe("channel validation and scheduling", () => {
       ).toEqual(accepted);
       expect(
         await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
-      ).toEqual({ auth_error: olderResult === "invalid_auth" ? "invalid_auth" : null });
+      ).toEqual({ auth_error: null });
     },
   );
 
-  it("invalidates an outstanding validation when an unblocked mapping is repaired", async () => {
+  it("rejects an authentication failure when validation changes immediately before its write", async () => {
     const m = await mapping();
     const installation = (await round2Installation(runtime(), "installation"))!;
-    const remote = vi.mocked(fetch).getMockImplementation()!;
-    let repaired = false;
-    vi.mocked(fetch).mockImplementation(async (input, init) => {
-      if (!repaired && String(input).includes("conversations.info")) {
-        repaired = true;
-        await repairSlackChannelNotifications(runtime(), owner, m.id);
-        return Response.json({ ok: false, error: "channel_not_found" });
-      }
-      return remote(input, init);
+    responses["conversations.info"] = { ok: false, error: "invalid_auth" };
+    const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+      new Proxy(statement, {
+        get(target, key) {
+          if (key === "bind") return (...args: unknown[]) => wrap(target.bind(...args));
+          if (key === "run")
+            return async () => {
+              responses["conversations.info"] = { ok: true, channel };
+              await validateMapping(runtime(), installation, m.id, m.channelId);
+              return target.run();
+            };
+          const value: unknown = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) =>
+            sql.includes("UPDATE slack_installations SET auth_error") ? wrap(target.prepare(sql)) : target.prepare(sql);
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
     });
-    await expect(validateMapping(runtime(), installation, m.id, m.channelId)).rejects.toBeInstanceOf(
+    await expect(validateMapping({ ...runtime(), DB: db }, installation, m.id, m.channelId)).rejects.toBeInstanceOf(
       StaleSlackValidationError,
     );
+    expect(await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first()).toEqual({
+      auth_error: null,
+    });
     expect(
-      await env.DB.prepare(
-        "SELECT validation_state,notification_blocked_at FROM slack_channel_subscriptions WHERE id=?",
-      )
+      await env.DB.prepare("SELECT validation_state,validation_error FROM slack_channel_subscriptions WHERE id=?")
         .bind(m.id)
         .first(),
-    ).toEqual({ validation_state: "valid", notification_blocked_at: null });
+    ).toEqual({ validation_state: "valid", validation_error: null });
   });
+
+  it.each(["channel_not_found", "invalid_auth"])(
+    "invalidates outstanding %s validation when an unblocked mapping is repaired",
+    async (code) => {
+      const m = await mapping();
+      const installation = (await round2Installation(runtime(), "installation"))!;
+      const remote = vi.mocked(fetch).getMockImplementation()!;
+      let repaired = false;
+      vi.mocked(fetch).mockImplementation(async (input, init) => {
+        if (!repaired && String(input).includes("conversations.info")) {
+          repaired = true;
+          await repairSlackChannelNotifications(runtime(), owner, m.id);
+          return Response.json({ ok: false, error: code });
+        }
+        return remote(input, init);
+      });
+      await expect(validateMapping(runtime(), installation, m.id, m.channelId)).rejects.toBeInstanceOf(
+        StaleSlackValidationError,
+      );
+      expect(
+        await env.DB.prepare(
+          "SELECT validation_state,notification_blocked_at FROM slack_channel_subscriptions WHERE id=?",
+        )
+          .bind(m.id)
+          .first(),
+      ).toEqual({ validation_state: "valid", notification_blocked_at: null });
+      expect(
+        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+      ).toEqual({ auth_error: null });
+    },
+  );
 
   it.each([
     ["chat:write", ["text", "legacy-channel"]],

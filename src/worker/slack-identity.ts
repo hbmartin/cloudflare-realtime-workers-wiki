@@ -216,8 +216,23 @@ export async function recordSlackPrimaryFactorProof(
 }
 
 export async function disconnectSlackIdentity(env: Env, userId: string, sessionId: string, workspaceId: string) {
-  const permit = await freshSecurityAuthorization(env, userId, sessionId),
-    guard = freshSecurityGuard(permit);
+  const sessionSql = `FROM session live JOIN session_security proof ON proof.session_id=live.id AND proof.user_id=live.userId
+    JOIN slack_protected_accounts security ON security.user_id=live.userId AND security.generation=proof.generation
+    WHERE live.userId=? AND live.id=? AND live.expiresAt>? AND proof.expires_at>?
+      AND proof.method IN ('totp','passkey','trust')
+      AND (proof.method<>'trust' OR EXISTS(SELECT 1 FROM trusted_browsers browser
+        WHERE browser.id=proof.trust_id AND browser.user_id=live.userId
+          AND browser.generation=security.generation AND browser.expires_at>?))`;
+  const sessionBinds = (now: number) => [userId, sessionId, new Date(now).toISOString(), now, now];
+  const permit = await env.DB.prepare(`SELECT security.generation ${sessionSql}`)
+    .bind(...sessionBinds(Date.now()))
+    .first<{ generation: number }>();
+  if (!permit)
+    throw new HttpError(403, "SECURITY_REQUIRED", "Sign in with account protection before disconnecting Slack.");
+  const guard = {
+    sql: `EXISTS(SELECT 1 ${sessionSql} AND security.generation=?)`,
+    binds: [...sessionBinds(Date.now()), permit.generation],
+  };
   const results = await env.DB.batch([
     env.DB.prepare(`DELETE FROM slack_user_links WHERE user_id=? AND installation_id IN
       (SELECT id FROM slack_installations WHERE workspace_id=?) AND ${guard.sql}`).bind(
@@ -229,6 +244,14 @@ export async function disconnectSlackIdentity(env: Env, userId: string, sessionI
       userId,
       ...guard.binds,
     ),
+    env.DB.prepare(`SELECT 1 FROM slack_user_links WHERE user_id=? AND installation_id IN
+      (SELECT id FROM slack_installations WHERE workspace_id=?) LIMIT 1`).bind(userId, workspaceId),
   ]);
+  if (!results[0]!.meta.changes && results[2]!.results.length)
+    throw new HttpError(
+      409,
+      "slack_link_changed",
+      "Slack authorization changed. Sign in again before disconnecting Slack.",
+    );
   return results[0]!.meta.changes;
 }
