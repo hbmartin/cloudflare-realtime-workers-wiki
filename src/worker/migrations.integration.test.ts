@@ -7,6 +7,47 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("adds validation revisions without changing evidence and advances unchanged validation writes", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0070"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@example.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Notes',1)"),
+      env.DB.prepare(
+        "INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at,generation) VALUES('installation','workspace','T123','Slack','B123','cipher','files:write','owner',1,1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_channel_subscriptions(id,installation_id,space_id,channel_id,channel_name,event_types_json,cadence,created_by,created_at,updated_at,validation_state,validated_at) VALUES('mapping','installation','workspace-general','C123','notes','[]','immediate','owner',1,1,'valid',7)",
+      ),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      await env.DB.prepare(
+        "SELECT validation_revision,validation_state,validated_at FROM slack_channel_subscriptions WHERE id='mapping'",
+      ).first(),
+    ).toEqual({ validation_revision: 0, validation_state: "valid", validated_at: 7 });
+    await env.DB.prepare(
+      "UPDATE slack_channel_subscriptions SET validation_state='valid',validated_at=7 WHERE id='mapping'",
+    ).run();
+    await env.DB.prepare(
+      "UPDATE slack_channel_subscriptions SET validation_state='valid',validated_at=7 WHERE id='mapping'",
+    ).run();
+    await env.DB.prepare(
+      "UPDATE slack_channel_subscriptions SET notification_blocked_at=NULL,notification_error=NULL WHERE id='mapping'",
+    ).run();
+    await env.DB.prepare("UPDATE slack_channel_subscriptions SET created_by='owner' WHERE id='mapping'").run();
+    await env.DB.prepare("UPDATE slack_channel_subscriptions SET updated_at=8 WHERE id='mapping'").run();
+    expect(
+      await env.DB.prepare(
+        "SELECT validation_revision,validation_state,validated_at FROM slack_channel_subscriptions WHERE id='mapping'",
+      ).first(),
+    ).toEqual({ validation_revision: 4, validation_state: "valid", validated_at: 7 });
+  });
+
   it("backfills abandoned allocation ownership and retains cleanup independently with an indexed deadline", async () => {
     await applyD1Migrations(
       env.DB,

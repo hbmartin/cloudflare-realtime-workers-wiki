@@ -140,11 +140,35 @@ export async function deliverThumbnail(env: Env, id: string) {
       filename: "diagram.png",
       length: png.byteLength,
     });
-    await env.DB.prepare(
-      `UPDATE slack_file_artifacts SET slack_file_id=?,upload_url=?,upload_phase='upload',updated_at=? WHERE id=? AND claim_token=?`,
-    )
-      .bind(upload.file_id, upload.upload_url, Date.now(), id, token)
-      .run();
+    const now = Date.now();
+    // A replaced claim or removed artifact must not strand Slack's allocation.
+    // Keep its original identity in the ledger in the same transaction as the save.
+    const saved = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE slack_file_artifacts SET slack_file_id=?,upload_url=?,upload_phase='upload',updated_at=? WHERE id=? AND claim_token=?`,
+      ).bind(upload.file_id, upload.upload_url, now, id, token),
+      env.DB.prepare(`INSERT OR IGNORE INTO slack_file_cleanup_jobs
+        (id,workspace_id,installation_id,installation_generation,team_id,bot_user_id,file_id,artifact_id,state,next_attempt_at,last_error,created_at,updated_at)
+        SELECT ?,?,?,?,?,?,?,?,'pending',?,'allocation_claim_lost',?,?
+        WHERE EXISTS(SELECT 1 FROM workspaces WHERE id=?)
+          AND NOT EXISTS(SELECT 1 FROM slack_file_artifacts WHERE installation_id=? AND slack_file_id=?)`).bind(
+        `slack-file-cleanup:${installation.id}:${upload.file_id}`,
+        installation.workspace_id,
+        installation.id,
+        installation.generation,
+        installation.team_id,
+        installation.bot_user_id,
+        upload.file_id,
+        id,
+        now,
+        now,
+        now,
+        installation.workspace_id,
+        installation.id,
+        upload.file_id,
+      ),
+    ]);
+    if (!saved[0]!.meta.changes) throw new DeliveryInProgressError();
     row.slack_file_id = upload.file_id;
     await checkpoint("upload");
     const response = await fetch(upload.upload_url, { method: "POST", body: png, signal: AbortSignal.timeout(10_000) });

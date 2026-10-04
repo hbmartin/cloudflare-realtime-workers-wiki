@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { parsePendingMigrations } from "./check-page-move-migration.mjs";
+import { checkSlackReviewMigration } from "./check-slack-review-migration.mjs";
 
 // Match 0067's backfill exactly: only each receipt's first ten changed pages.
 export const digestCollisionSql = `WITH selected_pages AS (
@@ -48,7 +49,7 @@ function queryRows(result, stage) {
   return value.flatMap((entry) => entry.results);
 }
 
-export function main(argv, execute) {
+export function main(argv, execute, { slackReviewMigrationSafe = false } = {}) {
   try {
     const args = [...argv];
     let preflightTimeoutMs = 300_000;
@@ -70,6 +71,7 @@ export function main(argv, execute) {
     const listing = execute(["d1", "migrations", "list", "DB", ...args], { timeout: 60_000, stdio: "pipe" });
     checkResult(listing, "migration listing");
     const pending = parsePendingMigrations(listing.stdout);
+    if (args.includes("--remote")) checkSlackReviewMigration(listing.stdout, slackReviewMigrationSafe);
     if (pending.includes("0067_review_delivery.sql")) {
       const query = (sql, stage) =>
         queryRows(
@@ -144,10 +146,13 @@ if (typeof import.meta.main !== "boolean")
   throw new Error("This script requires a Node.js runtime with import.meta.main support.");
 if (import.meta.main) {
   const wrangler = createRequire(import.meta.url).resolve("wrangler");
-  process.exitCode = main(process.argv.slice(2), (args, options) =>
-    spawnSync(process.execPath, [wrangler, ...args], {
-      encoding: "utf8",
-      ...options,
-    }),
+  process.exitCode = main(
+    process.argv.slice(2),
+    (args, options) =>
+      spawnSync(process.execPath, [wrangler, ...args], {
+        encoding: "utf8",
+        ...options,
+      }),
+    { slackReviewMigrationSafe: process.env.SLACK_REVIEW_MIGRATION_SAFE === "true" },
   );
 }

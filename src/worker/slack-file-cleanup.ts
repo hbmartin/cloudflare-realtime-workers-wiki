@@ -5,6 +5,7 @@ import {
   slackApi,
   slackHasScopes,
   slackInstallationError,
+  recordSlackInstallationError,
   SlackApiError,
   SlackRateLimitError,
   usableBotToken,
@@ -60,7 +61,10 @@ export async function processSlackFileCleanup(env: Env, id: string) {
       preparedToken = await usableBotToken(env, installation);
     } catch (error) {
       const paused =
-        error instanceof SlackApiError && (slackInstallationError(error) || error.code === "missing_scope");
+        error instanceof SlackApiError &&
+        (error.code === "missing_scope" ||
+          (slackInstallationError(error) &&
+            (await recordSlackInstallationError(env, installation.id, error, installation.generation))));
       await save(
         paused ? "paused" : "pending",
         error instanceof SlackApiError ? error.code : "cleanup_credentials_unavailable",
@@ -102,8 +106,13 @@ export async function processSlackFileCleanup(env: Env, id: string) {
           : error instanceof SlackRateLimitError
             ? "rate_limited"
             : "cleanup_delete_unconfirmed";
-      const pause = error instanceof SlackApiError && (error.code === "missing_scope" || slackInstallationError(error));
-      if (job.attempt_count + 1 >= 2 || (!pause && definiteSlackRejection(error))) await save("failed", code);
+      const authError = error instanceof SlackApiError && slackInstallationError(error);
+      const pause =
+        error instanceof SlackApiError &&
+        (error.code === "missing_scope" ||
+          (authError && (await recordSlackInstallationError(env, installation.id, error, installation.generation))));
+      if (job.attempt_count + 1 >= 2 || (!pause && !authError && definiteSlackRejection(error)))
+        await save("failed", code);
       else if (pause) await save("paused", code);
       else
         await save(

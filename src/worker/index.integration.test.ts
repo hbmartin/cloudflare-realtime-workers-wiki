@@ -42,7 +42,7 @@ import { processDeletionJob } from "./cleanup";
 import { migrateLegacyColumns } from "./document";
 import type { Env } from "./env";
 import { HttpError } from "./http";
-import worker, { backfillTableSearchValues, executeScheduledTasks } from "./index";
+import worker, { backfillTableSearchValues, executeScheduledTasks, runSlackMaintenance } from "./index";
 import { linkPreview } from "./link-previews";
 import { SCHEDULED_TASK_NAMES } from "./scheduled-task-names";
 import { broadcastWorkspaceEvent, eventForCurrentWorkspaceState, WorkspaceEvents } from "./workspace-events";
@@ -1474,6 +1474,67 @@ describe("Worker integration", () => {
       logged.mockRestore();
     }
   });
+
+  it.each([0, 1, 2, 3])(
+    "preserves Slack maintenance failures in logs and task state for combination %i",
+    async (combination) => {
+      const operations = ["redrive", "file_cleanup"] as const;
+      const errors = operations.map(
+        (operation) =>
+          new Error(`${operation} Authorization: Bearer ${operation}-secret retained-context ${"x".repeat(2_000)}`),
+      );
+      const attempted = new Set<string>();
+      const database = new Proxy(env.DB, {
+        get(target, property, receiver) {
+          if (property !== "prepare") return Reflect.get(target, property, receiver);
+          return (query: string) => {
+            const index = query.includes("UPDATE slack_interaction_receipts")
+              ? 0
+              : query.includes("SELECT id,workspace_id,team_id FROM slack_file_cleanup_jobs")
+                ? 1
+                : -1;
+            if (index !== -1) {
+              attempted.add(operations[index]!);
+              if (combination & (1 << index))
+                return {
+                  bind: () => ({ run: () => Promise.reject(errors[index]), all: () => Promise.reject(errors[index]) }),
+                };
+            }
+            return target.prepare(query);
+          };
+        },
+      });
+      const bindings = envWithDatabase(env, database);
+      const logged = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const failures = await executeScheduledTasks(bindings, createExecutionContext(), [
+          { name: "slack_redrive", run: () => runSlackMaintenance(bindings) },
+        ]).then(
+          () => [],
+          (error: AggregateError) => error.errors as AggregateError[],
+        );
+        const expectedErrors = errors.filter((_, index) => combination & (1 << index));
+        expect(failures.map((failure) => failure.errors)).toEqual(expectedErrors.length ? [expectedErrors] : []);
+        expect([...attempted].sort()).toEqual([...operations].sort());
+        const state = (await env.DB.prepare(
+          "SELECT last_error,last_succeeded_at,last_failed_at FROM observability_task_runs WHERE task_name='slack_redrive'",
+        ).first<{ last_error: string | null; last_succeeded_at: number | null; last_failed_at: number | null }>())!;
+        expect(state.last_error === null).toBe(combination === 0);
+        expect(typeof state.last_failed_at === "number").toBe(combination !== 0);
+        expect(typeof state.last_succeeded_at === "number").toBe(combination === 0);
+        expect(state.last_error?.length ?? 0).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
+        for (const operation of operations.filter((_, index) => combination & (1 << index))) {
+          expect(state.last_error).toContain(`${operation}:`);
+          expect(state.last_error).toContain("[redacted] retained-context");
+          expectStructuredLog(logged, "scheduled.slack_maintenance.failed", { operation, errorName: "Error" });
+        }
+        expect(JSON.stringify(logged.mock.calls)).not.toContain("-secret");
+        expect(state.last_error ?? "").not.toContain("-secret");
+      } finally {
+        logged.mockRestore();
+      }
+    },
+  );
 
   it("stores a bounded, singly redacted scheduled-task failure", async () => {
     const taskName = "test_redacted_failure";

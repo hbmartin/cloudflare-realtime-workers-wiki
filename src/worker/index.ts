@@ -96,7 +96,7 @@ import {
   TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
 import { PAGE_KINDS } from "../shared/page-kind";
-import { prefixedErrorLogFields, safeInstanceOf } from "../shared/error-log";
+import { boundedLogString, prefixedErrorLogFields, rawSafeErrorMessage, safeInstanceOf } from "../shared/error-log";
 import {
   PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
   PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
@@ -7107,6 +7107,27 @@ export async function backfillTableSearchValues(env: Env) {
   if (statements.length) await env.DB.batch(statements);
 }
 
+export async function runSlackMaintenance(env: Env) {
+  const operations = ["redrive", "file_cleanup"] as const;
+  const results = await Promise.allSettled([redriveStaleSlackOutbox(env), processDueSlackFileCleanup(env)]);
+  const failures: unknown[] = [];
+  const summaries: string[] = [];
+  for (const [index, result] of results.entries()) {
+    if (result.status !== "rejected") continue;
+    const operation = operations[index]!;
+    logger.error(
+      "scheduled.slack_maintenance.failed",
+      "scheduler",
+      "Slack maintenance operation failed",
+      { operation },
+      result.reason,
+    );
+    failures.push(result.reason);
+    summaries.push(`${operation}: ${boundedLogString(rawSafeErrorMessage(result.reason, "Unknown failure"), 180)}`);
+  }
+  if (failures.length) throw new AggregateError(failures, `Slack maintenance failed; ${summaries.join("; ")}`);
+}
+
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext) {
     const requestId = crypto.randomUUID();
@@ -7195,10 +7216,7 @@ export default {
           await purgeExpiredSlackSearchSessions(env);
         },
         link_previews: () => pruneLinkPreviews(env),
-        slack_redrive: async () => {
-          const results = await Promise.allSettled([redriveStaleSlackOutbox(env), processDueSlackFileCleanup(env)]);
-          for (const result of results) if (result.status === "rejected") throw result.reason;
-        },
+        slack_redrive: () => runSlackMaintenance(env),
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
         date_reminders: () => processDueDateReminders(env),

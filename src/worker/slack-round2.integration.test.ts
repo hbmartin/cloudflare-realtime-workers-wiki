@@ -34,6 +34,7 @@ import {
   listSlackDeliveryFailureGroups,
   acknowledgeSlackDeliveryFailures,
   usableBotToken,
+  slackWorkspaceStatus,
 } from "./slack";
 import { deliverShareRefresh } from "./slack-shares";
 import { createShare, revokeShare } from "./shares";
@@ -41,6 +42,7 @@ import { listActivity } from "./activity";
 import { notificationFanoutStatements } from "./notifications";
 import { mutateTask, taskListStatements } from "./tasks";
 import { deliverThumbnail } from "./slack-files";
+import { DeliveryInProgressError } from "./notifications";
 import { reconcileRound2Mapping, redriveRound2Outbox, round2DeliveryOutcome } from "./slack-recovery";
 
 const runtime = () =>
@@ -201,6 +203,97 @@ afterEach(() => {
 });
 
 describe("channel validation and scheduling", () => {
+  it.each([
+    ["channel_not_found", "success"],
+    ["missing_scope", "success"],
+    ["invalid_auth", "success"],
+    ["success", "channel_not_found"],
+    ["success", "missing_scope"],
+    ["success", "success"],
+  ])(
+    "rejects a stale %s validation after a newer %s commits at the same timestamp",
+    async (olderResult, newerResult) => {
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      const m = await mapping();
+      const installation = (await round2Installation(runtime(), "installation"))!;
+      const before = await env.DB.prepare("SELECT validation_revision FROM slack_channel_subscriptions WHERE id=?")
+        .bind(m.id)
+        .first<{ validation_revision: number }>();
+      let arrived!: () => void;
+      const started = new Promise<void>((resolve) => {
+        arrived = resolve;
+      });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let checks = 0;
+      const remote = vi.mocked(fetch).getMockImplementation()!;
+      vi.mocked(fetch).mockImplementation(async (input, init) => {
+        if (String(input).includes("conversations.info") && ++checks === 1) {
+          arrived();
+          await held;
+          return Response.json(olderResult === "success" ? { ok: true, channel } : { ok: false, error: olderResult });
+        }
+        return remote(input, init);
+      });
+      const older = validateMapping(runtime(), installation, m.id, m.channelId);
+      await started;
+      responses["conversations.info"] =
+        newerResult === "success" ? { ok: true, channel } : { ok: false, error: newerResult };
+      const newerOutcome = await validateMapping(runtime(), installation, m.id, m.channelId).catch(
+        (error: unknown) => error,
+      );
+      expect(newerOutcome instanceof SlackApiError ? newerOutcome.code : newerOutcome).toBe(
+        newerResult === "missing_scope" ? "missing_scope" : newerResult === "success",
+      );
+      const accepted = await env.DB.prepare(
+        "SELECT validation_revision,validation_state,validation_error,validated_at,notification_error FROM slack_channel_subscriptions WHERE id=?",
+      )
+        .bind(m.id)
+        .first();
+      expect(accepted).toMatchObject({ validation_revision: before!.validation_revision + 1, validated_at: now });
+      release();
+      await expect(older).rejects.toBeInstanceOf(StaleSlackValidationError);
+      expect(
+        await env.DB.prepare(
+          "SELECT validation_revision,validation_state,validation_error,validated_at,notification_error FROM slack_channel_subscriptions WHERE id=?",
+        )
+          .bind(m.id)
+          .first(),
+      ).toEqual(accepted);
+      expect(
+        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+      ).toEqual({ auth_error: null });
+    },
+  );
+
+  it("invalidates an outstanding validation when an unblocked mapping is repaired", async () => {
+    const m = await mapping();
+    const installation = (await round2Installation(runtime(), "installation"))!;
+    const remote = vi.mocked(fetch).getMockImplementation()!;
+    let repaired = false;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (!repaired && String(input).includes("conversations.info")) {
+        repaired = true;
+        await repairSlackChannelNotifications(runtime(), owner, m.id);
+        return Response.json({ ok: false, error: "channel_not_found" });
+      }
+      return remote(input, init);
+    });
+    await expect(validateMapping(runtime(), installation, m.id, m.channelId)).rejects.toBeInstanceOf(
+      StaleSlackValidationError,
+    );
+    expect(
+      await env.DB.prepare(
+        "SELECT validation_state,notification_blocked_at FROM slack_channel_subscriptions WHERE id=?",
+      )
+        .bind(m.id)
+        .first(),
+    ).toEqual({ validation_state: "valid", notification_blocked_at: null });
+  });
+
   it.each([
     ["chat:write", ["text", "legacy-channel"]],
     ["chat:write,links:write", ["text", "legacy-channel", "unfurl"]],
@@ -1600,6 +1693,88 @@ describe("thumbnail uploads and queued recovery", () => {
       .run();
     return `file:installation:1:page:1:${hash}`;
   }
+  it.each(["takeover", "artifact_deleted", "page_deleted", "identity_changed"])(
+    "retains an allocation after %s during the Slack request without uploading it",
+    async (change) => {
+      await mapping();
+      await page("page", { kind: "diagram" });
+      const id = await projection();
+      await env.BUCKET.put("thumbnail-key", "<svg></svg>");
+      responses["files.getUploadURLExternal"] = {
+        ok: true,
+        file_id: "FLOST",
+        upload_url: "https://uploads.slack.test/lost",
+      };
+      const remote = vi.mocked(fetch).getMockImplementation()!;
+      vi.mocked(fetch).mockImplementation(async (input, init) => {
+        if (String(input).includes("files.getUploadURLExternal")) {
+          if (change === "page_deleted") await env.DB.prepare("DELETE FROM pages WHERE id='page'").run();
+          else if (change === "artifact_deleted")
+            await env.DB.prepare("DELETE FROM slack_file_artifacts WHERE id=?").bind(id).run();
+          else {
+            await env.DB.prepare(
+              "UPDATE slack_file_artifacts SET claim_token='replacement-consumer',claimed_at=? WHERE id=?",
+            )
+              .bind(Date.now(), id)
+              .run();
+            if (change === "identity_changed")
+              await env.DB.prepare(
+                "UPDATE slack_installations SET generation=2,team_id='TOTHER',bot_user_id='BOTHER' WHERE id='installation'",
+              ).run();
+          }
+        }
+        return remote(input, init);
+      });
+      const bindings = {
+        ...runtime(),
+        BROWSER: { quickAction: vi.fn(async () => new Response(new Uint8Array([1, 2, 3]))) },
+      } as unknown as Env;
+      const outcomes = [
+        await deliverThumbnail(bindings, id).then(
+          () => null,
+          (error: unknown) => error,
+        ),
+      ];
+      expect(await env.DB.prepare("SELECT claim_token FROM slack_file_artifacts WHERE id=?").bind(id).first()).toEqual(
+        ["takeover", "identity_changed"].includes(change) ? { claim_token: "replacement-consumer" } : null,
+      );
+      if (change === "takeover") {
+        await env.DB.prepare("UPDATE slack_file_artifacts SET claimed_at=NULL,claim_token=NULL WHERE id=?")
+          .bind(id)
+          .run();
+        outcomes.push(
+          await deliverThumbnail(bindings, id).then(
+            () => null,
+            (error: unknown) => error,
+          ),
+        );
+      }
+      expect(outcomes).toHaveLength(change === "takeover" ? 2 : 1);
+      for (const outcome of outcomes) expect(outcome).toBeInstanceOf(DeliveryInProgressError);
+      expect(
+        (
+          await env.DB.prepare(
+            "SELECT workspace_id,installation_id,installation_generation,team_id,bot_user_id,file_id,artifact_id,state,attempt_count FROM slack_file_cleanup_jobs WHERE file_id='FLOST'",
+          ).all()
+        ).results,
+      ).toEqual([
+        {
+          workspace_id: "workspace",
+          installation_id: "installation",
+          installation_generation: 1,
+          team_id: "T123",
+          bot_user_id: "B123",
+          file_id: "FLOST",
+          artifact_id: id,
+          state: "pending",
+          attempt_count: 0,
+        },
+      ]);
+      expect(
+        calls.filter((call) => ["upload", "files.completeUploadExternal", "files.delete"].includes(call.method)),
+      ).toHaveLength(0);
+    },
+  );
   it.each([0, 1, 2, 3, 4, 5, 6, 7])(
     "gates thumbnail enqueueing, redrive, and delivery for flag combination %i",
     async (flags) => {
@@ -1755,6 +1930,7 @@ describe("thumbnail uploads and queued recovery", () => {
     } as unknown as Env;
     await deliverThumbnail(testEnv, id);
     await deliverThumbnail(testEnv, id);
+    expect(await env.DB.prepare("SELECT count(*) n FROM slack_file_cleanup_jobs").first()).toEqual({ n: 0 });
     expect(calls.filter((c) => c.method === "files.getUploadURLExternal")).toHaveLength(1);
     expect(calls.find((c) => c.method === "files.completeUploadExternal")!.body).toEqual({
       files: [{ id: "F123", title: "NoteFlare diagram thumbnail" }],
@@ -3181,6 +3357,98 @@ describe("durable abandoned thumbnail cleanup", () => {
       .bind(id)
       .run();
   }
+  it.each(["invalid_auth", "token_revoked", "account_inactive"])(
+    "records cleanup authentication failure %s and resumes without resetting attempts",
+    async (code) => {
+      const required = (await slackWorkspaceStatus(runtime(), owner)).installation!.scopeHealth.required;
+      await env.DB.prepare("UPDATE slack_installations SET scopes=?").bind(required.join(",")).run();
+      expect((await slackWorkspaceStatus(runtime(), owner)).reauthorization.required).toBe(false);
+      const id = await allocation();
+      await abandon();
+      responses["files.delete"] = { ok: false, error: code };
+      await processSlackFileCleanup(runtime(), id);
+      expect(
+        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+      ).toEqual({ auth_error: code });
+      expect((await slackWorkspaceStatus(runtime(), owner)).reauthorization.required).toBe(true);
+      expect(
+        await env.DB.prepare("SELECT state,attempt_count FROM slack_file_cleanup_jobs WHERE id=?").bind(id).first(),
+      ).toEqual({ state: "paused", attempt_count: 1 });
+      await env.DB.prepare(
+        "UPDATE slack_installations SET auth_error=NULL,auth_error_at=NULL,credential_revision=credential_revision+1",
+      ).run();
+      await resumeSlackFileCleanup(runtime(), "workspace");
+      responses["files.delete"] = { ok: true };
+      await processSlackFileCleanup(runtime(), id);
+      expect(
+        await env.DB.prepare("SELECT state,attempt_count FROM slack_file_cleanup_jobs WHERE id=?").bind(id).first(),
+      ).toEqual({ state: "completed", attempt_count: 2 });
+    },
+  );
+
+  it.each(["no_refresh_token", "revoked_refresh"])(
+    "records %s during cleanup token preparation without spending an attempt",
+    async (reason) => {
+      const id = await allocation();
+      await abandon();
+      await env.DB.prepare("UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?")
+        .bind(reason === "no_refresh_token" ? null : await encryptSlackToken(runtime(), "refresh-token"))
+        .run();
+      responses["oauth.v2.access"] = { ok: false, error: "token_revoked" };
+      await processSlackFileCleanup(runtime(), id);
+      expect(
+        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+      ).toEqual({ auth_error: reason === "no_refresh_token" ? "invalid_auth" : "token_revoked" });
+      expect(
+        await env.DB.prepare("SELECT state,attempt_count FROM slack_file_cleanup_jobs WHERE id=?").bind(id).first(),
+      ).toEqual({ state: "paused", attempt_count: 0 });
+      expect(calls.filter((call) => call.method === "files.delete")).toHaveLength(0);
+    },
+  );
+
+  it("records authentication failure even when the last cleanup attempt is exhausted", async () => {
+    const id = await allocation();
+    await abandon();
+    await env.DB.prepare("UPDATE slack_file_cleanup_jobs SET attempt_count=1 WHERE id=?").bind(id).run();
+    responses["files.delete"] = { ok: false, error: "invalid_auth" };
+    await processSlackFileCleanup(runtime(), id);
+    expect(await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first()).toEqual({
+      auth_error: "invalid_auth",
+    });
+    expect(
+      await env.DB.prepare("SELECT state,attempt_count FROM slack_file_cleanup_jobs WHERE id=?").bind(id).first(),
+    ).toEqual({ state: "failed", attempt_count: 2 });
+  });
+
+  it.each(["credential_revision", "generation"])(
+    "ignores a stale cleanup auth error after %s changes",
+    async (field) => {
+      const id = await allocation();
+      await abandon();
+      const remote = vi.mocked(fetch).getMockImplementation()!;
+      vi.mocked(fetch).mockImplementation(async (input, init) => {
+        if (String(input).includes("files.delete"))
+          await env.DB.prepare(`UPDATE slack_installations SET ${field}=${field}+1 WHERE id='installation'`).run();
+        return remote(input, init);
+      });
+      responses["files.delete"] = { ok: false, error: "invalid_auth" };
+      await processSlackFileCleanup(runtime(), id);
+      expect(
+        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+      ).toEqual({ auth_error: null });
+      expect(
+        await env.DB.prepare("SELECT state,attempt_count FROM slack_file_cleanup_jobs WHERE id=?").bind(id).first(),
+      ).toEqual({ state: "pending", attempt_count: 1 });
+      vi.mocked(fetch).mockImplementation(remote);
+      responses["files.delete"] = { ok: true };
+      await env.DB.prepare("UPDATE slack_file_cleanup_jobs SET next_attempt_at=1 WHERE id=?").bind(id).run();
+      await processSlackFileCleanup(runtime(), id);
+      expect(
+        await env.DB.prepare("SELECT state,attempt_count FROM slack_file_cleanup_jobs WHERE id=?").bind(id).first(),
+      ).toEqual({ state: "completed", attempt_count: 2 });
+    },
+  );
+
   it("captures replacement and terminal failure transactionally and survives page deletion", async () => {
     const first = await allocation();
     await abandon();
