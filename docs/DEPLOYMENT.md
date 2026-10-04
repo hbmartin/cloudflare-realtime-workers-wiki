@@ -189,6 +189,12 @@ hand. Before upgrading an existing installation, take a D1 export and stop any r
 then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
 new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
 
+Remote releases with pending Slack migrations `0069` or `0070` require
+`SLACK_REVIEW_MIGRATION_SAFE=true` after the [Slack rollout pause](#slack-review-follow-up-migration).
+This guard applies to both `pnpm db:remote` and `pnpm run deploy`; local database migrations do not
+require confirmation. The confirmation acknowledges an operator-completed pause and drain, rather
+than pausing consumers automatically.
+
 Before an older database applies `0067_review_delivery.sql`, quiesce legacy digest scheduling and keep it
 quiesced through migration application and the Worker rollout. `pnpm db:local` and `pnpm db:remote` run
 `scripts/migrate-d1.mjs`, which checks the exact first-ten-page event assignments that 0067 will backfill.
@@ -392,6 +398,12 @@ before making changes. Quiesce page moves or verify that the live Worker already
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
 until that manually dispatched run has deployed the new Worker.
 
+Pending `0069_slack_file_cleanup.sql` or `0070_slack_review_fences.sql` also stop automatic deployment.
+Follow the [Slack rollout pause](#slack-review-follow-up-migration), then manually dispatch with
+`confirm_slack_review_migration_safe` checked. The workflow passes this confirmation to the guarded
+remote migration command. Once these migrations are applied, later automatic releases need no Slack
+confirmation.
+
 It needs `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository or environment secrets and
 `PRODUCTION_BASE_URL` as a variable. The monitor additionally needs `CLOUDFLARE_OBSERVABILITY_TOKEN` and
 `OBSERVABILITY_PROBE_TOKEN`; its Cloudflare token includes Workers Scripts Read so it can list current Workflow
@@ -407,15 +419,58 @@ relying on it.
 ### Slack review follow-up migration
 
 Apply additive `0069_slack_file_cleanup.sql` before deploying the Slack review follow-up. It snapshots
-allocation ownership and adds an indexed cleanup ledger plus transactional capture triggers. Quiesce
-thumbnail upload consumers during migration and Worker rollout so the old uploader cannot delete an
-allocation outside the new attempt bookkeeping. Existing
+allocation ownership and adds an indexed cleanup ledger plus transactional capture triggers. Additive
+`0070_slack_review_fences.sql` adds a monotonically increasing channel-validation revision. Existing
 failed/retired allocations are backfilled; allocations whose original Slack identity cannot be verified
 are reported for manual cleanup rather than deleted. Existing migrations remain unchanged.
+
+When either migration is pending, perform this sequence **before applying migrations**:
+
+1. Pause the shared production delivery queue:
+
+   ```sh
+   pnpm wrangler queues pause-delivery cloudflare-realtime-notes-delivery --env production
+   ```
+
+2. In the live Worker's Cloudflare settings, set `SLACK_CHANNEL_VALIDATION_ENABLED` to `false` and
+   apply the variable change using the currently deployed code. Keep it `false` in the release's
+   production configuration too. This stops scheduled channel validation; the queue pause stops
+   new thumbnail consumers. Other queued jobs and notifications wait, while page editing remains
+   available. Record the intended Slack flags so they can be restored after verification.
+3. Wait **16 minutes after both changes take effect** for existing queue and scheduled invocations
+   to finish. The 60-second artifact claim expiry is not proof that an old consumer has stopped.
+   The interval exceeds Cloudflare's documented
+   [15-minute queue and cron invocation limit](https://developers.cloudflare.com/queues/platform/limits/).
+4. Export D1, then either manually dispatch the release workflow with
+   `confirm_slack_review_migration_safe` checked, or run:
+
+   ```sh
+   SLACK_REVIEW_MIGRATION_SAFE=true pnpm run deploy
+   ```
+
+   For separate migration and deployment commands, run
+   `SLACK_REVIEW_MIGRATION_SAFE=true pnpm db:remote`, then build and deploy the new Worker while
+   keeping the queue paused and channel validation disabled. Any pending page-move migration still
+   requires its separate safety procedure.
+
+5. Verify the deployed revision and health check, and inspect Slack delivery health and cleanup
+   records. Restore the intended Slack flags, synchronize configuration, and resume delivery:
+
+   ```sh
+   pnpm wrangler queues resume-delivery cloudflare-realtime-notes-delivery --env production
+   ```
+
+If migration or deployment fails, leave the queue paused and channel validation disabled until
+recovery is complete. Do not purge queued messages. Queue pause and resume use Cloudflare's
+[delivery controls](https://developers.cloudflare.com/queues/configuration/pause-purge/); queue
+messages remain subject to their normal retention period while paused. Operators need
+[Queues Edit permission](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
+for these controls in addition to the usual deployment credentials.
 
 Use the existing 15-minute cron. Cleanup runs independently of delivery recovery and thumbnail flags,
 with at most 25 candidates and two total deletion attempts per file. Validate partial OAuth grants,
 saved repairs with blocked bulk receipts, unmute/expiry wakeups, and cleanup health notices in staging.
 See [configuration and manual cleanup](CONFIGURATION.md#interactive-slack-workspace) for the
-operator procedure. Deployment, production migration, and feature activation are separate release
-steps; this change introduces no new flags or cron schedule.
+operator procedure. The guarded release may apply migrations and deploy in one run after the manual
+pause and drain. Feature activation follows health verification; this change introduces no new flags
+or cron schedule.

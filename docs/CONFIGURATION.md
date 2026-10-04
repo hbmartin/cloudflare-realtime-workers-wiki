@@ -318,7 +318,7 @@ ephemeral to the acting user while they are active in Slack; an uncertain send i
 recheck current identity, membership, mapping, and page permissions when delayed work runs; old buttons and
 saved modal state do not grant access. Owners may create a replacement share privately from a revoked pinned reference; its old public URL stays revoked.
 
-For Round 2 activation, apply forward migrations through `0069_slack_file_cleanup.sql`, configure `SLACK_DIGEST_DEFAULT_TIMEZONE`, run the channel-validation dry run, and call owner-only `POST /api/slack/configuration/sync`. The cron also synchronizes release configuration; authentication and Slack acknowledgment paths do not. The sync endpoint reports missing/invalid activation defaults. Channel revalidation preserves delivery permission blocks until explicit recovery establishes permission. Production release flags remain off until deployment and the live exit matrix are separately verified.
+For Round 2 activation, apply forward migrations through `0070_slack_review_fences.sql`, configure `SLACK_DIGEST_DEFAULT_TIMEZONE`, run the channel-validation dry run, and call owner-only `POST /api/slack/configuration/sync`. The cron also synchronizes release configuration; authentication and Slack acknowledgment paths do not. The sync endpoint reports missing/invalid activation defaults. Channel revalidation preserves delivery permission blocks until explicit recovery establishes permission. Production release flags remain off until deployment and the live exit matrix are separately verified.
 
 Reauthorization resumes each scope-paused operation only when its required permissions are present.
 Text notifications can resume without `files:write`; mirroring retains all mirror permissions and unfurls
@@ -352,7 +352,9 @@ require `BROWSER` or enabled thumbnail flags, but needs `files:write` and creden
 team/bot identity. The initial deletion counts toward a maximum of **two total deletion attempts**.
 Credential/scope prechecks spend no attempt. A failed first dispatch retries no sooner than 15 minutes,
 respecting longer Slack retry delays; each cron pass examines at most 25 due cleanup jobs.
-Reauthorization can resume paused cleanup but never resets its attempt budget.
+Reauthorization can resume paused cleanup but never resets its attempt budget. Authentication failures
+from cleanup also mark the installation unhealthy so Settings offers reauthorization. Allocations returned
+after claim takeover or artifact removal enter the same ledger with their original Slack identity.
 
 Permanent failures, exhausted attempts, and unverifiable ownership appear in Slack delivery health as
 thumbnail cleanup failures. Clearing that notice acknowledges it without restarting cleanup. Operators
