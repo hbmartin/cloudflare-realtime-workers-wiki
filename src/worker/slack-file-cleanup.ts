@@ -1,4 +1,5 @@
 import type { Env } from "./env";
+import type { SlackCleanupHealth } from "../shared/types";
 import { definiteSlackRejection } from "./slack-delivery";
 import { logger } from "./observability";
 import {
@@ -6,6 +7,7 @@ import {
   slackHasScopes,
   slackInstallationError,
   recordSlackInstallationError,
+  recordSlackFileScopeError,
   SlackApiError,
   SlackRateLimitError,
   usableBotToken,
@@ -23,6 +25,20 @@ type CleanupJob = {
 };
 const RETRY_MS = 15 * 60_000;
 const LEASE_MS = 60_000;
+
+export async function slackFileCleanupHealth(env: Env, workspaceId: string): Promise<SlackCleanupHealth> {
+  const rows =
+    await env.DB.prepare(`SELECT state,coalesce(last_error,'cleanup_credentials_unavailable') reason,count(*) count
+    FROM slack_file_cleanup_jobs WHERE workspace_id=? AND state IN ('pending','paused','failed') GROUP BY state,last_error`)
+      .bind(workspaceId)
+      .all<{ state: "pending" | "paused" | "failed"; reason: string; count: number }>();
+  const health: SlackCleanupHealth = { pending: 0, paused: 0, failed: 0, pausedByReason: [] };
+  for (const row of rows.results) {
+    health[row.state] += row.count;
+    if (row.state === "paused") health.pausedByReason.push({ reason: row.reason, count: row.count });
+  }
+  return health;
+}
 
 export async function processSlackFileCleanup(env: Env, id: string) {
   const now = Date.now();
@@ -52,7 +68,11 @@ export async function processSlackFileCleanup(env: Env, id: string) {
       AND disconnected_at IS NULL AND auth_error IS NULL`)
         .bind(job.workspace_id, job.team_id, job.bot_user_id)
         .first<SlackInstallation>();
-    if (!installation || !slackHasScopes(installation.scopes, ["files:write"])) {
+    if (
+      !installation ||
+      (installation.file_scope_error_revision !== null && installation.file_scope_error_revision !== undefined) ||
+      !slackHasScopes(installation.scopes, ["files:write"])
+    ) {
       await save("paused", installation ? "missing_scope" : "cleanup_credentials_unavailable");
       return false;
     }
@@ -62,7 +82,7 @@ export async function processSlackFileCleanup(env: Env, id: string) {
     } catch (error) {
       const paused =
         error instanceof SlackApiError &&
-        (error.code === "missing_scope" ||
+        ((error.code === "missing_scope" && (await recordSlackFileScopeError(env, installation, error))) ||
           (slackInstallationError(error) &&
             (await recordSlackInstallationError(env, installation.id, error, installation.generation))));
       await save(
@@ -73,10 +93,10 @@ export async function processSlackFileCleanup(env: Env, id: string) {
       return false;
     }
     // The reservation is durable before dispatch. A crash can consume a slot,
-    // but never permits a third dispatch or deletion under a changed identity.
+    // but never permits a third potentially effective dispatch or deletion under a changed identity.
     const reserved = await env.DB.prepare(`UPDATE slack_file_cleanup_jobs SET attempt_count=attempt_count+1,updated_at=?
       WHERE id=? AND claim_token=? AND attempt_count<2 AND EXISTS(SELECT 1 FROM slack_installations
-        WHERE id=? AND generation=? AND credential_revision=? AND team_id=? AND bot_user_id=? AND disconnected_at IS NULL AND auth_error IS NULL)`)
+        WHERE id=? AND generation=? AND credential_revision=? AND team_id=? AND bot_user_id=? AND disconnected_at IS NULL AND auth_error IS NULL AND file_scope_error_revision IS NULL)`)
       .bind(
         Date.now(),
         id,
@@ -89,13 +109,25 @@ export async function processSlackFileCleanup(env: Env, id: string) {
       )
       .run();
     if (!reserved.meta.changes) {
-      await save("paused", "cleanup_credentials_changed");
+      // No dispatch occurred. Re-read credentials on the next maintenance pass;
+      // a normal token rotation must not leave a permanently paused job.
+      await save("pending", "cleanup_credentials_changed", Date.now() + RETRY_MS);
       return false;
     }
     try {
       await slackApi(env, installation, "files.delete", { file: job.file_id }, 10_000, undefined, preparedToken);
       await save("completed", null);
     } catch (error) {
+      if (error instanceof SlackRateLimitError) {
+        // Slack definitively rejected dispatch. Refund only our reservation,
+        // and persist the deadline before releasing this claim.
+        await env.DB.prepare(`UPDATE slack_file_cleanup_jobs SET attempt_count=attempt_count-1,
+          state='pending',last_error='rate_limited',next_attempt_at=?,updated_at=?,claim_token=NULL,claimed_at=NULL
+          WHERE id=? AND claim_token=? AND attempt_count=?`)
+          .bind(Math.max(Date.now() + RETRY_MS, error.retryAt), Date.now(), id, token, job.attempt_count + 1)
+          .run();
+        return true;
+      }
       if (error instanceof SlackApiError && error.code === "file_deleted") {
         await save("completed", null);
         return false;
@@ -109,9 +141,12 @@ export async function processSlackFileCleanup(env: Env, id: string) {
       const authError = error instanceof SlackApiError && slackInstallationError(error);
       const pause =
         error instanceof SlackApiError &&
-        (error.code === "missing_scope" ||
+        ((error.code === "missing_scope" && (await recordSlackFileScopeError(env, installation, error))) ||
           (authError && (await recordSlackInstallationError(env, installation.id, error, installation.generation))));
-      if (job.attempt_count + 1 >= 2 || (!pause && !authError && definiteSlackRejection(error)))
+      if (
+        job.attempt_count + 1 >= 2 ||
+        (!pause && !authError && code !== "missing_scope" && definiteSlackRejection(error))
+      )
         await save("failed", code);
       else if (pause) await save("paused", code);
       else
@@ -120,7 +155,7 @@ export async function processSlackFileCleanup(env: Env, id: string) {
           code,
           Math.max(Date.now() + RETRY_MS, error instanceof SlackRateLimitError ? error.retryAt : 0),
         );
-      return error instanceof SlackRateLimitError;
+      return false;
     }
     return false;
   } finally {

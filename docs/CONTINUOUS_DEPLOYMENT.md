@@ -59,14 +59,14 @@ refuses to deploy when Wrangler's migration listing is not in a recognized empty
 the fixtures in `scripts/check-page-move-migration.test.mjs` alongside any intentional Wrangler-output parser
 change.
 
-Pending `0069_slack_file_cleanup.sql` or `0070_slack_review_fences.sql` also block automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, or `0071_slack_authorization_cleanup.sql` also block automatic deployment.
 Pause the shared delivery queue, disable live Slack channel validation, and allow 16 minutes for
 existing invocations to finish before dispatching with `confirm_slack_review_migration_safe` checked.
 Keep both paused through migration and deployment. Follow the exact
 [Slack release sequence](DEPLOYMENT.md#slack-review-follow-up-migration) to verify the release and resume
 delivery. The confirmation is accepted only on manual dispatch and is passed as
 `SLACK_REVIEW_MIGRATION_SAFE=true` to the remote migration wrapper. Local releases require the same
-environment confirmation; local database migrations do not. Once 0069 and 0070 are applied, later
+environment confirmation; local database migrations do not. Once 0069, 0070, and 0071 are applied, later
 automatic deployments resume without this confirmation.
 
 ## The release gate
@@ -74,10 +74,10 @@ automatic deployments resume without this confirmation.
 The `gate` job must pass before the `deploy` job starts, rather than running alongside it, because
 migrations are forward-only. What it runs depends on how the workflow was triggered:
 
-| Event                      | `pnpm check` in the gate | Deployment condition                                                                                           |
-| -------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| Completed CI run on `main` | Skipped                  | CI passed, its SHA is the current `main` tip, and migrations `0011`, `0069`, and `0070` are not pending        |
-| `workflow_dispatch`        | Runs                     | The ref passes; pending `0011` and pending `0069`/`0070` require their respective migration-safe confirmations |
+| Event                      | `pnpm check` in the gate | Deployment condition                                                                                                  |
+| -------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------- |
+| Completed CI run on `main` | Skipped                  | CI passed, its SHA is the current `main` tip, and migrations `0011`, `0069`, `0070`, and `0071` are not pending       |
+| `workflow_dispatch`        | Runs                     | The ref passes; pending `0011` and pending `0069`/`0070`/`0071` require their respective migration-safe confirmations |
 
 `.github/workflows/ci.yml` triggers on `on: push` with no branch filter, so every push to `main`
 starts CI on the same SHA. Its five jobs — static checks, unit, Worker integration, build, and the

@@ -1,7 +1,11 @@
 import { readFileSync } from "node:fs";
 import { parsePendingMigrations } from "./check-page-move-migration.mjs";
 
-const GUARDED_MIGRATIONS = ["0069_slack_file_cleanup.sql", "0070_slack_review_fences.sql"];
+const GUARDED_MIGRATIONS = [
+  "0069_slack_file_cleanup.sql",
+  "0070_slack_review_fences.sql",
+  "0071_slack_authorization_cleanup.sql",
+];
 
 export function checkSlackReviewMigration(output, confirmed = false) {
   const pending = parsePendingMigrations(output);

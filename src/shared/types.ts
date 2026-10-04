@@ -282,6 +282,8 @@ export type SlackStatus = {
   /** @deprecated Use identity.state during the rolling deployment. */
   linked: boolean;
   identity?: {
+    accessAuthorized?: boolean;
+    reauthorizationRequired?: boolean;
     state: "unlinked" | "legacy" | "verified";
     slackUserId: string | null;
     verifiedAt: number | null;
@@ -290,6 +292,13 @@ export type SlackStatus = {
     required: boolean;
     available: boolean;
   };
+};
+
+export type SlackCleanupHealth = {
+  pending: number;
+  paused: number;
+  failed: number;
+  pausedByReason: Array<{ reason: string; count: number }>;
 };
 
 export type Subscription = {

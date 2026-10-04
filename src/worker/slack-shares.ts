@@ -1,3 +1,4 @@
+import { slackAccessAuthorization } from "./slack-identity";
 import { definiteSlackRejection, recordDeliveryError, retireObsoleteReceipt } from "./slack-delivery";
 import type { Env } from "./env";
 import { sha256Hex } from "../shared/import-integrity";
@@ -30,12 +31,22 @@ type Refresh = {
 async function shareRefreshBlocks(env: Env, row: Refresh) {
   const page = await env.DB.prepare(`SELECT p.title,p.kind,p.plain_text,p.archived_at,p.import_job_id,
     EXISTS(SELECT 1 FROM workspace_members wm JOIN spaces s ON s.id=p.space_id WHERE wm.workspace_id=p.workspace_id AND wm.user_id=?
+      AND EXISTS(SELECT 1 FROM slack_authorized_user_links link JOIN slack_share_references reference ON reference.id=?
+        WHERE link.user_id=wm.user_id AND link.installation_id=? AND coalesce(link.verified_at,link.linked_at)<=reference.created_at)
       AND (wm.role='owner' OR s.visibility='workspace' OR EXISTS(SELECT 1 FROM space_members WHERE space_id=s.id AND user_id=wm.user_id))) can_read,
     EXISTS(SELECT 1 FROM slack_channel_subscriptions m WHERE m.installation_id=? AND m.channel_id=? AND m.space_id=p.space_id
       AND (m.page_id IS NULL OR m.page_id=p.id) AND m.validation_state='valid'
       AND EXISTS(SELECT 1 FROM workspace_members owner WHERE owner.workspace_id=p.workspace_id AND owner.user_id=m.created_by AND owner.role='owner')) mapped
     FROM pages p WHERE p.id=? AND p.workspace_id=?`)
-    .bind(row.observed_user_id, row.installation_id, row.channel_id, row.page_id, row.workspace_id)
+    .bind(
+      row.observed_user_id,
+      row.reference_id,
+      row.installation_id,
+      row.installation_id,
+      row.channel_id,
+      row.page_id,
+      row.workspace_id,
+    )
     .first<{
       title: string;
       kind: string;
@@ -163,10 +174,10 @@ export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = 
     const { channel } = await slackApi(env, installation, "conversations.info", { channel: row.channel_id });
     // Read authorization/lifecycle state after the last remote lookup, immediately before the effect.
     const reference = await env.DB.prepare(
-      `SELECT observed_user_id FROM slack_share_references WHERE id=? AND installation_generation=?`,
+      `SELECT observed_user_id,created_at FROM slack_share_references WHERE id=? AND installation_generation=?`,
     )
       .bind(row.reference_id, row.installation_generation)
-      .first<{ observed_user_id: string | null }>();
+      .first<{ observed_user_id: string | null; created_at: number }>();
     if (reference) row.observed_user_id = reference.observed_user_id;
     const rendered = await shareRefreshBlocks(env, row);
     const hash = await sha256Hex(
@@ -193,11 +204,22 @@ export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = 
       return;
     }
     try {
-      await slackApi(env, installation, "chat.unfurl", {
-        channel: row.channel_id,
-        ts: row.message_ts,
-        unfurls: { [row.url]: { blocks: rendered.blocks } },
-      });
+      await slackApi(
+        env,
+        installation,
+        "chat.unfurl",
+        {
+          channel: row.channel_id,
+          ts: row.message_ts,
+          unfurls: { [row.url]: { blocks: rendered.blocks } },
+        },
+        undefined,
+        undefined,
+        undefined,
+        rendered.state !== "unavailable" && row.observed_user_id
+          ? slackAccessAuthorization(env, installation, { userId: row.observed_user_id }, reference?.created_at)
+          : undefined,
+      );
       await finish(hash, rendered.state === "unavailable" ? "retired" : "sent");
     } catch (error) {
       await recordDeliveryError(env, installation, error);

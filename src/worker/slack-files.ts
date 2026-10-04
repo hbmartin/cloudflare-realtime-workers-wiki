@@ -9,13 +9,16 @@ import {
 } from "./slack-delivery";
 import { DIAGRAM_THUMBNAIL_HEIGHT, DIAGRAM_THUMBNAIL_WIDTH } from "../shared/diagram";
 import { round2Installation } from "./slack-channels";
-import { slackApi, SlackApiError, SlackRateLimitError, slackHasScopes } from "./slack";
+import { slackApi, SlackApiError, SlackRateLimitError, slackHasScopes, recordSlackFileScopeError } from "./slack";
 import type { Env } from "./env";
 
 async function cleanupAllocation(env: Env, installationId: string, artifactId: string, fileId: string | null) {
   if (!fileId) return;
   try {
-    await processSlackFileCleanup(env, `slack-file-cleanup:${installationId}:${fileId}`);
+    const job = await env.DB.prepare("SELECT id FROM slack_file_cleanup_jobs WHERE installation_id=? AND file_id=?")
+      .bind(installationId, fileId)
+      .first<{ id: string }>();
+    if (job) await processSlackFileCleanup(env, job.id);
   } catch (error) {
     logger.warn(
       "slack.file_cleanup.deferred",
@@ -95,7 +98,10 @@ export async function deliverThumbnail(env: Env, id: string) {
       return;
     }
     if (!env.BROWSER) throw new Error("thumbnail_unavailable");
-    if (!slackHasScopes(installation.scopes, ["files:write"]))
+    if (
+      (installation.file_scope_error_revision !== null && installation.file_scope_error_revision !== undefined) ||
+      !slackHasScopes(installation.scopes, ["files:write"])
+    )
       throw new SlackApiError("files.getUploadURLExternal", "missing_scope", 200, installation.credential_revision, [
         "files:write",
       ]);
@@ -145,8 +151,18 @@ export async function deliverThumbnail(env: Env, id: string) {
     // Keep its original identity in the ledger in the same transaction as the save.
     const saved = await env.DB.batch([
       env.DB.prepare(
-        `UPDATE slack_file_artifacts SET slack_file_id=?,upload_url=?,upload_phase='upload',updated_at=? WHERE id=? AND claim_token=?`,
-      ).bind(upload.file_id, upload.upload_url, now, id, token),
+        `UPDATE slack_file_artifacts SET slack_file_id=?,upload_url=?,upload_phase='upload',updated_at=?,
+          cleanup_workspace_id=?,cleanup_team_id=?,cleanup_bot_user_id=? WHERE id=? AND claim_token=?`,
+      ).bind(
+        upload.file_id,
+        upload.upload_url,
+        now,
+        installation.workspace_id,
+        installation.team_id,
+        installation.bot_user_id,
+        id,
+        token,
+      ),
       env.DB.prepare(`INSERT OR IGNORE INTO slack_file_cleanup_jobs
         (id,workspace_id,installation_id,installation_generation,team_id,bot_user_id,file_id,artifact_id,state,next_attempt_at,last_error,created_at,updated_at)
         SELECT ?,?,?,?,?,?,?,?,'pending',?,'allocation_claim_lost',?,?
@@ -183,6 +199,8 @@ export async function deliverThumbnail(env: Env, id: string) {
       .bind(Date.now(), id, token)
       .run();
   } catch (error) {
+    if (error instanceof SlackApiError && error.code === "missing_scope")
+      await recordSlackFileScopeError(env, installation, error);
     await recordDeliveryError(env, installation, error);
     const code =
       error instanceof SlackRateLimitError

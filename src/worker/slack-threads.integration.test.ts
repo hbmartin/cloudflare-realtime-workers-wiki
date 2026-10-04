@@ -1,5 +1,6 @@
+import { protectSlackFixtureUsers } from "../../tests/helpers/security";
 import { createShare, revokeShare } from "./shares";
-import { acceptSlackProductInteraction, openSlackProduct } from "./slack-product";
+import { acceptSlackProductInteraction, openSlackProduct, deliverSlackProductCopy } from "./slack-product";
 import {
   authorizeSlackCaptureJobRetry,
   deliverSlackCaptureFeedback,
@@ -39,7 +40,7 @@ import {
   acknowledgeSlackDeliveryFailures,
   deleteSlackChannelSubscription,
   handleSlackEvent,
-  recordVerifiedSlackIdentity,
+  recordSlackPrimaryFactorProof,
   slackWorkspaceStatus,
   listSlackDeliveryFailureGroups,
   repairSlackChannelNotifications,
@@ -411,9 +412,10 @@ beforeEach(async () => {
       `INSERT INTO account (id,accountId,providerId,userId,createdAt,updatedAt) VALUES ('owner-account','T123:UOWNER','slack','owner',1,1), ('viewer-account','T123:UVIEWER','slack','viewer',1,1)`,
     ),
     env.DB.prepare(
-      `INSERT INTO slack_user_links (installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,verified_at,migration_state) VALUES ('installation','owner','UOWNER',1,'owner-account','slack_openid',1,'verified'), ('installation','viewer','UVIEWER',1,'viewer-account','slack_openid',1,'verified')`,
+      `INSERT INTO slack_user_links (installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,verified_at,migration_state,security_generation) VALUES ('installation','owner','UOWNER',1,'owner-account','slack_openid',1,'verified',0), ('installation','viewer','UVIEWER',1,'viewer-account','slack_openid',1,'verified',0)`,
     ),
   ]);
+  await protectSlackFixtureUsers(["owner", "viewer"]);
   await mapping("space");
   vi.stubGlobal("fetch", vi.fn(mockSlack));
 });
@@ -1718,6 +1720,48 @@ describe("interactive Slack workspace", () => {
       .run();
     await consume("outbox:old-home-reset");
     expect(calls.filter((call) => call.method === "views.publish")).toHaveLength(3);
+  });
+
+  it("publishes no private Home content after disconnect during member validation", async () => {
+    beforeResponse = async (method) => {
+      if (method === "users.info") {
+        beforeResponse = undefined;
+        await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'").run();
+      }
+    };
+    await publishSlackHome(runtime(), "installation", "UOWNER");
+    expect(JSON.stringify(calls.find((c) => c.method === "views.publish")?.payload.view)).toContain("unavailable");
+  });
+  it("does not publish a captured Home view when access is revoked after its private reads", async () => {
+    const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+      new Proxy(statement, {
+        get(target, key) {
+          if (key === "bind") return (...args: unknown[]) => wrap(target.bind(...args));
+          if (key === "run")
+            return async () => {
+              const result = await target.run();
+              await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'").run();
+              return result;
+            };
+          const value: unknown = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) =>
+            sql.includes("UPDATE slack_view_sessions SET pending_state_json")
+              ? wrap(target.prepare(sql))
+              : target.prepare(sql);
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await expect(publishSlackHome({ ...runtime(), DB: db }, "installation", "UOWNER")).rejects.toMatchObject({
+      code: "slack_identity_required",
+    });
+    expect(calls.filter((c) => c.method === "views.publish")).toHaveLength(0);
   });
 
   it("retries a transient identity lookup instead of publishing an unavailable Home", async () => {
@@ -3820,14 +3864,21 @@ describe("Slack inbound replies and actions", () => {
       VALUES ('new-session',?,'new-token',?,?,'viewer')`)
       .bind(new Date(now + 60_000).toISOString(), now, now)
       .run();
-    await recordVerifiedSlackIdentity(runtime(), "viewer", "new-session", "viewer-account", {
-      installationGeneration: 0,
-      installationId: "installation",
-      workspaceId: "workspace",
-      teamId: "T123",
-      slackUserId: "UVIEWER",
-      accountSubject: "T123:UVIEWER",
-    });
+    await recordSlackPrimaryFactorProof(
+      runtime(),
+      "viewer",
+      "new-session",
+      "viewer-account",
+      {
+        installationGeneration: 0,
+        installationId: "installation",
+        workspaceId: "workspace",
+        teamId: "T123",
+        slackUserId: "UVIEWER",
+        accountSubject: "T123:UVIEWER",
+      },
+      "sign_in",
+    );
     expect(await env.DB.prepare(`SELECT verified_at FROM slack_user_links WHERE user_id = 'viewer'`).first()).toEqual({
       verified_at: 1,
     });
@@ -4911,6 +4962,36 @@ describe("Slack documents and tasks", () => {
       warned.mockRestore();
     }
   });
+  it("rechecks a queued copy inside the document after Slack access is revoked", async () => {
+    const id = await open("new");
+    const payload = submission(id, "document", "space:workspace-general", "Revoked queued copy");
+    (payload.view.state.values as Record<string, unknown>).body = { value: { value: "Private copied content" } };
+    await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500);
+    const document = new Proxy(env.DOCUMENT, {
+      get(target, key) {
+        if (key === "getByName")
+          return (name: string) => {
+            const stub = target.getByName(name);
+            return {
+              fetch: async (request: Request) => {
+                await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'").run();
+                return stub.fetch(request);
+              },
+            };
+          };
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as Env["DOCUMENT"];
+    await expect(deliverSlackProductCopy({ ...runtime(), DOCUMENT: document }, id)).rejects.toThrow(
+      "Slack content could not be copied",
+    );
+    const page = await env.DB.prepare("SELECT plain_text FROM pages WHERE title='Revoked queued copy'").first<{
+      plain_text: string;
+    }>();
+    expect(page?.plain_text ?? "").not.toContain("Private copied content");
+  });
+
   it("acknowledges permanent legacy copy errors and retries transient capture preparation", async () => {
     const bodySubmission = (id: string, title: string) => {
       const payload = submission(id, "document", "space:workspace-general", title);
@@ -5436,6 +5517,35 @@ describe("Slack documents and tasks", () => {
       state: "failed",
     });
   });
+  it("keeps a staged capture hidden after its security generation is revoked", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Revoked capture");
+    const job = await prepareSlackCapture(runtime(), captureId);
+    await env.DB.prepare(
+      "UPDATE account_security SET generation=generation+1,recovery_required=1 WHERE user_id='owner'",
+    ).run();
+    await expect(startJobExecution({ ...runtime(), WORKFLOW_INLINE: "true" }, job!)).rejects.toThrow(
+      /Slack|slack|identity/,
+    );
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM pages WHERE title='Revoked capture' AND import_job_id IS NULL",
+      ).first(),
+    ).toEqual({ count: 0 });
+  });
+  it("does not stage a capture when protection is reset during Slack reads", async () => {
+    const captureId = await startCapture("document", "space:workspace-general", "Reset during staging");
+    beforeResponse = async (method) => {
+      if (method === "chat.getPermalink") {
+        beforeResponse = undefined;
+        await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id='owner'").run();
+      }
+    };
+    await expect(prepareSlackCapture(runtime(), captureId)).rejects.toThrow(/Slack|slack|identity/);
+    expect(await env.DB.prepare("SELECT count(*) count FROM jobs WHERE id=?").bind(captureId).first()).toEqual({
+      count: 0,
+    });
+  });
+
   it("leaves no task or visible page if its list is locked before publication", async () => {
     await list();
     const captureId = await startCapture("task", "page:tasks", "Locked task");

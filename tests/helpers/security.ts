@@ -1,8 +1,20 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
-import { SELF } from "cloudflare:test";
+import { SELF, env } from "cloudflare:test";
 import { createOTP } from "@better-auth/utils/otp";
 import { base32 } from "@better-auth/utils/base32";
 import { splitSetCookieHeader } from "better-auth/cookies";
+
+// Private Slack fixtures represent accounts that already completed enrollment.
+// This does not authorize links: fixtures must supply their binding generation.
+export async function protectSlackFixtureUsers(ids: string[]) {
+  for (const id of ids)
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT OR IGNORE INTO twoFactor(id,userId,secret,backupCodes,verified) VALUES(?,?,'fixture-factor','[]',1)`,
+      ).bind(`fixture-factor:${id}`, id),
+      env.DB.prepare("UPDATE account_security SET codes_saved=1 WHERE user_id=?").bind(id),
+    ]);
+}
 
 export function responseCookies(response: Response, previous = "") {
   const jar = new Map(

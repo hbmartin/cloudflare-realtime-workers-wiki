@@ -6,7 +6,7 @@ import { deliverShareRefresh } from "./slack-shares";
 import { deliverThumbnail } from "./slack-files";
 import { StaleSlackValidationError } from "./slack-channels";
 import { thumbnailDeliveryEnabled } from "./slack-delivery";
-import { ROUND2_OUTBOX_SQL, slackScopeRequirements } from "./slack-delivery-contracts";
+import { ROUND2_OUTBOX_SQL, slackScopeRequirements, SLACK_OUTBOX_CHANNEL_TYPE_SQL } from "./slack-delivery-contracts";
 import { deliverSlackProductCopy } from "./slack-product";
 import {
   captureFeedbackStatement,
@@ -1570,10 +1570,16 @@ async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: st
 
 async function pauseSlackScopeOutbox(env: Env, outboxId: string, topic: string, error: unknown) {
   const now = Date.now();
+  const destination = await env.DB.prepare(
+    `SELECT ${SLACK_OUTBOX_CHANNEL_TYPE_SQL} channel_type FROM outbox WHERE id=?`,
+  )
+    .bind(outboxId)
+    .first<{ channel_type: string | null }>();
   const scopes = slackScopeRequirements(
     topic,
     error instanceof SlackApiError ? error.method : undefined,
     error instanceof SlackApiError ? error.neededScopes : [],
+    destination?.channel_type,
   );
   await env.DB.prepare(`UPDATE outbox SET slack_scope_paused_at=COALESCE(slack_scope_paused_at,?),slack_scope_required_json=?,
     enqueued_at=COALESCE(enqueued_at,?),slack_claim_recheck_at=NULL,
@@ -2097,8 +2103,22 @@ export async function consumeDeliveryMessage(
   };
   const round2Failure = async (error: unknown) => {
     if (error instanceof StaleSlackValidationError) {
-      message.retry({ delaySeconds: 2 });
-      return "retried" as const;
+      const now = Date.now();
+      await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_claim_recheck_at=?,
+        slack_redrive_due_at=NULL,last_error='slack_validation_stale' WHERE id=?`)
+        .bind(now + 2000, now + 2000, outboxId)
+        .run();
+      try {
+        await env.DELIVERY_QUEUE.send({ outboxId }, { delaySeconds: 2 });
+        await env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?,slack_claim_recheck_at=NULL
+          WHERE id=? AND last_error='slack_validation_stale'`)
+          .bind(now, now + SLACK_REDRIVE_STALE_MS, outboxId)
+          .run();
+      } catch {
+        // Durable claim recheck recovers an enqueue failure without queue retries.
+      }
+      message.ack();
+      return "acknowledged" as const;
     }
     if (slackMissingScope(error)) await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
     else if (error instanceof DeliveryInProgressError) {

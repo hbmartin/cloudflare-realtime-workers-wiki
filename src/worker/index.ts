@@ -1,4 +1,5 @@
-import { processDueSlackFileCleanup } from "./slack-file-cleanup";
+import { processDueSlackFileCleanup, slackFileCleanupHealth } from "./slack-file-cleanup";
+import { disconnectSlackIdentity } from "./slack-identity";
 import { wakeRound2Mapping } from "./slack-delivery";
 import { activityMutationStart, activityMutationEnd, activePageSelectionSql } from "./activity-mutations";
 import { DOCX_MIME } from "../shared/docx-metadata";
@@ -2876,6 +2877,12 @@ app.post("/api/slack/link", async (c) => {
   return c.json({ ok: true });
 });
 
+app.delete("/api/slack/identity", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await disconnectSlackIdentity(c.env, member.user.id, member.session.id, member.workspace.id);
+  return c.json({ ok: true });
+});
+
 app.post("/api/slack/commands", async (c) => {
   const deadlineAt = Date.now() + 2_500;
   const beforeAck = async <T>(work: Promise<T>): Promise<T> => {
@@ -3075,7 +3082,10 @@ app.get("/api/slack/channels", async (c) => {
 app.get("/api/slack/delivery-health", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
-  return c.json({ orphanedFailures: await listSlackDeliveryFailureGroups(c.env, member) });
+  return c.json({
+    orphanedFailures: await listSlackDeliveryFailureGroups(c.env, member),
+    cleanup: await slackFileCleanupHealth(c.env, member.workspace.id),
+  });
 });
 
 app.post("/api/slack/delivery-health/:id/acknowledge", async (c) => {

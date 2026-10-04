@@ -6,6 +6,7 @@ import type {
   Page,
   SlackChannelSubscription as ChannelSubscription,
   SlackStatus,
+  SlackCleanupHealth,
   Space,
 } from "../shared/types";
 import { api, apiErrorMessage, authClient, json } from "./api";
@@ -32,15 +33,27 @@ function initialSlackOAuthError() {
   const params = new URLSearchParams(window.location.search);
   const oauthError = params.get("error");
   if (!oauthError) return "";
-  const message = oauthError.toLowerCase().includes("link")
-    ? "Slack could not be connected to this account. Sign in normally and try again."
-    : "Slack authorization could not be completed.";
+  const known: Record<string, string> = {
+    security_required: "Verify an authenticator code or passkey in Account protection, then connect Slack again.",
+    unauthorized: "Your session expired. Sign in again before connecting Slack.",
+    slack_team_mismatch: "Use an account from the connected Slack workspace.",
+    slack_scope_missing:
+      "Ask the workspace owner to reauthorize Slack with users:read, then connect your identity again.",
+    slack_member_invalid: "Use an active, full member account from the connected Slack workspace.",
+    slack_link_changed: "Slack authorization changed. Verify your account protection and connect Slack again.",
+  };
+  const message =
+    known[oauthError.toLowerCase()] ??
+    (oauthError.toLowerCase().includes("link")
+      ? "Slack could not be connected to this account. Sign in normally and try again."
+      : "Slack authorization could not be completed.");
   removeLinkToken();
   return message;
 }
 
 export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces: Space[]; pages: Page[] }) {
   const [status, setStatus] = useState<SlackStatus | null>(null);
+  const [cleanup, setCleanup] = useState<SlackCleanupHealth | null>(null);
   const [subscriptions, setSubscriptions] = useState<ChannelSubscription[]>([]);
   const [orphanedFailures, setOrphanedFailures] = useState<
     Array<{
@@ -77,6 +90,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
       }
       if (owner) {
         const health = await api<{
+          cleanup?: SlackCleanupHealth;
           orphanedFailures: Array<{
             id: string;
             channelName: string;
@@ -84,6 +98,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
           }>;
         }>("/api/slack/delivery-health");
         setOrphanedFailures(health.orphanedFailures ?? []);
+        setCleanup(health.cleanup ?? null);
       }
     } catch (cause) {
       setError(apiErrorMessage(cause, "Slack settings could not be loaded."));
@@ -166,9 +181,26 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
         callbackURL: "/?view=settings&slack=verified",
         errorCallbackURL: "/?view=settings&slackAuth=callback",
       });
-      if (result.error) throw new Error(result.error.message || "Slack identity linking failed.");
+      if (result.error) {
+        setError(result.error.message || "Slack identity could not be connected.");
+        setBusy(false);
+      }
     } catch (cause) {
       setError(apiErrorMessage(cause, "Slack identity could not be connected. Try again."));
+      setBusy(false);
+    }
+  }
+
+  async function disconnectIdentity() {
+    setBusy(true);
+    setError("");
+    try {
+      await api("/api/slack/identity", { method: "DELETE" });
+      setNotice("Slack access was disconnected. Your Slack sign-in remains available.");
+      await load();
+    } catch (cause) {
+      setError(apiErrorMessage(cause, "Slack access could not be disconnected."));
+    } finally {
       setBusy(false);
     }
   }
@@ -344,9 +376,17 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
           </div>
         </div>
       )}
-      {connected && status?.installation?.capabilities?.identity.available && identityState !== "verified" && (
-        <button className="primary-small" disabled={busy} onClick={() => void linkIdentity()}>
-          {identityState === "legacy" ? "Verify Slack identity" : "Connect Slack identity"}
+      {connected &&
+        status?.installation?.capabilities?.identity.available &&
+        (identityState !== "verified" || status.identity?.reauthorizationRequired) && (
+          <button className="primary-small" disabled={busy} onClick={() => void linkIdentity()}>
+            {identityState === "legacy" ? "Verify Slack identity" : "Connect Slack identity"}
+          </button>
+        )}
+      {status?.identity?.reauthorizationRequired && <p>Verify your account protection and reconnect Slack access.</p>}
+      {connected && status?.linked && (
+        <button disabled={busy} onClick={() => void disconnectIdentity()}>
+          Disconnect Slack access
         </button>
       )}
       {connected && status?.installation?.authError && (
@@ -619,6 +659,21 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
             {!subscriptions.length && <p className="empty-copy">No Slack channels are mapped yet.</p>}
           </div>
         </>
+      )}
+      {owner && cleanup && cleanup.paused > 0 && (
+        <article>
+          <h3>Thumbnail cleanup paused</h3>
+          {cleanup.pausedByReason.map(({ reason, count }) => (
+            <p key={reason}>
+              {count} {count === 1 ? "file is" : "files are"} waiting.{" "}
+              {reason === "missing_scope"
+                ? "Reauthorize Slack with files:write to resume cleanup."
+                : reason === "cleanup_credentials_unavailable"
+                  ? "Reconnect the original Slack workspace and bot to resume cleanup."
+                  : "Reauthorize Slack to resume cleanup; files with an unverifiable original identity require manual attention."}
+            </p>
+          ))}
+        </article>
       )}
       {owner &&
         orphanedFailures.map((group) => (

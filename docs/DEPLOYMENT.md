@@ -189,7 +189,7 @@ hand. Before upgrading an existing installation, take a D1 export and stop any r
 then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
 new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
 
-Remote releases with pending Slack migrations `0069` or `0070` require
+Remote releases with pending Slack migrations `0069`, `0070`, or `0071` require
 `SLACK_REVIEW_MIGRATION_SAFE=true` after the [Slack rollout pause](#slack-review-follow-up-migration).
 This guard applies to both `pnpm db:remote` and `pnpm run deploy`; local database migrations do not
 require confirmation. The confirmation acknowledges an operator-completed pause and drain, rather
@@ -398,7 +398,7 @@ before making changes. Quiesce page moves or verify that the live Worker already
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
 until that manually dispatched run has deployed the new Worker.
 
-Pending `0069_slack_file_cleanup.sql` or `0070_slack_review_fences.sql` also stop automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, or `0071_slack_authorization_cleanup.sql` also stop automatic deployment.
 Follow the [Slack rollout pause](#slack-review-follow-up-migration), then manually dispatch with
 `confirm_slack_review_migration_safe` checked. The workflow passes this confirmation to the guarded
 remote migration command. Once these migrations are applied, later automatic releases need no Slack
@@ -420,11 +420,13 @@ relying on it.
 
 Apply additive `0069_slack_file_cleanup.sql` before deploying the Slack review follow-up. It snapshots
 allocation ownership and adds an indexed cleanup ledger plus transactional capture triggers. Additive
-`0070_slack_review_fences.sql` adds a monotonically increasing channel-validation revision. Existing
-failed/retired allocations are backfilled; allocations whose original Slack identity cannot be verified
+`0070_slack_review_fences.sql` adds a monotonically increasing channel-validation revision.
+`0071_slack_authorization_cleanup.sql` separates primary login from private Slack access, binds access and primary proofs to protection generations, records file-scope blocks and preserves explicit allocation ownership. It keeps existing links only for accounts with an enrolled factor, saved recovery codes and no recovery in progress; their original linking authorization cannot be established. Existing transient primary proofs are cleared, and proof reads reject older writes without authenticated-source metadata. OAuth login is preserved. Do not roll back to code that allows linking without fresh verification.
+
+Existing failed/retired allocations are backfilled; allocations whose original Slack identity cannot be verified
 are reported for manual cleanup rather than deleted. Existing migrations remain unchanged.
 
-When either migration is pending, perform this sequence **before applying migrations**:
+When any of these migrations is pending, perform this sequence **before applying migrations**:
 
 1. Pause the shared production delivery queue:
 
@@ -468,7 +470,7 @@ messages remain subject to their normal retention period while paused. Operators
 for these controls in addition to the usual deployment credentials.
 
 Use the existing 15-minute cron. Cleanup runs independently of delivery recovery and thumbnail flags,
-with at most 25 candidates and two total deletion attempts per file. Validate partial OAuth grants,
+with at most 25 candidates and two potentially effective or uncertain deletion attempts per file; definite 429 responses defer without consuming that budget. Validate partial OAuth grants,
 saved repairs with blocked bulk receipts, unmute/expiry wakeups, and cleanup health notices in staging.
 See [configuration and manual cleanup](CONFIGURATION.md#interactive-slack-workspace) for the
 operator procedure. The guarded release may apply migrations and deploy in one run after the manual

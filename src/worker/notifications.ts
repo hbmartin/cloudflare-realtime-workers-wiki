@@ -811,7 +811,7 @@ function digestRecipientSql(channel: DigestChannel) {
     ? currentMember
     : `${currentMember} AND EXISTS (
          SELECT 1 FROM slack_installations installation
-         JOIN slack_user_links link
+         JOIN slack_authorized_user_links link
            ON link.installation_id = installation.id AND link.user_id = n.user_id
         WHERE installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL
        )`;
@@ -1029,7 +1029,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
            ON membership.workspace_id = n.workspace_id AND membership.user_id = n.user_id
          JOIN slack_installations installation
            ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL
-         JOIN slack_user_links link
+         JOIN slack_authorized_user_links link
            ON link.installation_id = installation.id AND link.user_id = n.user_id
          LEFT JOIN notification_preferences preference
            ON preference.user_id = n.user_id AND preference.event_type = n.event_type

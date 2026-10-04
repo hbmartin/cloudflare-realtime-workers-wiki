@@ -7,6 +7,68 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("grandfathers protected bindings, rejects older writes and revokes access on reset or unlink", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((m) => m.name < "0071"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('protected','Protected','protected@example.test',1,1),('unprotected','Unprotected','unprotected@example.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Notes',1)"),
+      env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace','protected','owner',1),('workspace','unprotected','editor',1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO twoFactor(id,userId,secret,backupCodes,verified) VALUES('factor','protected','secret','[]',1)",
+      ),
+      env.DB.prepare("UPDATE account_security SET codes_saved=1 WHERE user_id='protected'"),
+      env.DB.prepare(
+        "INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at) VALUES('installation','workspace','T123','Slack','B123','cipher','users:read','protected',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at) VALUES('installation','protected','UPROTECTED',1),('installation','unprotected','UUNPROTECTED',1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO account(id,userId,providerId,accountId,createdAt,updatedAt) VALUES('oauth','protected','slack','T123:UPROTECTED',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO session(id,userId,token,expiresAt,createdAt,updatedAt) VALUES('session','protected','session-token','2099-01-01T00:00:00.000Z',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_primary_factor_proofs(session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at) VALUES('session','protected','oauth','T123','UPROTECTED',1,9999999999999)",
+      ),
+    ]);
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect((await env.DB.prepare("SELECT user_id FROM slack_authorized_user_links").all()).results).toEqual([
+      { user_id: "protected" },
+    ]);
+    expect(await env.DB.prepare("SELECT 1 FROM slack_primary_factor_proofs").first()).toBeNull();
+    await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='protected'").run();
+    await env.DB.prepare(
+      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at) VALUES('installation','protected','UPROTECTED',2)",
+    ).run();
+    expect(await env.DB.prepare("SELECT 1 FROM slack_authorized_user_links").first()).toBeNull();
+    await env.DB.prepare(
+      "UPDATE slack_user_links SET security_generation=0,better_auth_account_id='oauth',migration_state='verified',verification_method='slack_openid',verified_at=2 WHERE user_id='protected'",
+    ).run();
+    expect(await env.DB.prepare("SELECT 1 FROM slack_authorized_user_links").first()).not.toBeNull();
+    await env.DB.prepare("DELETE FROM account WHERE id='oauth'").run();
+    expect(await env.DB.prepare("SELECT 1 FROM slack_user_links WHERE user_id='protected'").first()).toBeNull();
+    await env.DB.prepare(
+      "INSERT INTO account(id,userId,providerId,accountId,createdAt,updatedAt) VALUES('oauth','protected','slack','T123:UPROTECTED',1,1)",
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,security_generation) VALUES('installation','protected','UPROTECTED',3,0)",
+    ).run();
+    await env.DB.prepare(
+      "UPDATE account_security SET generation=generation+1,recovery_required=1 WHERE user_id='protected'",
+    ).run();
+    expect(await env.DB.prepare("SELECT 1 FROM slack_user_links WHERE user_id='protected'").first()).toBeNull();
+    expect(await env.DB.prepare("SELECT 1 FROM account WHERE id='oauth'").first()).not.toBeNull();
+  });
+
   it("adds validation revisions without changing evidence and advances unchanged validation writes", async () => {
     await applyD1Migrations(
       env.DB,

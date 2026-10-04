@@ -82,11 +82,8 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
       throw error;
     }
     if (error instanceof SlackApiError && slackInstallationError(error)) {
-      const current = await env.DB.prepare(`SELECT 1 FROM slack_channel_subscriptions WHERE ${fence}`)
-        .bind(...fenceBinds())
-        .first();
-      if (!current) throw new StaleSlackValidationError();
-      await recordSlackInstallationError(env, installation.id, error, installation.generation);
+      if (!(await recordSlackInstallationError(env, installation.id, error, installation.generation)))
+        throw new StaleSlackValidationError();
       throw error;
     }
     const saved =
