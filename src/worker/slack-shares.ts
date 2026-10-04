@@ -32,7 +32,7 @@ async function shareRefreshBlocks(env: Env, row: Refresh) {
   const page = await env.DB.prepare(`SELECT p.title,p.kind,p.plain_text,p.archived_at,p.import_job_id,
     EXISTS(SELECT 1 FROM workspace_members wm JOIN spaces s ON s.id=p.space_id WHERE wm.workspace_id=p.workspace_id AND wm.user_id=?
       AND EXISTS(SELECT 1 FROM slack_authorized_user_links link JOIN slack_share_references reference ON reference.id=?
-        WHERE link.user_id=wm.user_id AND link.installation_id=? AND coalesce(link.verified_at,link.linked_at)<=reference.created_at)
+        WHERE link.user_id=wm.user_id AND link.installation_id=? AND link.authorization_started_at<=reference.created_at)
       AND (wm.role='owner' OR s.visibility='workspace' OR EXISTS(SELECT 1 FROM space_members WHERE space_id=s.id AND user_id=wm.user_id))) can_read,
     EXISTS(SELECT 1 FROM slack_channel_subscriptions m WHERE m.installation_id=? AND m.channel_id=? AND m.space_id=p.space_id
       AND (m.page_id IS NULL OR m.page_id=p.id) AND m.validation_state='valid'

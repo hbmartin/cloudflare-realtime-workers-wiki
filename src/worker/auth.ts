@@ -7,6 +7,7 @@ import {
   createAuthMiddleware,
   getOAuthState,
   getSessionFromCtx,
+  isAPIError,
 } from "better-auth/api";
 import { genericOAuth, twoFactor } from "better-auth/plugins";
 import { authorizePasskeyRegistration, mandatorySecurity, requireSecurity } from "./security";
@@ -59,7 +60,9 @@ function slackLinkContext(value: unknown): SlackLinkAuthorization | null {
         Number.isFinite(binding.linked_at) &&
         (binding.better_auth_account_id === null || typeof binding.better_auth_account_id === "string") &&
         (binding.verified_at === null || Number.isFinite(binding.verified_at)) &&
-        (binding.security_generation === null || Number.isSafeInteger(binding.security_generation)),
+        (binding.security_generation === null || Number.isSafeInteger(binding.security_generation)) &&
+        Number.isSafeInteger(binding.installation_generation) &&
+        (binding.authorization_started_at === null || Number.isFinite(binding.authorization_started_at)),
     )
   )
     return null;
@@ -73,6 +76,39 @@ function slackAuthError(error: unknown): never {
       message: error.message,
     });
   throw error;
+}
+
+function isSlackCallback(ctx: GenericEndpointContext) {
+  return ctx.path === "/callback/slack" || (ctx.path === "/callback/:id" && ctx.params?.id === "slack");
+}
+
+async function slackCallbackFailure(env: Env, ctx: GenericEndpointContext, error: unknown): Promise<never> {
+  if (!isSlackCallback(ctx)) slackAuthError(error);
+  const state = await getOAuthState();
+  const origin = new URL(env.BETTER_AUTH_URL);
+  const fallback = state?.link ? "/?view=settings&slackAuth=callback" : "/?slackAuth=callback";
+  let destination = new URL(fallback, origin);
+  if (typeof state?.errorURL === "string") {
+    try {
+      const requested = new URL(state.errorURL, origin);
+      if (requested.origin === origin.origin) destination = requested;
+    } catch {
+      // Malformed destinations use the local callback screen.
+    }
+  }
+  const code = error instanceof HttpError ? error.code : isAPIError(error) ? error.body?.code : undefined;
+  destination.searchParams.set("error", typeof code === "string" ? code.toLowerCase() : "slack_unavailable");
+  throw ctx.redirect(destination.toString());
+}
+
+async function slackCallbackSucceeded(env: Env, ctx: GenericEndpointContext) {
+  const context = ctx.context as typeof ctx.context & { returned?: unknown; responseHeaders?: Headers };
+  const returned = context.returned;
+  if (!isAPIError(returned) || returned.statusCode < 300 || returned.statusCode >= 400) return false;
+  const location = new Headers(returned.headers).get("location") ?? context.responseHeaders?.get("location");
+  const state = await getOAuthState();
+  if (!location || typeof state?.callbackURL !== "string") return false;
+  return new URL(location, env.BETTER_AUTH_URL).href === new URL(state.callbackURL, env.BETTER_AUTH_URL).href;
 }
 
 function slackInviteContext(value: unknown): SlackInviteContext | null {
@@ -257,11 +293,13 @@ export function createAuth(env: Env, allowRegistration = false) {
                 await finishSlackAuthentication(env, ctx, account.userId, current.session.id);
               } catch (error) {
                 // The library has committed this newly created account already.
-                // Remove only this callback's account when the access grant loses its fence.
-                await env.DB.prepare("DELETE FROM account WHERE id=? AND userId=? AND providerId='slack'")
+                // Preserve an account another callback has adopted into a grant or proof.
+                await env.DB.prepare(`DELETE FROM account WHERE id=? AND userId=? AND providerId='slack'
+                  AND NOT EXISTS(SELECT 1 FROM slack_user_links WHERE better_auth_account_id=account.id)
+                  AND NOT EXISTS(SELECT 1 FROM slack_primary_factor_proofs WHERE account_id=account.id)`)
                   .bind(account.id, account.userId)
                   .run();
-                slackAuthError(error);
+                await slackCallbackFailure(env, ctx, error);
               }
             }
           },
@@ -271,7 +309,14 @@ export function createAuth(env: Env, allowRegistration = false) {
         create: {
           after: async (session, ctx) => {
             if (!ctx) return;
-            await finishSlackAuthentication(env, ctx, session.userId, session.id);
+            try {
+              await finishSlackAuthentication(env, ctx, session.userId, session.id);
+            } catch (error) {
+              await env.DB.prepare("DELETE FROM session WHERE id=? AND userId=?")
+                .bind(session.id, session.userId)
+                .run();
+              await slackCallbackFailure(env, ctx, error);
+            }
           },
         },
       },
@@ -336,17 +381,17 @@ export function createAuth(env: Env, allowRegistration = false) {
         });
       }),
       after: createAuthMiddleware(async (ctx) => {
-        if (ctx.path !== "/callback/slack" && !(ctx.path === "/callback/:id" && ctx.params?.id === "slack")) return;
+        if (!isSlackCallback(ctx)) return;
         const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
         // Existing OAuth accounts use update rather than create. Complete the
         // access grant for either path, without ever granting a primary proof.
-        if (policy.notesSlackLink && !policy.notesSlackLinkFinished && !(ctx.context.returned instanceof APIError)) {
-          const current = await getSessionFromCtx(ctx, { disableRefresh: true });
-          if (!current) throw new APIError("UNAUTHORIZED", { code: "UNAUTHORIZED", message: "Sign in again." });
+        if (policy.notesSlackLink && !policy.notesSlackLinkFinished && (await slackCallbackSucceeded(env, ctx))) {
           try {
+            const current = await getSessionFromCtx(ctx, { disableRefresh: true });
+            if (!current) throw new APIError("UNAUTHORIZED", { code: "UNAUTHORIZED", message: "Sign in again." });
             await finishSlackAuthentication(env, ctx, current.user.id, current.session.id);
           } catch (error) {
-            slackAuthError(error);
+            await slackCallbackFailure(env, ctx, error);
           }
         }
         if (policy.notesSlackInviteClaimed) return;

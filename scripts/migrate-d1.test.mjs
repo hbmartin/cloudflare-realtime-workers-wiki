@@ -7,18 +7,19 @@ const result = (rows) => ({ status: 0, stdout: JSON.stringify([{ success: true, 
 afterEach(() => vi.restoreAllMocks());
 
 describe("Slack migration safety in the deployment wrapper", () => {
-  it.each(["0069_slack_file_cleanup.sql", "0070_slack_review_fences.sql"])(
-    "stops remote %s before preflight or migration application",
-    (migration) => {
-      vi.spyOn(console, "error").mockImplementation(() => undefined);
-      const execute = vi
-        .fn()
-        .mockReturnValue({ status: 0, stdout: `Migrations to be applied:\n0067_review_delivery.sql\n${migration}\n` });
-      expect(main(["--remote", "--env", "production"], execute)).toBe(1);
-      expect(execute).toHaveBeenCalledOnce();
-      expect(console.error).toHaveBeenCalledWith(expect.stringContaining("manually confirmed safe upgrade"));
-    },
-  );
+  it.each([
+    "0069_slack_file_cleanup.sql",
+    "0070_slack_review_fences.sql",
+    "0072_slack_link_authorization_started_at.sql",
+  ])("stops remote %s before preflight or migration application", (migration) => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const execute = vi
+      .fn()
+      .mockReturnValue({ status: 0, stdout: `Migrations to be applied:\n0067_review_delivery.sql\n${migration}\n` });
+    expect(main(["--remote", "--env", "production"], execute)).toBe(1);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("manually confirmed safe upgrade"));
+  });
 
   it.each(["--local", "--remote"])("applies confirmed or local migrations: %s", (target) => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);

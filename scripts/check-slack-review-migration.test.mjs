@@ -7,18 +7,20 @@ const entrypoint = fileURLToPath(new URL("./check-slack-review-migration.mjs", i
 const listing = (names) => `Migrations to be applied:\n${names.join("\n")}\n`;
 
 describe("Slack review migration deployment gate", () => {
-  it.each(["0069_slack_file_cleanup.sql", "0070_slack_review_fences.sql", "0071_slack_authorization_cleanup.sql"])(
-    "requires confirmation while %s is pending",
-    (migration) => {
-      const pending = listing([migration]);
-      expect(() => checkSlackReviewMigration(pending)).toThrow("manually confirmed safe upgrade");
-      expect(checkSlackReviewMigration(pending, true)).toEqual([migration]);
-    },
-  );
+  it.each([
+    "0069_slack_file_cleanup.sql",
+    "0070_slack_review_fences.sql",
+    "0071_slack_authorization_cleanup.sql",
+    "0072_slack_link_authorization_started_at.sql",
+  ])("requires confirmation while %s is pending", (migration) => {
+    const pending = listing([migration]);
+    expect(() => checkSlackReviewMigration(pending)).toThrow("manually confirmed safe upgrade");
+    expect(checkSlackReviewMigration(pending, true)).toEqual([migration]);
+  });
 
   it.each([false, true])("accepts later releases regardless of confirmation: %s", (confirmed) => {
     expect(checkSlackReviewMigration("No migrations to apply!", confirmed)).toEqual([]);
-    expect(checkSlackReviewMigration(listing(["0072_future.sql"]), confirmed)).toEqual(["0072_future.sql"]);
+    expect(checkSlackReviewMigration(listing(["0073_future.sql"]), confirmed)).toEqual(["0073_future.sql"]);
   });
 
   it.each(["", "Unexpected Wrangler output", "Migrations to be applied:\n(no table)"])(

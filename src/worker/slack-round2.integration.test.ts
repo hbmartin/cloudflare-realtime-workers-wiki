@@ -157,7 +157,7 @@ async function event(
 }
 async function reference(kind = "page", shareId: string | null = null, id = "reference") {
   await env.DB.prepare(
-    "INSERT OR IGNORE INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation) VALUES('installation','owner','U123',1,1,0)",
+    "INSERT OR IGNORE INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation,authorization_started_at) VALUES('installation','owner','U123',1,1,0,1)",
   ).run();
   await env.DB.prepare(`INSERT INTO slack_share_references(id,installation_id,installation_generation,page_id,channel_id,message_ts,url,share_link_id,observed_user_id,reference_kind,created_at,updated_at)
     VALUES(?,'installation',1,'page','C123',?,?,?, 'owner',?,?,?)`)
@@ -1406,11 +1406,68 @@ describe("queued share lifecycle", () => {
     await deliverShareRefresh(runtime(), (await refreshes()).at(-1)!.id);
     expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(0);
   });
+  it.each(["legacy relink", "legacy verification", "new grant"])(
+    "renders historical previews after %s",
+    async (mode) => {
+      await mapping();
+      await page();
+      await reference();
+      const timestamp = Date.now() + 1000;
+      if (mode === "legacy verification") {
+        await env.DB.prepare(
+          "INSERT INTO account(id,accountId,providerId,userId,createdAt,updatedAt) VALUES('continuity-account','T123:U123','slack','owner',1,1)",
+        ).run();
+        await env.DB.prepare(
+          "UPDATE slack_user_links SET migration_state='verified',verification_method='slack_openid',better_auth_account_id='continuity-account',verified_at=?,linked_at=?",
+        )
+          .bind(timestamp, timestamp)
+          .run();
+      } else
+        await env.DB.prepare("UPDATE slack_user_links SET linked_at=?,authorization_started_at=?")
+          .bind(timestamp, mode === "new grant" ? timestamp : 1)
+          .run();
+      await createShare(runtime(), owner, "page", "http://example.test", {});
+      for (const job of await refreshes()) await deliverShareRefresh(runtime(), job.id);
+      const effects = JSON.stringify(calls.filter((call) => call.method === "chat.unfurl"));
+      expect(effects).toContain(mode === "new grant" ? "no longer available" : "Current excerpt");
+      expect(effects.includes("no longer available")).toBe(mode === "new grant");
+    },
+  );
+
+  it("delivers queued private unfurls under the unchanged grant start", async () => {
+    await mapping();
+    await page();
+    await reference();
+    await env.DB.prepare(`INSERT INTO slack_unfurls(id,workspace_id,installation_id,installation_generation,channel_id,message_ts,user_id,unfurls_json,created_at)
+      VALUES('continuous-unfurl','workspace','installation',1,'C123','123.456','owner',?,?)`)
+      .bind(
+        JSON.stringify({
+          "http://example.test/?page=page": {
+            blocks: [{ type: "section", text: { type: "plain_text", text: "Earlier preview" } }],
+          },
+        }),
+        Date.now(),
+      )
+      .run();
+    await env.DB.prepare("UPDATE slack_user_links SET linked_at=?")
+      .bind(Date.now() + 1000)
+      .run();
+    await deliverSlackUnfurl(
+      { ...runtime(), SLACK_SHARE_REFRESH_ENABLED: "false" },
+      "continuous-unfurl",
+      "continuous-outbox",
+    );
+    expect(JSON.stringify(calls.filter((call) => call.method === "chat.unfurl"))).toContain("Earlier preview");
+    expect(
+      await env.DB.prepare("SELECT delivered_at,retired_at FROM slack_unfurls WHERE id='continuous-unfurl'").first(),
+    ).toEqual({ delivered_at: expect.any(Number), retired_at: null });
+  });
+
   it("re-observation invalidates rendering evidence and refreshes an edited message", async () => {
     await mapping();
     await page();
     await env.DB.prepare(
-      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation) VALUES('installation','owner','U123',1,1,0)",
+      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation,authorization_started_at) VALUES('installation','owner','U123',1,1,0,1)",
     ).run();
     const linkEvent = {
       type: "event_callback",
@@ -1489,7 +1546,7 @@ describe("queued share lifecycle", () => {
     await page();
     const share = await createShare(runtime(), owner, "page", "http://example.test", {});
     await env.DB.prepare(
-      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation) VALUES('installation','owner','U123',1,1,0)",
+      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation,authorization_started_at) VALUES('installation','owner','U123',1,1,0,1)",
     ).run();
     const url = `http://example.test/share/${share.url.split("/").at(-1)}`;
     await handleSlackEvent(runtime(), {
@@ -3255,14 +3312,202 @@ describe("review follow-up permissions and recovery", () => {
     expect(send).toHaveBeenCalledTimes(2);
     expect(
       await env.DB.prepare("SELECT slack_redrive_count,last_error FROM outbox WHERE id=?").bind(row.id).first(),
-    ).toEqual({ slack_redrive_count: 8, last_error: "slack_validation_stale" });
+    ).toEqual({ slack_redrive_count: 8, last_error: null });
     expect(
       await env.DB.prepare("SELECT round2_state FROM slack_channel_events WHERE subscription_id=?").bind(m.id).first(),
     ).toEqual({ round2_state: "pending" });
   });
+  it("preserves a pending coordination retry while the destination is temporarily paused", async () => {
+    const m = await mapping("immediate");
+    await page();
+    const row = (await env.DB.prepare("SELECT id FROM outbox WHERE topic='slack_channel'").first<{ id: string }>())!;
+    await env.DB.prepare(
+      "UPDATE outbox SET slack_redrive_count=8,slack_redrive_due_at=NULL,slack_claim_recheck_at=1,last_error='slack_validation_stale' WHERE id=?",
+    )
+      .bind(row.id)
+      .run();
+    await env.DB.prepare("UPDATE slack_channel_subscriptions SET snoozed_until=? WHERE id=?")
+      .bind(Date.now() + 3600000, m.id)
+      .run();
+    const send = vi.fn();
+    const bindings = { ...runtime(), DELIVERY_QUEUE: { send } } as unknown as Env;
+    await redriveRound2Outbox(bindings);
+    const paused = await env.DB.prepare("SELECT slack_claim_recheck_at FROM outbox WHERE id=?")
+      .bind(row.id)
+      .first<{ slack_claim_recheck_at: number | null }>();
+    expect(paused?.slack_claim_recheck_at).toEqual(expect.any(Number));
+    expect(send).not.toHaveBeenCalled();
+    await env.DB.prepare("UPDATE slack_channel_subscriptions SET snoozed_until=NULL WHERE id=?").bind(m.id).run();
+    await env.DB.prepare("UPDATE outbox SET slack_claim_recheck_at=1,slack_redrive_due_at=1 WHERE id=?")
+      .bind(row.id)
+      .run();
+    await redriveRound2Outbox(bindings);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(
+      await env.DB.prepare("SELECT last_error,slack_redrive_count FROM outbox WHERE id=?").bind(row.id).first(),
+    ).toEqual({ last_error: null, slack_redrive_count: 8 });
+  });
+
+  it.each(["paused", "competing", "exhausting"])(
+    "preserves a newer stale retry during %s recovery",
+    async (outcome) => {
+      const m = await mapping("immediate");
+      await page();
+      const row = (await env.DB.prepare("SELECT id FROM outbox WHERE topic='slack_channel'").first<{ id: string }>())!;
+      const budget = outcome === "exhausting" ? 8 : 7;
+      await env.DB.prepare(
+        "UPDATE outbox SET enqueued_at=1,available_at=1,slack_redrive_count=?,slack_redrive_due_at=1,last_error=NULL WHERE id=?",
+      )
+        .bind(budget, row.id)
+        .run();
+      if (outcome === "paused")
+        await env.DB.prepare("UPDATE slack_channel_subscriptions SET snoozed_until=? WHERE id=?")
+          .bind(Date.now() + 3600000, m.id)
+          .run();
+      else if (outcome === "competing")
+        await env.DB.prepare(
+          "UPDATE slack_channel_events SET claim_token='competing',claimed_at=? WHERE subscription_id=?",
+        )
+          .bind(Date.now(), m.id)
+          .run();
+      const due = Date.now() + 123456;
+      const db = new Proxy(env.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+                new Proxy(statement, {
+                  get(prepared, key) {
+                    if (key === "bind") return (...binds: unknown[]) => wrap(prepared.bind(...binds));
+                    if (key === "first" && sql.includes("outcome,state,claimed_at,attempted_at,paused,blocked_child"))
+                      return async () => {
+                        const status = await prepared.first();
+                        await env.DB.prepare(
+                          "UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,slack_claim_recheck_at=?,last_error='slack_validation_stale' WHERE id=?",
+                        )
+                          .bind(due, due, row.id)
+                          .run();
+                        return status;
+                      };
+                    const value: unknown = Reflect.get(prepared, key, prepared);
+                    return typeof value === "function" ? value.bind(prepared) : value;
+                  },
+                });
+              return wrap(target.prepare(sql));
+            };
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const send = vi.fn();
+      await redriveRound2Outbox({ ...runtime(), DB: db, DELIVERY_QUEUE: { send } } as unknown as Env);
+      expect(send).not.toHaveBeenCalled();
+      expect(
+        await env.DB.prepare("SELECT round2_state FROM slack_channel_events WHERE subscription_id=?")
+          .bind(m.id)
+          .first(),
+      ).toEqual({ round2_state: "pending" });
+      expect(
+        await env.DB.prepare(
+          "SELECT enqueued_at,available_at,slack_redrive_due_at,slack_claim_recheck_at,last_error,slack_redrive_count FROM outbox WHERE id=?",
+        )
+          .bind(row.id)
+          .first(),
+      ).toEqual({
+        enqueued_at: null,
+        available_at: due,
+        slack_redrive_due_at: null,
+        slack_claim_recheck_at: due,
+        last_error: "slack_validation_stale",
+        slack_redrive_count: budget,
+      });
+    },
+  );
+
+  it("exhausts ordinary retryable work after its coordination exemption is consumed", async () => {
+    const m = await mapping("immediate");
+    await page();
+    const row = (await env.DB.prepare("SELECT id FROM outbox WHERE topic='slack_channel'").first<{ id: string }>())!;
+    await env.DB.prepare(
+      "UPDATE outbox SET slack_redrive_count=8,slack_redrive_due_at=NULL,slack_claim_recheck_at=1,last_error='slack_validation_stale' WHERE id=?",
+    )
+      .bind(row.id)
+      .run();
+    const send = vi.fn();
+    const bindings = { ...runtime(), DELIVERY_QUEUE: { send } } as unknown as Env;
+    await redriveRound2Outbox(bindings);
+    expect(send).toHaveBeenCalledTimes(1);
+    await env.DB.prepare("UPDATE outbox SET slack_redrive_due_at=1 WHERE id=?").bind(row.id).run();
+    await redriveRound2Outbox(bindings);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(
+      await env.DB.prepare("SELECT last_error,slack_redrive_count FROM outbox WHERE id=?").bind(row.id).first(),
+    ).toEqual({ last_error: "redrive_exhausted", slack_redrive_count: 8 });
+    expect(
+      await env.DB.prepare("SELECT round2_state FROM slack_channel_events WHERE subscription_id=?").bind(m.id).first(),
+    ).toEqual({ round2_state: "retired" });
+  });
+
+  it.each([false, true])("preserves a newer stale retry during maintenance enqueue failure %s", async (fails) => {
+    await mapping("immediate");
+    await page();
+    const row = (await env.DB.prepare("SELECT id FROM outbox WHERE topic='slack_channel'").first<{ id: string }>())!;
+    await env.DB.prepare(
+      "UPDATE outbox SET enqueued_at=1,available_at=1,slack_redrive_count=7,slack_redrive_due_at=1,last_error=NULL WHERE id=?",
+    )
+      .bind(row.id)
+      .run();
+    const due = Date.now() + 123456;
+    const send = vi.fn(async () => {
+      await env.DB.prepare(
+        "UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,slack_claim_recheck_at=?,last_error='slack_validation_stale' WHERE id=?",
+      )
+        .bind(due, due, row.id)
+        .run();
+      if (fails) throw new Error("Queue unavailable");
+    });
+    await redriveRound2Outbox({ ...runtime(), DELIVERY_QUEUE: { send } } as unknown as Env);
+    expect(
+      await env.DB.prepare(
+        "SELECT enqueued_at,available_at,slack_redrive_due_at,slack_claim_recheck_at,last_error,slack_redrive_count FROM outbox WHERE id=?",
+      )
+        .bind(row.id)
+        .first(),
+    ).toEqual({
+      enqueued_at: null,
+      available_at: due,
+      slack_redrive_due_at: null,
+      slack_claim_recheck_at: due,
+      last_error: "slack_validation_stale",
+      slack_redrive_count: 7,
+    });
+  });
+
+  it("groups cleanup health by normalized reason", async () => {
+    await env.DB.batch(
+      [null, "cleanup_credentials_unavailable", "missing_scope"].map((reason, n) =>
+        env.DB.prepare(`INSERT INTO slack_file_cleanup_jobs(id,workspace_id,installation_id,installation_generation,team_id,bot_user_id,file_id,artifact_id,state,last_error,created_at,updated_at)
+        VALUES(?,'workspace','installation',1,'T123','B123',?,'health-artifact','paused',?,1,1)`).bind(
+          `health-${n}`,
+          `F${n}`,
+          reason,
+        ),
+      ),
+    );
+    const health = await slackFileCleanupHealth(runtime(), "workspace");
+    expect(health.paused).toBe(3);
+    expect(health.pausedByReason).toEqual(
+      expect.arrayContaining([
+        { reason: "cleanup_credentials_unavailable", count: 2 },
+        { reason: "missing_scope", count: 1 },
+      ]),
+    );
+    expect(health.pausedByReason).toHaveLength(2);
+  });
+
   it("blocks personal content when access is revoked during token rotation", async () => {
     await env.DB.prepare(
-      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation) VALUES('installation','owner','U123',1,1,0)",
+      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation,authorization_started_at) VALUES('installation','owner','U123',1,1,0,1)",
     ).run();
     await env.DB.prepare("UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?")
       .bind(await encryptSlackToken(runtime(), "refresh"))

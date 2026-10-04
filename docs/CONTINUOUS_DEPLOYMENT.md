@@ -59,7 +59,7 @@ refuses to deploy when Wrangler's migration listing is not in a recognized empty
 the fixtures in `scripts/check-page-move-migration.test.mjs` alongside any intentional Wrangler-output parser
 change.
 
-Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, or `0071_slack_authorization_cleanup.sql` also block automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, or `0072_slack_link_authorization_started_at.sql` also block automatic deployment.
 Pause the shared delivery queue, disable live Slack channel validation, and allow 16 minutes for
 existing invocations to finish before dispatching with `confirm_slack_review_migration_safe` checked.
 Keep both paused through migration and deployment. Follow the exact

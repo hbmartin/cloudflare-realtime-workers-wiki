@@ -152,6 +152,157 @@ beforeEach(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
 });
 
+async function legacyChannelFixture(cadence: "immediate" | "digest") {
+  const installed = await bootstrap();
+  await installSlack(installed.member);
+  const bindings: Env = { ...slackEnv(), SLACK_CHANNEL_VALIDATION_ENABLED: "false" };
+  const mapping = await upsertSlackChannelSubscription(bindings, memberContext(installed.member), {
+    spaceId: installed.page.spaceId,
+    pageId: null,
+    channelId: "C0123456789",
+    channelName: "notes",
+    cadence,
+    eventTypes: ["page_edit", "mention"],
+  });
+  await env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+    VALUES('actor-event',?,?,'mention',?,?,?,1)`)
+    .bind(mapping.id, installed.member.workspace.id, installed.member.user.id, installed.page.id, cadence)
+    .run();
+  return { ...installed, bindings, mapping };
+}
+
+describe("legacy channel event settlement", () => {
+  it.each(["immediate", "digest"] as const)("suppresses unauthorized %s actors", async (cadence) => {
+    const fixture = await legacyChannelFixture(cadence);
+    await env.DB.prepare("UPDATE account_security SET codes_saved=0 WHERE user_id=?")
+      .bind(fixture.member.user.id)
+      .run();
+    const remote = vi.fn();
+    vi.stubGlobal("fetch", remote);
+    if (cadence === "immediate") await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+    else await sendDueSlackChannelDigests(fixture.bindings, Date.UTC(2026, 9, 4, 10));
+    expect(remote).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare(
+        "SELECT suppressed_at,delivered_at FROM slack_channel_events WHERE id='actor-event'",
+      ).first(),
+    ).toEqual({ suppressed_at: expect.any(Number), delivered_at: null });
+  });
+
+  it("suppresses an actor in account recovery", async () => {
+    const fixture = await legacyChannelFixture("immediate");
+    await env.DB.prepare("UPDATE account_security SET recovery_required=1 WHERE user_id=?")
+      .bind(fixture.member.user.id)
+      .run();
+    await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+    expect(
+      await env.DB.prepare("SELECT suppressed_at FROM slack_channel_events WHERE id='actor-event'").first(),
+    ).toEqual({ suppressed_at: expect.any(Number) });
+  });
+
+  it.each(["other claim", "delivered"])("preserves an event with %s", async (mode) => {
+    const fixture = await legacyChannelFixture("immediate");
+    await env.DB.prepare("UPDATE account_security SET codes_saved=0 WHERE user_id=?")
+      .bind(fixture.member.user.id)
+      .run();
+    await env.DB.prepare(
+      mode === "other claim"
+        ? "UPDATE slack_channel_events SET claim_token='other',claimed_at=1 WHERE id='actor-event'"
+        : "UPDATE slack_channel_events SET delivered_at=1 WHERE id='actor-event'",
+    ).run();
+    const before = await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first();
+    await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+    expect(await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first()).toEqual(before);
+  });
+
+  it.each(["immediate", "digest"] as const)("suppresses access revoked after the %s claim", async (cadence) => {
+    const fixture = await legacyChannelFixture(cadence);
+    let claimed = false;
+    const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+      new Proxy(statement, {
+        get(target, key) {
+          if (key === "bind") return (...binds: unknown[]) => wrap(target.bind(...binds));
+          if (key === "all")
+            return async () => {
+              const result = await target.all();
+              claimed = true;
+              await env.DB.prepare("UPDATE account_security SET codes_saved=0 WHERE user_id=?")
+                .bind(fixture.member.user.id)
+                .run();
+              return result;
+            };
+          const value = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) =>
+            sql.includes("UPDATE slack_channel_events SET claimed_at")
+              ? wrap(target.prepare(sql))
+              : target.prepare(sql);
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const bindings = { ...fixture.bindings, DB: db };
+    const remote = vi.fn();
+    vi.stubGlobal("fetch", remote);
+    if (cadence === "immediate") await deliverSlackChannelEvent(bindings, "actor-event");
+    else await sendDueSlackChannelDigests(bindings, Date.UTC(2026, 9, 4, 10));
+    expect(claimed).toBe(true);
+    expect(remote).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare("SELECT suppressed_at,claim_token FROM slack_channel_events WHERE id='actor-event'").first(),
+    ).toEqual({ suppressed_at: expect.any(Number), claim_token: null });
+  });
+
+  it.each(["muted", "snoozed", "installation error"])("keeps %s events deferred", async (mode) => {
+    const fixture = await legacyChannelFixture("immediate");
+    await env.DB.prepare(
+      mode === "installation error"
+        ? "UPDATE slack_installations SET auth_error='invalid_auth'"
+        : mode === "muted"
+          ? "UPDATE slack_channel_subscriptions SET muted_at=1"
+          : "UPDATE slack_channel_subscriptions SET snoozed_until=9999999999999",
+    ).run();
+    await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+    expect(
+      await env.DB.prepare(
+        "SELECT suppressed_at,delivered_at FROM slack_channel_events WHERE id='actor-event'",
+      ).first(),
+    ).toEqual({ suppressed_at: null, delivered_at: null });
+  });
+
+  it("keeps authorized integration actors eligible", async () => {
+    const fixture = await legacyChannelFixture("immediate");
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('legacy-bot','Bot','legacy-bot@example.test',1,1)",
+      ),
+      env.DB.prepare(`INSERT INTO integrations(id,workspace_id,bot_user_id,name,read_comments,insert_comments,created_by,created_at,updated_at)
+        VALUES('legacy-integration',?,'legacy-bot','Writer',1,1,?,1,1)`).bind(
+        fixture.member.workspace.id,
+        fixture.member.user.id,
+      ),
+      env.DB.prepare(
+        "INSERT INTO integration_grants(integration_id,root_page_id,created_by,created_at) VALUES('legacy-integration',?,?,1)",
+      ).bind(fixture.page.id, fixture.member.user.id),
+      env.DB.prepare("UPDATE slack_channel_events SET actor_id='legacy-bot' WHERE id='actor-event'"),
+    ]);
+    const remote = vi.fn(async () => Response.json({ ok: true, ts: "123.456" }));
+    vi.stubGlobal("fetch", remote);
+    await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+    expect(remote).toHaveBeenCalledTimes(1);
+    expect(
+      await env.DB.prepare(
+        "SELECT suppressed_at,delivered_at FROM slack_channel_events WHERE id='actor-event'",
+      ).first(),
+    ).toEqual({ suppressed_at: null, delivered_at: expect.any(Number) });
+  });
+});
+
 describe("Slack share-refresh HTTP enqueueing", () => {
   it.each(["rate limit", "competing claim"])(
     "returns a saved repair and sweeps safe work after a reconciliation %s",
@@ -1338,8 +1489,8 @@ describe("Slack security and integration", () => {
       status: 422,
     });
     await env.DB.prepare(
-      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation)
-       VALUES ('slack-installation', ?, 'UVIEWER', ?,0)`,
+      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation,authorization_started_at)
+       VALUES ('slack-installation', ?, 'UVIEWER', ?,0,1)`,
     )
       .bind(viewer.member.user.id, Date.now())
       .run();
@@ -1361,8 +1512,8 @@ describe("Slack security and integration", () => {
     const viewer = await inviteViewer(installed.cookie);
     await installSlack(installed.member);
     await env.DB.prepare(
-      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation)
-       VALUES ('slack-installation', ?, 'UVIEWER', ?,0)`,
+      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation,authorization_started_at)
+       VALUES ('slack-installation', ?, 'UVIEWER', ?,0,1)`,
     )
       .bind(viewer.member.user.id, Date.now())
       .run();

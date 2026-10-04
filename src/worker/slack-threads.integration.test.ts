@@ -412,7 +412,7 @@ beforeEach(async () => {
       `INSERT INTO account (id,accountId,providerId,userId,createdAt,updatedAt) VALUES ('owner-account','T123:UOWNER','slack','owner',1,1), ('viewer-account','T123:UVIEWER','slack','viewer',1,1)`,
     ),
     env.DB.prepare(
-      `INSERT INTO slack_user_links (installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,verified_at,migration_state,security_generation) VALUES ('installation','owner','UOWNER',1,'owner-account','slack_openid',1,'verified',0), ('installation','viewer','UVIEWER',1,'viewer-account','slack_openid',1,'verified',0)`,
+      `INSERT INTO slack_user_links (installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,verified_at,migration_state,security_generation,authorization_started_at) VALUES ('installation','owner','UOWNER',1,'owner-account','slack_openid',1,'verified',0,1), ('installation','viewer','UVIEWER',1,'viewer-account','slack_openid',1,'verified',0,1)`,
     ),
   ]);
   await protectSlackFixtureUsers(["owner", "viewer"]);

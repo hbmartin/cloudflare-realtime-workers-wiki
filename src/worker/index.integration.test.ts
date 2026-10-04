@@ -2987,6 +2987,117 @@ describe("Worker integration", () => {
     });
   });
 
+  it.each(["identical", "conflicting hash", "date token", "block limit", "byte limit"])(
+    "rechecks document mutation state after concurrent authorization: %s",
+    async (mode) => {
+      const installed = await bootstrap();
+      const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+      await stub.fetch(internalWarmupRequest());
+      await runInDurableObject(stub, async (instance) => {
+        const document = instance as unknown as TestDocument;
+        const count = mode === "block limit" ? 9999 : 1;
+        installDocumentBlocks(
+          document.document,
+          ...Array.from({ length: count }, (_, n) => documentBlock(`existing-${n}`, "Before").container),
+        );
+        if (mode === "byte limit") {
+          const size = Y.encodeStateAsUpdate(document.document).byteLength;
+          document.document.getMap("test-padding").set("padding", "x".repeat(24 * 1024 * 1024 - size - 1600));
+        }
+        let release!: () => void, entered!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const ready = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        let reads = 0;
+        const original = document.bindings.DB;
+        const authorized = {
+          bind() {
+            return this;
+          },
+          async first() {
+            if (++reads === 2) entered();
+            await gate;
+            return { allowed: 1 };
+          },
+        };
+        document.bindings.DB = new Proxy(original, {
+          get(target, key) {
+            if (key === "prepare")
+              return (sql: string) =>
+                sql.includes("SELECT 1 FROM slack_product_sessions") ? authorized : target.prepare(sql);
+            const value = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        const mutation = (n: number) => {
+          const same = mode === "identical";
+          const content =
+            mode === "date token"
+              ? [
+                  {
+                    type: "dateMention",
+                    attrs: {
+                      tokenId: "shared-date",
+                      revision: "rev",
+                      createdBy: installed.userId,
+                      kind: "all-day",
+                      value: "2026-10-04",
+                      timezone: "UTC",
+                    },
+                  },
+                ]
+              : [{ type: "text", text: mode === "byte limit" ? "x".repeat(1000) : `Added-${same ? 0 : n}` }];
+          return new Request("https://document.internal/api-mutate", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+            body: JSON.stringify({
+              actorId: installed.userId,
+              slackProductSessionId: "race-session",
+              operationId: same || mode === "conflicting hash" ? "same-operation" : `operation-${n}`,
+              suppressExternalEffects: true,
+              operations: [
+                {
+                  type: "append_children",
+                  children: [
+                    {
+                      type: "blockContainer",
+                      attrs: { id: `new-${same ? 0 : n}` },
+                      content: [{ type: "paragraph", content }],
+                    },
+                  ],
+                },
+              ],
+            }),
+          });
+        };
+        try {
+          const first = document.onRequest(mutation(0));
+          const second = document.onRequest(mutation(1));
+          await ready;
+          release();
+          const responses = await Promise.all([first, second]);
+          expect(responses.map((response) => response.status).sort((a, b) => a - b)).toEqual(
+            mode === "identical"
+              ? [200, 200]
+              : mode === "block limit" || mode === "byte limit"
+                ? [200, 413]
+                : [200, 409],
+          );
+          const group = document.document.getXmlFragment("document-store").get(0) as Y.XmlElement;
+          expect(group.length).toBe(count + 1);
+          expect(document.document.getMap("api-operation-receipts").size).toBe(1);
+        } finally {
+          release();
+          document.bindings.DB = original;
+        }
+      });
+    },
+    60_000,
+  );
+
   it.each([
     { role: "owner", visibility: "workspace", spaceRole: "viewer", allowed: true },
     { role: "editor", visibility: "workspace", spaceRole: "viewer", allowed: false },

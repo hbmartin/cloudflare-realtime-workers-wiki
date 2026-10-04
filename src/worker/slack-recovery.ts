@@ -66,6 +66,30 @@ export async function round2DeliveryOutcome(
   return (await round2DeliveryStatus(env, topic, id)).outcome;
 }
 
+type Round2OutboxSnapshot = {
+  id: string;
+  enqueued_at: number | null;
+  available_at: number;
+  last_error: string | null;
+  slack_redrive_due_at: number | null;
+  slack_claim_recheck_at: number | null;
+  slack_redrive_count: number;
+  slack_scope_paused_at: number | null;
+};
+const recoverySnapshotSql = `id=? AND enqueued_at IS ? AND available_at=? AND last_error IS ?
+  AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ? AND slack_redrive_count=? AND slack_scope_paused_at IS NULL`;
+function recoverySnapshotBinds(sibling: Round2OutboxSnapshot) {
+  return [
+    sibling.id,
+    sibling.enqueued_at,
+    sibling.available_at,
+    sibling.last_error,
+    sibling.slack_redrive_due_at,
+    sibling.slack_claim_recheck_at,
+    sibling.slack_redrive_count,
+  ];
+}
+
 export async function redriveRound2Outbox(env: Env) {
   const topics = (Object.keys(round2Receipts) as Array<keyof typeof round2Receipts>).filter((topic) =>
     topic === "slack_file_upload"
@@ -91,11 +115,10 @@ export async function redriveRound2Outbox(env: Env) {
       SELECT * FROM (${deadlineStream("slack_claim_recheck_at", 2)}) ORDER BY due_at,id LIMIT 200), candidates AS (
       SELECT id,min(due_at) due_at FROM (SELECT * FROM regular UNION ALL SELECT * FROM claims)
       GROUP BY id ORDER BY due_at,id LIMIT 200)
-    SELECT o.id,o.topic,o.slack_round2_receipt_id receipt_id,
-      o.last_error='slack_validation_stale' coordination_recheck
+    SELECT o.id,o.topic,o.slack_round2_receipt_id receipt_id
       FROM candidates c JOIN outbox o ON o.id=c.id ORDER BY c.due_at,c.id`)
     .bind(now, now)
-    .all<{ id: string; topic: keyof typeof round2Receipts; receipt_id: string | null; coordination_recheck: number }>();
+    .all<{ id: string; topic: keyof typeof round2Receipts; receipt_id: string | null }>();
   const seen = new Set<string>();
   let recoveries = 0;
   for (const row of rows.results) {
@@ -111,22 +134,48 @@ export async function redriveRound2Outbox(env: Env) {
     const key = `${row.topic}:${id}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    const siblings = await env.DB.prepare(`SELECT id,enqueued_at,available_at,last_error,slack_redrive_due_at,
+      slack_claim_recheck_at,slack_redrive_count,slack_scope_paused_at FROM outbox WHERE topic=? AND slack_round2_receipt_id=?`)
+      .bind(row.topic, id)
+      .all<Round2OutboxSnapshot>();
+    const current = siblings.results.find((sibling) => sibling.id === row.id);
+    if (
+      !current ||
+      current.slack_scope_paused_at !== null ||
+      ![current.slack_redrive_due_at, current.slack_claim_recheck_at].some((due) => due !== null && due <= now)
+    )
+      continue;
+    const coordinationRecheck =
+      current.last_error === "slack_validation_stale" &&
+      current.slack_claim_recheck_at !== null &&
+      current.slack_claim_recheck_at <= now;
+    const budget = Math.max(0, ...siblings.results.map((sibling) => sibling.slack_redrive_count));
+    // A queue consumer can create a newer validation retry during status reads or send().
+    const fence = recoverySnapshotSql;
     const status = await round2DeliveryStatus(env, row.topic, id);
     if (status.outcome === "completed") {
-      await env.DB.prepare(
-        `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL WHERE topic=? AND slack_round2_receipt_id=?`,
-      )
-        .bind(row.topic, id)
-        .run();
+      await env.DB.batch(
+        siblings.results.map((sibling) =>
+          env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL WHERE ${fence}`).bind(
+            ...recoverySnapshotBinds(sibling),
+          ),
+        ),
+      );
       continue;
     }
     if (status.outcome === "competing") {
       const due = Math.max(now + 1_000, (status.claimed_at ?? now) + 60_000);
-      await env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=?,
-        slack_redrive_due_at=CASE WHEN slack_redrive_due_at<=? THEN ? ELSE slack_redrive_due_at END
-        WHERE topic=? AND slack_round2_receipt_id=? AND slack_scope_paused_at IS NULL`)
-        .bind(due, now, due, row.topic, id)
-        .run();
+      await env.DB.batch(
+        siblings.results.map((sibling) =>
+          env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=?,
+        slack_redrive_due_at=CASE WHEN slack_redrive_due_at<=? THEN ? ELSE slack_redrive_due_at END WHERE ${fence}`).bind(
+            due,
+            now,
+            due,
+            ...recoverySnapshotBinds(sibling),
+          ),
+        ),
+      );
       continue;
     }
     if (
@@ -134,69 +183,78 @@ export async function redriveRound2Outbox(env: Env) {
       (status.outcome === "uncertain" &&
         (status.state !== "sending" || status.attempted_at === null || status.paused || status.blocked_child))
     ) {
-      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=NULL
-        WHERE topic=? AND slack_round2_receipt_id=? AND slack_scope_paused_at IS NULL`)
-        .bind(now + 30 * 60_000, row.topic, id)
-        .run();
+      const due = now + 30 * 60_000;
+      await env.DB.batch(
+        siblings.results.map((sibling) =>
+          env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),
+        slack_claim_recheck_at=CASE WHEN last_error='slack_validation_stale' AND slack_claim_recheck_at IS NOT NULL
+          THEN max(slack_claim_recheck_at,?) ELSE NULL END WHERE ${fence}`).bind(
+            due,
+            due,
+            ...recoverySnapshotBinds(sibling),
+          ),
+        ),
+      );
       continue;
     }
     // Exhaustion also writes receipt, failure and sibling records. Bound that
     // work with enqueue attempts so a spent backlog cannot monopolize a pass.
     if (recoveries >= 50) continue;
     recoveries++;
-    const budget = (await env.DB.prepare(
-      `SELECT coalesce(max(slack_redrive_count),0) count FROM outbox WHERE topic=? AND slack_round2_receipt_id=?`,
-    )
-      .bind(row.topic, id)
-      .first<{ count: number }>())!.count;
-    if (status.outcome === "retryable" && !row.coordination_recheck && budget >= 8) {
-      if (await exhaustRound2Receipt(env, row.topic, id))
-        await env.DB.prepare(
-          `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error='redrive_exhausted' WHERE topic=? AND slack_round2_receipt_id=?`,
-        )
-          .bind(row.topic, id)
-          .run();
+    if (status.outcome === "retryable" && !coordinationRecheck && budget >= 8) {
+      if (await exhaustRound2Receipt(env, row.topic, id, current))
+        await env.DB.batch(
+          siblings.results.map((sibling) =>
+            env.DB.prepare(
+              `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error='redrive_exhausted' WHERE ${fence}`,
+            ).bind(...recoverySnapshotBinds(sibling)),
+          ),
+        );
       continue;
     }
     try {
       await env.DELIVERY_QUEUE.send({ outboxId: row.id });
     } catch {
-      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=?,last_error=CASE WHEN last_error='slack_validation_stale' THEN last_error ELSE 'round2_enqueue_failed' END
-        WHERE topic=? AND slack_round2_receipt_id=? AND slack_scope_paused_at IS NULL`)
-        .bind(now + 60_000, now + 60_000, row.topic, id)
-        .run();
+      await env.DB.batch(
+        siblings.results.map((sibling) =>
+          env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=?,
+          last_error=CASE WHEN last_error='slack_validation_stale' THEN last_error ELSE 'round2_enqueue_failed' END WHERE ${fence}`).bind(
+            now + 60_000,
+            now + 60_000,
+            ...recoverySnapshotBinds(sibling),
+          ),
+        ),
+      );
       continue;
     }
     const due = now + Math.min(6 * 60 * 60_000, 15 * 60_000 * 2 ** Math.min(budget, 5));
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?,slack_claim_recheck_at=NULL,slack_redrive_count=(
-        SELECT max(b.slack_redrive_count) FROM outbox b WHERE b.topic=? AND b.slack_round2_receipt_id=?)+? WHERE id=?`).bind(
-        now,
-        due,
-        row.topic,
-        id,
-        status.outcome === "retryable" && !row.coordination_recheck ? 1 : 0,
-        row.id,
+    await env.DB.batch(
+      siblings.results.map((sibling) =>
+        env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?,slack_claim_recheck_at=NULL,
+        last_error=CASE WHEN last_error='slack_validation_stale' THEN NULL ELSE last_error END,
+        slack_redrive_count=? WHERE ${fence}`).bind(
+          now,
+          due,
+          budget + (status.outcome === "retryable" && !coordinationRecheck ? 1 : 0),
+          ...recoverySnapshotBinds(sibling),
+        ),
       ),
-      env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?,slack_claim_recheck_at=NULL,slack_redrive_count=(SELECT slack_redrive_count FROM outbox WHERE id=?)
-        WHERE topic=? AND slack_round2_receipt_id=? AND id<>? AND slack_scope_paused_at IS NULL`).bind(
-        now,
-        due,
-        row.id,
-        row.topic,
-        id,
-        row.id,
-      ),
-    ]);
+    );
   }
 }
 
-async function exhaustRound2Receipt(env: Env, topic: keyof typeof round2Receipts, id: string) {
+async function exhaustRound2Receipt(
+  env: Env,
+  topic: keyof typeof round2Receipts,
+  id: string,
+  snapshot: Round2OutboxSnapshot,
+) {
   const contract = round2Receipts[topic];
   const token = crypto.randomUUID();
   const claim = await env.DB.prepare(`UPDATE ${contract.table} SET claim_token=?,claimed_at=? WHERE id=?
-    AND (SELECT ${outcomeSql()} FROM (${receiptStatusSql(topic, "?")}))='retryable'`)
-    .bind(token, Date.now(), id, id)
+    AND (SELECT ${outcomeSql()} FROM (${receiptStatusSql(topic, "?")}))='retryable'
+    AND EXISTS(SELECT 1 FROM outbox WHERE ${recoverySnapshotSql})`)
+    .bind(token, Date.now(), id, id, ...recoverySnapshotBinds(snapshot))
     .run();
   if (!claim.meta.changes) return false;
   const mappingJoin =

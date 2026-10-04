@@ -990,9 +990,6 @@ export class Document extends YServer {
       if (body.expectedSequence !== undefined) {
         if (!Number.isInteger(body.expectedSequence) || Number(body.expectedSequence) < 0)
           return Response.json({ error: "Invalid expected sequence." }, { status: 400 });
-        this.flushPendingUpdates();
-        if (this.compaction || this.metadata.dirty || this.metadata.snapshot_seq !== body.expectedSequence)
-          return Response.json({ error: "revision_changed" }, { status: 409 });
       }
       const operationId =
         typeof body.operationId === "string" && /^[A-Za-z0-9:_-]{1,200}$/.test(body.operationId)
@@ -1007,6 +1004,34 @@ export class Document extends YServer {
         this.flushPendingUpdates();
         if (this.metadata.dirty) await this.compact();
       }
+      if (body.slackProductSessionId !== undefined) {
+        if (typeof body.slackProductSessionId !== "string")
+          return Response.json({ error: "Invalid Slack authorization." }, { status: 400 });
+        const authorized = await this.bindings.DB.prepare(`SELECT 1 FROM slack_product_sessions product_session
+          JOIN pages destination ON destination.id=product_session.result_page_id
+          JOIN workspace_members member ON member.workspace_id=destination.workspace_id AND member.user_id=?
+          LEFT JOIN space_members space_member ON space_member.space_id=destination.space_id AND space_member.user_id=member.user_id
+          JOIN spaces space ON space.id=destination.space_id
+          WHERE product_session.id=? AND product_session.result_page_id=?
+            AND json_extract(product_session.identity_json,'$.userId')=member.user_id
+            AND destination.archived_at IS NULL AND destination.import_job_id IS NULL
+            AND (member.role='owner' OR (member.role='editor'
+              AND (space.visibility='workspace' OR space_member.user_id IS NOT NULL)
+              AND coalesce(space_member.role,'editor')='editor'))
+            AND ${SLACK_PRODUCT_SESSION_ACCESS_SQL}`)
+          .bind(body.actorId, body.slackProductSessionId, this.ids.pageId)
+          .first();
+        if (!authorized) return Response.json({ error: "slack_identity_required" }, { status: 403 });
+      }
+      this.flushPendingUpdates();
+      if (
+        this.purged ||
+        this.metadata.retired ||
+        this.metadata.restore_pending ||
+        this.transition ||
+        this.metadata.read_only
+      )
+        return Response.json({ error: "revision_changed" }, { status: 409 });
       const receipts = operationId ? this.document.getMap<string>("api-operation-receipts") : null;
       if (operationId && receipts?.has(operationId)) {
         if (receipts.get(operationId) !== requestHash)
@@ -1021,6 +1046,7 @@ export class Document extends YServer {
         body.expectedSequence !== undefined &&
         (!Number.isInteger(body.expectedSequence) ||
           this.metadata.dirty ||
+          this.compaction ||
           this.metadata.snapshot_seq !== body.expectedSequence)
       )
         return Response.json({ error: "revision_changed" }, { status: 409 });
@@ -1061,36 +1087,6 @@ export class Document extends YServer {
         return Response.json({ error: "Document size limit exceeded." }, { status: 413 });
       }
       clone.destroy();
-      if (body.slackProductSessionId !== undefined) {
-        if (typeof body.slackProductSessionId !== "string")
-          return Response.json({ error: "Invalid Slack authorization." }, { status: 400 });
-        const authorized = await this.bindings.DB.prepare(`SELECT 1 FROM slack_product_sessions product_session
-          JOIN pages destination ON destination.id=product_session.result_page_id
-          JOIN workspace_members member ON member.workspace_id=destination.workspace_id AND member.user_id=?
-          LEFT JOIN space_members space_member ON space_member.space_id=destination.space_id AND space_member.user_id=member.user_id
-          JOIN spaces space ON space.id=destination.space_id
-          WHERE product_session.id=? AND product_session.result_page_id=?
-            AND json_extract(product_session.identity_json,'$.userId')=member.user_id
-            AND destination.archived_at IS NULL AND destination.import_job_id IS NULL
-            AND (member.role='owner' OR (member.role='editor'
-              AND (space.visibility='workspace' OR space_member.user_id IS NOT NULL)
-              AND coalesce(space_member.role,'editor')='editor'))
-            AND ${SLACK_PRODUCT_SESSION_ACCESS_SQL}`)
-          .bind(body.actorId, body.slackProductSessionId, this.ids.pageId)
-          .first();
-        if (!authorized) return Response.json({ error: "slack_identity_required" }, { status: 403 });
-      }
-      this.flushPendingUpdates();
-      if (
-        this.purged ||
-        this.metadata.retired ||
-        this.metadata.restore_pending ||
-        this.transition ||
-        this.metadata.read_only ||
-        (body.expectedSequence !== undefined &&
-          (this.metadata.dirty || this.compaction || this.metadata.snapshot_seq !== body.expectedSequence))
-      )
-        return Response.json({ error: "revision_changed" }, { status: 409 });
       this.pendingAuthorId = body.actorId;
       this.pendingNotifyEdit = false;
       this.document.transact(() => {
@@ -1099,7 +1095,10 @@ export class Document extends YServer {
       }, "api-mutation");
       this.flushPendingUpdates();
       if (this.metadata.dirty) await this.compact(true, body.suppressExternalEffects === true);
-      return Response.json({ document, sequence: this.metadata.snapshot_seq });
+      return Response.json({
+        document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")),
+        sequence: this.metadata.snapshot_seq,
+      });
     }
     if (request.method === "GET" && url.pathname.endsWith("/legacy-comments")) {
       if (this.metadata.content_kind !== "document") return Response.json({ threads: [] });
