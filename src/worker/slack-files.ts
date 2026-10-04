@@ -1,3 +1,5 @@
+import { processSlackFileCleanup } from "./slack-file-cleanup";
+import { logger } from "./observability";
 import { DeliveryInProgressError } from "./notifications";
 import {
   definiteSlackRejection,
@@ -9,6 +11,21 @@ import { DIAGRAM_THUMBNAIL_HEIGHT, DIAGRAM_THUMBNAIL_WIDTH } from "../shared/dia
 import { round2Installation } from "./slack-channels";
 import { slackApi, SlackApiError, SlackRateLimitError, slackHasScopes } from "./slack";
 import type { Env } from "./env";
+
+async function cleanupAllocation(env: Env, installationId: string, artifactId: string, fileId: string | null) {
+  if (!fileId) return;
+  try {
+    await processSlackFileCleanup(env, `slack-file-cleanup:${installationId}:${fileId}`);
+  } catch (error) {
+    logger.warn(
+      "slack.file_cleanup.deferred",
+      "slack",
+      "Abandoned allocation retained for cleanup",
+      { artifactId },
+      error,
+    );
+  }
+}
 
 export async function deliverThumbnail(env: Env, id: string) {
   if (!thumbnailDeliveryEnabled(env)) return;
@@ -30,6 +47,7 @@ export async function deliverThumbnail(env: Env, id: string) {
   const installation = await round2Installation(env, row.installation_id, row.installation_generation);
   if (!installation) {
     await retireObsoleteReceipt(env, "slack_file_artifacts", id, row.installation_id, row.installation_generation);
+    await cleanupAllocation(env, row.installation_id, id, row.slack_file_id);
     return;
   }
   const token = crypto.randomUUID();
@@ -73,6 +91,7 @@ export async function deliverThumbnail(env: Env, id: string) {
       await env.DB.prepare(`UPDATE slack_file_artifacts SET state='retired',updated_at=? WHERE id=? AND claim_token=?`)
         .bind(Date.now(), id, token)
         .run();
+      await cleanupAllocation(env, installation.id, id, row.slack_file_id);
       return;
     }
     if (!env.BROWSER) throw new Error("thumbnail_unavailable");
@@ -92,7 +111,7 @@ export async function deliverThumbnail(env: Env, id: string) {
       await checkpoint("prepare");
       row.slack_file_id = null;
       row.upload_url = null;
-      if (abandoned) await slackApi(env, installation, "files.delete", { file: abandoned }).catch(() => undefined);
+      await cleanupAllocation(env, installation.id, id, abandoned);
     }
     const source = await env.BUCKET.get(row.thumbnail_r2_key);
     if (!source || source.size > 2 * 1024 * 1024) throw new Error("thumbnail_unavailable");
@@ -126,6 +145,7 @@ export async function deliverThumbnail(env: Env, id: string) {
     )
       .bind(upload.file_id, upload.upload_url, Date.now(), id, token)
       .run();
+    row.slack_file_id = upload.file_id;
     await checkpoint("upload");
     const response = await fetch(upload.upload_url, { method: "POST", body: png, signal: AbortSignal.timeout(10_000) });
     if (!response.ok) throw new Error(`thumbnail_upload_http_${response.status}`);
@@ -161,6 +181,7 @@ export async function deliverThumbnail(env: Env, id: string) {
       .bind(retry ? "pending" : "failed", code, Date.now(), id, token)
       .run();
     if (retry) throw error;
+    await cleanupAllocation(env, installation.id, id, row?.slack_file_id ?? null);
   } finally {
     await env.DB.prepare(
       "UPDATE slack_file_artifacts SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?",

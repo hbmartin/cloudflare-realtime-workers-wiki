@@ -87,6 +87,28 @@ describe("SlackSettings", () => {
     );
   });
 
+  it("reports thumbnail cleanup as manual attention and only acknowledges the health notice", async () => {
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/slack/status") return { available: true, missing: [], installation: null, linked: false };
+      if (path === "/api/slack/delivery-health")
+        return {
+          orphanedFailures: [
+            { id: "slack-file-cleanup:installation", channelName: "Slack thumbnail cleanup", failedDeliveries: 1 },
+          ],
+        };
+      if (path === "/api/slack/delivery-health/slack-file-cleanup%3Ainstallation/acknowledge") return { ok: true };
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    expect(await screen.findByText("1 thumbnail cleanup failure needs manual attention.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry cleanup/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Clear failures" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith("/api/slack/delivery-health/slack-file-cleanup%3Ainstallation/acknowledge", {
+        method: "POST",
+      }),
+    );
+  });
   it("clearly reports unavailable operator configuration", async () => {
     vi.mocked(api).mockResolvedValue({
       available: false,

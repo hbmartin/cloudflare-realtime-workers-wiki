@@ -7,6 +7,67 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("backfills abandoned allocation ownership and retains cleanup independently with an indexed deadline", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0069"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@example.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Notes',1)"),
+      env.DB.prepare(
+        "INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at,generation) VALUES('installation','workspace','T123','Slack','B123','cipher','files:write','owner',1,1,2)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,position,title,created_by,updated_by,created_at,updated_at) VALUES('page','workspace','a0','Page','owner','owner',1,1)",
+      ),
+    ]);
+    await env.DB.batch(
+      [
+        ["known", "failed", 2],
+        ["unknown", "retired", 1],
+        ["uploaded", "uploaded", 2],
+      ].map(([id, state, generation]) =>
+        env.DB.prepare(
+          "INSERT INTO slack_file_artifacts(id,installation_id,installation_generation,page_id,content_epoch,content_sha256,thumbnail_r2_key,slack_file_id,state,created_at,updated_at) VALUES(?,'installation',?,'page',1,?,'key',?,?,1,1)",
+        ).bind(id, generation, id, `F${id}`, state),
+      ),
+    );
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT artifact_id,state,team_id,bot_user_id,attempt_count FROM slack_file_cleanup_jobs ORDER BY artifact_id",
+        ).all()
+      ).results,
+    ).toEqual([
+      { artifact_id: "known", state: "pending", team_id: "T123", bot_user_id: "B123", attempt_count: 0 },
+      { artifact_id: "unknown", state: "failed", team_id: null, bot_user_id: null, attempt_count: 0 },
+    ]);
+    expect(await env.DB.prepare("SELECT reason FROM slack_delivery_failures").first()).toEqual({
+      reason: "cleanup_identity_unverified",
+    });
+    await env.DB.prepare("DELETE FROM pages WHERE id='page'").run();
+    expect(await env.DB.prepare("SELECT count(*) n FROM slack_file_cleanup_jobs").first()).toEqual({ n: 2 });
+    await env.DB.prepare(`WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<20000)
+      INSERT INTO slack_file_cleanup_jobs(id,workspace_id,installation_id,installation_generation,team_id,bot_user_id,file_id,artifact_id,state,attempt_count,created_at,updated_at)
+      SELECT 'history:'||n,'workspace','installation',2,'T123','B123','history-file:'||n,'history','completed',1,1,1 FROM history`).run();
+    const plan = (
+      await env.DB.prepare(
+        "EXPLAIN QUERY PLAN SELECT id FROM slack_file_cleanup_jobs WHERE state='pending' AND next_attempt_at<=? AND (claimed_at IS NULL OR claimed_at<=?) ORDER BY next_attempt_at,id LIMIT 25",
+      )
+        .bind(Date.now(), Date.now() - 60000)
+        .all<{ detail: string }>()
+    ).results
+      .map((row) => row.detail)
+      .join("\n");
+    expect(plan).toContain("slack_file_cleanup_due");
+    expect(plan).not.toContain("SCAN slack_file_cleanup_jobs");
+    await env.DB.prepare("DELETE FROM workspaces WHERE id='workspace'").run();
+    expect(await env.DB.prepare("SELECT count(*) n FROM slack_file_cleanup_jobs").first()).toEqual({ n: 0 });
+  });
   it("upgrades guarded receipt identities and uses bounded deadline indexes across large history", async () => {
     await applyD1Migrations(
       env.DB,

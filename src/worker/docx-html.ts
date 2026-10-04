@@ -250,8 +250,8 @@ export function docxHtmlToDocument(html: string, imageSources: ReadonlySet<strin
         const grid: ProseMirrorJson[][] = Array.from({ length: rows.length }, () => []);
         for (const { cell, row: rowIndex, column, colspan, rowspan } of cells) {
           if (
-            Number(cell.attribs.colspan || 1) > 1 ||
-            Number(cell.attribs.rowspan || 1) > 1 ||
+            colspan > 1 ||
+            rowspan > 1 ||
             DomUtils.getElementsByTagName("table", cell.children).length ||
             DomUtils.getElementsByTagName("ul", cell.children).length ||
             DomUtils.getElementsByTagName("ol", cell.children).length

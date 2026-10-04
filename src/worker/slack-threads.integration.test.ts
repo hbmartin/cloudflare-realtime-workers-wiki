@@ -2602,7 +2602,18 @@ describe("canonical Slack mirrors", () => {
         .first<{ id: string }>())!;
       await deliverSlackWorkspaceAction(runtime(), receipt.id);
     };
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO slack_digest_receipts(id,installation_id,installation_generation,subscription_id,window_start,window_end,channel_id,created_at) VALUES('wake-control','installation',0,'space',0,1,'CSPACE',1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_redrive_due_at) VALUES('wake-control','workspace','slack_digest','{\"digestId\":\"wake-control\"}',1,1,1,9999999999999)",
+      ),
+    ]);
     await click("noteflare_mapping_unmute", "1700000809.000011");
+    expect(
+      await env.DB.prepare("SELECT enqueued_at,slack_redrive_due_at FROM outbox WHERE id='wake-control'").first(),
+    ).toEqual({ enqueued_at: null, slack_redrive_due_at: null });
     const first = (await deliveries(created.id)).find((delivery) => delivery.operation === "refresh")!;
     expect(first.state).toBe("pending");
     await click("noteflare_mapping_mute", "1700000809.000012");

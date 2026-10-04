@@ -1,3 +1,4 @@
+import { round2WakeStatement } from "./slack-delivery-contracts";
 import { listTasks } from "./tasks";
 import { listNotifications } from "./notifications";
 import type { Env, MemberContext } from "./env";
@@ -1257,6 +1258,9 @@ async function deliverRootAction(env: Env, receiptId: string, input: ActionInput
             receiptId,
             hours as 1 | 8 | 24,
           )),
+      ...(unchanged && mode === "unmute"
+        ? [round2WakeStatement(env, link.subscription_id!, null, installation.generation)]
+        : []),
       env.DB.prepare(
         `UPDATE slack_interaction_receipts SET processed_at = ?, outcome = 'accepted', payload_json = NULL WHERE id = ? AND processed_at IS NULL`,
       ).bind(Date.now(), receiptId),

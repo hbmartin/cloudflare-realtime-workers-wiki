@@ -18,6 +18,12 @@ describe("DOCX conversion", () => {
       expect(result.issues).toContainEqual(expect.objectContaining({ code: "docx_table_simplified" }));
     },
   );
+  it.each(["1.9", "99999"])("reports normalized single-row spans once without a merged-cell issue: %s", (span) => {
+    const result = docxHtmlToDocument(`<table><tr><td rowspan="${span}">Cell</td></tr></table>`);
+    expect(result.issues.filter((issue) => issue.code === "docx_table_simplified")).toEqual([
+      { code: "docx_table_simplified", detail: "Invalid or truncated table span" },
+    ]);
+  });
   it("truncates finite fractions and clamps rowspans to the source rows", () => {
     const result = docxHtmlToDocument('<table><tr><td colspan="2.9" rowspan="99999">Cell</td></tr><tr></tr></table>');
     const rows = descendants(result.document, "tableRow");

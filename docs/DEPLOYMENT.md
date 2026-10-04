@@ -403,3 +403,19 @@ optional manual-approval gate, how to switch to manual releases, and what Worker
 deployments, or a staging environment would trade instead. The workflow has not been exercised
 against a live Cloudflare account in this repository; validate it on a throwaway Worker before
 relying on it.
+
+### Slack review follow-up migration
+
+Apply additive `0069_slack_file_cleanup.sql` before deploying the Slack review follow-up. It snapshots
+allocation ownership and adds an indexed cleanup ledger plus transactional capture triggers. Quiesce
+thumbnail upload consumers during migration and Worker rollout so the old uploader cannot delete an
+allocation outside the new attempt bookkeeping. Existing
+failed/retired allocations are backfilled; allocations whose original Slack identity cannot be verified
+are reported for manual cleanup rather than deleted. Existing migrations remain unchanged.
+
+Use the existing 15-minute cron. Cleanup runs independently of delivery recovery and thumbnail flags,
+with at most 25 candidates and two total deletion attempts per file. Validate partial OAuth grants,
+saved repairs with blocked bulk receipts, unmute/expiry wakeups, and cleanup health notices in staging.
+See [configuration and manual cleanup](CONFIGURATION.md#interactive-slack-workspace) for the
+operator procedure. Deployment, production migration, and feature activation are separate release
+steps; this change introduces no new flags or cron schedule.

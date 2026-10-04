@@ -7,7 +7,7 @@ import worker from "./index";
 import { consumeDeliveryMessage } from "./jobs";
 import { syncRound2Configuration } from "./slack-channels";
 import { createShare } from "./shares";
-import { notificationFanoutStatements, DeliveryInProgressError } from "./notifications";
+import { notificationFanoutStatements } from "./notifications";
 import {
   consumeSlackLink,
   createSlackOAuthUrl,
@@ -169,7 +169,7 @@ describe("Slack share-refresh HTTP enqueueing", () => {
         if (method === "conversations.info")
           return Response.json({ ok: true, channel: { id: "C123", name: "notes", is_channel: true, is_member: true } });
         if (method === "conversations.history") {
-          if (failure === "competing claim") throw new DeliveryInProgressError();
+          if (failure === "competing claim") throw new Error("A live claim must prevent history lookup.");
           return new Response("limited", { status: 429, headers: { "Retry-After": "45" } });
         }
         throw new Error(`Unexpected Slack method ${method}`);
@@ -199,6 +199,10 @@ describe("Slack share-refresh HTTP enqueueing", () => {
           installed.member.workspace.id,
         ),
       ]);
+      if (failure === "competing claim")
+        await env.DB.prepare("UPDATE slack_digest_receipts SET claim_token='competing',claimed_at=? WHERE id='older'")
+          .bind(Date.now())
+          .run();
       const context = createExecutionContext();
       const response = await worker.fetch(
         request(installed.cookie, `/api/slack/channels/${m.id}/repair-notifications`, { method: "POST" }),
@@ -217,7 +221,9 @@ describe("Slack share-refresh HTTP enqueueing", () => {
         await env.DB.prepare("SELECT state,attempted_at FROM slack_digest_receipts WHERE id='older'").first(),
       ).toEqual({ state: "sending", attempted_at: 1 });
       expect(send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ outboxId: "safe-outbox" }));
-      expect(fetchMock.mock.calls.some(([input]) => String(input).includes("conversations.history"))).toBe(true);
+      expect(fetchMock.mock.calls.some(([input]) => String(input).includes("conversations.history"))).toBe(
+        failure === "rate limit",
+      );
       expect(fetchMock.mock.calls.some(([input]) => String(input).includes("chat.postMessage"))).toBe(false);
     },
   );

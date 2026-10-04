@@ -1,3 +1,4 @@
+import { processDueSlackFileCleanup } from "./slack-file-cleanup";
 import { wakeRound2Mapping } from "./slack-delivery";
 import { activityMutationStart, activityMutationEnd, activePageSelectionSql } from "./activity-mutations";
 import { DOCX_MIME } from "../shared/docx-metadata";
@@ -7194,7 +7195,10 @@ export default {
           await purgeExpiredSlackSearchSessions(env);
         },
         link_previews: () => pruneLinkPreviews(env),
-        slack_redrive: () => redriveStaleSlackOutbox(env),
+        slack_redrive: async () => {
+          const results = await Promise.allSettled([redriveStaleSlackOutbox(env), processDueSlackFileCleanup(env)]);
+          for (const result of results) if (result.status === "rejected") throw result.reason;
+        },
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
         date_reminders: () => processDueDateReminders(env),
