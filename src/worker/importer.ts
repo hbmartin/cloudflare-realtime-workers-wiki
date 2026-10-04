@@ -1,4 +1,5 @@
 import { activityMutationStart, activityMutationEnd } from "./activity-mutations";
+import { slackCaptureAccessSql } from "./slack-identity";
 import { tracing, type WorkflowStep } from "cloudflare:workers";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import {
@@ -1313,7 +1314,7 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
          WHERE capture.id = ? AND capture.job_id = ? AND capture.state = 'running'
            AND capture.workspace_id = ? AND capture.requested_by = ?
            AND installation.generation = capture.installation_generation
-           AND installation.disconnected_at IS NULL
+           AND installation.disconnected_at IS NULL AND ${slackCaptureAccessSql("capture")}
        ))`,
   ).bind(
     ...(externalPage ? [externalPage.id, externalParentId, externalPage.id, externalPosition] : []),

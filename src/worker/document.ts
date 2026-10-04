@@ -1,4 +1,5 @@
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
+import { SLACK_PRODUCT_SESSION_ACCESS_SQL } from "./slack-identity";
 import { tracing } from "cloudflare:workers";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { YServer } from "y-partyserver";
@@ -967,6 +968,7 @@ export class Document extends YServer {
         suppressExternalEffects?: unknown;
         operationId?: unknown;
         expectedSequence?: unknown;
+        slackProductSessionId?: unknown;
       };
       try {
         body = await request.json();
@@ -1059,6 +1061,23 @@ export class Document extends YServer {
         return Response.json({ error: "Document size limit exceeded." }, { status: 413 });
       }
       clone.destroy();
+      if (body.slackProductSessionId !== undefined) {
+        if (typeof body.slackProductSessionId !== "string")
+          return Response.json({ error: "Invalid Slack authorization." }, { status: 400 });
+        const authorized = await this.bindings.DB.prepare(`SELECT 1 FROM slack_product_sessions product_session
+          JOIN pages destination ON destination.id=product_session.result_page_id
+          JOIN workspace_members member ON member.workspace_id=destination.workspace_id AND member.user_id=?
+          LEFT JOIN space_members space_member ON space_member.space_id=destination.space_id AND space_member.user_id=member.user_id
+          JOIN spaces space ON space.id=destination.space_id
+          WHERE product_session.id=? AND product_session.result_page_id=?
+            AND json_extract(product_session.identity_json,'$.userId')=member.user_id
+            AND destination.archived_at IS NULL AND destination.import_job_id IS NULL
+            AND (member.role='owner' OR (member.role='editor' AND (space.visibility='workspace' OR space_member.role='editor')))
+            AND ${SLACK_PRODUCT_SESSION_ACCESS_SQL}`)
+          .bind(body.actorId, body.slackProductSessionId, this.ids.pageId)
+          .first();
+        if (!authorized) return Response.json({ error: "slack_identity_required" }, { status: 403 });
+      }
       this.flushPendingUpdates();
       if (
         this.purged ||

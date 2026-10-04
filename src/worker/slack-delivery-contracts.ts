@@ -62,14 +62,26 @@ export function slackScopeRequirements(
   topic: string,
   method?: string,
   needed: readonly string[] = [],
+  channelType?: string | null,
 ): SlackScopeRequirements {
   const scopes = needed.length ? needed : slackDeliveryScopes(topic, method);
   const clauses: string[][] = [];
   for (const scope of new Set(scopes)) {
     const family = scopeFamilies.find((candidate) => candidate.some((value) => value === scope));
     const supported = family?.slice(0, 2).filter((value) => scopes.includes(value));
-    const clause = supported?.length ? supported : [scope];
-    if (!clauses.some((prior) => JSON.stringify(prior) === JSON.stringify(clause))) clauses.push([...clause]);
+    const selected =
+      supported && supported.length > 1
+        ? channelType === "public_channel"
+          ? [supported[0]!]
+          : channelType === "private_channel"
+            ? [supported[1]!]
+            : supported
+        : supported?.length
+          ? supported
+          : [scope];
+    for (const required of selected) {
+      if (!clauses.some((prior) => prior.length === 1 && prior[0] === required)) clauses.push([required]);
+    }
   }
   if (["slack_thread_reply", "slack_inbound_reply", "slack_thread_action", "slack_unfurl"].includes(topic))
     for (const scope of slackDeliveryScopes(topic))
@@ -89,7 +101,7 @@ const fallbackSql = `CASE topic ${[
   "slack_bulk",
   "slack_share_refresh",
 ]
-  .map((topic) => `WHEN '${topic}' THEN '${JSON.stringify(slackScopeRequirements(topic))}'`)
+  .map((topic) => `WHEN '${topic}' THEN '${JSON.stringify(slackDeliveryScopes(topic))}'`)
   .join(" ")}
  ELSE '[["chat:write"]]' END`;
 const storedScopesSql = `CASE WHEN json_type(${validStored})='array' AND json_array_length(${validStored})>0
@@ -114,11 +126,28 @@ function clauseSql(value: string, type: string, requirements: string) {
     })
     .join(" ")} ELSE json_array(${value}) END`;
 }
-export const SLACK_PAUSED_SCOPES_SQL = `(SELECT json_group_array(json(clause)) FROM (
- SELECT ${clauseSql("required.value", "required.type", storedScopesSql)} clause FROM json_each(${storedScopesSql}) required
+export const SLACK_OUTBOX_CHANNEL_TYPE_SQL = `CASE outbox.topic
+ WHEN 'slack_channel' THEN (SELECT m.channel_type FROM slack_channel_events r JOIN slack_channel_subscriptions m ON m.id=r.subscription_id WHERE r.id=outbox.slack_round2_receipt_id)
+ WHEN 'slack_digest' THEN (SELECT m.channel_type FROM slack_digest_receipts r JOIN slack_channel_subscriptions m ON m.id=r.subscription_id WHERE r.id=outbox.slack_round2_receipt_id)
+ WHEN 'slack_bulk' THEN (SELECT m.channel_type FROM slack_bulk_receipts r JOIN slack_channel_subscriptions m ON m.installation_id=r.installation_id AND m.channel_id=r.channel_id WHERE r.id=outbox.slack_round2_receipt_id LIMIT 1)
+ WHEN 'slack_share_refresh' THEN (SELECT m.channel_type FROM slack_share_refreshes r JOIN slack_channel_subscriptions m ON m.installation_id=r.installation_id AND m.channel_id=r.channel_id WHERE r.id=outbox.slack_round2_receipt_id LIMIT 1)
+ END`;
+const pausedClausesSql = `SELECT ${clauseSql("required.value", "required.type", storedScopesSql)} clause FROM json_each(${storedScopesSql}) required
  UNION SELECT json_array(value) FROM json_each(CASE
    WHEN topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action') THEN '${JSON.stringify(SLACK_MIRROR_SCOPES)}'
-   WHEN topic='slack_unfurl' THEN '["links:write"]' ELSE '[]' END)))`;
+   WHEN topic='slack_unfurl' THEN '["links:write"]' ELSE '[]' END)`;
+// A public/private alternative is narrowed using the actual destination. Unknown
+// destinations retain both requirements rather than resuming with the wrong family.
+export const SLACK_PAUSED_SCOPES_SQL = `(WITH clauses AS (${pausedClausesSql}),
+ context AS (SELECT ${SLACK_OUTBOX_CHANNEL_TYPE_SQL} channel_type), expanded AS (
+ SELECT CASE WHEN json_array_length(clause)>1 AND alternative.value IN
+ ('channels:read','groups:read','channels:history','groups:history') THEN json_array(alternative.value) ELSE clause END clause
+ FROM clauses,json_each(clauses.clause) alternative,context
+ WHERE json_array_length(clauses.clause)=1 OR alternative.value NOT IN ('channels:read','groups:read','channels:history','groups:history')
+   OR context.channel_type IS NULL OR context.channel_type NOT IN ('public_channel','private_channel')
+   OR (context.channel_type='public_channel' AND alternative.value LIKE 'channels:%')
+   OR (context.channel_type='private_channel' AND alternative.value LIKE 'groups:%'))
+ SELECT json_group_array(json(clause)) FROM (SELECT DISTINCT clause FROM expanded))`;
 
 export function slackScopesGrantedSql(requirements: string, granted: string) {
   return `NOT EXISTS(SELECT 1 FROM json_each(${requirements}) clause WHERE NOT EXISTS(
@@ -159,7 +188,7 @@ export async function resumeSlackFileCleanup(env: Env, workspaceId: string) {
     WHERE workspace_id=? AND state='paused' AND attempt_count<2 AND EXISTS(
       SELECT 1 FROM slack_installations i WHERE i.workspace_id=slack_file_cleanup_jobs.workspace_id
       AND i.team_id=slack_file_cleanup_jobs.team_id AND i.bot_user_id=slack_file_cleanup_jobs.bot_user_id
-      AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND instr(','||i.scopes||',',',files:write,')>0)`)
+      AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND i.file_scope_error_revision IS NULL AND instr(','||i.scopes||',',',files:write,')>0)`)
     .bind(Date.now(), Date.now(), workspaceId)
     .run();
 }

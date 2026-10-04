@@ -1,4 +1,5 @@
-import { processDueSlackFileCleanup } from "./slack-file-cleanup";
+import { processDueSlackFileCleanup, slackFileCleanupHealth } from "./slack-file-cleanup";
+import { disconnectSlackIdentity } from "./slack-identity";
 import { wakeRound2Mapping } from "./slack-delivery";
 import { activityMutationStart, activityMutationEnd, activePageSelectionSql } from "./activity-mutations";
 import { DOCX_MIME } from "../shared/docx-metadata";
@@ -96,7 +97,7 @@ import {
   TABLE_TEXT_CELL_MAX,
 } from "../shared/table-limits";
 import { PAGE_KINDS } from "../shared/page-kind";
-import { prefixedErrorLogFields, safeInstanceOf } from "../shared/error-log";
+import { boundedLogString, prefixedErrorLogFields, rawSafeErrorMessage, safeInstanceOf } from "../shared/error-log";
 import {
   PAGE_MOVE_RECEIPT_PRUNE_BATCH_SIZE,
   PAGE_MOVE_RECEIPT_PRUNE_MAX_BATCHES,
@@ -2876,6 +2877,12 @@ app.post("/api/slack/link", async (c) => {
   return c.json({ ok: true });
 });
 
+app.delete("/api/slack/identity", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await disconnectSlackIdentity(c.env, member.user.id, member.session.id, member.workspace.id);
+  return c.json({ ok: true });
+});
+
 app.post("/api/slack/commands", async (c) => {
   const deadlineAt = Date.now() + 2_500;
   const beforeAck = async <T>(work: Promise<T>): Promise<T> => {
@@ -3075,7 +3082,10 @@ app.get("/api/slack/channels", async (c) => {
 app.get("/api/slack/delivery-health", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
-  return c.json({ orphanedFailures: await listSlackDeliveryFailureGroups(c.env, member) });
+  return c.json({
+    orphanedFailures: await listSlackDeliveryFailureGroups(c.env, member),
+    cleanup: await slackFileCleanupHealth(c.env, member.workspace.id),
+  });
 });
 
 app.post("/api/slack/delivery-health/:id/acknowledge", async (c) => {
@@ -7107,6 +7117,27 @@ export async function backfillTableSearchValues(env: Env) {
   if (statements.length) await env.DB.batch(statements);
 }
 
+export async function runSlackMaintenance(env: Env) {
+  const operations = ["redrive", "file_cleanup"] as const;
+  const results = await Promise.allSettled([redriveStaleSlackOutbox(env), processDueSlackFileCleanup(env)]);
+  const failures: unknown[] = [];
+  const summaries: string[] = [];
+  for (const [index, result] of results.entries()) {
+    if (result.status !== "rejected") continue;
+    const operation = operations[index]!;
+    logger.error(
+      "scheduled.slack_maintenance.failed",
+      "scheduler",
+      "Slack maintenance operation failed",
+      { operation },
+      result.reason,
+    );
+    failures.push(result.reason);
+    summaries.push(`${operation}: ${boundedLogString(rawSafeErrorMessage(result.reason, "Unknown failure"), 180)}`);
+  }
+  if (failures.length) throw new AggregateError(failures, `Slack maintenance failed; ${summaries.join("; ")}`);
+}
+
 export default {
   async fetch(request: Request, env: Env, context: ExecutionContext) {
     const requestId = crypto.randomUUID();
@@ -7195,10 +7226,7 @@ export default {
           await purgeExpiredSlackSearchSessions(env);
         },
         link_previews: () => pruneLinkPreviews(env),
-        slack_redrive: async () => {
-          const results = await Promise.allSettled([redriveStaleSlackOutbox(env), processDueSlackFileCleanup(env)]);
-          for (const result of results) if (result.status === "rejected") throw result.reason;
-        },
+        slack_redrive: () => runSlackMaintenance(env),
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
         date_reminders: () => processDueDateReminders(env),

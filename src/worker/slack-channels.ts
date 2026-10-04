@@ -26,13 +26,14 @@ export class StaleSlackValidationError extends Error {
 }
 export async function validateMapping(env: Env, installation: SlackInstallation, mappingId: string, channelId: string) {
   const prior =
-    await env.DB.prepare(`SELECT m.created_by,m.validation_scope_error_revision,m.notification_blocked_at,m.notification_error
+    await env.DB.prepare(`SELECT m.created_by,m.validation_revision,m.validation_scope_error_revision,m.notification_blocked_at,m.notification_error
     FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
     JOIN workspace_members owner ON owner.workspace_id=i.workspace_id AND owner.user_id=m.created_by AND owner.role='owner'
     WHERE m.id=? AND m.installation_id=? AND m.channel_id=? AND i.generation=? AND i.credential_revision=? AND i.disconnected_at IS NULL`)
       .bind(mappingId, installation.id, channelId, installation.generation, installation.credential_revision)
       .first<{
         created_by: string;
+        validation_revision: number;
         validation_scope_error_revision: number | null;
         notification_blocked_at: number | null;
         notification_error: string | null;
@@ -40,7 +41,7 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
   if (!prior) throw new StaleSlackValidationError();
   if (prior.validation_scope_error_revision === installation.credential_revision)
     throw new SlackApiError("conversations.info", "missing_scope", 200, installation.credential_revision);
-  const fence = `id=? AND installation_id=? AND channel_id=? AND created_by=? AND notification_blocked_at IS ? AND notification_error IS ?
+  const fence = `id=? AND installation_id=? AND channel_id=? AND created_by=? AND validation_revision=? AND notification_blocked_at IS ? AND notification_error IS ?
     AND EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND credential_revision=? AND disconnected_at IS NULL)
     AND EXISTS(SELECT 1 FROM workspace_members wm JOIN slack_installations i ON i.workspace_id=wm.workspace_id
       WHERE i.id=installation_id AND wm.user_id=slack_channel_subscriptions.created_by AND wm.role='owner')`;
@@ -49,6 +50,7 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
     installation.id,
     channelId,
     prior.created_by,
+    prior.validation_revision,
     prior.notification_blocked_at,
     prior.notification_error,
     installation.id,
@@ -80,11 +82,8 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
       throw error;
     }
     if (error instanceof SlackApiError && slackInstallationError(error)) {
-      const current = await env.DB.prepare(`SELECT 1 FROM slack_channel_subscriptions WHERE ${fence}`)
-        .bind(...fenceBinds())
-        .first();
-      if (!current) throw new StaleSlackValidationError();
-      await recordSlackInstallationError(env, installation.id, error, installation.generation);
+      if (!(await recordSlackInstallationError(env, installation.id, error, installation.generation)))
+        throw new StaleSlackValidationError();
       throw error;
     }
     const saved =

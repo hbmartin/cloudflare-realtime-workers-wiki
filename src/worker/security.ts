@@ -73,7 +73,8 @@ async function readSecurity(env: Env, userId: string, sessionId: string | null, 
     s.method,s.verified_at,s.expires_at,
     (SELECT primary_proof.expires_at FROM slack_primary_factor_proofs primary_proof
       WHERE primary_proof.session_id=live.id AND primary_proof.user_id=a.user_id
-        AND primary_proof.expires_at>?) slack_primary_expires_at
+        AND primary_proof.expires_at>? AND primary_proof.security_generation=a.generation
+        AND primary_proof.authentication_source IN ('sign_in','sign_up')) slack_primary_expires_at
     FROM account_security a
     LEFT JOIN session live ON live.id=? AND live.userId=a.user_id AND live.expiresAt>?
     LEFT JOIN session_security s ON s.session_id=live.id AND s.user_id=a.user_id AND s.generation=a.generation
@@ -151,6 +152,58 @@ export async function requireSecurity(env: Env, userId: string, sessionId: strin
   return proof.expires_at;
 }
 
+export type FreshSecurityAuthorization = { userId: string; sessionId: string; generation: number; expiresAt: number };
+
+export async function freshSecurityAuthorization(
+  env: Env,
+  userId: string,
+  sessionId: string,
+): Promise<FreshSecurityAuthorization> {
+  const { status, proof, account } = await readSecurity(env, userId, sessionId);
+  if (account.recovery_pending_key_hash && account.recovery_pending_session_id === sessionId)
+    throw new HttpError(403, "SECURITY_REQUIRED", "Save your recovery resume key before continuing.");
+  if (status.state !== "ready")
+    throw new HttpError(
+      403,
+      "SECURITY_REQUIRED",
+      !status.codesSaved
+        ? "Save your recovery codes before connecting Slack."
+        : "Complete account protection before connecting Slack.",
+    );
+  if (!status.fresh || !proof)
+    throw new HttpError(
+      403,
+      "SECURITY_REQUIRED",
+      "Verify an authenticator code or passkey again before connecting Slack.",
+    );
+  return {
+    userId,
+    sessionId,
+    generation: account.generation,
+    expiresAt: Math.min(proof.expires_at, proof.verified_at + FRESH_MS),
+  };
+}
+
+export function freshSecurityGuard(authorization: FreshSecurityAuthorization) {
+  const now = Date.now();
+  return {
+    sql: `? > ? AND EXISTS(SELECT 1 FROM session live JOIN session_security proof ON proof.session_id=live.id
+      JOIN slack_protected_accounts security ON security.user_id=live.userId AND security.generation=proof.generation
+      WHERE live.userId=? AND live.id=? AND security.generation=? AND live.expiresAt>?
+        AND proof.method IN ('totp','passkey') AND proof.expires_at>? AND proof.verified_at>?)`,
+    binds: [
+      authorization.expiresAt,
+      now,
+      authorization.userId,
+      authorization.sessionId,
+      authorization.generation,
+      new Date(now).toISOString(),
+      now,
+      now - FRESH_MS,
+    ],
+  };
+}
+
 async function identity(ctx: GenericEndpointContext): Promise<Identity | null> {
   const session = await getSessionFromCtx(ctx);
   if (session) return { userId: session.user.id, sessionId: session.session.id, challenge: null };
@@ -220,8 +273,11 @@ async function primaryFactor(ctx: GenericEndpointContext, env: Env, id: Identity
       ? await env.DB.prepare(
           `SELECT 1 FROM slack_primary_factor_proofs proof
             JOIN session live ON live.id=proof.session_id AND live.userId=proof.user_id
+            JOIN account_security security ON security.user_id=proof.user_id AND security.generation=proof.security_generation
+            JOIN account oauth ON oauth.id=proof.account_id AND oauth.userId=proof.user_id AND oauth.providerId='slack'
            WHERE proof.session_id=? AND proof.user_id=? AND proof.expires_at>?
-             AND live.expiresAt>?`,
+             AND live.expiresAt>? AND proof.authentication_source IN ('sign_in','sign_up')
+             AND oauth.accountId=proof.team_id||':'||proof.slack_user_id`,
         )
           .bind(id.sessionId, id.userId, Date.now(), new Date().toISOString())
           .first()
@@ -1202,7 +1258,7 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
               "/sign-in/social",
               "/callback/slack",
             ]);
-            if (publicPaths.has(ctx.path)) return;
+            if (publicPaths.has(ctx.path) || (ctx.path === "/callback/:id" && ctx.params?.id === "slack")) return;
             const pendingIdentity = await identity(ctx);
             if (pendingIdentity?.sessionId) {
               const account = await securityAccount(env, pendingIdentity.userId);
@@ -1213,8 +1269,6 @@ export function mandatorySecurity(env: Env): BetterAuthPlugin {
               )
                 throw deny("Save your recovery resume key before continuing.");
             }
-            // Slack linking requires a live session through Better Auth's session middleware.
-            if (ctx.path === "/link-social" && ctx.body?.provider === "slack") return;
             if (ctx.path.startsWith("/security/")) return;
             if (ctx.path === "/two-factor/verify-totp") {
               const id = await requireIdentity(ctx);

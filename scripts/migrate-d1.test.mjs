@@ -5,6 +5,35 @@ import { digestCollisionSql, main } from "./migrate-d1.mjs";
 const pending = "Migrations to be applied:\n0067_review_delivery.sql\n";
 const result = (rows) => ({ status: 0, stdout: JSON.stringify([{ success: true, results: rows }]) });
 afterEach(() => vi.restoreAllMocks());
+
+describe("Slack migration safety in the deployment wrapper", () => {
+  it.each(["0069_slack_file_cleanup.sql", "0070_slack_review_fences.sql"])(
+    "stops remote %s before preflight or migration application",
+    (migration) => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const execute = vi
+        .fn()
+        .mockReturnValue({ status: 0, stdout: `Migrations to be applied:\n0067_review_delivery.sql\n${migration}\n` });
+      expect(main(["--remote", "--env", "production"], execute)).toBe(1);
+      expect(execute).toHaveBeenCalledOnce();
+      expect(console.error).toHaveBeenCalledWith(expect.stringContaining("manually confirmed safe upgrade"));
+    },
+  );
+
+  it.each(["--local", "--remote"])("applies confirmed or local migrations: %s", (target) => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const execute = vi
+      .fn()
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: "Migrations to be applied:\n0069_slack_file_cleanup.sql\n0070_slack_review_fences.sql\n",
+      })
+      .mockReturnValueOnce({ status: 0 });
+    expect(main([target], execute, { slackReviewMigrationSafe: target === "--remote" })).toBe(0);
+    expect(execute.mock.calls.at(-1)[0]).toEqual(["d1", "migrations", "apply", "DB", target]);
+  });
+});
+
 function legacy() {
   const db = new DatabaseSync(":memory:");
   db.exec(`CREATE TABLE slack_digest_receipts(id TEXT,subscription_id TEXT,state TEXT,window_start INTEGER,window_end INTEGER);

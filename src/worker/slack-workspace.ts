@@ -1,3 +1,4 @@
+import { slackAccessAuthorization } from "./slack-identity";
 import { round2WakeStatement } from "./slack-delivery-contracts";
 import { listTasks } from "./tasks";
 import { listNotifications } from "./notifications";
@@ -668,8 +669,10 @@ async function deliverSearch(
     : (input?.search ?? (parseSession(row) as SearchState));
   const expectedHash = row.view_hash;
   let view: Record<string, unknown>;
+  let authorize: (() => Promise<void>) | undefined;
   try {
-    const { member } = await verifiedMember(env, installation, row.slack_user_id, input?.identity);
+    const { member, identity } = await verifiedMember(env, installation, row.slack_user_id, input?.identity);
+    authorize = slackAccessAuthorization(env, installation, identity);
     const result = await searchPages(env.DB, member, searchRequest(state));
     view = searchModal(row.id, state, origin(env), result, undefined, row.revision + 1);
   } catch (error) {
@@ -743,11 +746,20 @@ async function deliverSearch(
   if (!attempted.meta.changes) return "deferred";
   let updated: { view?: { hash?: string } };
   try {
-    updated = await slackApi(env, installation, "views.update", {
-      view_id: row.view_id,
-      view,
-      ...(expectedHash ? { hash: expectedHash } : {}),
-    });
+    updated = await slackApi(
+      env,
+      installation,
+      "views.update",
+      {
+        view_id: row.view_id,
+        view,
+        ...(expectedHash ? { hash: expectedHash } : {}),
+      },
+      undefined,
+      undefined,
+      undefined,
+      authorize,
+    );
   } catch (error) {
     if (error instanceof SlackApiError && error.code === "hash_conflict") {
       if (row.pending_attempts === 0) {
@@ -887,9 +899,11 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
       .run();
   }
   let view: Record<string, unknown>;
+  let authorize: (() => Promise<void>) | undefined;
   let unavailableView = false;
   try {
-    const { member } = await verifiedMember(env, installation, userId);
+    const { member, identity } = await verifiedMember(env, installation, userId);
+    authorize = slackAccessAuthorization(env, installation, identity);
     const result = await mentionsInbox(env, member, state.asOf, state.cursors[state.page] ?? null, 10);
     view = homeView({
       sessionId: id,
@@ -921,11 +935,20 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
       .bind(JSON.stringify(state), pendingToken, id, old?.revision ?? 0, old?.view_hash ?? null)
       .run();
     if (!intent.meta.changes) return;
-    const published = await slackApi(env, installation, "views.publish", {
-      user_id: userId,
-      view,
-      ...(!reset && !unavailableView && old?.view_hash ? { hash: old.view_hash } : {}),
-    });
+    const published = await slackApi(
+      env,
+      installation,
+      "views.publish",
+      {
+        user_id: userId,
+        view,
+        ...(!reset && !unavailableView && old?.view_hash ? { hash: old.view_hash } : {}),
+      },
+      undefined,
+      undefined,
+      undefined,
+      authorize,
+    );
     await env.DB.prepare(
       `UPDATE slack_view_sessions SET installation_generation = ?, state_json = ?, view_id = ?, view_hash = ?,
         pending_state_json = NULL, pending_revision = NULL, pending_token = NULL,
@@ -959,7 +982,7 @@ function rootGuard(env: Env, receiptId: string, input: ActionInput, linkId: stri
         AND mapping.channel_id = l.channel_id AND mapping.mirror_enabled = 1 AND mapping.validation_state = 'valid'
       JOIN pages p ON p.id = l.page_id AND p.workspace_id = i.workspace_id AND p.space_id = mapping.space_id
       JOIN spaces space ON space.id = p.space_id
-      JOIN slack_user_links link ON link.installation_id = i.id AND link.installation_generation = i.generation
+      JOIN slack_authorized_user_links link ON link.installation_id = i.id AND link.installation_generation = i.generation
       JOIN account account ON account.id = link.better_auth_account_id AND account.userId = link.user_id
       JOIN workspace_members wm ON wm.workspace_id = i.workspace_id AND wm.user_id = link.user_id
       LEFT JOIN space_members sm ON sm.space_id = space.id AND sm.user_id = wm.user_id
@@ -997,7 +1020,7 @@ function homeGuard(env: Env, receiptId: string, input: ActionInput, sessionId: s
       SELECT 1 FROM slack_interaction_receipts receipt
       JOIN slack_installations i ON i.id = receipt.installation_id AND i.disconnected_at IS NULL
       JOIN slack_view_sessions session ON session.installation_id = i.id AND session.installation_generation = i.generation
-      JOIN slack_user_links link ON link.installation_id = i.id AND link.installation_generation = i.generation
+      JOIN slack_authorized_user_links link ON link.installation_id = i.id AND link.installation_generation = i.generation
       JOIN account account ON account.id = link.better_auth_account_id AND account.userId = link.user_id
       JOIN workspace_members wm ON wm.workspace_id = i.workspace_id AND wm.user_id = link.user_id
       WHERE receipt.id = ? AND receipt.processed_at IS NULL
@@ -1287,7 +1310,7 @@ function unfurlGuard(env: Env, receiptId: string, input: ActionInput, referenceI
       JOIN slack_channel_subscriptions mapping ON mapping.installation_id = i.id AND mapping.channel_id = ref.channel_id
         AND mapping.space_id = p.space_id AND mapping.validation_state = 'valid'
         AND (mapping.page_id IS NULL OR mapping.page_id = p.id)
-      JOIN slack_user_links link ON link.installation_id = i.id AND link.installation_generation = i.generation
+      JOIN slack_authorized_user_links link ON link.installation_id = i.id AND link.installation_generation = i.generation
       JOIN account account ON account.id = link.better_auth_account_id AND account.userId = link.user_id
       JOIN workspace_members wm ON wm.workspace_id = i.workspace_id AND wm.user_id = link.user_id AND wm.role = 'owner'
       WHERE receipt.id = ? AND receipt.processed_at IS NULL

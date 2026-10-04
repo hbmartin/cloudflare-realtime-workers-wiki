@@ -91,9 +91,11 @@ export async function redriveRound2Outbox(env: Env) {
       SELECT * FROM (${deadlineStream("slack_claim_recheck_at", 2)}) ORDER BY due_at,id LIMIT 200), candidates AS (
       SELECT id,min(due_at) due_at FROM (SELECT * FROM regular UNION ALL SELECT * FROM claims)
       GROUP BY id ORDER BY due_at,id LIMIT 200)
-    SELECT o.id,o.topic,o.slack_round2_receipt_id receipt_id FROM candidates c JOIN outbox o ON o.id=c.id ORDER BY c.due_at,c.id`)
+    SELECT o.id,o.topic,o.slack_round2_receipt_id receipt_id,
+      o.last_error='slack_validation_stale' coordination_recheck
+      FROM candidates c JOIN outbox o ON o.id=c.id ORDER BY c.due_at,c.id`)
     .bind(now, now)
-    .all<{ id: string; topic: keyof typeof round2Receipts; receipt_id: string | null }>();
+    .all<{ id: string; topic: keyof typeof round2Receipts; receipt_id: string | null; coordination_recheck: number }>();
   const seen = new Set<string>();
   let recoveries = 0;
   for (const row of rows.results) {
@@ -147,7 +149,7 @@ export async function redriveRound2Outbox(env: Env) {
     )
       .bind(row.topic, id)
       .first<{ count: number }>())!.count;
-    if (status.outcome === "retryable" && budget >= 8) {
+    if (status.outcome === "retryable" && !row.coordination_recheck && budget >= 8) {
       if (await exhaustRound2Receipt(env, row.topic, id))
         await env.DB.prepare(
           `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error='redrive_exhausted' WHERE topic=? AND slack_round2_receipt_id=?`,
@@ -159,7 +161,7 @@ export async function redriveRound2Outbox(env: Env) {
     try {
       await env.DELIVERY_QUEUE.send({ outboxId: row.id });
     } catch {
-      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=?,last_error='round2_enqueue_failed'
+      await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=?,last_error=CASE WHEN last_error='slack_validation_stale' THEN last_error ELSE 'round2_enqueue_failed' END
         WHERE topic=? AND slack_round2_receipt_id=? AND slack_scope_paused_at IS NULL`)
         .bind(now + 60_000, now + 60_000, row.topic, id)
         .run();
@@ -173,7 +175,7 @@ export async function redriveRound2Outbox(env: Env) {
         due,
         row.topic,
         id,
-        status.outcome === "retryable" ? 1 : 0,
+        status.outcome === "retryable" && !row.coordination_recheck ? 1 : 0,
         row.id,
       ),
       env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?,slack_claim_recheck_at=NULL,slack_redrive_count=(SELECT slack_redrive_count FROM outbox WHERE id=?)

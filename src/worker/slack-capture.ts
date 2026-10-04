@@ -8,6 +8,7 @@ import { slackApi, SlackApiError, type SlackHistoryMessage, type SlackInstallati
 import { requireChannelMember, validateChannel, verifiedMember } from "./slack-threads";
 import { taskAssignees } from "./tasks";
 import { logger } from "./observability";
+import { slackCaptureAccessSql } from "./slack-identity";
 import type { TaskStatus } from "../shared/tasks";
 
 export const SLACK_CAPTURE_PAGE_GONE_MESSAGE = "Saved to NoteFlare, but the page is no longer available.";
@@ -675,11 +676,12 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
     const linked = await env.DB.batch([
       env.DB.prepare(
         `UPDATE jobs SET input_key=?,updated_at=? WHERE id=? AND input_key IS ? AND status='queued'
-         AND EXISTS (SELECT 1 FROM slack_captures WHERE id=? AND installation_generation=? AND state='pending')`,
+         AND EXISTS (SELECT 1 FROM slack_captures WHERE id=? AND installation_generation=? AND state='pending' AND ${slackCaptureAccessSql("slack_captures")})`,
       ).bind(inputKey, timestamp, existingJob.id, existingJob.input_key, capture.id, capture.installation_generation),
       env.DB.prepare(
         `UPDATE slack_captures SET job_id=?,state='running',attempt=attempt+1,updated_at=?
          WHERE id=? AND installation_generation=? AND state='pending' AND job_id IS NULL
+           AND ${slackCaptureAccessSql("slack_captures")}
            AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND input_key=? AND status IN ('queued','running'))`,
       ).bind(existingJob.id, timestamp, capture.id, capture.installation_generation, existingJob.id, inputKey),
     ]);
@@ -716,7 +718,7 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
        options_json, created_at, updated_at)
      SELECT id,workspace_id,destination_space_id,'import','queued',requested_by,id,?,?,?,?
        FROM slack_captures
-      WHERE id=? AND installation_generation=? AND state='pending' AND job_id IS NULL`).bind(
+      WHERE id=? AND installation_generation=? AND state='pending' AND job_id IS NULL AND ${slackCaptureAccessSql("slack_captures")}`).bind(
       inputKey,
       JSON.stringify(options),
       timestamp,
@@ -727,6 +729,7 @@ export async function prepareSlackCapture(env: Env, captureId: string): Promise<
     env.DB.prepare(
       `UPDATE slack_captures SET job_id=?,state='running',attempt=attempt+1,updated_at=?
        WHERE id=? AND installation_generation=? AND state='pending' AND job_id IS NULL
+         AND ${slackCaptureAccessSql("slack_captures")}
          AND EXISTS (SELECT 1 FROM jobs WHERE id=? AND input_key=? AND status='queued'
            AND workspace_id=? AND requested_by=?)`,
     ).bind(

@@ -1,3 +1,4 @@
+import { slackAccessAuthorization } from "./slack-identity";
 import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
@@ -155,7 +156,7 @@ async function newSession(env: Env, installation: SlackInstallation, userId: str
       Date.now(),
     )
     .run();
-  return { id, member };
+  return { id, member, identity };
 }
 function composeView(id: string, state: State) {
   const task = state.task;
@@ -304,7 +305,7 @@ export async function openSlackProduct(
   if (!["new", "task", "tasks", "task-list"].includes(command)) return null;
   try {
     const state: State = { kind: command === "task" ? "task" : command === "task-list" ? "task-list" : "document" };
-    const { id, member } = await newSession(env, installation, userId, state, triggerId);
+    const { id, member, identity } = await newSession(env, installation, userId, state, triggerId);
     const view = command === "tasks" ? await tasksView(env, id, member) : composeView(id, state);
     const result = await slackApi(
       env,
@@ -312,6 +313,9 @@ export async function openSlackProduct(
       "views.open",
       { trigger_id: triggerId, view },
       Math.max(1, deadlineAt - Date.now() - 150),
+      undefined,
+      undefined,
+      slackAccessAuthorization(env, installation, identity),
     );
     await env.DB.prepare("UPDATE slack_product_sessions SET view_id=? WHERE id=?").bind(result.view.id, id).run();
     return { response_type: "ephemeral", text: "" };
@@ -364,7 +368,7 @@ async function destination(env: Env, member: MemberContext, value: string | null
 function authorization(session: Session) {
   const identity = JSON.parse(session.identity_json) as NonNullable<Identity>;
   return {
-    sql: `EXISTS(SELECT 1 FROM slack_installations i JOIN slack_user_links l ON l.installation_id=i.id AND l.installation_generation=i.generation JOIN account a ON a.id=l.better_auth_account_id AND a.userId=l.user_id
+    sql: `EXISTS(SELECT 1 FROM slack_installations i JOIN slack_authorized_user_links l ON l.installation_id=i.id AND l.installation_generation=i.generation JOIN account a ON a.id=l.better_auth_account_id AND a.userId=l.user_id
     WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL AND l.slack_user_id=? AND l.user_id=? AND l.better_auth_account_id=? AND l.verified_at=? AND l.migration_state='verified' AND l.verification_method='slack_openid' AND a.providerId='slack' AND a.accountId=i.team_id||':'||l.slack_user_id)`,
     binds: [
       session.installation_id,
@@ -776,7 +780,8 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
   const installation = await installationForTeam(env, payload.team?.id);
   if (typeof payload.user?.id !== "string" || typeof payload.trigger_id !== "string")
     return { handled: true, response: {} };
-  const { member } = await verifiedMember(env, installation, payload.user.id);
+  const { member, identity } = await verifiedMember(env, installation, payload.user.id);
+  const authorize = slackAccessAuthorization(env, installation, identity);
   let state: State = { kind: action?.action_id === "noteflare_compose_task" ? "task" : "document" };
   if (shortcut) {
     if (
@@ -822,10 +827,19 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
     if (!capture) throw new HttpError(404, "slack_capture_unavailable", "Reopen the capture form.");
     if (action.action_id === "noteflare_capture_retry" && current.session.capture_id)
       capture = await retryFailedSlackCapture(env, current.session.capture_id);
-    await slackApi(env, installation, "views.update", {
-      view_id: String(payload.view?.id),
-      view: captureView(env, current.session.id, capture),
-    });
+    await slackApi(
+      env,
+      installation,
+      "views.update",
+      {
+        view_id: String(payload.view?.id),
+        view: captureView(env, current.session.id, capture),
+      },
+      undefined,
+      undefined,
+      undefined,
+      authorize,
+    );
     return { handled: true, response: {} };
   }
   const { id } = await newSession(env, installation, payload.user.id, state, payload.trigger_id);
@@ -851,8 +865,20 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
             ...(typeof payload.view.hash === "string" ? { hash: payload.view.hash } : {}),
           },
           remaining,
+          undefined,
+          undefined,
+          authorize,
         )
-      : await slackApi(env, installation, "views.open", { trigger_id: payload.trigger_id, view }, remaining);
+      : await slackApi(
+          env,
+          installation,
+          "views.open",
+          { trigger_id: payload.trigger_id, view },
+          remaining,
+          undefined,
+          undefined,
+          authorize,
+        );
   await env.DB.prepare("UPDATE slack_product_sessions SET view_id=? WHERE id=?").bind(opened.view.id, id).run();
   return { handled: true, response: {} };
 }
@@ -966,6 +992,7 @@ async function copySlackProductContent(env: Env, sessionId: string) {
       headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
       body: JSON.stringify({
         actorId: member.user.id,
+        slackProductSessionId: session.id,
         operationId: `slack-${session.id}`,
         operations: [{ type: "append_children", children: blocks, position: { type: "end" } }],
       }),
@@ -976,15 +1003,43 @@ async function copySlackProductContent(env: Env, sessionId: string) {
     .bind(JSON.stringify({ ...state, copied: true }), session.id)
     .run();
   if (session.view_id)
-    await slackApi(env, installation, "views.update", {
-      view_id: session.view_id,
-      view: resultView(env, session.id, page.id, false),
-    }).catch(() => undefined);
+    await slackApi(
+      env,
+      installation,
+      "views.update",
+      {
+        view_id: session.view_id,
+        view: resultView(env, session.id, page.id, false),
+      },
+      undefined,
+      undefined,
+      undefined,
+      slackAccessAuthorization(env, installation, JSON.parse(session.identity_json) as NonNullable<Identity>),
+    ).catch(() => undefined);
 }
 
 export async function acceptSlackProductInteraction(env: Env, payload: SlackInteractionPayload, deadlineAt: number) {
   try {
-    return await acceptProductInteraction(env, payload, deadlineAt);
+    const result = await acceptProductInteraction(env, payload, deadlineAt);
+    if (
+      "response" in result &&
+      result.response &&
+      ("options" in result.response ||
+        ("response_action" in result.response && result.response.response_action === "update"))
+    ) {
+      const session =
+        await env.DB.prepare(`SELECT product_session.* FROM slack_product_sessions product_session JOIN slack_installations installation ON installation.id=product_session.installation_id
+        WHERE product_session.id=? AND product_session.slack_user_id=? AND installation.team_id=? AND installation.generation=product_session.generation AND installation.disconnected_at IS NULL`)
+          .bind(payload.view?.private_metadata ?? "", payload.user?.id ?? "", payload.team?.id ?? "")
+          .first<Session>();
+      if (!session) throw new HttpError(403, "slack_identity_required", "Reopen this form after reconnecting Slack.");
+      await slackAccessAuthorization(
+        env,
+        { id: session.installation_id, generation: session.generation },
+        JSON.parse(session.identity_json) as NonNullable<Identity>,
+      )();
+    }
+    return result;
   } catch (error) {
     logInteractionFailure(payload, error);
     if (payload.type === "view_submission" && payload.view?.callback_id === CALLBACK)

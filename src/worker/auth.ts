@@ -14,7 +14,14 @@ import type { MemberContext } from "./env";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import { consumeFixedWindow } from "./rate-limit";
-import { recordVerifiedSlackIdentity, validateSlackIdentity, type VerifiedSlackIdentity } from "./slack";
+import { validateSlackIdentity, type VerifiedSlackIdentity } from "./slack";
+import {
+  authorizeSlackLink,
+  checkSlackLinkAuthorization,
+  recordSlackPrimaryFactorProof,
+  recordVerifiedSlackIdentity,
+  type SlackLinkAuthorization,
+} from "./slack-identity";
 
 type SlackInviteContext = {
   inviteId: string;
@@ -24,10 +31,49 @@ type SlackInviteContext = {
 };
 
 type SlackAuthPolicyContext = {
+  notesSlackLink?: SlackLinkAuthorization;
+  notesSlackLinkFinished?: boolean;
+  notesSlackAuthenticationSource?: "sign_in" | "sign_up";
   notesSlackIdentity?: VerifiedSlackIdentity;
   notesSlackInvite?: SlackInviteContext;
   notesSlackInviteClaimed?: boolean;
 };
+
+function slackLinkContext(value: unknown): SlackLinkAuthorization | null {
+  if (!value || typeof value !== "object") return null;
+  const source = value as SlackLinkAuthorization;
+  if (
+    typeof source.userId !== "string" ||
+    typeof source.sessionId !== "string" ||
+    !Number.isSafeInteger(source.generation) ||
+    !Number.isFinite(source.expiresAt) ||
+    !Array.isArray(source.bindings)
+  )
+    return null;
+  if (
+    !source.bindings.every(
+      (binding) =>
+        binding &&
+        typeof binding.installation_id === "string" &&
+        typeof binding.slack_user_id === "string" &&
+        Number.isFinite(binding.linked_at) &&
+        (binding.better_auth_account_id === null || typeof binding.better_auth_account_id === "string") &&
+        (binding.verified_at === null || Number.isFinite(binding.verified_at)) &&
+        (binding.security_generation === null || Number.isSafeInteger(binding.security_generation)),
+    )
+  )
+    return null;
+  return source;
+}
+
+function slackAuthError(error: unknown): never {
+  if (error instanceof HttpError)
+    throw new APIError(error.status === 401 ? "UNAUTHORIZED" : "FORBIDDEN", {
+      code: error.code,
+      message: error.message,
+    });
+  throw error;
+}
 
 function slackInviteContext(value: unknown): SlackInviteContext | null {
   if (!value || typeof value !== "object") return null;
@@ -85,6 +131,7 @@ async function finishSlackAuthentication(env: Env, ctx: GenericEndpointContext, 
   const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
   const identity = policy.notesSlackIdentity;
   if (!identity) return;
+  if (policy.notesSlackLinkFinished) return;
   const account = await env.DB.prepare(
     `SELECT id FROM account WHERE providerId = 'slack' AND accountId = ? AND userId = ?`,
   )
@@ -93,7 +140,21 @@ async function finishSlackAuthentication(env: Env, ctx: GenericEndpointContext, 
   if (!account) {
     throw new APIError("UNAUTHORIZED", { code: "SLACK_IDENTITY_INVALID", message: "Slack identity linking failed." });
   }
-  await recordVerifiedSlackIdentity(env, userId, sessionId, account.id, identity);
+  if (policy.notesSlackLink) {
+    await checkSlackLinkAuthorization(env, policy.notesSlackLink, userId, sessionId);
+    await recordVerifiedSlackIdentity(env, userId, sessionId, account.id, identity, policy.notesSlackLink);
+    policy.notesSlackLinkFinished = true;
+    return;
+  }
+  if (!policy.notesSlackAuthenticationSource) return;
+  await recordSlackPrimaryFactorProof(
+    env,
+    userId,
+    sessionId,
+    account.id,
+    identity,
+    policy.notesSlackAuthenticationSource,
+  );
   const invite = policy.notesSlackInvite ?? (await trustedSlackInvite());
   if (invite) {
     await claimSlackInvite(env, userId, invite);
@@ -140,6 +201,17 @@ export function createAuth(env: Env, allowRegistration = false) {
         }
         const linkedUserId = typeof state?.link?.userId === "string" ? state.link.userId : null;
         try {
+          const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
+          if (source.action === "link-account") {
+            const permit = slackLinkContext(state?.serverContext?.slackLink);
+            const current = await getSessionFromCtx(ctx, { disableRefresh: true });
+            if (!permit || !current || current.user.id !== linkedUserId)
+              throw new HttpError(401, "UNAUTHORIZED", "Sign in again before connecting Slack.");
+            await checkSlackLinkAuthorization(env, permit, current.user.id, current.session.id);
+            policy.notesSlackLink = permit;
+          } else {
+            policy.notesSlackAuthenticationSource = source.action === "create-user" ? "sign_up" : "sign_in";
+          }
           const identity = await validateSlackIdentity(env, profile, {
             ...(invite ? { workspaceId: invite.workspaceId, teamId: invite.teamId } : {}),
             ...(linkedUserId ? { memberUserId: linkedUserId } : {}),
@@ -159,9 +231,15 @@ export function createAuth(env: Env, allowRegistration = false) {
               errorDescription: "Sign in normally, then connect Slack from Settings.",
             };
           }
-          const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
           policy.notesSlackIdentity = identity;
           if (invite) policy.notesSlackInvite = invite;
+          if (policy.notesSlackLink)
+            await checkSlackLinkAuthorization(
+              env,
+              policy.notesSlackLink,
+              policy.notesSlackLink.userId,
+              policy.notesSlackLink.sessionId,
+            );
         } catch (error) {
           if (error instanceof HttpError) return { error: error.code, errorDescription: error.message };
           return {
@@ -180,8 +258,17 @@ export function createAuth(env: Env, allowRegistration = false) {
             const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
             if (!policy.notesSlackIdentity || account.accountId !== policy.notesSlackIdentity.accountSubject) return;
             const current = await getSessionFromCtx(ctx, { disableRefresh: true });
-            if (current?.user.id === account.userId) {
-              await finishSlackAuthentication(env, ctx, account.userId, current.session.id);
+            if (policy.notesSlackLink && current?.user.id === account.userId) {
+              try {
+                await finishSlackAuthentication(env, ctx, account.userId, current.session.id);
+              } catch (error) {
+                // The library has committed this newly created account already.
+                // Remove only this callback's account when the access grant loses its fence.
+                await env.DB.prepare("DELETE FROM account WHERE id=? AND userId=? AND providerId='slack'")
+                  .bind(account.id, account.userId)
+                  .run();
+                slackAuthError(error);
+              }
             }
           },
         },
@@ -197,6 +284,27 @@ export function createAuth(env: Env, allowRegistration = false) {
     },
     hooks: {
       before: createAuthMiddleware(async (ctx) => {
+        if (ctx.path === "/link-social" && ctx.body?.provider === "slack") {
+          if (
+            ctx.body.idToken !== undefined ||
+            ctx.body.scopes !== undefined ||
+            ctx.body.additionalParams !== undefined
+          )
+            throw new APIError("BAD_REQUEST", {
+              code: "SLACK_LINK_REDIRECT_REQUIRED",
+              message: "Connect Slack through the Settings authorization flow.",
+            });
+          const current = await getSessionFromCtx(ctx, { disableRefresh: true });
+          if (!current)
+            throw new APIError("UNAUTHORIZED", { code: "UNAUTHORIZED", message: "Sign in before connecting Slack." });
+          try {
+            const permit = await authorizeSlackLink(env, current.user.id, current.session.id);
+            await addOAuthServerContext({ slackLink: permit });
+          } catch (error) {
+            slackAuthError(error);
+          }
+          return;
+        }
         if (ctx.path !== "/sign-in/social" || ctx.body?.provider !== "slack" || ctx.body?.requestSignUp !== true) {
           return;
         }
@@ -234,8 +342,19 @@ export function createAuth(env: Env, allowRegistration = false) {
         });
       }),
       after: createAuthMiddleware(async (ctx) => {
-        if (ctx.path !== "/callback/slack") return;
+        if (ctx.path !== "/callback/slack" && !(ctx.path === "/callback/:id" && ctx.params?.id === "slack")) return;
         const policy = ctx.context as typeof ctx.context & SlackAuthPolicyContext;
+        // Existing OAuth accounts use update rather than create. Complete the
+        // access grant for either path, without ever granting a primary proof.
+        if (policy.notesSlackLink && !policy.notesSlackLinkFinished && !(ctx.context.returned instanceof APIError)) {
+          const current = await getSessionFromCtx(ctx, { disableRefresh: true });
+          if (!current) throw new APIError("UNAUTHORIZED", { code: "UNAUTHORIZED", message: "Sign in again." });
+          try {
+            await finishSlackAuthentication(env, ctx, current.user.id, current.session.id);
+          } catch (error) {
+            slackAuthError(error);
+          }
+        }
         if (policy.notesSlackInviteClaimed) return;
         const invite = policy.notesSlackInvite ?? (await trustedSlackInvite());
         if (!invite) return;

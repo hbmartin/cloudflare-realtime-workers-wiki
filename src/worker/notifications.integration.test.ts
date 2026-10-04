@@ -1,4 +1,4 @@
-import { enrollAccount } from "../../tests/helpers/security";
+import { enrollAccount, protectSlackFixtureUsers } from "../../tests/helpers/security";
 import { abortAllDurableObjects, applyD1Migrations, env, reset, runInDurableObject, SELF } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
@@ -1157,8 +1157,8 @@ describe("notification feed and subscriptions", () => {
                  ?, 'chat:write', ?, ?, ?)`,
       ).bind(installed.workspaceId, token, installed.userId, timestamp, timestamp),
       env.DB.prepare(
-        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at)
-         VALUES ('digest-discovery-installation', 'linked-digest-user', 'ULINKED', ?)`,
+        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation)
+         VALUES ('digest-discovery-installation', 'linked-digest-user', 'ULINKED', ?,0)`,
       ).bind(timestamp),
       env.DB.prepare(
         `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone) VALUES
@@ -1191,6 +1191,7 @@ describe("notification feed and subscriptions", () => {
                  '{"notificationId":"linked-digest-notification"}', ?, ?)`,
       ).bind(installed.workspaceId, timestamp, timestamp),
     ]);
+    await protectSlackFixtureUsers(["linked-digest-user"]);
     const fetchMock = vi.fn(async () => Response.json({ ok: true }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -1235,8 +1236,8 @@ describe("notification feed and subscriptions", () => {
       ).bind(installed.workspaceId, token, installed.userId, timestamp, timestamp),
       env.DB.prepare(
         `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
-         INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at)
-         SELECT 'digest-budget-installation', printf('budget-user-%02d', n), printf('UBUDGET%02d', n), ?
+         INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation)
+         SELECT 'digest-budget-installation', printf('budget-user-%02d', n), printf('UBUDGET%02d', n), ?,0
            FROM sequence`,
       ).bind(timestamp),
       env.DB.prepare(
@@ -1263,6 +1264,9 @@ describe("notification feed and subscriptions", () => {
            FROM notifications WHERE id LIKE 'budget-notification-%'`,
       ).bind(timestamp, timestamp),
     ]);
+    await protectSlackFixtureUsers(
+      Array.from({ length: 10 }, (_, n) => `budget-user-${String(n + 1).padStart(2, "0")}`),
+    );
     let statementCount = 0;
     const countedDatabase = new Proxy(env.DB, {
       get(target, property) {
@@ -1364,10 +1368,10 @@ describe("notification feed and subscriptions", () => {
         timestamp,
       ),
       env.DB.prepare(
-        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at) VALUES
-          ('rate-installation-one', 'rate-user-a', 'URATEA', ?),
-          ('rate-installation-one', 'rate-user-b', 'URATEB', ?),
-          ('rate-installation-two', 'rate-user-c', 'URATEC', ?)`,
+        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation) VALUES
+          ('rate-installation-one', 'rate-user-a', 'URATEA', ?,0),
+          ('rate-installation-one', 'rate-user-b', 'URATEB', ?,0),
+          ('rate-installation-two', 'rate-user-c', 'URATEC', ?,0)`,
       ).bind(timestamp, timestamp, timestamp),
       env.DB.prepare(
         `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone) VALUES
@@ -1403,6 +1407,7 @@ describe("notification feed and subscriptions", () => {
            FROM notifications WHERE id LIKE 'rate-notification-%'`,
       ).bind(timestamp, timestamp),
     ]);
+    await protectSlackFixtureUsers(["rate-user-a", "rate-user-b", "rate-user-c"]);
     const channels: string[] = [];
     let remainingRateLimits = 1;
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {

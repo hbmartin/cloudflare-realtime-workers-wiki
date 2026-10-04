@@ -1070,8 +1070,13 @@ describe("security lifecycle regressions", () => {
       env.DB.prepare(`INSERT INTO account (id,accountId,providerId,userId,createdAt,updatedAt)
         VALUES ('slack-proof-account','T123:UOWNER','slack',?,?,?)`).bind(user!.id, now, now),
       env.DB.prepare(`INSERT INTO slack_primary_factor_proofs
-        (session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at)
-        VALUES (?,?,'slack-proof-account','T123','UOWNER',?,?)`).bind(session!.id, user!.id, now, now + 600_000),
+        (session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at,security_generation,authentication_source)
+        VALUES (?,?,'slack-proof-account','T123','UOWNER',?,?,(SELECT generation FROM account_security WHERE user_id=(SELECT userId FROM account WHERE id='slack-proof-account')),'sign_in')`).bind(
+        session!.id,
+        user!.id,
+        now,
+        now + 600_000,
+      ),
     ]);
     expect(await (await request(replacement, "/api/security/status")).json()).toMatchObject({
       state: "recovery_required",
@@ -1106,8 +1111,8 @@ describe("security lifecycle regressions", () => {
       .bind(user!.id)
       .first<{ id: string }>();
     await env.DB.prepare(`INSERT INTO slack_primary_factor_proofs
-      (session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at)
-      VALUES (?,?,'slack-proof-account','T123','UOWNER',?,?)`)
+      (session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at,security_generation,authentication_source)
+      VALUES (?,?,'slack-proof-account','T123','UOWNER',?,?,(SELECT generation FROM account_security WHERE user_id=(SELECT userId FROM account WHERE id='slack-proof-account')),'sign_in')`)
       .bind(nextSession!.id, user!.id, Date.now(), Date.now() + 600_000)
       .run();
     expect((await request(nextSignIn, "/api/security/resume-recovery", { resumeKey })).status).toBe(403);
@@ -1453,8 +1458,8 @@ describe("security lifecycle regressions", () => {
       .run();
     for (const session of sessions.results)
       await env.DB.prepare(`INSERT OR IGNORE INTO slack_primary_factor_proofs
-      (session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at)
-      VALUES (?,?,'slack-proof-account','T123','UOWNER',?,?)`)
+      (session_id,user_id,account_id,team_id,slack_user_id,verified_at,expires_at,security_generation,authentication_source)
+      VALUES (?,?,'slack-proof-account','T123','UOWNER',?,?,(SELECT generation FROM account_security WHERE user_id=(SELECT userId FROM account WHERE id='slack-proof-account')),'sign_in')`)
         .bind(session.id, user!.id, now, now + 600_000)
         .run();
     const signInCookies = [responseCookies(first), responseCookies(second)];

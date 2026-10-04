@@ -70,6 +70,65 @@ describe("SlackSettings", () => {
     expect(connect).toBeEnabled();
   });
 
+  it("shows the required security step when the server denies linking", async () => {
+    vi.mocked(api).mockResolvedValue({
+      available: true,
+      installation: { connected: true, capabilities: { identity: { available: true } } },
+      linked: false,
+    });
+    vi.mocked(authClient.linkSocial).mockResolvedValueOnce({
+      data: null,
+      error: {
+        status: 403,
+        statusText: "Forbidden",
+        code: "SECURITY_REQUIRED",
+        message: "Save your recovery resume key before continuing.",
+      },
+    });
+    render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Connect Slack identity" }));
+    expect(await screen.findByText("Save your recovery resume key before continuing.")).toBeInTheDocument();
+    expect(screen.queryByText("Slack identity could not be connected. Try again.")).not.toBeInTheDocument();
+  });
+  it.each([
+    ["slack_team_mismatch", "Use an account from the connected Slack workspace."],
+    [
+      "slack_scope_missing",
+      "Ask the workspace owner to reauthorize Slack with users:read, then connect your identity again.",
+    ],
+  ])("shows an actionable callback error: %s", async (code, message) => {
+    history.replaceState(null, "", `/?slackAuth=callback&error=${code}`);
+    vi.mocked(api).mockResolvedValue({ available: true, installation: null, linked: false });
+    render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
+    expect(await screen.findByText(message)).toBeInTheDocument();
+  });
+
+  it("shows paused cleanup remediation and disconnects access separately from sign-in", async () => {
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/slack/status")
+        return {
+          available: true,
+          installation: { connected: true },
+          identity: { state: "verified", accessAuthorized: true, slackUserId: "U123" },
+          linked: true,
+        };
+      if (path === "/api/slack/delivery-health")
+        return {
+          orphanedFailures: [],
+          cleanup: { pending: 0, paused: 3, failed: 0, pausedByReason: [{ reason: "missing_scope", count: 3 }] },
+        };
+      if (path === "/api/slack/identity") return { ok: true };
+      return { subscriptions: [] };
+    });
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+    expect(await screen.findByText(/Reauthorize Slack with files:write to resume cleanup/)).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Disconnect Slack access" }));
+    await waitFor(() => expect(api).toHaveBeenCalledWith("/api/slack/identity", { method: "DELETE" }));
+    expect(
+      await screen.findByText("Slack access was disconnected. Your Slack sign-in remains available."),
+    ).toBeInTheDocument();
+  });
+
   it("acknowledges a failure for an orphaned link using its encoded identifier", async () => {
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/slack/status") return { available: true, missing: [], installation: null, linked: false };

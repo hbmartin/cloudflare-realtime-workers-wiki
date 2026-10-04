@@ -111,7 +111,7 @@ the affected capability without breaking existing notification delivery.
 #### Requirements
 
 - Configure Better Auth's Slack OpenID provider with `openid profile email` and disable implicit account linking.
-- Existing users connect Slack from authenticated NoteFlare Settings. The connection must bind the Slack team ID and
+- Existing users connect Slack from NoteFlare Settings after completing protection and verifying TOTP/passkey within five minutes. Callback completion rechecks the authorizing session and protection generation. The connection must bind the Slack team ID and
   user ID returned by OpenID to the current Better Auth account and the active NoteFlare Slack installation.
 - A valid, unused NoteFlare invitation may initiate Slack signup. The invite is reserved before redirect, carried in
   protected OAuth state, and consumed only after the callback establishes the new account.

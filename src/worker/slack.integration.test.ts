@@ -21,6 +21,7 @@ import {
   handleSlackCommand,
   handleSlackEvent,
   recordVerifiedSlackIdentity,
+  recordSlackPrimaryFactorProof,
   recordSlackInstallationError,
   sendPersonalSlackNotification,
   sendDueSlackChannelDigests,
@@ -70,6 +71,12 @@ async function bootstrapResponse() {
 async function bootstrap() {
   const cookie = await enrollAccount(await bootstrapResponse());
   const member = await (await SELF.fetch(request(cookie, "/api/me"))).json<ClientMemberContext>();
+  sessionIds.set(
+    member.user.id,
+    (await env.DB.prepare("SELECT id FROM session WHERE userId=? ORDER BY createdAt DESC LIMIT 1")
+      .bind(member.user.id)
+      .first<{ id: string }>())!.id,
+  );
   const pages = await (await SELF.fetch(request(cookie, "/api/pages/tree"))).json<{ pages: Page[] }>();
   return { cookie, member, page: pages.pages[0]! };
 }
@@ -96,13 +103,21 @@ async function inviteViewer(ownerCookie: string) {
   expect(accepted.status).toBe(200);
   const cookie = await enrollAccount(accepted, token);
   const member = await (await SELF.fetch(request(cookie, "/api/me"))).json<ClientMemberContext>();
+  sessionIds.set(
+    member.user.id,
+    (await env.DB.prepare("SELECT id FROM session WHERE userId=? ORDER BY createdAt DESC LIMIT 1")
+      .bind(member.user.id)
+      .first<{ id: string }>())!.id,
+  );
   return { cookie, member };
 }
+
+const sessionIds = new Map<string, string>();
 
 function memberContext(member: ClientMemberContext): MemberContext {
   return {
     ...member,
-    session: { id: "test-session", expiresAt: new Date(Date.now() + 60_000) },
+    session: { id: sessionIds.get(member.user.id)!, expiresAt: new Date(Date.now() + 60_000) },
   };
 }
 
@@ -641,14 +656,11 @@ describe("Slack security and integration", () => {
       return response;
     }
 
-    it("starts linking without enrollment and does not grant workspace assurance", async () => {
+    it("rejects linking without enrollment and does not grant workspace assurance", async () => {
       const cookie = responseCookies(await bootstrapResponse());
       const response = await link(cookie);
-      expect(response.status).toBe(200);
-      const { url } = await response.json<{ url: string }>();
-      expect(new URL(url).origin).toBe("https://slack.com");
-      expect(new URL(url).searchParams.get("state")).toBeTruthy();
-      expect(new URL(url).searchParams.get("code_challenge")).toBeTruthy();
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ code: "SECURITY_REQUIRED" });
       expect(await env.DB.prepare("SELECT 1 FROM session_security").first()).toBeNull();
       expect(await (await securityRequest(cookie, "/api/security/status")).json()).toMatchObject({
         state: "enrollment_required",
@@ -658,7 +670,7 @@ describe("Slack security and integration", () => {
       expect((await securityRequest(cookie, "/api/slack/oauth/start")).status).toBe(401);
     });
 
-    it("allows older assurance only for Slack linking and preserves its verification time", async () => {
+    it("rejects older assurance without changing its verification time", async () => {
       const { cookie } = await bootstrap();
       const verifiedAt = Date.now() - 6 * 60_000;
       await env.DB.prepare("UPDATE session_security SET verified_at = ?").bind(verifiedAt).run();
@@ -666,7 +678,7 @@ describe("Slack security and integration", () => {
         state: "ready",
         fresh: false,
       });
-      expect((await link(cookie)).status).toBe(200);
+      expect((await link(cookie)).status).toBe(403);
       const otherProvider = await link(cookie, "google");
       expect(otherProvider.status).toBe(403);
       expect(await otherProvider.json()).toMatchObject({ code: "SECURITY_REQUIRED" });
@@ -678,7 +690,7 @@ describe("Slack security and integration", () => {
       });
     });
 
-    it("allows a trusted-browser session without fresh factor verification", async () => {
+    it("rejects a trusted-browser session without fresh factor verification", async () => {
       const { cookie } = await bootstrap();
       const trusted = await securityRequest(cookie, "/api/security/trust", {});
       expect(trusted.status).toBe(200);
@@ -695,7 +707,7 @@ describe("Slack security and integration", () => {
         state: "ready",
         fresh: false,
       });
-      expect((await link(session)).status).toBe(200);
+      expect((await link(session)).status).toBe(403);
     });
 
     it.each(["anonymous", "expired session"])("rejects %s requests", async (mode) => {
@@ -796,6 +808,15 @@ describe("Slack security and integration", () => {
       .bind(installed.member.user.id)
       .first<{ id: string }>();
     await recordVerifiedSlackIdentity(slackEnv(), installed.member.user.id, session!.id, "slack-account", identity);
+    expect(await env.DB.prepare("SELECT 1 FROM slack_primary_factor_proofs").first()).toBeNull();
+    await recordSlackPrimaryFactorProof(
+      slackEnv(),
+      installed.member.user.id,
+      session!.id,
+      "slack-account",
+      identity,
+      "sign_in",
+    );
     expect(await slackWorkspaceStatus(slackEnv(), memberContext(installed.member))).toMatchObject({
       identity: { state: "verified", slackUserId: "UOWNER" },
       linked: true,
@@ -934,7 +955,7 @@ describe("Slack security and integration", () => {
       createExecutionContext(),
     );
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("openid.connect.token"))).toBe(true);
-    expect(await start()).toMatchObject({ status: 409 });
+    expect(await start()).toMatchObject({ status: 200 });
 
     const direct = await worker.fetch(
       request(installed.cookie, "/api/auth/sign-in/social", {
@@ -948,6 +969,7 @@ describe("Slack security and integration", () => {
     expect(direct.status).toBe(403);
 
     await env.DB.prepare(`UPDATE invites SET claim_expires_at = 0`).run();
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 61_000);
     expect((await start()).status).toBe(200);
   });
 
@@ -1177,8 +1199,8 @@ describe("Slack security and integration", () => {
     await env.DB.batch([
       env.DB.prepare(`UPDATE slack_installations SET token_expires_at = 0 WHERE team_id = 'T123'`),
       env.DB.prepare(
-        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at) VALUES (?, ?, 'UOWNER', ?)`,
-      ).bind(installation!.id, installed.member.user.id, Date.now()),
+        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,installation_generation,security_generation) VALUES (?, ?, 'UOWNER', ?,(SELECT generation FROM slack_installations WHERE id=?),0)`,
+      ).bind(installation!.id, installed.member.user.id, Date.now(), installation!.id),
     ]);
     fetchMock.mockImplementation(async (input: string | URL | Request) => {
       const url = String(input);
@@ -1316,8 +1338,8 @@ describe("Slack security and integration", () => {
       status: 422,
     });
     await env.DB.prepare(
-      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at)
-       VALUES ('slack-installation', ?, 'UVIEWER', ?)`,
+      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation)
+       VALUES ('slack-installation', ?, 'UVIEWER', ?,0)`,
     )
       .bind(viewer.member.user.id, Date.now())
       .run();
@@ -1339,8 +1361,8 @@ describe("Slack security and integration", () => {
     const viewer = await inviteViewer(installed.cookie);
     await installSlack(installed.member);
     await env.DB.prepare(
-      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at)
-       VALUES ('slack-installation', ?, 'UVIEWER', ?)`,
+      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation)
+       VALUES ('slack-installation', ?, 'UVIEWER', ?,0)`,
     )
       .bind(viewer.member.user.id, Date.now())
       .run();

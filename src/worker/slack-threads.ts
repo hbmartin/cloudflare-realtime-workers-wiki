@@ -92,11 +92,36 @@ function mirrorRouteError(error: unknown): never {
     throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
   throw error;
 }
-async function memberFor(env: Env, workspaceId: string, userId: string): Promise<MemberContext> {
+async function memberFor(
+  env: Env,
+  workspaceId: string,
+  userId: string,
+  authorization?: { installation: SlackInstallation; identity: Identity },
+): Promise<MemberContext> {
   const row = await env.DB.prepare(`SELECT u.id, u.name, u.email, wm.role, w.name workspace_name, w.location_hint
     FROM user u JOIN workspace_members wm ON wm.user_id = u.id JOIN workspaces w ON w.id = wm.workspace_id
-    WHERE u.id = ? AND wm.workspace_id = ?`)
-    .bind(userId, workspaceId)
+    JOIN slack_protected_accounts protection ON protection.user_id=u.id
+    WHERE u.id = ? AND wm.workspace_id = ? ${
+      authorization
+        ? `AND EXISTS(SELECT 1 FROM slack_authorized_user_links link
+      WHERE link.installation_id=? AND link.installation_generation=? AND link.user_id=u.id
+        AND link.slack_user_id=? AND link.better_auth_account_id=? AND link.verified_at=?
+        AND link.migration_state='verified' AND link.verification_method='slack_openid')`
+        : ""
+    }`)
+    .bind(
+      userId,
+      workspaceId,
+      ...(authorization
+        ? [
+            authorization.installation.id,
+            authorization.installation.generation,
+            authorization.identity.slackUserId,
+            authorization.identity.accountId,
+            authorization.identity.verifiedAt,
+          ]
+        : []),
+    )
     .first<{
       id: string;
       name: string;
@@ -119,7 +144,7 @@ export async function identityFor(
   slackUserId: string,
 ): Promise<Identity | null> {
   return env.DB.prepare(`SELECT l.user_id userId, l.better_auth_account_id accountId, l.verified_at verifiedAt, l.slack_user_id slackUserId
-    FROM slack_user_links l JOIN account a ON a.id = l.better_auth_account_id AND a.userId = l.user_id
+    FROM slack_authorized_user_links l JOIN account a ON a.id = l.better_auth_account_id AND a.userId = l.user_id
     JOIN workspace_members wm ON wm.user_id = l.user_id AND wm.workspace_id = ?
     WHERE l.installation_id = ? AND l.slack_user_id = ? AND l.installation_generation = ?
       AND l.verification_method = 'slack_openid' AND l.migration_state = 'verified' AND l.verified_at IS NOT NULL
@@ -155,7 +180,10 @@ export async function verifiedMember(
     { "https://slack.com/team_id": installation.team_id, "https://slack.com/user_id": slackUserId },
     { workspaceId: installation.workspace_id, memberUserId: identity.userId },
   );
-  return { identity, member: await memberFor(env, installation.workspace_id, identity.userId) };
+  return {
+    identity,
+    member: await memberFor(env, installation.workspace_id, identity.userId, { installation, identity }),
+  };
 }
 export async function validateChannel(env: Env, installation: SlackInstallation, channelId: string) {
   const { channel } = await slackApi(env, installation, "conversations.info", { channel: channelId });
@@ -249,7 +277,7 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
   let channelValidated = false;
   try {
     const link = await env.DB.prepare(
-      `SELECT slack_user_id FROM slack_user_links WHERE installation_id = ? AND user_id = ?`,
+      `SELECT slack_user_id FROM slack_authorized_user_links WHERE installation_id = ? AND user_id = ?`,
     )
       .bind(installation.id, member.user.id)
       .first<{ slack_user_id: string }>();
@@ -262,7 +290,7 @@ export async function setSlackMirror(env: Env, member: MemberContext, subscripti
     const result =
       await env.DB.prepare(`UPDATE slack_channel_subscriptions SET mirror_enabled = 1, channel_name = ?, channel_type = ?, validation_state = 'valid', validation_error = NULL, validated_at = ?, bot_is_member = 1, updated_at = ?
       WHERE id = ? AND EXISTS (SELECT 1 FROM slack_installations i JOIN workspace_members wm ON wm.workspace_id = i.workspace_id
-        JOIN slack_user_links l ON l.installation_id = i.id AND l.user_id = wm.user_id
+        JOIN slack_authorized_user_links l ON l.installation_id = i.id AND l.user_id = wm.user_id
         JOIN account a ON a.id = l.better_auth_account_id AND a.userId = wm.user_id
         WHERE i.id = ? AND i.generation = ? AND i.disconnected_at IS NULL AND wm.user_id = ? AND wm.role = 'owner'
           AND l.installation_generation = i.generation AND l.verified_at = ? AND l.migration_state = 'verified' AND a.id = ?)
@@ -440,7 +468,7 @@ function mutationGuard(env: Env, receiptId: string, input: Input, threadId: stri
     JOIN comment_threads ct ON ct.id = t.thread_id AND ct.page_id = p.id
     JOIN workspace_members wm ON wm.workspace_id = i.workspace_id AND wm.user_id = ?
     LEFT JOIN space_members sm ON sm.space_id = sp.id AND sm.user_id = wm.user_id
-    JOIN slack_user_links u ON u.installation_id = i.id AND u.user_id = wm.user_id
+    JOIN slack_authorized_user_links u ON u.installation_id = i.id AND u.user_id = wm.user_id
     JOIN account a ON a.id = u.better_auth_account_id AND a.userId = wm.user_id
     WHERE t.id = ? AND t.thread_id = ? AND t.state = 'active' AND t.root_message_ts = ? AND t.channel_id = ?
       AND i.id = ? AND i.generation = ? AND t.installation_generation = i.generation AND i.disconnected_at IS NULL
@@ -626,7 +654,7 @@ async function mentionMember(env: Env, installation: SlackInstallation, slackUse
 }
 async function mentionSlackId(env: Env, installation: SlackInstallation, userId: string, pageId: string) {
   const link = await env.DB.prepare(
-    `SELECT slack_user_id FROM slack_user_links WHERE installation_id = ? AND user_id = ?`,
+    `SELECT slack_user_id FROM slack_authorized_user_links WHERE installation_id = ? AND user_id = ?`,
   )
     .bind(installation.id, userId)
     .first<{ slack_user_id: string }>();
