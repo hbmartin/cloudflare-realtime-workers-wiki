@@ -1616,7 +1616,8 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
   let claimed = false;
   try {
     const installation = await installationFor(env, payload.installationId, payload.generation);
-    const { member } = await verifiedMember(env, installation, payload.userId);
+    const { member, identity } = await verifiedMember(env, installation, payload.userId);
+    const authorize = slackAccessAuthorization(env, installation, identity);
     if (member.role !== "owner") unavailable();
     await validateChannel(env, installation, payload.channelId);
     await requireChannelMember(env, installation, payload.channelId, payload.userId);
@@ -1666,11 +1667,20 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
       .run();
     if (!receipt.meta.changes) return;
     claimed = true;
-    await slackApi(env, installation, "chat.postEphemeral", {
-      channel: payload.channelId,
-      user: payload.userId,
-      text: `Public share: ${share.url}`,
-    });
+    await slackApi(
+      env,
+      installation,
+      "chat.postEphemeral",
+      {
+        channel: payload.channelId,
+        user: payload.userId,
+        text: `Public share: ${share.url}`,
+      },
+      undefined,
+      undefined,
+      undefined,
+      authorize,
+    );
     await env.DB.prepare(
       `UPDATE slack_interaction_receipts SET response_delivery_state = 'sent', denial_sent_at = ?
         WHERE id = ? AND response_delivery_state = 'sending'`,

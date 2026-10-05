@@ -1,6 +1,15 @@
+import * as Y from "yjs";
 import { enrollAccount } from "../../tests/helpers/security";
 import { Client } from "@notionhq/client";
-import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
+import {
+  applyD1Migrations,
+  createExecutionContext,
+  env,
+  reset,
+  runInDurableObject,
+  SELF,
+  waitOnExecutionContext,
+} from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "./index";
 import { recoverNotionMarkdownTasks } from "./notion-api";
@@ -848,6 +857,74 @@ describe("Notion-compatible API", () => {
       .filter((point) => point.indexes[0] === "http.request")
       .map((point) => point.blobs[2]);
     expect(routes).toEqual(["/v1/pages/:pageId", "/v1/pages/:pageId", "/v1/pages/:pageId", "/unmatched"]);
+  });
+
+  it("returns the updated Notion block when it is deleted during compaction", async () => {
+    const installed = await bootstrap();
+    const created = await integration(installed.cookie, installed.pageId);
+    const appended = await notion(created.token).blocks.children.append({
+      block_id: installed.pageId,
+      children: [{ paragraph: { rich_text: [{ text: { content: "Before race" } }] } }],
+    });
+    const blockId = appended.results[0]!.id;
+    let deleted = false;
+    const bindings = new Proxy(env, {
+      get(target, key, receiver) {
+        if (key === "DOCUMENT")
+          return {
+            getByName(name: string) {
+              const stub = env.DOCUMENT.getByName(name);
+              return {
+                async fetch(request: Request) {
+                  if (!new URL(request.url).pathname.endsWith("/api-mutate")) return stub.fetch(request);
+                  const body = await request.text();
+                  return runInDurableObject(stub, async (instance) => {
+                    const room = instance as unknown as {
+                      document: Y.Doc;
+                      compact(force?: boolean): Promise<void>;
+                      onRequest(request: Request): Promise<Response>;
+                    };
+                    const compact = room.compact.bind(room);
+                    const spy = vi.spyOn(room, "compact").mockImplementation(async (force) => {
+                      const group = room.document.getXmlFragment("document-store").get(0) as Y.XmlElement;
+                      group.delete(group.length - 1, 1);
+                      deleted = true;
+                      await compact(force);
+                    });
+                    try {
+                      return await room.onRequest(
+                        new Request(request.url, {
+                          method: request.method,
+                          headers: request.headers,
+                          body,
+                        }),
+                      );
+                    } finally {
+                      spy.mockRestore();
+                    }
+                  });
+                },
+              };
+            },
+          };
+        return Reflect.get(target, key, receiver);
+      },
+    }) as Cloudflare.Env;
+    const context = createExecutionContext();
+    const response = await worker.fetch(
+      notionRequest(created.token, `/blocks/${blockId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ paragraph: { rich_text: [{ text: { content: "Updated before deletion" } }] } }),
+      }),
+      bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    const responseBody = await response.json();
+    expect(response.status).toBe(200);
+    expect(deleted).toBe(true);
+    expect(JSON.stringify(responseBody)).toContain("Updated before deletion");
   });
 
   it("runs page, block, search, user, position, and in_trash calls through the official SDK", async () => {

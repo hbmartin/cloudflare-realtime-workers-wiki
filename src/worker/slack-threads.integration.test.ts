@@ -1769,84 +1769,88 @@ describe("interactive Slack workspace", () => {
     async (mode) => {
       const now = Date.now();
       const clock = vi.spyOn(Date, "now").mockReturnValue(now);
-      await env.DB.prepare(`INSERT INTO member_mentions(workspace_id,source_page_id,target_user_id,excerpt,first_seen_at,first_seen_actor_id,projection_seq)
+      try {
+        await env.DB.prepare(`INSERT INTO member_mentions(workspace_id,source_page_id,target_user_id,excerpt,first_seen_at,first_seen_actor_id,projection_seq)
         VALUES('workspace','page','viewer','Private Home excerpt',?,'owner',1)`)
-        .bind(now - 1000)
-        .run();
-      await publishSlackHome(runtime(), "installation", "UVIEWER");
-      const session = (await env.DB.prepare("SELECT id,view_hash FROM slack_view_sessions WHERE kind='home'").first<{
-        id: string;
-        view_hash: string;
-      }>())!;
-      await env.DB.prepare("UPDATE slack_view_sessions SET state_json=? WHERE id=?")
-        .bind(JSON.stringify({ asOf: now - 1, cursors: [null, null], page: 1 }), session.id)
-        .run();
-      await acceptSlackWorkspaceInteraction(runtime(), {
-        type: "block_actions",
-        team: { id: "T123" },
-        user: { id: "UVIEWER" },
-        view: { id: "VHOME", hash: session.view_hash, private_metadata: session.id },
-        actions: [{ action_id: "noteflare_home_previous", action_ts: "1700000901.000001", value: session.id }],
-      });
-      const receipt = (await env.DB.prepare(
-        "SELECT id FROM slack_interaction_receipts WHERE callback_id='noteflare_home_previous'",
-      ).first<{ id: string }>())!;
-      calls = [];
-      if (mode.includes("hash retry")) homeHash = "a-newer-slack-hash";
-      if (mode === "during token refresh")
-        await env.DB.prepare(
-          "UPDATE slack_installations SET token_expires_at=?,bot_refresh_token_ciphertext=? WHERE id='installation'",
-        )
-          .bind(now + 61_000, await encryptSlackToken(runtime(), "xoxr-old"))
+          .bind(now - 1000)
           .run();
-      vi.mocked(fetch).mockImplementation(async (input, init) => {
-        if (String(input).endsWith("/oauth.v2.access")) {
-          await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='viewer'").run();
-          return Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: 3600 });
-        }
-        const response = await mockSlack(input, init);
-        if (mode === "before hash retry" && String(input).endsWith("/views.publish"))
-          await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='viewer'").run();
-        return response;
-      });
-      const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
-        new Proxy(statement, {
+        await publishSlackHome(runtime(), "installation", "UVIEWER");
+        const session = (await env.DB.prepare("SELECT id,view_hash FROM slack_view_sessions WHERE kind='home'").first<{
+          id: string;
+          view_hash: string;
+        }>())!;
+        await env.DB.prepare("UPDATE slack_view_sessions SET state_json=? WHERE id=?")
+          .bind(JSON.stringify({ asOf: now - 1, cursors: [null, null], page: 1 }), session.id)
+          .run();
+        await acceptSlackWorkspaceInteraction(runtime(), {
+          type: "block_actions",
+          team: { id: "T123" },
+          user: { id: "UVIEWER" },
+          view: { id: "VHOME", hash: session.view_hash, private_metadata: session.id },
+          actions: [{ action_id: "noteflare_home_previous", action_ts: "1700000901.000001", value: session.id }],
+        });
+        const receipt = (await env.DB.prepare(
+          "SELECT id FROM slack_interaction_receipts WHERE callback_id='noteflare_home_previous'",
+        ).first<{ id: string }>())!;
+        calls = [];
+        if (mode.includes("hash retry")) homeHash = "a-newer-slack-hash";
+        if (mode === "during token refresh")
+          await env.DB.prepare(
+            "UPDATE slack_installations SET token_expires_at=?,bot_refresh_token_ciphertext=? WHERE id='installation'",
+          )
+            .bind(now + 61_000, await encryptSlackToken(runtime(), "xoxr-old"))
+            .run();
+        vi.mocked(fetch).mockImplementation(async (input, init) => {
+          if (String(input).endsWith("/oauth.v2.access")) {
+            await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='viewer'").run();
+            return Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: 3600 });
+          }
+          const response = await mockSlack(input, init);
+          if (mode === "before hash retry" && String(input).endsWith("/views.publish"))
+            await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='viewer'").run();
+          return response;
+        });
+        const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+          new Proxy(statement, {
+            get(target, key) {
+              if (key === "bind") return (...args: unknown[]) => wrap(target.bind(...args));
+              if (key === "run")
+                return async () => {
+                  const result = await target.run();
+                  if (mode === "after private reads")
+                    await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='viewer'").run();
+                  if (mode === "during token refresh") clock.mockReturnValue(now + 2000);
+                  return result;
+                };
+              const value: unknown = Reflect.get(target, key, target);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
+        const db = new Proxy(env.DB, {
           get(target, key) {
-            if (key === "bind") return (...args: unknown[]) => wrap(target.bind(...args));
-            if (key === "run")
-              return async () => {
-                const result = await target.run();
-                if (mode === "after private reads")
-                  await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='viewer'").run();
-                if (mode === "during token refresh") clock.mockReturnValue(now + 2000);
-                return result;
-              };
+            if (key === "prepare")
+              return (sql: string) =>
+                sql.includes("UPDATE slack_view_sessions SET pending_state_json")
+                  ? wrap(target.prepare(sql))
+                  : target.prepare(sql);
             const value: unknown = Reflect.get(target, key, target);
             return typeof value === "function" ? value.bind(target) : value;
           },
         });
-      const db = new Proxy(env.DB, {
-        get(target, key) {
-          if (key === "prepare")
-            return (sql: string) =>
-              sql.includes("UPDATE slack_view_sessions SET pending_state_json")
-                ? wrap(target.prepare(sql))
-                : target.prepare(sql);
-          const value: unknown = Reflect.get(target, key, target);
-          return typeof value === "function" ? value.bind(target) : value;
-        },
-      });
-      await deliverSlackWorkspaceAction({ ...runtime(), DB: db }, receipt.id);
-      const publishes = calls.filter((call) => call.method === "views.publish");
-      expect(publishes).toHaveLength(mode === "allowed hash retry" ? 2 : mode === "before hash retry" ? 1 : 0);
-      expect(
-        await env.DB.prepare("SELECT outcome FROM slack_interaction_receipts WHERE id=?").bind(receipt.id).first(),
-      ).toEqual({ outcome: mode === "allowed hash retry" ? "accepted" : "denied" });
-      expect(
-        await env.DB.prepare("SELECT json_extract(state_json,'$.page') page FROM slack_view_sessions WHERE id=?")
-          .bind(session.id)
-          .first(),
-      ).toEqual({ page: mode === "allowed hash retry" ? 0 : 1 });
+        await deliverSlackWorkspaceAction({ ...runtime(), DB: db }, receipt.id);
+        const publishes = calls.filter((call) => call.method === "views.publish");
+        expect(publishes).toHaveLength(mode === "allowed hash retry" ? 2 : mode === "before hash retry" ? 1 : 0);
+        expect(
+          await env.DB.prepare("SELECT outcome FROM slack_interaction_receipts WHERE id=?").bind(receipt.id).first(),
+        ).toEqual({ outcome: mode === "allowed hash retry" ? "accepted" : "denied" });
+        expect(
+          await env.DB.prepare("SELECT json_extract(state_json,'$.page') page FROM slack_view_sessions WHERE id=?")
+            .bind(session.id)
+            .first(),
+        ).toEqual({ page: mode === "allowed hash retry" ? 0 : 1 });
+      } finally {
+        clock.mockRestore();
+      }
     },
   );
 
@@ -2395,6 +2399,67 @@ describe("interactive Slack workspace", () => {
       await env.DB.prepare(`SELECT delivered_at,retired_at FROM slack_unfurls WHERE id='unfurl-scope'`).first(),
     ).toEqual({ delivered_at: null, retired_at: null });
     expect(await redriveStaleSlackOutbox(runtime())).toBe(0);
+  });
+
+  it.each(["during token refresh", "after claiming"])("blocks share responses revoked %s", async (mode) => {
+    const { link } = await activeThread();
+    const receiptId = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
+    await deliverSlackWorkspaceAction(runtime(), receiptId);
+    const row = (await env.DB.prepare(
+      "SELECT payload_json FROM outbox WHERE topic='slack_share_response' ORDER BY rowid LIMIT 1",
+    ).first<{ payload_json: string }>())!;
+    const payload = JSON.parse(row.payload_json) as Record<string, unknown>;
+    calls = [];
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      if (mode === "during token refresh") {
+        await env.DB.prepare("UPDATE slack_installations SET token_expires_at=?,bot_refresh_token_ciphertext=?")
+          .bind(now + 61_000, await encryptSlackToken(runtime(), "xoxr-old"))
+          .run();
+        vi.mocked(fetch).mockImplementation(async (input, init) => {
+          if (String(input).endsWith("/oauth.v2.access")) {
+            await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'").run();
+            return Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: 3600 });
+          }
+          return mockSlack(input, init);
+        });
+      }
+      const db = new Proxy(env.DB, {
+        get(target, key) {
+          if (key === "prepare")
+            return (sql: string) => {
+              const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+                new Proxy(statement, {
+                  get(prepared, method) {
+                    if (method === "bind") return (...args: unknown[]) => wrap(prepared.bind(...args));
+                    if (method === "run" && sql.includes("response_delivery_state = 'sending'"))
+                      return async () => {
+                        const result = await prepared.run();
+                        if (mode === "during token refresh") clock.mockReturnValue(now + 2000);
+                        else await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'").run();
+                        return result;
+                      };
+                    const value: unknown = Reflect.get(prepared, method, prepared);
+                    return typeof value === "function" ? value.bind(prepared) : value;
+                  },
+                });
+              return wrap(target.prepare(sql));
+            };
+          const value: unknown = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      await deliverSlackShareResponse({ ...runtime(), DB: db }, payload);
+      expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(0);
+      expect(
+        await env.DB.prepare("SELECT response_delivery_state state FROM slack_interaction_receipts WHERE id=?")
+          .bind(receiptId)
+          .first(),
+      ).toEqual({ state: "blocked" });
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("sends share links outside the thread and distinguishes rate limits from uncertain sends", async () => {

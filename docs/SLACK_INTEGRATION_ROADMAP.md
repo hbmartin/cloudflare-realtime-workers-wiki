@@ -122,7 +122,7 @@ the affected capability without breaking existing notification delivery.
   assurance requirements remain unchanged.
 - The OpenID team ID must match the workspace's active Slack installation. A member cannot attach an identity from a
   different Slack workspace.
-- Continue honoring authorized legacy `slack_user_links` for existing outbound personal notifications during migration. Installation disconnect/reconnect, protection changes, or lost membership revoke access and require explicit relinking; Settings shows delivery as paused until authorization is restored.
+- Continue honoring authorized legacy `slack_user_links` for existing outbound personal notifications during migration. Installation disconnect/reconnect, protection changes, or lost membership revoke access and require explicit relinking; Member removal deletes that workspace’s stored Slack access link; rejoining requires explicit relinking with a new authorization start. Settings shows delivery as paused until authorization is restored.
   Require an OpenID-verified link for interactions, inbound comments, capture, and Slack login.
 - Deprecate `/notes link` once members have had a migration window. Do not silently upgrade legacy links to verified
   OpenID links.

@@ -6,6 +6,7 @@ const GUARDED_MIGRATIONS = [
   "0070_slack_review_fences.sql",
   "0071_slack_authorization_cleanup.sql",
   "0072_slack_link_authorization_started_at.sql",
+  "0073_slack_membership_revocation.sql",
 ];
 
 export function checkSlackReviewMigration(output, confirmed = false) {

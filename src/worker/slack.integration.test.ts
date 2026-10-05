@@ -189,6 +189,137 @@ describe("legacy channel event settlement", () => {
     ).toEqual({ suppressed_at: expect.any(Number), delivered_at: null });
   });
 
+  it("leaves a live competing claim untouched for an authorized event", async () => {
+    const fixture = await legacyChannelFixture("immediate");
+    await env.DB.prepare("UPDATE slack_channel_events SET claim_token='other',claimed_at=? WHERE id='actor-event'")
+      .bind(Date.now())
+      .run();
+    const before = await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first();
+    const remote = vi.fn();
+    vi.stubGlobal("fetch", remote);
+    await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+    expect(remote).not.toHaveBeenCalled();
+    expect(await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first()).toEqual(before);
+  });
+
+  it.each(["immediate", "digest", "partial digest"] as const)(
+    "rechecks %s authorization during token refresh",
+    async (mode) => {
+      const fixture = await legacyChannelFixture(mode === "immediate" ? "immediate" : "digest");
+      if (mode === "partial digest") {
+        const viewer = await inviteViewer(fixture.cookie);
+        await env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+          VALUES('surviving-event',?,?,'mention',?,?,'digest',1)`)
+          .bind(fixture.mapping.id, fixture.member.workspace.id, viewer.member.user.id, fixture.page.id)
+          .run();
+      }
+      await env.DB.prepare("UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?")
+        .bind(await encryptSlackToken(fixture.bindings, "xoxr-old"))
+        .run();
+      const posts: Array<Record<string, unknown>> = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          if (String(input).includes("oauth.v2.access")) {
+            await env.DB.prepare("UPDATE account_security SET codes_saved=0 WHERE user_id=?")
+              .bind(fixture.member.user.id)
+              .run();
+            return Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: 3600 });
+          }
+          if (String(input).includes("chat.postMessage"))
+            posts.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return Response.json({ ok: true, ts: "1700000000.000001" });
+        }),
+      );
+      if (mode === "immediate") await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+      else await sendDueSlackChannelDigests(fixture.bindings, Date.UTC(2026, 9, 4, 10));
+      expect(posts).toHaveLength(mode === "partial digest" ? 1 : 0);
+      expect(
+        await env.DB.prepare(
+          "SELECT suppressed_at,delivered_at FROM slack_channel_events WHERE id='actor-event'",
+        ).first(),
+      ).toEqual({ suppressed_at: expect.any(Number), delivered_at: null });
+      expect(posts.map((post) => post.text)).toEqual(mode === "partial digest" ? ["1 NoteFlare update"] : []);
+      expect(JSON.stringify(posts)).not.toContain(fixture.member.user.name);
+      const delivered = { delivered_at: expect.any(Number), suppressed_at: null };
+      expect(
+        await env.DB.prepare(
+          "SELECT delivered_at,suppressed_at FROM slack_channel_events WHERE id='surviving-event'",
+        ).first(),
+      ).toEqual(mode === "partial digest" ? delivered : null);
+    },
+  );
+
+  it.each(["immediate", "digest"] as const)(
+    "does not dispatch %s work after losing its claim during refresh",
+    async (cadence) => {
+      const fixture = await legacyChannelFixture(cadence);
+      await env.DB.prepare("UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?")
+        .bind(await encryptSlackToken(fixture.bindings, "xoxr-old"))
+        .run();
+      const posts = vi.fn();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          if (String(input).includes("oauth.v2.access")) {
+            await env.DB.prepare(
+              "UPDATE slack_channel_events SET claim_token='competitor',claimed_at=? WHERE id='actor-event'",
+            )
+              .bind(Date.now())
+              .run();
+            return Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: 3600 });
+          }
+          posts();
+          return Response.json({ ok: true, ts: "1700000000.000001" });
+        }),
+      );
+      if (cadence === "immediate") await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+      else await sendDueSlackChannelDigests(fixture.bindings, Date.UTC(2026, 9, 4, 10));
+      expect(posts).not.toHaveBeenCalled();
+      expect(
+        await env.DB.prepare(
+          "SELECT claim_token,delivered_at,suppressed_at FROM slack_channel_events WHERE id='actor-event'",
+        ).first(),
+      ).toEqual({ claim_token: "competitor", delivered_at: null, suppressed_at: null });
+    },
+  );
+
+  it.each(["immediate", "digest"] as const)(
+    "releases %s claims after a dispatch authorization query fails",
+    async (cadence) => {
+      const fixture = await legacyChannelFixture(cadence);
+      const db = new Proxy(env.DB, {
+        get(target, key) {
+          if (key === "prepare")
+            return (sql: string) => {
+              if (sql.trimStart().startsWith("SELECT event.id FROM slack_channel_events event"))
+                throw new Error("authorization database unavailable");
+              return target.prepare(sql);
+            };
+          const value: unknown = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const remote = vi.fn();
+      vi.stubGlobal("fetch", remote);
+      const delivery =
+        cadence === "immediate"
+          ? deliverSlackChannelEvent({ ...fixture.bindings, DB: db }, "actor-event")
+          : sendDueSlackChannelDigests({ ...fixture.bindings, DB: db }, Date.UTC(2026, 9, 4, 10));
+      const error = await delivery.then(
+        () => "",
+        (cause: Error) => cause.message,
+      );
+      expect(error).toBe(cadence === "immediate" ? "authorization database unavailable" : "");
+      expect(remote).not.toHaveBeenCalled();
+      expect(
+        await env.DB.prepare(
+          "SELECT claim_token,claimed_at,delivered_at,suppressed_at FROM slack_channel_events WHERE id='actor-event'",
+        ).first(),
+      ).toEqual({ claim_token: null, claimed_at: null, delivered_at: null, suppressed_at: null });
+    },
+  );
+
   it("suppresses an actor in account recovery", async () => {
     const fixture = await legacyChannelFixture("immediate");
     await env.DB.prepare("UPDATE account_security SET recovery_required=1 WHERE user_id=?")
@@ -207,9 +338,11 @@ describe("legacy channel event settlement", () => {
       .run();
     await env.DB.prepare(
       mode === "other claim"
-        ? "UPDATE slack_channel_events SET claim_token='other',claimed_at=1 WHERE id='actor-event'"
-        : "UPDATE slack_channel_events SET delivered_at=1 WHERE id='actor-event'",
-    ).run();
+        ? "UPDATE slack_channel_events SET claim_token='other',claimed_at=? WHERE id='actor-event'"
+        : "UPDATE slack_channel_events SET delivered_at=? WHERE id='actor-event'",
+    )
+      .bind(Date.now())
+      .run();
     const before = await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first();
     await deliverSlackChannelEvent(fixture.bindings, "actor-event");
     expect(await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first()).toEqual(before);
