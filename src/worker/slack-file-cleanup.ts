@@ -29,7 +29,7 @@ const LEASE_MS = 60_000;
 export async function slackFileCleanupHealth(env: Env, workspaceId: string): Promise<SlackCleanupHealth> {
   const rows =
     await env.DB.prepare(`SELECT state,coalesce(last_error,'cleanup_credentials_unavailable') reason,count(*) count
-    FROM slack_file_cleanup_jobs WHERE workspace_id=? AND state IN ('pending','paused','failed') GROUP BY state,last_error`)
+    FROM slack_file_cleanup_jobs WHERE workspace_id=? AND state IN ('pending','paused','failed') GROUP BY state,coalesce(last_error,'cleanup_credentials_unavailable')`)
       .bind(workspaceId)
       .all<{ state: "pending" | "paused" | "failed"; reason: string; count: number }>();
   const health: SlackCleanupHealth = { pending: 0, paused: 0, failed: 0, pausedByReason: [] };
@@ -132,12 +132,7 @@ export async function processSlackFileCleanup(env: Env, id: string) {
         await save("completed", null);
         return false;
       }
-      const code =
-        error instanceof SlackApiError
-          ? error.code
-          : error instanceof SlackRateLimitError
-            ? "rate_limited"
-            : "cleanup_delete_unconfirmed";
+      const code = error instanceof SlackApiError ? error.code : "cleanup_delete_unconfirmed";
       const authError = error instanceof SlackApiError && slackInstallationError(error);
       const pause =
         error instanceof SlackApiError &&
@@ -149,12 +144,7 @@ export async function processSlackFileCleanup(env: Env, id: string) {
       )
         await save("failed", code);
       else if (pause) await save("paused", code);
-      else
-        await save(
-          "pending",
-          code,
-          Math.max(Date.now() + RETRY_MS, error instanceof SlackRateLimitError ? error.retryAt : 0),
-        );
+      else await save("pending", code, Date.now() + RETRY_MS);
       return false;
     }
     return false;

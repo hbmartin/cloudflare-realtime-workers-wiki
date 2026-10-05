@@ -92,6 +92,13 @@ describe("SlackSettings", () => {
   });
   it.each([
     ["slack_team_mismatch", "Use an account from the connected Slack workspace."],
+    ["slack_member_removed", "Use an active member account from the connected Slack workspace."],
+    ["slack_bot_forbidden", "Use your personal Slack member account, rather than a bot account."],
+    ["slack_guest_forbidden", "Use a full member account from the connected Slack workspace."],
+    ["slack_external_forbidden", "Use a member account from the connected Slack workspace, rather than Slack Connect."],
+    ["__proto__", "Slack authorization could not be completed."],
+    ["constructor", "Slack authorization could not be completed."],
+    ["unknown_error", "Slack authorization could not be completed."],
     [
       "slack_scope_missing",
       "Ask the workspace owner to reauthorize Slack with users:read, then connect your identity again.",
@@ -101,6 +108,23 @@ describe("SlackSettings", () => {
     vi.mocked(api).mockResolvedValue({ available: true, installation: null, linked: false });
     render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
     expect(await screen.findByText(message)).toBeInTheDocument();
+  });
+
+  it.each([false, true])("describes legacy delivery with authorization %s", async (accessAuthorized) => {
+    vi.mocked(api).mockResolvedValue({
+      available: true,
+      installation: { connected: true, teamName: "Slack" },
+      identity: { state: "legacy", accessAuthorized, reauthorizationRequired: !accessAuthorized },
+      linked: true,
+    });
+    render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
+    expect(
+      await screen.findByText(
+        accessAuthorized
+          ? "Your legacy Slack delivery link is active. Verify it to enable Slack sign-in."
+          : "Your legacy Slack delivery is paused. Verify account protection and relink Slack to resume delivery.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("shows paused cleanup remediation and disconnects access separately from sign-in", async () => {
@@ -319,7 +343,7 @@ describe("SlackSettings", () => {
             },
           },
           linked: true,
-          identity: { state: "legacy", slackUserId: "U123", verifiedAt: null },
+          identity: { state: "legacy", slackUserId: "U123", verifiedAt: null, accessAuthorized: true },
           reauthorization: { required: true, available: true },
         };
       }
@@ -327,7 +351,7 @@ describe("SlackSettings", () => {
       throw new Error(`Unexpected request: ${path}`);
     });
     render(<SlackSettings owner spaces={[space]} pages={[page]} />);
-    expect(await screen.findByText(/legacy Slack delivery link still works/)).toBeInTheDocument();
+    expect(await screen.findByText(/legacy Slack delivery link is active/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Verify Slack identity" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Reauthorize Slack" })).toBeInTheDocument();
     expect(screen.getByText("Missing: chat:write")).toBeInTheDocument();

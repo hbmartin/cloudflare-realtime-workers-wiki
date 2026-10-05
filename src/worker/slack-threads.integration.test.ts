@@ -412,7 +412,7 @@ beforeEach(async () => {
       `INSERT INTO account (id,accountId,providerId,userId,createdAt,updatedAt) VALUES ('owner-account','T123:UOWNER','slack','owner',1,1), ('viewer-account','T123:UVIEWER','slack','viewer',1,1)`,
     ),
     env.DB.prepare(
-      `INSERT INTO slack_user_links (installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,verified_at,migration_state,security_generation) VALUES ('installation','owner','UOWNER',1,'owner-account','slack_openid',1,'verified',0), ('installation','viewer','UVIEWER',1,'viewer-account','slack_openid',1,'verified',0)`,
+      `INSERT INTO slack_user_links (installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,verified_at,migration_state,security_generation,authorization_started_at) VALUES ('installation','owner','UOWNER',1,'owner-account','slack_openid',1,'verified',0,1), ('installation','viewer','UVIEWER',1,'viewer-account','slack_openid',1,'verified',0,1)`,
     ),
   ]);
   await protectSlackFixtureUsers(["owner", "viewer"]);
@@ -1763,6 +1763,92 @@ describe("interactive Slack workspace", () => {
     });
     expect(calls.filter((c) => c.method === "views.publish")).toHaveLength(0);
   });
+
+  it.each(["after private reads", "during token refresh", "before hash retry", "allowed hash retry"])(
+    "rechecks Home navigation authorization %s",
+    async (mode) => {
+      const now = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      await env.DB.prepare(`INSERT INTO member_mentions(workspace_id,source_page_id,target_user_id,excerpt,first_seen_at,first_seen_actor_id,projection_seq)
+        VALUES('workspace','page','viewer','Private Home excerpt',?,'owner',1)`)
+        .bind(now - 1000)
+        .run();
+      await publishSlackHome(runtime(), "installation", "UVIEWER");
+      const session = (await env.DB.prepare("SELECT id,view_hash FROM slack_view_sessions WHERE kind='home'").first<{
+        id: string;
+        view_hash: string;
+      }>())!;
+      await env.DB.prepare("UPDATE slack_view_sessions SET state_json=? WHERE id=?")
+        .bind(JSON.stringify({ asOf: now - 1, cursors: [null, null], page: 1 }), session.id)
+        .run();
+      await acceptSlackWorkspaceInteraction(runtime(), {
+        type: "block_actions",
+        team: { id: "T123" },
+        user: { id: "UVIEWER" },
+        view: { id: "VHOME", hash: session.view_hash, private_metadata: session.id },
+        actions: [{ action_id: "noteflare_home_previous", action_ts: "1700000901.000001", value: session.id }],
+      });
+      const receipt = (await env.DB.prepare(
+        "SELECT id FROM slack_interaction_receipts WHERE callback_id='noteflare_home_previous'",
+      ).first<{ id: string }>())!;
+      calls = [];
+      if (mode.includes("hash retry")) homeHash = "a-newer-slack-hash";
+      if (mode === "during token refresh")
+        await env.DB.prepare(
+          "UPDATE slack_installations SET token_expires_at=?,bot_refresh_token_ciphertext=? WHERE id='installation'",
+        )
+          .bind(now + 61_000, await encryptSlackToken(runtime(), "xoxr-old"))
+          .run();
+      vi.mocked(fetch).mockImplementation(async (input, init) => {
+        if (String(input).endsWith("/oauth.v2.access")) {
+          await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='viewer'").run();
+          return Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: 3600 });
+        }
+        const response = await mockSlack(input, init);
+        if (mode === "before hash retry" && String(input).endsWith("/views.publish"))
+          await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='viewer'").run();
+        return response;
+      });
+      const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+        new Proxy(statement, {
+          get(target, key) {
+            if (key === "bind") return (...args: unknown[]) => wrap(target.bind(...args));
+            if (key === "run")
+              return async () => {
+                const result = await target.run();
+                if (mode === "after private reads")
+                  await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='viewer'").run();
+                if (mode === "during token refresh") clock.mockReturnValue(now + 2000);
+                return result;
+              };
+            const value: unknown = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+      const db = new Proxy(env.DB, {
+        get(target, key) {
+          if (key === "prepare")
+            return (sql: string) =>
+              sql.includes("UPDATE slack_view_sessions SET pending_state_json")
+                ? wrap(target.prepare(sql))
+                : target.prepare(sql);
+          const value: unknown = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      await deliverSlackWorkspaceAction({ ...runtime(), DB: db }, receipt.id);
+      const publishes = calls.filter((call) => call.method === "views.publish");
+      expect(publishes).toHaveLength(mode === "allowed hash retry" ? 2 : mode === "before hash retry" ? 1 : 0);
+      expect(
+        await env.DB.prepare("SELECT outcome FROM slack_interaction_receipts WHERE id=?").bind(receipt.id).first(),
+      ).toEqual({ outcome: mode === "allowed hash retry" ? "accepted" : "denied" });
+      expect(
+        await env.DB.prepare("SELECT json_extract(state_json,'$.page') page FROM slack_view_sessions WHERE id=?")
+          .bind(session.id)
+          .first(),
+      ).toEqual({ page: mode === "allowed hash retry" ? 0 : 1 });
+    },
+  );
 
   it("retries a transient identity lookup instead of publishing an unavailable Home", async () => {
     userFailure = "transient";

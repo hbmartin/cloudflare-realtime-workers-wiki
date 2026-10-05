@@ -166,12 +166,22 @@ export async function recordSlackInstallationError(
   installationId: string,
   error: SlackApiError,
   generation?: number,
+  condition?: { sql: string; binds: (string | number | null)[] },
 ) {
   const result = await env.DB.prepare(
     `UPDATE slack_installations SET auth_error=?, auth_error_at=COALESCE(auth_error_at,?)
-      WHERE id=? AND disconnected_at IS NULL AND credential_revision=? AND (? IS NULL OR generation=?)`,
+      WHERE id=? AND disconnected_at IS NULL AND credential_revision=? AND (? IS NULL OR generation=?)
+        ${condition ? `AND (${condition.sql})` : ""}`,
   )
-    .bind(error.code, Date.now(), installationId, error.credentialRevision, generation ?? null, generation ?? null)
+    .bind(
+      error.code,
+      Date.now(),
+      installationId,
+      error.credentialRevision,
+      generation ?? null,
+      generation ?? null,
+      ...(condition?.binds ?? []),
+    )
     .run();
   return result.meta.changes > 0;
 }
@@ -1817,11 +1827,17 @@ export async function consumeSlackLink(env: Env, member: MemberContext, rawToken
             AND link.slack_user_id <> ?) AND ${guard.sql}`,
     ).bind(timestamp, tokenHash, timestamp, row.installation_id, member.user.id, row.slack_user_id, ...guard.binds),
     env.DB.prepare(
-      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation,installation_generation)
-       SELECT ?, ?, ?, ?,?,?
+      `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation,installation_generation,authorization_started_at)
+       SELECT ?, ?, ?, ?,?,?,?
        WHERE EXISTS (SELECT 1 FROM slack_link_tokens WHERE token_hash = ? AND used_at = ?)
          AND ${guard.sql} AND EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)
        ON CONFLICT(installation_id, user_id) DO UPDATE SET
+         authorization_started_at=CASE WHEN slack_user_links.slack_user_id=excluded.slack_user_id
+           AND slack_user_links.installation_generation=excluded.installation_generation
+           AND slack_user_links.security_generation=excluded.security_generation
+           AND EXISTS(SELECT 1 FROM slack_authorized_user_links authorized
+             WHERE authorized.installation_id=slack_user_links.installation_id AND authorized.user_id=slack_user_links.user_id)
+           THEN slack_user_links.authorization_started_at ELSE excluded.authorization_started_at END,
          slack_user_id = excluded.slack_user_id, linked_at = excluded.linked_at,
          security_generation=excluded.security_generation,installation_generation=excluded.installation_generation
        WHERE slack_user_links.migration_state <> 'verified'
@@ -1833,6 +1849,7 @@ export async function consumeSlackLink(env: Env, member: MemberContext, rawToken
       timestamp,
       authorization.generation,
       row.generation,
+      timestamp,
       tokenHash,
       timestamp,
       ...guard.binds,
@@ -2077,12 +2094,40 @@ export const channelActivityActorAccessSql = channelActorAccessSql.replace(
     OR (event.event_type IN ('page_created','page_edit','page_moved','page_archived','task_status_changed') AND bot.read_content=1 AND (bot.insert_content=1 OR bot.update_content=1)))`,
 );
 
+async function suppressDeniedLegacyChannelEvents(
+  env: Env,
+  ids: readonly string[] | null,
+  claimToken: string | null = null,
+  digestBefore?: number,
+) {
+  await env.DB.prepare(`UPDATE slack_channel_events SET suppressed_at=?,claim_token=NULL,claimed_at=NULL
+    WHERE delivered_at IS NULL AND suppressed_at IS NULL AND claim_token IS ?
+      AND id IN (SELECT event.id FROM slack_channel_events event JOIN pages page ON page.id=event.page_id
+        JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
+        WHERE NOT ${channelActorAccessSql}
+          AND (? IS NULL OR event.id IN (SELECT value FROM json_each(?)))
+          AND (? IS NULL OR (event.cadence='digest' AND event.created_at<?))
+          AND (?=0 OR subscription.round2_initialized=0))`)
+    .bind(
+      Date.now(),
+      claimToken,
+      ids ? JSON.stringify(ids) : null,
+      ids ? JSON.stringify(ids) : null,
+      digestBefore ?? null,
+      digestBefore ?? null,
+      env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0,
+    )
+    .run();
+}
+
 export async function deliverSlackChannelEvent(env: Env, eventId: string) {
+  await suppressDeniedLegacyChannelEvents(env, [eventId]);
   if (!(await channelEvent(env, eventId))) return;
   const claim = await claimSlackRows(env, "slack_channel_events", [eventId]);
   if (!claim.ids.length) return;
   const row = await channelEvent(env, eventId);
   if (!row) {
+    await suppressDeniedLegacyChannelEvents(env, [eventId], claim.token);
     await releaseSlackClaims(env, "slack_channel_events", [eventId], claim.token);
     return;
   }
@@ -2435,7 +2480,12 @@ export async function handleSlackEvent(env: Env, payload: SlackEventPayload) {
   return { ok: true };
 }
 
-async function retireSlackUnfurl(env: Env, unfurlId: string, reason: "missing_message_ts", outboxId: string) {
+async function retireSlackUnfurl(
+  env: Env,
+  unfurlId: string,
+  reason: "missing_message_ts" | "slack_identity_revoked",
+  outboxId: string,
+) {
   const timestamp = Date.now();
   await env.DB.batch([
     env.DB.prepare(
@@ -2477,13 +2527,11 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
   }
   const authorized =
     await env.DB.prepare(`SELECT 1 FROM slack_authorized_user_links link JOIN slack_unfurls unfurl ON unfurl.user_id=link.user_id AND unfurl.installation_id=link.installation_id
-    WHERE unfurl.id=? AND coalesce(link.verified_at,link.linked_at)<=unfurl.created_at`)
+    WHERE unfurl.id=? AND link.authorization_started_at<=unfurl.created_at`)
       .bind(unfurlId)
       .first();
   if (!authorized) {
-    await env.DB.prepare("UPDATE slack_unfurls SET retired_at=?,retirement_reason='slack_identity_revoked' WHERE id=?")
-      .bind(Date.now(), unfurlId)
-      .run();
+    await retireSlackUnfurl(env, unfurlId, "slack_identity_revoked", outboxId);
     return;
   }
   const stored = JSON.parse(row.unfurls_json) as Record<string, unknown>;
@@ -2564,6 +2612,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
   const date = new Date(timestamp);
   if (date.getUTCHours() < 9) return;
   const cutoff = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 9);
+  await suppressDeniedLegacyChannelEvents(env, null, null, cutoff);
   const subscriptions = await env.DB.prepare(
     `SELECT event.subscription_id, subscription.installation_id
        FROM slack_channel_events event
@@ -2629,7 +2678,12 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
         "slack_channel_events",
         events.results.map((event) => event.id),
       );
-      const claimedIds = new Set(claim.ids);
+      await suppressDeniedLegacyChannelEvents(env, claim.ids, claim.token);
+      const live = await env.DB.prepare(`SELECT id FROM slack_channel_events
+        WHERE id IN (SELECT value FROM json_each(?)) AND claim_token=? AND delivered_at IS NULL AND suppressed_at IS NULL`)
+        .bind(JSON.stringify(claim.ids), claim.token)
+        .all<{ id: string }>();
+      const claimedIds = new Set(live.results.map((event) => event.id));
       const claimed = events.results.filter((event) => claimedIds.has(event.id));
       if (!claimed.length) continue;
       const installation: SlackInstallation = { ...first, id: first.installation_id };

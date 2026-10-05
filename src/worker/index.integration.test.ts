@@ -1475,9 +1475,16 @@ describe("Worker integration", () => {
     }
   });
 
-  it.each([0, 1, 2, 3])(
-    "preserves Slack maintenance failures in logs and task state for combination %i",
-    async (combination) => {
+  it.each([false, true].flatMap((priorSuccess) => [0, 1, 2, 3].map((combination) => ({ priorSuccess, combination }))))(
+    "preserves Slack maintenance failures in logs and task state for combination $combination with prior success $priorSuccess",
+    async ({ combination, priorSuccess }) => {
+      const previousSuccess = priorSuccess ? Date.now() - 60_000 : null;
+      await env.DB.prepare("DELETE FROM observability_task_runs WHERE task_name='slack_redrive'").run();
+      if (previousSuccess !== null)
+        await env.DB.prepare(`INSERT INTO observability_task_runs(task_name,last_started_at,last_succeeded_at,first_observed_at)
+          VALUES('slack_redrive',?,?,?)`)
+          .bind(previousSuccess, previousSuccess, previousSuccess)
+          .run();
       const operations = ["redrive", "file_cleanup"] as const;
       const errors = operations.map(
         (operation) =>
@@ -1521,7 +1528,8 @@ describe("Worker integration", () => {
         ).first<{ last_error: string | null; last_succeeded_at: number | null; last_failed_at: number | null }>())!;
         expect(state.last_error === null).toBe(combination === 0);
         expect(typeof state.last_failed_at === "number").toBe(combination !== 0);
-        expect(typeof state.last_succeeded_at === "number").toBe(combination === 0);
+        const successTimestamp = expect.any(Number);
+        expect(state.last_succeeded_at).toEqual(combination === 0 ? successTimestamp : previousSuccess);
         expect(state.last_error?.length ?? 0).toBeLessThanOrEqual(PERSISTED_ERROR_MESSAGE_LIMIT);
         for (const operation of operations.filter((_, index) => combination & (1 << index))) {
           expect(state.last_error).toContain(`${operation}:`);
@@ -2978,6 +2986,197 @@ describe("Worker integration", () => {
       expect(next).toBeGreaterThan(events[0]!.seq);
     });
   });
+
+  it.each(["identical", "conflicting hash", "date token", "block limit", "byte limit"])(
+    "rechecks document mutation state after concurrent authorization: %s",
+    async (mode) => {
+      const installed = await bootstrap();
+      const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+      await stub.fetch(internalWarmupRequest());
+      await runInDurableObject(stub, async (instance) => {
+        const document = instance as unknown as TestDocument;
+        const count = mode === "block limit" ? 9999 : 1;
+        installDocumentBlocks(
+          document.document,
+          ...Array.from({ length: count }, (_, n) => documentBlock(`existing-${n}`, "Before").container),
+        );
+        if (mode === "byte limit") {
+          const size = Y.encodeStateAsUpdate(document.document).byteLength;
+          document.document.getMap("test-padding").set("padding", "x".repeat(24 * 1024 * 1024 - size - 1600));
+        }
+        let release!: () => void, entered!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        const ready = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        let reads = 0;
+        const original = document.bindings.DB;
+        const authorized = {
+          bind() {
+            return this;
+          },
+          async first() {
+            if (++reads === 2) entered();
+            await gate;
+            return { allowed: 1 };
+          },
+        };
+        document.bindings.DB = new Proxy(original, {
+          get(target, key) {
+            if (key === "prepare")
+              return (sql: string) =>
+                sql.includes("SELECT 1 FROM slack_product_sessions") ? authorized : target.prepare(sql);
+            const value = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        const mutation = (n: number) => {
+          const same = mode === "identical";
+          const content =
+            mode === "date token"
+              ? [
+                  {
+                    type: "dateMention",
+                    attrs: {
+                      tokenId: "shared-date",
+                      revision: "rev",
+                      createdBy: installed.userId,
+                      kind: "all-day",
+                      value: "2026-10-04",
+                      timezone: "UTC",
+                    },
+                  },
+                ]
+              : [{ type: "text", text: mode === "byte limit" ? "x".repeat(1000) : `Added-${same ? 0 : n}` }];
+          return new Request("https://document.internal/api-mutate", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+            body: JSON.stringify({
+              actorId: installed.userId,
+              slackProductSessionId: "race-session",
+              operationId: same || mode === "conflicting hash" ? "same-operation" : `operation-${n}`,
+              suppressExternalEffects: true,
+              operations: [
+                {
+                  type: "append_children",
+                  children: [
+                    {
+                      type: "blockContainer",
+                      attrs: { id: `new-${same ? 0 : n}` },
+                      content: [{ type: "paragraph", content }],
+                    },
+                  ],
+                },
+              ],
+            }),
+          });
+        };
+        try {
+          const first = document.onRequest(mutation(0));
+          const second = document.onRequest(mutation(1));
+          await ready;
+          release();
+          const responses = await Promise.all([first, second]);
+          expect(responses.map((response) => response.status).sort((a, b) => a - b)).toEqual(
+            mode === "identical"
+              ? [200, 200]
+              : mode === "block limit" || mode === "byte limit"
+                ? [200, 413]
+                : [200, 409],
+          );
+          const group = document.document.getXmlFragment("document-store").get(0) as Y.XmlElement;
+          expect(group.length).toBe(count + 1);
+          expect(document.document.getMap("api-operation-receipts").size).toBe(1);
+        } finally {
+          release();
+          document.bindings.DB = original;
+        }
+      });
+    },
+    60_000,
+  );
+
+  it.each([
+    { role: "owner", visibility: "workspace", spaceRole: "viewer", allowed: true },
+    { role: "editor", visibility: "workspace", spaceRole: "viewer", allowed: false },
+    { role: "editor", visibility: "workspace", spaceRole: null, allowed: true },
+    { role: "editor", visibility: "workspace", spaceRole: "editor", allowed: true },
+    { role: "editor", visibility: "private", spaceRole: "editor", allowed: true },
+    { role: "editor", visibility: "private", spaceRole: "viewer", allowed: false },
+    { role: "editor", visibility: "private", spaceRole: null, allowed: false },
+    { role: "viewer", visibility: "workspace", spaceRole: "editor", allowed: false },
+  ])(
+    "checks Slack document writes for $role in $visibility space with role $spaceRole",
+    async ({ role, visibility, spaceRole, allowed }) => {
+      const installed = await bootstrap();
+      const { space_id: spaceId } = (await env.DB.prepare("SELECT space_id FROM pages WHERE id=?")
+        .bind(installed.pageId)
+        .first<{ space_id: string }>())!;
+      await env.DB.batch([
+        env.DB.prepare(`INSERT INTO user(id,name,email,createdAt,updatedAt)
+          VALUES('mutation-admin','Other owner','mutation-admin@example.test',1,1)`),
+        env.DB.prepare(`INSERT INTO workspace_members(workspace_id,user_id,role,created_at)
+          VALUES(?,'mutation-admin','owner',1)`).bind(installed.workspaceId),
+        env.DB.prepare("UPDATE workspace_members SET role=? WHERE user_id=?").bind(role, installed.userId),
+        env.DB.prepare("UPDATE spaces SET visibility=? WHERE id=?").bind(visibility, spaceId),
+        env.DB.prepare("DELETE FROM space_members WHERE space_id=? AND user_id=?").bind(spaceId, installed.userId),
+        env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at,generation)
+        VALUES('mutation-installation',?,'TMUTATION','Slack','UBOT','unused','users:read',?,1,1,0)`).bind(
+          installed.workspaceId,
+          installed.userId,
+        ),
+        env.DB.prepare(`INSERT INTO account(id,accountId,providerId,userId,createdAt,updatedAt)
+        VALUES('mutation-account','TMUTATION:UMUTATION','slack',?,1,1)`).bind(installed.userId),
+        env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,verified_at,migration_state,installation_generation,security_generation)
+        SELECT 'mutation-installation',user_id,'UMUTATION',1,'mutation-account','slack_openid',1,'verified',0,generation FROM account_security WHERE user_id=?`).bind(
+          installed.userId,
+        ),
+        env.DB.prepare(`INSERT INTO slack_product_sessions(id,installation_id,generation,slack_user_id,identity_json,state_json,result_page_id,created_at)
+        VALUES('mutation-session','mutation-installation',0,'UMUTATION',?,'{}',?,1)`).bind(
+          JSON.stringify({ userId: installed.userId, accountId: "mutation-account", verifiedAt: 1 }),
+          installed.pageId,
+        ),
+      ]);
+      if (spaceRole)
+        await env.DB.prepare("INSERT INTO space_members(space_id,user_id,role,created_at) VALUES(?,?,?,1)")
+          .bind(spaceId, installed.userId, spaceRole)
+          .run();
+      const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+      await stub.fetch(internalWarmupRequest());
+      await runInDurableObject(stub, async (instance) => {
+        const document = instance as unknown as TestDocument;
+        installDocumentBlocks(document.document, documentBlock("slack-block", "Before").container);
+        const before = Y.encodeStateAsUpdate(document.document);
+        const response = await document.onRequest(
+          new Request("https://document.internal/api-mutate", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+            body: JSON.stringify({
+              actorId: installed.userId,
+              slackProductSessionId: "mutation-session",
+              operations: [
+                {
+                  type: "update_block",
+                  internalId: "slack-block",
+                  node: {
+                    type: "paragraph",
+                    attrs: { backgroundColor: "default", textColor: "default", textAlignment: "left" },
+                    content: [{ type: "text", text: "After" }],
+                  },
+                },
+              ],
+            }),
+          }),
+        );
+        expect(response.status).toBe(allowed ? 200 : 403);
+        expect(JSON.stringify(await response.json())).toContain(allowed ? "After" : "slack_identity_required");
+        const after = Y.encodeStateAsUpdate(document.document);
+        expect(after.length === before.length && after.every((byte, index) => byte === before[index])).toBe(!allowed);
+      });
+    },
+  );
 
   it("applies API block mutations without replacing unaffected shared Yjs nodes", async () => {
     const installed = await bootstrap();

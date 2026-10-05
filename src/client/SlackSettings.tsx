@@ -39,11 +39,14 @@ function initialSlackOAuthError() {
     slack_team_mismatch: "Use an account from the connected Slack workspace.",
     slack_scope_missing:
       "Ask the workspace owner to reauthorize Slack with users:read, then connect your identity again.",
-    slack_member_invalid: "Use an active, full member account from the connected Slack workspace.",
+    slack_member_removed: "Use an active member account from the connected Slack workspace.",
+    slack_bot_forbidden: "Use your personal Slack member account, rather than a bot account.",
+    slack_guest_forbidden: "Use a full member account from the connected Slack workspace.",
+    slack_external_forbidden: "Use a member account from the connected Slack workspace, rather than Slack Connect.",
     slack_link_changed: "Slack authorization changed. Verify your account protection and connect Slack again.",
   };
   const message =
-    known[oauthError.toLowerCase()] ??
+    (Object.hasOwn(known, oauthError.toLowerCase()) ? known[oauthError.toLowerCase()] : undefined) ??
     (oauthError.toLowerCase().includes("link")
       ? "Slack could not be connected to this account. Sign in normally and try again."
       : "Slack authorization could not be completed.");
@@ -369,7 +372,11 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
             {identityState === "verified" ? (
               <p>Your Slack identity is verified.</p>
             ) : identityState === "legacy" ? (
-              <p>Your legacy Slack delivery link still works. Verify it to enable Slack sign-in.</p>
+              <p>
+                {status?.identity?.accessAuthorized
+                  ? "Your legacy Slack delivery link is active. Verify it to enable Slack sign-in."
+                  : "Your legacy Slack delivery is paused. Verify account protection and relink Slack to resume delivery."}
+              </p>
             ) : (
               <p>Connect your Slack identity, or run /notes link for legacy personal delivery.</p>
             )}

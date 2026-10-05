@@ -2041,9 +2041,19 @@ export async function consumeDeliveryMessage(
     return "retried";
   }
   const outboxId = body.outboxId;
-  const row = await env.DB.prepare(`SELECT id, topic, payload_json, available_at FROM outbox WHERE id = ?`)
+  const row = await env.DB.prepare(`SELECT id, topic, payload_json, available_at,last_error,enqueued_at,
+    slack_redrive_due_at,slack_claim_recheck_at FROM outbox WHERE id = ?`)
     .bind(outboxId)
-    .first<{ id: string; topic: string; payload_json: string; available_at: number }>();
+    .first<{
+      id: string;
+      topic: string;
+      payload_json: string;
+      available_at: number;
+      last_error: string | null;
+      enqueued_at: number | null;
+      slack_redrive_due_at: number | null;
+      slack_claim_recheck_at: number | null;
+    }>();
   if (!row) {
     message.ack();
     return "acknowledged";
@@ -2055,6 +2065,22 @@ export async function consumeDeliveryMessage(
     return "retried";
   }
   const payload = jsonRecord(row.payload_json);
+  const retryFence = `id=? AND available_at=? AND enqueued_at IS ? AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ?`;
+  const retryBinds = [
+    outboxId,
+    row.available_at,
+    row.enqueued_at,
+    row.slack_redrive_due_at,
+    row.slack_claim_recheck_at,
+  ];
+  const clearValidationStale = async () => {
+    if (row.last_error !== "slack_validation_stale") return;
+    await env.DB.prepare(
+      `UPDATE outbox SET last_error=NULL WHERE ${retryFence} AND last_error='slack_validation_stale'`,
+    )
+      .bind(...retryBinds)
+      .run();
+  };
   // A payload that fails validation will never become valid, so record it and ack
   // instead of retrying. An unknown topic still throws: a rolling deploy can leave an
   // older consumer reading a topic a newer one writes, and that does resolve on retry.
@@ -2068,17 +2094,18 @@ export async function consumeDeliveryMessage(
     return "discarded";
   };
   const retainRound2 = async (status: Awaited<ReturnType<typeof round2DeliveryStatus>>) => {
+    await clearValidationStale();
     if (status.outcome === "competing") {
-      await env.DB.prepare("UPDATE outbox SET slack_claim_recheck_at=? WHERE id=?")
-        .bind(Math.max(Date.now() + 1_000, (status.claimed_at ?? Date.now()) + 60_000), outboxId)
+      await env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=? WHERE ${retryFence}`)
+        .bind(Math.max(Date.now() + 1_000, (status.claimed_at ?? Date.now()) + 60_000), ...retryBinds)
         .run();
     } else {
       await env.DB.prepare(
-        `UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=NULL WHERE id=?`,
+        `UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=NULL WHERE ${retryFence}`,
       )
         .bind(
           Date.now() + (status.outcome === "paused" || status.outcome === "uncertain" ? 30 * 60_000 : 60_000),
-          outboxId,
+          ...retryBinds,
         )
         .run();
     }
@@ -2110,9 +2137,10 @@ export async function consumeDeliveryMessage(
         .run();
       try {
         await env.DELIVERY_QUEUE.send({ outboxId }, { delaySeconds: 2 });
-        await env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?,slack_claim_recheck_at=NULL
-          WHERE id=? AND last_error='slack_validation_stale'`)
-          .bind(now, now + SLACK_REDRIVE_STALE_MS, outboxId)
+        await env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?,slack_claim_recheck_at=NULL,last_error=NULL
+          WHERE id=? AND last_error='slack_validation_stale' AND available_at=? AND slack_claim_recheck_at=?
+            AND enqueued_at IS NULL AND slack_redrive_due_at IS NULL`)
+          .bind(now, now + SLACK_REDRIVE_STALE_MS, outboxId, now + 2000, now + 2000)
           .run();
       } catch {
         // Durable claim recheck recovers an enqueue failure without queue retries.
@@ -2120,14 +2148,17 @@ export async function consumeDeliveryMessage(
       message.ack();
       return "acknowledged" as const;
     }
+    await clearValidationStale();
     if (slackMissingScope(error)) await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
     else if (error instanceof DeliveryInProgressError) {
-      await env.DB.prepare("UPDATE outbox SET slack_claim_recheck_at=? WHERE id=?")
-        .bind(Date.now() + 60_000, outboxId)
+      await env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=? WHERE ${retryFence}`)
+        .bind(Date.now() + 60_000, ...retryBinds)
         .run();
     } else if (error instanceof SlackApiError && slackInstallationError(error)) {
-      await env.DB.prepare("UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?) WHERE id=?")
-        .bind(Date.now() + 60_000, outboxId)
+      await env.DB.prepare(
+        `UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?) WHERE ${retryFence}`,
+      )
+        .bind(Date.now() + 60_000, ...retryBinds)
         .run();
     } else throw error;
     message.ack();

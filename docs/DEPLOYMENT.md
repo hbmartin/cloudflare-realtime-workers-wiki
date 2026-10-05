@@ -398,7 +398,7 @@ before making changes. Quiesce page moves or verify that the live Worker already
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
 until that manually dispatched run has deployed the new Worker.
 
-Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, or `0071_slack_authorization_cleanup.sql` also stop automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, or `0072_slack_link_authorization_started_at.sql` also stop automatic deployment.
 Follow the [Slack rollout pause](#slack-review-follow-up-migration), then manually dispatch with
 `confirm_slack_review_migration_safe` checked. The workflow passes this confirmation to the guarded
 remote migration command. Once these migrations are applied, later automatic releases need no Slack
@@ -421,7 +421,7 @@ relying on it.
 Apply additive `0069_slack_file_cleanup.sql` before deploying the Slack review follow-up. It snapshots
 allocation ownership and adds an indexed cleanup ledger plus transactional capture triggers. Additive
 `0070_slack_review_fences.sql` adds a monotonically increasing channel-validation revision.
-`0071_slack_authorization_cleanup.sql` separates primary login from private Slack access, binds access and primary proofs to protection generations, records file-scope blocks and preserves explicit allocation ownership. It keeps existing links only for accounts with an enrolled factor, saved recovery codes and no recovery in progress; their original linking authorization cannot be established. Existing transient primary proofs are cleared, and proof reads reject older writes without authenticated-source metadata. OAuth login is preserved. Do not roll back to code that allows linking without fresh verification.
+`0071_slack_authorization_cleanup.sql` separates primary login from private Slack access, binds access and primary proofs to protection generations, records file-scope blocks and preserves explicit allocation ownership. It keeps existing links only for accounts with an enrolled factor, saved recovery codes and no recovery in progress; their original linking authorization cannot be established. Existing transient primary proofs are cleared, and proof reads reject older writes without authenticated-source metadata. `0072_slack_link_authorization_started_at.sql` separates the continuous access-grant start from verification and relink timestamps, preserving eligible earlier previews through unchanged relinking or legacy verification. It backfills only known timestamps; lost historical grant times are not reconstructed. Installation disconnect/reconnect still requires explicit relinking. OAuth login is preserved. Do not roll back to code that allows linking without fresh verification.
 
 Existing failed/retired allocations are backfilled; allocations whose original Slack identity cannot be verified
 are reported for manual cleanup rather than deleted. Existing migrations remain unchanged.

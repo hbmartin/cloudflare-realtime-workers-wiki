@@ -1058,7 +1058,8 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
   if (!input.sessionId) unavailable();
   const installation = await installationFor(env, input.installationId, input.generation);
   const session = await sessionFor(env, input.sessionId, "home", installation, input.slackUserId);
-  const { member } = await verifiedMember(env, installation, input.slackUserId, input.identity);
+  const { member, identity } = await verifiedMember(env, installation, input.slackUserId, input.identity);
+  const authorize = slackAccessAuthorization(env, installation, identity);
   if (session.view_id !== input.viewId || session.view_hash !== input.viewHash) {
     await supersedeHomeAction(env, receiptId);
     return;
@@ -1142,11 +1143,20 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
   }
   let published: { view: { id: string; hash?: string } };
   try {
-    published = await slackApi(env, installation, "views.publish", {
-      user_id: input.slackUserId,
-      view,
-      ...(session.view_hash ? { hash: session.view_hash } : {}),
-    });
+    published = await slackApi(
+      env,
+      installation,
+      "views.publish",
+      {
+        user_id: input.slackUserId,
+        view,
+        ...(session.view_hash ? { hash: session.view_hash } : {}),
+      },
+      undefined,
+      undefined,
+      undefined,
+      authorize,
+    );
   } catch (error) {
     if (!(error instanceof SlackApiError && error.code === "hash_conflict")) throw error;
     const current = await env.DB.prepare(`SELECT pending_token FROM slack_view_sessions WHERE id = ?`)
@@ -1156,10 +1166,19 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
       await supersedeHomeAction(env, receiptId);
       return;
     }
-    published = await slackApi(env, installation, "views.publish", {
-      user_id: input.slackUserId,
-      view,
-    });
+    published = await slackApi(
+      env,
+      installation,
+      "views.publish",
+      {
+        user_id: input.slackUserId,
+        view,
+      },
+      undefined,
+      undefined,
+      undefined,
+      authorize,
+    );
   }
   if (!published.view.hash) throw new Error("Slack did not return the published Home hash.");
   await env.DB.batch([
