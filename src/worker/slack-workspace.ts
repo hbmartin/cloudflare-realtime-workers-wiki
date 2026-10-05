@@ -250,8 +250,7 @@ export async function openSlackSearch(
           trigger_id: triggerId,
           view: searchModal(id, state, origin(env)),
         },
-        Math.min(1_800, Math.max(1, deadlineAt - Date.now() - 150)),
-        controller.signal,
+        { timeoutMs: Math.min(1_800, Math.max(1, deadlineAt - Date.now() - 150)), signal: controller.signal },
       );
     });
     // Keep a started token rotation alive after the slash-command deadline.
@@ -755,10 +754,7 @@ async function deliverSearch(
         view,
         ...(expectedHash ? { hash: expectedHash } : {}),
       },
-      undefined,
-      undefined,
-      undefined,
-      authorize,
+      { beforeDispatch: authorize },
     );
   } catch (error) {
     if (error instanceof SlackApiError && error.code === "hash_conflict") {
@@ -944,10 +940,7 @@ export async function publishSlackHome(env: Env, installationId: string, userId:
         view,
         ...(!reset && !unavailableView && old?.view_hash ? { hash: old.view_hash } : {}),
       },
-      undefined,
-      undefined,
-      undefined,
-      authorize,
+      { beforeDispatch: authorize },
     );
     await env.DB.prepare(
       `UPDATE slack_view_sessions SET installation_generation = ?, state_json = ?, view_id = ?, view_hash = ?,
@@ -1152,10 +1145,7 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
         view,
         ...(session.view_hash ? { hash: session.view_hash } : {}),
       },
-      undefined,
-      undefined,
-      undefined,
-      authorize,
+      { beforeDispatch: authorize },
     );
   } catch (error) {
     if (!(error instanceof SlackApiError && error.code === "hash_conflict")) throw error;
@@ -1174,10 +1164,7 @@ async function deliverHomeAction(env: Env, receiptId: string, input: ActionInput
         user_id: input.slackUserId,
         view,
       },
-      undefined,
-      undefined,
-      undefined,
-      authorize,
+      { beforeDispatch: authorize },
     );
   }
   if (!published.view.hash) throw new Error("Slack did not return the published Home hash.");
@@ -1454,6 +1441,7 @@ async function deliverShareAction(
           messageTs: context.messageTs,
           pageId: context.pageId,
           shareId,
+          identity: input.identity,
           ...(context.linkId ? { linkId: context.linkId } : { referenceId: context.referenceId }),
         },
       ),
@@ -1613,98 +1601,133 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
     typeof payload.shareId !== "string"
   )
     return;
+  const storedReceipt =
+    await env.DB.prepare(`SELECT received_at,response_delivery_state,outcome FROM slack_interaction_receipts
+    WHERE id=? AND installation_id=?`)
+      .bind(payload.receiptId, payload.installationId)
+      .first<{ received_at: number; response_delivery_state: string | null; outcome: string }>();
+  if (
+    !storedReceipt ||
+    storedReceipt.outcome !== "accepted" ||
+    (storedReceipt.response_delivery_state !== null && storedReceipt.response_delivery_state !== "pending")
+  )
+    return;
+  const expected = payload.identity as Partial<NonNullable<ActionInput["identity"]>> | null;
+  if (
+    !expected ||
+    typeof expected !== "object" ||
+    typeof expected.userId !== "string" ||
+    typeof expected.accountId !== "string" ||
+    typeof expected.verifiedAt !== "number" ||
+    expected.slackUserId !== payload.userId
+  ) {
+    await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error='request_identity_unavailable'
+      WHERE id=? AND (response_delivery_state IS NULL OR response_delivery_state='pending')`)
+      .bind(payload.receiptId)
+      .run();
+    return;
+  }
+  const identity = expected as NonNullable<ActionInput["identity"]>;
   let claimed = false;
+  let dispatched = false;
+  const attemptedAt = Date.now();
   try {
     const installation = await installationFor(env, payload.installationId, payload.generation);
-    const { member, identity } = await verifiedMember(env, installation, payload.userId);
-    const authorize = slackAccessAuthorization(env, installation, identity);
-    if (member.role !== "owner") unavailable();
+    await verifiedMember(env, installation, payload.userId, identity);
     await validateChannel(env, installation, payload.channelId);
     await requireChannelMember(env, installation, payload.channelId, payload.userId);
-    const page = await pageForMember(env, member, payload.pageId);
-    const mapping = await env.DB.prepare(
-      `SELECT id FROM slack_channel_subscriptions WHERE installation_id = ? AND channel_id = ?
-        AND space_id = ? AND (page_id IS NULL OR page_id = ?) AND validation_state = 'valid' LIMIT 1`,
-    )
-      .bind(installation.id, payload.channelId, page.space_id, page.id)
-      .first();
-    if (!mapping) unavailable();
-    if (typeof payload.linkId === "string") {
-      const link = await env.DB.prepare(
-        `SELECT 1 FROM slack_thread_links WHERE id = ? AND installation_id = ? AND installation_generation = ?
-          AND page_id = ? AND channel_id = ? AND root_message_ts = ? AND state = 'active'`,
-      )
-        .bind(payload.linkId, installation.id, installation.generation, page.id, payload.channelId, payload.messageTs)
-        .first();
-      if (!link) unavailable();
-    } else if (typeof payload.referenceId === "string") {
-      const reference = await env.DB.prepare(
-        `SELECT 1 FROM slack_share_references WHERE id = ? AND installation_id = ? AND installation_generation = ?
-          AND page_id = ? AND channel_id = ? AND message_ts = ? AND state <> 'retired'`,
-      )
+    const authorizedShare = async () => {
+      const row = await env.DB.prepare(`SELECT share.url_key FROM share_links share
+        JOIN pages page ON page.id=share.root_page_id AND page.workspace_id=share.workspace_id
+        JOIN slack_installations installation ON installation.workspace_id=page.workspace_id
+        JOIN slack_authorized_user_links link ON link.installation_id=installation.id
+        JOIN workspace_members member ON member.workspace_id=page.workspace_id AND member.user_id=link.user_id
+        WHERE installation.id=? AND installation.generation=? AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
+          AND link.installation_generation=? AND link.user_id=? AND link.slack_user_id=?
+          AND link.better_auth_account_id=? AND link.verified_at=? AND link.migration_state='verified'
+          AND link.verification_method='slack_openid' AND link.authorization_started_at<=?
+          AND member.role='owner' AND page.id=? AND page.archived_at IS NULL AND page.import_job_id IS NULL AND page.is_template=0
+          AND share.id=? AND share.revoked_at IS NULL
+          AND EXISTS(SELECT 1 FROM slack_channel_subscriptions mapping WHERE mapping.installation_id=installation.id
+            AND mapping.channel_id=? AND mapping.space_id=page.space_id AND (mapping.page_id IS NULL OR mapping.page_id=page.id)
+            AND mapping.validation_state='valid')
+          AND (EXISTS(SELECT 1 FROM slack_thread_links thread WHERE thread.id=? AND thread.installation_id=installation.id
+            AND thread.installation_generation=installation.generation AND thread.page_id=page.id AND thread.channel_id=?
+            AND thread.root_message_ts=? AND thread.state='active'
+            AND EXISTS(SELECT 1 FROM slack_channel_subscriptions mapping WHERE mapping.id=thread.subscription_id
+              AND mapping.installation_id=installation.id AND mapping.channel_id=thread.channel_id AND mapping.space_id=page.space_id
+              AND (mapping.page_id IS NULL OR mapping.page_id=page.id) AND mapping.mirror_enabled=1 AND mapping.validation_state='valid'))
+            OR EXISTS(SELECT 1 FROM slack_share_references reference WHERE reference.id=? AND reference.installation_id=installation.id
+              AND reference.installation_generation=installation.generation AND reference.page_id=page.id
+              AND reference.channel_id=? AND reference.message_ts=? AND reference.state<>'retired'))
+          AND EXISTS(SELECT 1 FROM slack_interaction_receipts receipt WHERE receipt.id=? AND receipt.outcome='accepted'
+            AND (?=0 OR (receipt.response_delivery_state='sending' AND receipt.response_delivery_attempted_at=?)))`)
         .bind(
-          payload.referenceId,
           installation.id,
           installation.generation,
-          page.id,
+          installation.generation,
+          identity.userId,
+          identity.slackUserId,
+          identity.accountId,
+          identity.verifiedAt,
+          storedReceipt.received_at,
+          payload.pageId,
+          payload.shareId,
+          payload.channelId,
+          payload.linkId ?? null,
           payload.channelId,
           payload.messageTs,
+          payload.referenceId ?? null,
+          payload.channelId,
+          payload.messageTs,
+          payload.receiptId,
+          claimed ? 1 : 0,
+          attemptedAt,
         )
-        .first();
-      if (!reference) unavailable();
-    } else unavailable();
-    const share = await getShare(env, member, payload.pageId, origin(env));
-    if (!share || share.id !== payload.shareId) unavailable();
-    // Token refresh happens before the attempt claim, so its failures remain safe to retry.
-    await usableBotToken(env, installation);
-    // A second consumer cannot repost an uncertain ephemeral send.
-    const receipt = await env.DB.prepare(
-      `UPDATE slack_interaction_receipts SET response_delivery_state = 'sending',
-         response_delivery_attempted_at = ?, response_delivery_error = NULL WHERE id = ? AND outcome = 'accepted'
-         AND denial_sent_at IS NULL AND (response_delivery_state IS NULL OR response_delivery_state = 'pending')`,
-    )
-      .bind(Date.now(), payload.receiptId)
+        .first<{ url_key: string }>();
+      if (!row) unavailable();
+      return {
+        channel: payload.channelId as string,
+        user: payload.userId as string,
+        text: `Public share: ${origin(env)}/share/${row.url_key}`,
+      };
+    };
+    const sharePayload = await authorizedShare();
+    const receipt = await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='sending',
+      response_delivery_attempted_at=?,response_delivery_error=NULL WHERE id=? AND outcome='accepted'
+      AND denial_sent_at IS NULL AND (response_delivery_state IS NULL OR response_delivery_state='pending')`)
+      .bind(attemptedAt, payload.receiptId)
       .run();
     if (!receipt.meta.changes) return;
     claimed = true;
-    await slackApi(
-      env,
-      installation,
-      "chat.postEphemeral",
-      {
-        channel: payload.channelId,
-        user: payload.userId,
-        text: `Public share: ${share.url}`,
+    await slackApi(env, installation, "chat.postEphemeral", sharePayload, {
+      beforeDispatch: authorizedShare,
+      onDispatch: () => {
+        dispatched = true;
       },
-      undefined,
-      undefined,
-      undefined,
-      authorize,
-    );
-    await env.DB.prepare(
-      `UPDATE slack_interaction_receipts SET response_delivery_state = 'sent', denial_sent_at = ?
-        WHERE id = ? AND response_delivery_state = 'sending'`,
-    )
-      .bind(Date.now(), payload.receiptId)
+    });
+    await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='sent',denial_sent_at=?
+      WHERE id=? AND response_delivery_state='sending' AND response_delivery_attempted_at=?`)
+      .bind(Date.now(), payload.receiptId, attemptedAt)
       .run();
   } catch (error) {
-    if (!claimed && error instanceof SlackApiError && slackInstallationError(error)) {
-      await recordSlackInstallationError(env, payload.installationId, error);
+    if (error instanceof SlackApiError && slackInstallationError(error))
+      await recordSlackInstallationError(env, payload.installationId, error, payload.generation);
+    if (
+      error instanceof SlackRateLimitError ||
+      (!dispatched && (!deniedError(error) || slackInstallationError(error)))
+    ) {
+      if (claimed)
+        await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='pending'
+        WHERE id=? AND response_delivery_state='sending' AND response_delivery_attempted_at=?`)
+          .bind(payload.receiptId, attemptedAt)
+          .run();
       throw error;
     }
-    if (error instanceof SlackRateLimitError) {
-      await env.DB.prepare(
-        `UPDATE slack_interaction_receipts SET response_delivery_state = 'pending' WHERE id = ? AND response_delivery_state = 'sending'`,
-      )
-        .bind(payload.receiptId)
-        .run();
-      throw error;
-    }
-    if (claimed || deniedError(error)) {
-      await env.DB.prepare(
-        `UPDATE slack_interaction_receipts SET response_delivery_state = 'blocked', response_delivery_error = ?
-          WHERE id = ? AND (response_delivery_state = 'sending' OR response_delivery_state = 'pending')`,
-      )
+    if (dispatched || deniedError(error)) {
+      await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error=?
+        WHERE id=? AND ((?=1 AND response_delivery_state='sending' AND response_delivery_attempted_at=?)
+          OR (?=0 AND (response_delivery_state IS NULL OR response_delivery_state='pending')))`)
         .bind(
           error instanceof SlackApiError
             ? error.code
@@ -1712,6 +1735,9 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
               ? "permission_unavailable"
               : "send_unconfirmed",
           payload.receiptId,
+          claimed ? 1 : 0,
+          attemptedAt,
+          claimed ? 1 : 0,
         )
         .run();
       return;

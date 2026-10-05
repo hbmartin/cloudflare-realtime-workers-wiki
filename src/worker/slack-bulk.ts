@@ -3,6 +3,7 @@ import { DeliveryInProgressError } from "./notifications";
 import { round2Installation, validateMapping } from "./slack-channels";
 import { reconcileBotPost } from "./slack-digests";
 import {
+  SlackDispatchSkippedError,
   definiteSlackRejection,
   invalidSlackDestination,
   recordDeliveryError,
@@ -66,58 +67,122 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
           .run();
       return;
     }
-    const loadEvents = () =>
-      env.DB.prepare(`SELECT e.id,e.page_id,m.id mapping_id FROM slack_channel_events e
+    const pausedSql = `SELECT 1 FROM slack_channel_events event
+      JOIN slack_channel_subscriptions m ON m.id=event.subscription_id JOIN slack_installations i ON i.id=m.installation_id
+      WHERE event.summary_id=? AND i.id=? AND i.generation=? AND i.disconnected_at IS NULL AND m.channel_id=?
+        AND (i.auth_error IS NOT NULL OR m.notification_blocked_at IS NOT NULL OR m.muted_at IS NOT NULL OR coalesce(m.snoozed_until,0)>?)`;
+    const pauseBinds = () => [id, installation.id, installation.generation, row!.channel_id, Date.now()];
+    const paused = () =>
+      env.DB.prepare(pausedSql)
+        .bind(...pauseBinds())
+        .first();
+    const loadEvents = (expectedState = "pending") =>
+      env.DB.prepare(`SELECT e.id,e.page_id,m.id mapping_id,EXISTS(${pausedSql}) paused FROM slack_channel_events e
       JOIN slack_channel_subscriptions m ON m.id=e.subscription_id JOIN pages page ON page.id=e.page_id
-      WHERE e.summary_id=? AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
+      JOIN slack_installations installation ON installation.id=m.installation_id
+      WHERE e.summary_id=? AND EXISTS(SELECT 1 FROM slack_bulk_receipts receipt WHERE receipt.id=e.summary_id AND receipt.claim_token=? AND receipt.state=? AND receipt.installation_generation=? AND receipt.installation_id=installation.id AND receipt.channel_id=? AND receipt.event_type=?) AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
+      AND installation.generation=? AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
       AND m.installation_id=? AND m.channel_id=? AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=?
       AND m.notification_blocked_at IS NULL AND page.import_job_id IS NULL AND page.is_template=0
       AND EXISTS(SELECT 1 FROM workspace_members w WHERE w.workspace_id=? AND w.user_id=m.created_by AND w.role='owner')
       AND (${channelActivityActorAccessSql.replaceAll("event.", "e.")} OR page.archived_at IS NOT NULL OR page.space_id<>m.space_id)
-      AND EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type)`)
-        .bind(id, installation.id, row!.channel_id, Date.now(), installation.workspace_id)
-        .all<{ id: string; page_id: string; mapping_id: string }>();
+      AND m.validation_state='valid' AND EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type) ORDER BY e.id`)
+        .bind(
+          ...pauseBinds(),
+          id,
+          token,
+          expectedState,
+          installation.generation,
+          row!.channel_id,
+          row!.event_type,
+          installation.generation,
+          installation.id,
+          row!.channel_id,
+          Date.now(),
+          installation.workspace_id,
+        )
+        .all<{ id: string; page_id: string; mapping_id: string; paused: number }>();
     let events = await loadEvents();
     if (!events.results.length) {
-      await finish("retired");
+      if (!(await paused())) await finish("retired");
       return;
     }
     if (!(await validateMapping(env, installation, events.results[0]!.mapping_id, row.channel_id))) return;
     events = await loadEvents();
     if (!events.results.length) {
-      await finish("retired");
+      if (!(await paused())) await finish("retired");
       return;
     }
-    const ids = JSON.stringify(events.results.map((e) => e.id));
-    const checkpoint = await env.DB.prepare(
-      `UPDATE slack_bulk_receipts SET state='sending',attempted_at=?,event_ids_json=? WHERE id=? AND state='pending' AND claim_token=?`,
-    )
-      .bind(Date.now(), ids, id, token)
-      .run();
-    if (!checkpoint.meta.changes) throw new DeliveryInProgressError();
-    const count = new Set(events.results.map((e) => e.page_id)).size;
-    const text = `${count} pages ${row.event_type === "page_archived" ? "archived" : "moved"}`;
+    let dispatched = false;
     try {
-      const posted = await slackApi(env, installation, "chat.postMessage", {
-        channel: row.channel_id,
-        text,
-        blocks: [
-          {
-            type: "section",
-            text: {
-              type: "mrkdwn",
-              verbatim: true,
-              text: `${text}\n<${new URL(env.BETTER_AUTH_URL).origin}/?view=activity|View Activity>`,
-            },
+      const posted = await slackApi(
+        env,
+        installation,
+        "chat.postMessage",
+        { channel: row.channel_id, text: "" },
+        {
+          onDispatch: () => {
+            dispatched = true;
           },
-        ],
-        metadata: { event_type: "noteflare_bulk", event_payload: { delivery_id: id } },
-        unfurl_links: false,
-        unfurl_media: false,
-      });
+          beforeDispatch: async () => {
+            events = await loadEvents();
+            if (events.results.some((event) => event.paused)) throw new SlackDispatchSkippedError();
+            if (!events.results.length) {
+              if (!(await paused())) await finish("retired");
+              throw new SlackDispatchSkippedError();
+            }
+            const ids = JSON.stringify(events.results.map((e) => e.id));
+            const [checkpoint] = await env.DB.batch([
+              env.DB.prepare(`UPDATE slack_bulk_receipts SET state='sending',attempted_at=?,event_ids_json=?
+                WHERE id=? AND state='pending' AND claim_token=?`).bind(Date.now(), ids, id, token),
+              env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
+                WHERE summary_id=? AND id NOT IN (SELECT value FROM json_each(?))
+                  AND EXISTS(SELECT 1 FROM slack_bulk_receipts WHERE id=? AND claim_token=? AND state='sending')`).bind(
+                Date.now(),
+                id,
+                ids,
+                id,
+                token,
+              ),
+            ]);
+            if (!checkpoint!.meta.changes) throw new DeliveryInProgressError();
+            const finalEvents = await loadEvents("sending");
+            if (
+              finalEvents.results.some((event) => event.paused) ||
+              JSON.stringify(finalEvents.results.map((e) => e.id)) !== ids
+            )
+              throw new DeliveryInProgressError();
+            const count = new Set(finalEvents.results.map((e) => e.page_id)).size;
+            const text = `${count} pages ${row!.event_type === "page_archived" ? "archived" : "moved"}`;
+            return {
+              channel: row!.channel_id,
+              text,
+              blocks: [
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    verbatim: true,
+                    text: `${text}\n<${new URL(env.BETTER_AUTH_URL).origin}/?view=activity|View Activity>`,
+                  },
+                },
+              ],
+              metadata: { event_type: "noteflare_bulk", event_payload: { delivery_id: id } },
+              unfurl_links: false,
+              unfurl_media: false,
+            };
+          },
+        },
+      );
       await finish("sent", posted.ts);
     } catch (error) {
-      await recordDeliveryError(env, installation, error, events.results[0]!.mapping_id, row.channel_id);
+      if (!dispatched)
+        await env.DB.prepare(`UPDATE slack_bulk_receipts SET state='pending',attempted_at=NULL
+        WHERE id=? AND claim_token=? AND state='sending'`)
+          .bind(id, token)
+          .run();
+      if (error instanceof SlackDispatchSkippedError) return;
+      await recordDeliveryError(env, installation, error, events.results[0]?.mapping_id, row.channel_id);
       if (error instanceof SlackApiError && error.code === "msg_too_long") {
         await recordPermanentDeliveryFailure(
           env,

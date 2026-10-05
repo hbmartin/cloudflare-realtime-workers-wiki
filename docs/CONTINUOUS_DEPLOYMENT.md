@@ -69,15 +69,19 @@ delivery. The confirmation is accepted only on manual dispatch and is passed as
 environment confirmation; local database migrations do not. Once 0069, 0070, 0071, 0072, and 0073 are applied, later
 automatic deployments resume without this confirmation.
 
+Slack account-link callbacks started before the authorization binding fences were deployed must be restarted from
+Settings if they captured an existing link. The callback returns `slack_link_changed` and does not write a grant.
+Permits with no existing bindings and complete current permits remain valid.
+
 ## The release gate
 
 The `gate` job must pass before the `deploy` job starts, rather than running alongside it, because
 migrations are forward-only. What it runs depends on how the workflow was triggered:
 
-| Event                      | `pnpm check` in the gate | Deployment condition                                                                                                  |
-| -------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| Completed CI run on `main` | Skipped                  | CI passed, its SHA is the current `main` tip, and migrations `0011`, `0069`, `0070`, and `0071` are not pending       |
-| `workflow_dispatch`        | Runs                     | The ref passes; pending `0011` and pending `0069`/`0070`/`0071` require their respective migration-safe confirmations |
+| Event                      | `pnpm check` in the gate | Deployment condition                                                                                                                |
+| -------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Completed CI run on `main` | Skipped                  | CI passed, its SHA is the current `main` tip, and migrations `0011`, `0069`, `0070`, `0071`, `0072`, and `0073` are not pending     |
+| `workflow_dispatch`        | Runs                     | The ref passes; pending `0011` and pending `0069`/`0070`/`0071`/`0072`/`0073` require their respective migration-safe confirmations |
 
 `.github/workflows/ci.yml` triggers on `on: push` with no branch filter, so every push to `main`
 starts CI on the same SHA. Its five jobs — static checks, unit, Worker integration, build, and the

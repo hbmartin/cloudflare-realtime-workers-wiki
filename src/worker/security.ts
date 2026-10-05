@@ -184,24 +184,39 @@ export async function freshSecurityAuthorization(
   };
 }
 
-export function freshSecurityGuard(authorization: FreshSecurityAuthorization) {
-  const now = Date.now();
+export function protectedSessionGuard(
+  authorization: { userId: string; sessionId: string; generation?: number },
+  policy: "fresh" | "active",
+  now = Date.now(),
+) {
   return {
-    sql: `? > ? AND EXISTS(SELECT 1 FROM session live JOIN session_security proof ON proof.session_id=live.id
+    sql: `EXISTS(SELECT 1 FROM session live JOIN session_security proof ON proof.session_id=live.id AND proof.user_id=live.userId
       JOIN slack_protected_accounts security ON security.user_id=live.userId AND security.generation=proof.generation
-      WHERE live.userId=? AND live.id=? AND security.generation=? AND live.expiresAt>?
-        AND proof.method IN ('totp','passkey') AND proof.expires_at>? AND proof.verified_at>?)`,
+      WHERE live.userId=? AND live.id=? ${authorization.generation === undefined ? "" : "AND security.generation=?"}
+        AND live.expiresAt>? AND proof.expires_at>?
+        ${
+          policy === "fresh"
+            ? "AND proof.method IN ('totp','passkey') AND proof.verified_at>?"
+            : `AND proof.method IN ('totp','passkey','trust')
+          AND (proof.method<>'trust' OR EXISTS(SELECT 1 FROM trusted_browsers browser
+            WHERE browser.id=proof.trust_id AND browser.user_id=live.userId
+              AND browser.generation=security.generation AND browser.expires_at>?))`
+        })`,
     binds: [
-      authorization.expiresAt,
-      now,
       authorization.userId,
       authorization.sessionId,
-      authorization.generation,
+      ...(authorization.generation === undefined ? [] : [authorization.generation]),
       new Date(now).toISOString(),
       now,
-      now - FRESH_MS,
+      policy === "fresh" ? now - FRESH_MS : now,
     ],
   };
+}
+
+export function freshSecurityGuard(authorization: FreshSecurityAuthorization) {
+  const now = Date.now();
+  const guard = protectedSessionGuard(authorization, "fresh", now);
+  return { sql: `? > ? AND ${guard.sql}`, binds: [authorization.expiresAt, now, ...guard.binds] };
 }
 
 async function identity(ctx: GenericEndpointContext): Promise<Identity | null> {

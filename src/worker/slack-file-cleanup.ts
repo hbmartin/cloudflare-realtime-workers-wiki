@@ -115,7 +115,7 @@ export async function processSlackFileCleanup(env: Env, id: string) {
       return false;
     }
     try {
-      await slackApi(env, installation, "files.delete", { file: job.file_id }, 10_000, undefined, preparedToken);
+      await slackApi(env, installation, "files.delete", { file: job.file_id }, { timeoutMs: 10_000, preparedToken });
       await save("completed", null);
     } catch (error) {
       if (error instanceof SlackRateLimitError) {

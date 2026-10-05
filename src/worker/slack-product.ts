@@ -312,10 +312,10 @@ export async function openSlackProduct(
       installation,
       "views.open",
       { trigger_id: triggerId, view },
-      Math.max(1, deadlineAt - Date.now() - 150),
-      undefined,
-      undefined,
-      slackAccessAuthorization(env, installation, identity),
+      {
+        timeoutMs: Math.max(1, deadlineAt - Date.now() - 150),
+        beforeDispatch: slackAccessAuthorization(env, installation, identity),
+      },
     );
     await env.DB.prepare("UPDATE slack_product_sessions SET view_id=? WHERE id=?").bind(result.view.id, id).run();
     return { response_type: "ephemeral", text: "" };
@@ -835,10 +835,7 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
         view_id: String(payload.view?.id),
         view: captureView(env, current.session.id, capture),
       },
-      undefined,
-      undefined,
-      undefined,
-      authorize,
+      { beforeDispatch: authorize },
     );
     return { handled: true, response: {} };
   }
@@ -864,20 +861,14 @@ async function acceptProductInteraction(env: Env, payload: SlackInteractionPaylo
             view,
             ...(typeof payload.view.hash === "string" ? { hash: payload.view.hash } : {}),
           },
-          remaining,
-          undefined,
-          undefined,
-          authorize,
+          { timeoutMs: remaining, beforeDispatch: authorize },
         )
       : await slackApi(
           env,
           installation,
           "views.open",
           { trigger_id: payload.trigger_id, view },
-          remaining,
-          undefined,
-          undefined,
-          authorize,
+          { timeoutMs: remaining, beforeDispatch: authorize },
         );
   await env.DB.prepare("UPDATE slack_product_sessions SET view_id=? WHERE id=?").bind(opened.view.id, id).run();
   return { handled: true, response: {} };
@@ -890,6 +881,32 @@ async function copySlackProductContent(env: Env, sessionId: string) {
   if (!session?.result_page_id) return;
   const state = JSON.parse(session.state_json) as State;
   if (state.copied) return;
+  const operationId = `slack-${session.id}`;
+  const destinationEpoch = await env.DB.prepare("SELECT content_epoch FROM pages WHERE id=?")
+    .bind(session.result_page_id)
+    .first<{ content_epoch: number }>();
+  if (!destinationEpoch) throw new HttpError(404, "page_not_found", "The destination no longer exists.");
+  const room = env.DOCUMENT.getByName(`${session.result_page_id}~${destinationEpoch.content_epoch}`);
+  const markCopied = () =>
+    env.DB.prepare(`UPDATE slack_product_sessions SET state_json=json_set(state_json,'$.copied',json('true'))
+    WHERE id=? AND result_page_id=?`)
+      .bind(session.id, session.result_page_id)
+      .run();
+  const receiptUrl = new URL("https://document.internal/api-mutate-receipt");
+  receiptUrl.searchParams.set("operationId", operationId);
+  receiptUrl.searchParams.set("responseMode", "receipt");
+  const receipt = await room.fetch(
+    new Request(receiptUrl, { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+  );
+  if (receipt.ok) {
+    const result = await receipt.json<{ found?: boolean; committed?: boolean; operationId?: string }>();
+    if (result.found === true && result.committed === true && result.operationId === operationId) {
+      await markCopied();
+      return;
+    }
+    throw new Error("Slack copy receipt could not be verified.");
+  }
+  if (receipt.status !== 404) throw new Error("Slack copy receipt is temporarily unavailable.");
   const installation = await env.DB.prepare(
     "SELECT * FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL",
   )
@@ -993,15 +1010,17 @@ async function copySlackProductContent(env: Env, sessionId: string) {
       body: JSON.stringify({
         actorId: member.user.id,
         slackProductSessionId: session.id,
-        operationId: `slack-${session.id}`,
+        operationId,
+        responseMode: "receipt",
         operations: [{ type: "append_children", children: blocks, position: { type: "end" } }],
       }),
     }),
   );
   if (!response.ok) throw new Error("Slack content could not be copied. Retry this capture.");
-  await env.DB.prepare("UPDATE slack_product_sessions SET state_json=? WHERE id=?")
-    .bind(JSON.stringify({ ...state, copied: true }), session.id)
-    .run();
+  const committed = await response.json<{ committed?: boolean; operationId?: string }>();
+  if (committed.committed !== true || committed.operationId !== operationId)
+    throw new Error("Slack copy receipt could not be verified.");
+  await markCopied();
   if (session.view_id)
     await slackApi(
       env,
@@ -1011,10 +1030,13 @@ async function copySlackProductContent(env: Env, sessionId: string) {
         view_id: session.view_id,
         view: resultView(env, session.id, page.id, false),
       },
-      undefined,
-      undefined,
-      undefined,
-      slackAccessAuthorization(env, installation, JSON.parse(session.identity_json) as NonNullable<Identity>),
+      {
+        beforeDispatch: slackAccessAuthorization(
+          env,
+          installation,
+          JSON.parse(session.identity_json) as NonNullable<Identity>,
+        ),
+      },
     ).catch(() => undefined);
 }
 
@@ -1061,7 +1083,7 @@ export async function acceptSlackProductInteraction(env: Env, payload: SlackInte
             trigger_id: payload.trigger_id,
             view: modal("", [{ type: "section", text: { type: "plain_text", text: errorText(error) } }]),
           },
-          Math.max(1, deadlineAt - Date.now() - 150),
+          { timeoutMs: Math.max(1, deadlineAt - Date.now() - 150) },
         ).catch(() => undefined);
     }
     return { handled: true, response: {} };
@@ -1082,16 +1104,28 @@ export async function deliverSlackProductCopy(env: Env, sessionId: string) {
         .bind(session.installation_id, session.generation)
         .first<SlackInstallation>();
       if (installation)
-        await slackApi(env, installation, "views.update", {
-          view_id: session.view_id,
-          view: modal(session.id, [
-            {
-              type: "section",
-              text: { type: "plain_text", text: `The source could not be copied. ${errorText(error)}` },
-            },
-            { type: "actions", elements: [button("Retry copy", "noteflare_copy_retry", session.id)] },
-          ]),
-        }).catch(() => undefined);
+        await slackApi(
+          env,
+          installation,
+          "views.update",
+          {
+            view_id: session.view_id,
+            view: modal(session.id, [
+              {
+                type: "section",
+                text: { type: "plain_text", text: `The source could not be copied. ${errorText(error)}` },
+              },
+              { type: "actions", elements: [button("Retry copy", "noteflare_copy_retry", session.id)] },
+            ]),
+          },
+          {
+            beforeDispatch: slackAccessAuthorization(
+              env,
+              installation,
+              JSON.parse(session.identity_json) as NonNullable<Identity>,
+            ),
+          },
+        ).catch(() => undefined);
     }
     throw error;
   }

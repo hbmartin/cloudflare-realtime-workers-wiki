@@ -5027,7 +5027,8 @@ describe("delivery outbox", () => {
     await sweepOutbox(bindingsWith({ DB: database, DELIVERY_QUEUE: { send } }));
     expect(send).toHaveBeenCalledWith({ outboxId, correlationId });
     expect(prepared.some((sql) => /SELECT\s+correlation_id\s+FROM\s+outbox/i.test(sql))).toBe(false);
-    expect(prepared.some((sql) => /SELECT\s+id,\s*correlation_id\s+FROM\s+outbox/i.test(sql))).toBe(true);
+    expect(prepared.some((sql) => /SELECT[\s\S]*FROM\s+outbox\s+WHERE\s+id\s*=/i.test(sql))).toBe(false);
+    expect(prepared.some((sql) => /SELECT\s+id,\s*correlation_id[,\s][\s\S]*FROM\s+outbox/i.test(sql))).toBe(true);
   });
 
   it("falls back to invocation correlation when an older outbox row stores null", async () => {

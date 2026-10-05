@@ -1438,9 +1438,7 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
                 text,
                 blocks,
               },
-              undefined,
-              undefined,
-              sendToken,
+              { preparedToken: sendToken },
             )
           : await slackApi(
               env,
@@ -1456,9 +1454,7 @@ export async function deliverSlackThread(env: Env, deliveryId: string) {
                 unfurl_links: false,
                 unfurl_media: false,
               },
-              undefined,
-              undefined,
-              sendToken,
+              { preparedToken: sendToken },
             );
       if (result.channel !== link.channel_id || !TS.test(result.ts))
         throw new Error("Slack message result is incomplete.");

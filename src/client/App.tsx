@@ -1,3 +1,4 @@
+import { slackAuthErrorMessage } from "./slack-auth-errors";
 import { ActivityView } from "./ActivityView";
 import { TasksView } from "./TasksView";
 import { ActionMenu, Icon, RecentPages, readPreference, savePreference } from "./WorkspaceUI";
@@ -699,11 +700,7 @@ function clearPendingInvite() {
 
 const SLACK_AUTH_ERRORS: Record<string, string> = {
   access_denied: "Slack sign-in was cancelled.",
-  security_required: "Verify an authenticator code or passkey in Account protection, then connect Slack again.",
-  unauthorized: "Your session expired. Sign in again before connecting Slack.",
-  slack_link_changed: "Slack authorization changed. Verify your account protection and connect Slack again.",
   slack_identity_invalid: "Slack could not verify your identity. Sign in again.",
-  slack_bot_forbidden: "Use your personal Slack member account, rather than a bot account.",
   slack_not_connected: "Ask the workspace owner to connect Slack first.",
   slack_unavailable: "Slack is temporarily unavailable. Try again or sign in normally.",
   account_not_linked: "Sign in normally, then connect Slack from Settings.",
@@ -711,7 +708,6 @@ const SLACK_AUTH_ERRORS: Record<string, string> = {
   registration_closed: "Open a valid invitation before creating an account with Slack.",
   invite_required: "Open a valid invitation before creating an account with Slack.",
   invite_reservation_expired: "The invitation reservation expired. Open the invitation again.",
-  slack_team_mismatch: "Use an account from the connected Slack workspace.",
   slack_scope_missing: "The workspace owner must reauthorize Slack before it can be used.",
   slack_guest_forbidden: "Slack guest accounts cannot sign in to NoteFlare.",
   slack_external_forbidden: "Slack Connect members cannot sign in to NoteFlare.",
@@ -723,7 +719,7 @@ function consumeSlackAuthError() {
   const raw = url.searchParams.get("error")?.toLowerCase() ?? "";
   if (!raw && !url.searchParams.has("slackAuth")) return "";
   const message =
-    (Object.hasOwn(SLACK_AUTH_ERRORS, raw) ? SLACK_AUTH_ERRORS[raw] : undefined) ??
+    slackAuthErrorMessage(raw, SLACK_AUTH_ERRORS) ??
     "Slack sign-in could not be completed. Try again or sign in normally.";
   url.searchParams.delete("error");
   url.searchParams.delete("error_description");

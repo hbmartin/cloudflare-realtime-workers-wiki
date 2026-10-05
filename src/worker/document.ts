@@ -945,14 +945,16 @@ export class Document extends YServer {
       });
     }
     if (request.method === "GET" && url.pathname.endsWith("/api-mutate-receipt")) {
+      if (this.purged || this.metadata.retired) return this.retiredApiResponse();
       const operationId = url.searchParams.get("operationId");
       if (!operationId || !/^[A-Za-z0-9:_-]{1,200}$/.test(operationId))
         return Response.json({ error: "Invalid operation ID." }, { status: 400 });
+      const responseMode = url.searchParams.get("responseMode") ?? "content";
+      if (responseMode !== "content" && responseMode !== "receipt")
+        return Response.json({ error: "Invalid response mode." }, { status: 400 });
       if (!this.document.getMap<string>("api-operation-receipts").has(operationId))
         return Response.json({ found: false }, { status: 404 });
-      const content = this.captureApiContent();
-      if (this.metadata.snapshot_seq < content.sequence) await this.compact();
-      return Response.json({ found: true, ...content });
+      return this.apiMutationResponse({ operationId, receiptOnly: responseMode === "receipt", found: true });
     }
     if (request.method === "POST" && url.pathname.endsWith("/api-mutate")) {
       if (this.metadata.content_kind !== "document") {
@@ -965,6 +967,7 @@ export class Document extends YServer {
         operationId?: unknown;
         expectedSequence?: unknown;
         slackProductSessionId?: unknown;
+        responseMode?: unknown;
       };
       try {
         body = await request.json();
@@ -991,12 +994,19 @@ export class Document extends YServer {
         typeof body.operationId === "string" && /^[A-Za-z0-9:_-]{1,200}$/.test(body.operationId)
           ? body.operationId
           : null;
+      if (
+        (body.responseMode !== undefined && body.responseMode !== "content" && body.responseMode !== "receipt") ||
+        (body.responseMode === "receipt" && !operationId)
+      )
+        return Response.json({ error: "Invalid response mode or operation ID." }, { status: 400 });
       const requestHash = operationId
         ? await sha256Hex(canonicalJson({ actorId: body.actorId, operations: body.operations }))
         : null;
+      if (this.purged || this.metadata.retired) return this.retiredApiResponse();
       if (body.expectedSequence !== undefined) {
         this.flushPendingUpdates();
         if (this.metadata.dirty || this.compaction) await this.compact();
+        if (this.purged || this.metadata.retired) return this.retiredApiResponse();
         this.flushPendingUpdates();
         if (this.metadata.dirty) await this.compact();
       }
@@ -1019,7 +1029,9 @@ export class Document extends YServer {
           .bind(body.actorId, body.slackProductSessionId, this.ids.pageId)
           .first();
       };
-      if (!(await authorized())) return Response.json({ error: "slack_identity_required" }, { status: 403 });
+      const access = await authorized();
+      if (this.purged || this.metadata.retired) return this.retiredApiResponse();
+      if (!access) return Response.json({ error: "slack_identity_required" }, { status: 403 });
       this.flushPendingUpdates();
       if (
         this.purged ||
@@ -1033,11 +1045,13 @@ export class Document extends YServer {
       if (operationId && receipts?.has(operationId)) {
         if (receipts.get(operationId) !== requestHash)
           return Response.json({ error: "idempotency_key_reused" }, { status: 409 });
-        const content = this.captureApiContent();
-        if (this.metadata.snapshot_seq < content.sequence)
-          await this.compact(true, body.suppressExternalEffects === true);
-        if (!(await authorized())) return Response.json({ error: "slack_identity_required" }, { status: 403 });
-        return Response.json(content);
+        return this.apiMutationResponse({
+          operationId,
+          receiptOnly: body.responseMode === "receipt",
+          authorized,
+          forceVersion: true,
+          suppressExternalEffects: body.suppressExternalEffects === true,
+        });
       }
       if (
         body.expectedSequence !== undefined &&
@@ -1090,11 +1104,13 @@ export class Document extends YServer {
         for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(this.document, operation);
         if (operationId && requestHash) receipts!.set(operationId, requestHash);
       }, "api-mutation");
-      const content = this.captureApiContent();
-      if (this.metadata.snapshot_seq < content.sequence)
-        await this.compact(true, body.suppressExternalEffects === true);
-      if (!(await authorized())) return Response.json({ error: "slack_identity_required" }, { status: 403 });
-      return Response.json(content);
+      return this.apiMutationResponse({
+        operationId,
+        receiptOnly: body.responseMode === "receipt",
+        authorized,
+        forceVersion: true,
+        suppressExternalEffects: body.suppressExternalEffects === true,
+      });
     }
     if (request.method === "GET" && url.pathname.endsWith("/legacy-comments")) {
       if (this.metadata.content_kind !== "document") return Response.json({ threads: [] });
@@ -1307,11 +1323,54 @@ export class Document extends YServer {
     return new Response("Not found", { status: 404 });
   }
 
+  private retiredApiResponse() {
+    return Response.json({ error: "This document version has been retired." }, { status: 410 });
+  }
+
+  private async apiMutationResponse(options: {
+    operationId: string | null;
+    receiptOnly: boolean;
+    found?: boolean;
+    authorized?: () => Promise<unknown>;
+    forceVersion?: boolean;
+    suppressExternalEffects?: boolean;
+  }) {
+    if (this.purged || this.metadata.retired) return this.retiredApiResponse();
+    const content = this.captureApiContent(options.receiptOnly);
+    const active = this.compaction;
+    const waited = Boolean(active) || this.metadata.snapshot_seq < content.sequence;
+    if (waited) {
+      try {
+        if (active) await active;
+        if (this.purged || this.metadata.retired) return this.retiredApiResponse();
+        if (this.metadata.snapshot_seq < content.sequence)
+          await this.compact(options.forceVersion, options.suppressExternalEffects);
+      } catch (error) {
+        if (this.purged || this.metadata.retired) return this.retiredApiResponse();
+        throw error;
+      }
+      if (this.purged || this.metadata.retired) return this.retiredApiResponse();
+      if (!options.receiptOnly && options.authorized) {
+        const allowed = await options.authorized();
+        if (this.purged || this.metadata.retired) return this.retiredApiResponse();
+        if (!allowed) return Response.json({ error: "slack_identity_required" }, { status: 403 });
+      }
+    }
+    return Response.json({
+      ...(options.found ? { found: true } : {}),
+      ...(options.receiptOnly ? { committed: true, operationId: options.operationId } : content),
+    });
+  }
+
   // Capture both values without yielding; compaction may include later websocket edits.
-  private captureApiContent() {
+  private captureApiContent(receiptOnly = false) {
     this.flushPendingUpdates();
     return {
-      document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson,
+      ...(receiptOnly
+        ? {}
+        : {
+            document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson,
+          }),
       sequence: this.state.storage.sql
         .exec<{ sequence: number }>(
           `SELECT max(?,coalesce(MAX(seq),0)) sequence FROM update_events`,

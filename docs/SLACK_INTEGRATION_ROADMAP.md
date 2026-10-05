@@ -111,8 +111,10 @@ the affected capability without breaking existing notification delivery.
 #### Requirements
 
 - Configure Better Auth's Slack OpenID provider with `openid profile email` and disable implicit account linking.
-- Existing users connect Slack from NoteFlare Settings after completing protection and verifying TOTP/passkey within five minutes. Callback completion rechecks the authorizing session and protection generation. The connection must bind the Slack team ID and
+- Existing users connect or relink Slack from NoteFlare Settings after completing protection and verifying TOTP/passkey within five minutes. Callback completion rechecks the authorizing session and protection generation. The connection must bind the Slack team ID and
   user ID returned by OpenID to the current Better Auth account and the active NoteFlare Slack installation.
+- Members may disconnect Slack access from an active protected session with an unexpired TOTP/passkey proof or
+  valid trusted-browser proof without fresh verification. Disconnecting Slack access preserves Slack sign-in.
 - A valid, unused NoteFlare invitation may initiate Slack signup. The invite is reserved before redirect, carried in
   protected OAuth state, and consumed only after the callback establishes the new account.
 - Public Slack signup remains closed. Slack signup without a valid invitation fails without creating an account.
@@ -128,6 +130,15 @@ the affected capability without breaking existing notification delivery.
   OpenID links.
 - Slack Settings shows whether the current member is unlinked, legacy-linked, or OpenID-verified and provides the
   appropriate connect or migration action.
+
+Historical channel events retire when their actor loses membership, account protection, or the continuous Slack
+grant. Restoring authority does not replay those events. Temporary destination, credential, and scope pauses keep
+work pending. Legacy digest cleanup examines at most 50 subscriptions and 40 candidate events per subscription.
+
+Stale channel-validation retries retain `slack_validation_stale` as a durable coordination exemption from the eight
+ordinary redrives. Enqueue acceptance, queue loss, wakeups, competing claims, pauses, and unresolved uncertain sends
+do not consume it. A runnable consumer attempt consumes it when work completes or remains retryable; another stale
+validation failure establishes a new exemption.
 
 #### Failure behavior
 
