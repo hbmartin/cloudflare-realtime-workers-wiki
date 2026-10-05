@@ -1531,11 +1531,22 @@ async function enqueueOutbox(env: Env, row: SweepOutboxRow) {
   const outboxId = row.id;
   const correlationId = row.correlation_id ?? currentObservabilityContext()?.correlationId ?? undefined;
   if (row.round2 && row.receipt_id) {
-    await enqueueRound2Outbox(env, outboxId, row.topic as keyof typeof round2Receipts, row.receipt_id, {
-      dueAt: Date.now() + SLACK_REDRIVE_STALE_MS,
-      correlationId,
-      expectedVersion: row.attempts,
-    });
+    const accepted = await enqueueRound2Outbox(
+      env,
+      outboxId,
+      row.topic as keyof typeof round2Receipts,
+      row.receipt_id,
+      {
+        dueAt: Date.now() + SLACK_REDRIVE_STALE_MS,
+        correlationId,
+        expectedVersion: row.attempts,
+      },
+    );
+    if (!accepted)
+      await env.DB.prepare(`UPDATE outbox SET available_at=max(available_at,?)
+        WHERE id=? AND attempts=? AND enqueued_at IS NULL AND slack_scope_paused_at IS NULL`)
+        .bind(Date.now() + SLACK_REDRIVE_STALE_MS, outboxId, row.attempts)
+        .run();
     return;
   }
   try {

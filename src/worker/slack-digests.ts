@@ -5,6 +5,7 @@ import {
   recordDeliveryError,
   recordPermanentDeliveryFailure,
   retireObsoleteReceipt,
+  retireDigestReceiptStatements,
   thumbnailDeliveryEnabled,
 } from "./slack-delivery";
 import { logger } from "./observability";
@@ -440,6 +441,8 @@ async function nextMessage(
   return message;
 }
 
+class EmptyDigestPageSkippedError extends SlackDispatchSkippedError {}
+
 export async function deliverDigest(env: Env, id: string, reconcileOnly = false) {
   if (env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true") return;
   if (env.SLACK_RICH_DIGESTS_ENABLED === "true" && env.WORKSPACE_ACTIVITY_ENABLED !== "true")
@@ -476,6 +479,8 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
     )
       .bind(state, ts, error, id, token)
       .run();
+  const retireRoot = (error: string | null = null) =>
+    env.DB.batch(retireDigestReceiptStatements(env, id, token, error));
   try {
     receipt = (await env.DB.prepare(`SELECT * FROM slack_digest_receipts WHERE id=? AND claim_token=?`)
       .bind(id, token)
@@ -603,14 +608,14 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
             (mapping.snoozed_until && mapping.snoozed_until > Date.now()))
         )
           return;
-        await updateRoot("retired");
+        await retireRoot();
         return;
       }
       if (
         receipt.window_end <= Math.max(mapping.digest_not_before, mapping.snoozed_until ?? 0) ||
         digestWindow(Date.now(), mapping.digest_time, mapping.digest_timezone!).end !== receipt.window_end
       ) {
-        await updateRoot("retired");
+        await retireRoot();
         return;
       }
       if (!(await validateMapping(env, installation, mapping.id, mapping.channel_id))) return;
@@ -646,7 +651,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
                     .bind(installation.id, installation.generation)
                     .first();
                   if (paused) throw new SlackDispatchSkippedError();
-                  await updateRoot("retired");
+                  await retireRoot();
                   throw new SlackDispatchSkippedError();
                 }
                 if (!eligible(currentMapping, Date.now())) throw new SlackDispatchSkippedError();
@@ -656,14 +661,14 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
                   digestWindow(Date.now(), currentMapping.digest_time, currentMapping.digest_timezone!).end !==
                     receipt!.window_end
                 ) {
-                  await updateRoot("retired");
+                  await retireRoot();
                   throw new SlackDispatchSkippedError();
                 }
                 const currentPages = await digestPages(env, currentMapping, receipt!, installation, message!);
                 if (!currentPages.length) {
                   await finishMessage("retired", null);
                   await updateRoot("pending");
-                  throw new SlackDispatchSkippedError();
+                  throw new EmptyDigestPageSkippedError();
                 }
                 const eventIds = JSON.stringify(currentPages.flatMap((page) => page.eventIds ?? []));
                 const pageIds = JSON.stringify(currentPages.map((page) => page.pageId));
@@ -777,34 +782,36 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
                 `UPDATE slack_digest_receipts SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=? AND state='sending'`,
               ).bind(id, token),
             ]);
-          if (error instanceof SlackDispatchSkippedError) return;
-          await recordDeliveryError(env, installation, error, mapping.id, mapping.channel_id);
-          if (error instanceof SlackApiError && error.code === "msg_too_long") {
-            await recordPermanentDeliveryFailure(
-              env,
-              installation,
-              message.sequence === 0 ? id : message.id,
-              mapping.id,
-              mapping.channel_id,
-              error.code,
-            );
-            await finishMessage("retired", null);
-            await updateRoot("pending", null, error.code);
-          } else {
-            if (invalidSlackDestination(error)) {
+          if (error instanceof SlackDispatchSkippedError && !(error instanceof EmptyDigestPageSkippedError)) return;
+          if (!(error instanceof EmptyDigestPageSkippedError)) {
+            await recordDeliveryError(env, installation, error, mapping.id, mapping.channel_id);
+            if (error instanceof SlackApiError && error.code === "msg_too_long") {
+              await recordPermanentDeliveryFailure(
+                env,
+                installation,
+                message.sequence === 0 ? id : message.id,
+                mapping.id,
+                mapping.channel_id,
+                error.code,
+              );
               await finishMessage("retired", null);
-              await updateRoot("retired", null, error.code);
-              return;
+              await updateRoot("pending", null, error.code);
+            } else {
+              if (invalidSlackDestination(error)) {
+                await finishMessage("retired", null);
+                await retireRoot(error.code);
+                return;
+              }
+              if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
+                await env.DB.prepare(
+                  `UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,last_error=? WHERE id=? AND claim_token=?`,
+                )
+                  .bind(error instanceof SlackApiError ? error.code : "rate_limited", message.id, token)
+                  .run();
+                await updateRoot("pending");
+              }
+              throw error;
             }
-            if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
-              await env.DB.prepare(
-                `UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,last_error=? WHERE id=? AND claim_token=?`,
-              )
-                .bind(error instanceof SlackApiError ? error.code : "rate_limited", message.id, token)
-                .run();
-              await updateRoot("pending");
-            }
-            throw error;
           }
         }
       }
@@ -814,7 +821,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
       !eligible(mapping, Date.now()) ||
       digestWindow(Date.now(), mapping.digest_time, mapping.digest_timezone!).end !== receipt.window_end
     ) {
-      await updateRoot("retired");
+      await retireRoot();
       return;
     }
     const next = await nextMessage(env, receipt, mapping, installation, token);

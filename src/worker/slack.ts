@@ -2128,7 +2128,10 @@ function deniedLegacyChannelEventsStatement(env: Env, ids: readonly string[], cl
     WHERE delivered_at IS NULL AND suppressed_at IS NULL AND claim_token IS ?
       AND id IN (SELECT event.id FROM slack_channel_events event JOIN pages page ON page.id=event.page_id
         JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
-        WHERE (page.is_template=1 OR NOT ${channelActorAccessSql})
+        WHERE (page.is_template=1 OR NOT ${channelActorAccessSql}
+          OR NOT EXISTS(SELECT 1 FROM workspace_members owner JOIN slack_installations installation
+            ON installation.workspace_id=owner.workspace_id AND installation.id=subscription.installation_id
+            WHERE owner.user_id=subscription.created_by AND owner.role='owner'))
           AND event.id IN (SELECT value FROM json_each(?))
           AND (?=0 OR subscription.round2_initialized=0))`).bind(
     Date.now(),

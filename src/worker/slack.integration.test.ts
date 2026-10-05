@@ -175,6 +175,50 @@ async function legacyChannelFixture(cadence: "immediate" | "digest") {
 }
 
 describe("legacy channel event settlement", () => {
+  it.each(
+    (["immediate", "digest"] as const).flatMap((cadence) =>
+      (["before delivery", "token refresh"] as const).map((boundary) => ({ cadence, boundary })),
+    ),
+  )("retires $cadence events after owner demotion at $boundary", async ({ cadence, boundary }) => {
+    const fixture = await legacyChannelFixture(cadence);
+    const backup = await inviteViewer(fixture.cookie);
+    await env.DB.prepare("UPDATE workspace_members SET role='owner' WHERE user_id=?").bind(backup.member.user.id).run();
+    const demote = () =>
+      env.DB.prepare("UPDATE workspace_members SET role='viewer' WHERE user_id=?").bind(fixture.member.user.id).run();
+    if (boundary === "before delivery") await demote();
+    else
+      await env.DB.prepare("UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?")
+        .bind(await encryptSlackToken(fixture.bindings, "refresh-token"))
+        .run();
+    const posts = vi.fn();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        if (String(input).includes("oauth.v2.access")) {
+          await demote();
+          return Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: 3600 });
+        }
+        posts();
+        return Response.json({ ok: true, ts: "123.001" });
+      }),
+    );
+    const deliver = () =>
+      cadence === "immediate"
+        ? deliverSlackChannelEvent(fixture.bindings, "actor-event")
+        : sendDueSlackChannelDigests(fixture.bindings, Date.UTC(2026, 9, 4, 10));
+    await deliver();
+    expect(
+      await env.DB.prepare(
+        "SELECT suppressed_at,delivered_at,claim_token FROM slack_channel_events WHERE id='actor-event'",
+      ).first(),
+    ).toEqual({ suppressed_at: expect.any(Number), delivered_at: null, claim_token: null });
+    await env.DB.prepare("UPDATE workspace_members SET role='owner' WHERE user_id=?")
+      .bind(fixture.member.user.id)
+      .run();
+    await deliver();
+    expect(posts).not.toHaveBeenCalled();
+  });
+
   it("excludes templates from fanout and suppresses an already queued template event", async () => {
     const fixture = await legacyChannelFixture("immediate");
     await env.DB.prepare("UPDATE pages SET is_template=1 WHERE id=?").bind(fixture.page.id).run();

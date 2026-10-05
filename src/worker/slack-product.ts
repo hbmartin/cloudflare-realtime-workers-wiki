@@ -892,6 +892,28 @@ async function copySlackProductContent(env: Env, sessionId: string) {
     WHERE id=? AND result_page_id=?`)
       .bind(session.id, session.result_page_id)
       .run();
+  const updateCopiedView = async () => {
+    if (!session.view_id) return;
+    const installation = await env.DB.prepare(
+      "SELECT * FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL",
+    )
+      .bind(session.installation_id, session.generation)
+      .first<SlackInstallation>();
+    if (!installation) return;
+    await slackApi(
+      env,
+      installation,
+      "views.update",
+      { view_id: session.view_id, view: resultView(env, session.id, session.result_page_id!, false) },
+      {
+        beforeDispatch: slackAccessAuthorization(
+          env,
+          installation,
+          JSON.parse(session.identity_json) as NonNullable<Identity>,
+        ),
+      },
+    );
+  };
   const receiptUrl = new URL("https://document.internal/api-mutate-receipt");
   receiptUrl.searchParams.set("operationId", operationId);
   receiptUrl.searchParams.set("responseMode", "receipt");
@@ -902,6 +924,7 @@ async function copySlackProductContent(env: Env, sessionId: string) {
     const result = await receipt.json<{ found?: boolean; committed?: boolean; operationId?: string }>();
     if (result.found === true && result.committed === true && result.operationId === operationId) {
       await markCopied();
+      await updateCopiedView().catch(() => undefined);
       return;
     }
     throw new Error("Slack copy receipt could not be verified.");
@@ -1021,23 +1044,7 @@ async function copySlackProductContent(env: Env, sessionId: string) {
   if (committed.committed !== true || committed.operationId !== operationId)
     throw new Error("Slack copy receipt could not be verified.");
   await markCopied();
-  if (session.view_id)
-    await slackApi(
-      env,
-      installation,
-      "views.update",
-      {
-        view_id: session.view_id,
-        view: resultView(env, session.id, page.id, false),
-      },
-      {
-        beforeDispatch: slackAccessAuthorization(
-          env,
-          installation,
-          JSON.parse(session.identity_json) as NonNullable<Identity>,
-        ),
-      },
-    ).catch(() => undefined);
+  await updateCopiedView().catch(() => undefined);
 }
 
 export async function acceptSlackProductInteraction(env: Env, payload: SlackInteractionPayload, deadlineAt: number) {

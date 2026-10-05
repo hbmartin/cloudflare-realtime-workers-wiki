@@ -1341,7 +1341,7 @@ export class Document extends YServer {
     const waited = Boolean(active) || this.metadata.snapshot_seq < content.sequence;
     if (waited) {
       try {
-        if (active) await active;
+        if (active) await active.catch(() => undefined);
         if (this.purged || this.metadata.retired) return this.retiredApiResponse();
         if (this.metadata.snapshot_seq < content.sequence)
           await this.compact(options.forceVersion, options.suppressExternalEffects);

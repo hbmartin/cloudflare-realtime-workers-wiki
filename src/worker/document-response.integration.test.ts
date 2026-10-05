@@ -186,7 +186,16 @@ describe("document mutation response barriers", () => {
     });
   });
 
-  it.each(["included", "behind", "retired", "purged"])("waits for active mutation compaction: %s", async (mode) => {
+  it.each([
+    "included",
+    "behind",
+    "retired",
+    "purged",
+    "active failure",
+    "retry failure",
+    "retired failure",
+    "purged failure",
+  ])("waits for active mutation compaction: %s", async (mode) => {
     const installed = await fixture();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
     await stub.fetch(internalWarmupRequest());
@@ -213,7 +222,9 @@ describe("document mutation response barriers", () => {
               if (writes++ === 0) {
                 started();
                 await held;
+                if (mode.includes("failure")) throw new Error("Compaction write unavailable");
               }
+              if (mode === "retry failure") throw new Error("Compaction retry unavailable");
               return target.put(...args);
             };
           const value: unknown = Reflect.get(target, key, target);
@@ -231,9 +242,10 @@ describe("document mutation response barriers", () => {
           headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
         }),
       );
+      const settledResponse = response.catch((error: unknown) => error);
       await Promise.resolve();
-      if (mode === "retired") room.metadata.retired = 1;
-      if (mode === "purged")
+      if (mode.startsWith("retired")) room.metadata.retired = 1;
+      if (mode.startsWith("purged"))
         await room.onRequest(
           new Request("https://document.internal/purge", {
             method: "POST",
@@ -243,17 +255,36 @@ describe("document mutation response barriers", () => {
       release();
       try {
         await active.catch((error) => {
-          if (mode !== "purged") throw error;
+          if (!mode.startsWith("purged") && !mode.includes("failure")) throw error;
         });
-        const result = await response;
-        const retired = mode === "retired" || mode === "purged";
-        expect(result.status).toBe(retired ? 410 : 200);
-        const body = await result.json<{ document?: unknown; sequence?: number }>();
-        expect(body.sequence ?? null).toBe(retired ? null : captured);
+        const result = await settledResponse;
+        const failed = mode === "retry failure";
+        const retired = mode.startsWith("retired") || mode.startsWith("purged");
+        expect(result instanceof Error ? result.message : null).toBe(failed ? "Compaction retry unavailable" : null);
+        expect(result instanceof Response ? result.status : null).toBe(failed ? null : retired ? 410 : 200);
+        const body = result instanceof Response ? await result.json<{ document?: unknown; sequence?: number }>() : {};
+        expect(body.sequence ?? null).toBe(retired || failed ? null : captured);
         expect(JSON.stringify(body.document) ?? "").toContain(
-          retired ? "" : mode === "behind" ? "Captured content before response" : "Captured content",
+          retired || failed ? "" : mode === "behind" ? "Captured content before response" : "Captured content",
         );
-        expect(compact).toHaveBeenCalledTimes(mode === "behind" ? 2 : 1);
+        const compactions = ["behind", "active failure", "retry failure"].includes(mode) ? 2 : 1;
+        expect(compact).toHaveBeenCalledTimes(compactions);
+        const lookup =
+          retired || failed
+            ? null
+            : await room.onRequest(
+                new Request(
+                  "https://document.internal/api-mutate-receipt?operationId=barrier-operation&responseMode=receipt",
+                  {
+                    headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+                  },
+                ),
+              );
+        expect(lookup ? await lookup.json() : null).toEqual(
+          retired || failed ? null : { found: true, committed: true, operationId: "barrier-operation" },
+        );
+        expect(compact).toHaveBeenCalledTimes(compactions);
+        expect(room.document.getMap("api-operation-receipts").size).toBe(1);
       } finally {
         room.bindings.BUCKET = originalBucket;
         compact.mockRestore();

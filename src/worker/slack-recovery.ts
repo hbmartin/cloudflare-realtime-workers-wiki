@@ -18,8 +18,13 @@ function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string) {
   if (mapping)
     destinationPause = `m.notification_blocked_at IS NOT NULL OR m.muted_at IS NOT NULL OR coalesce(m.snoozed_until,0)>${Date.now()}`;
   else if (topic === "slack_bulk")
-    destinationPause = `EXISTS(SELECT 1 FROM slack_channel_subscriptions m WHERE m.installation_id=r.installation_id AND m.channel_id=r.channel_id)
-    AND NOT EXISTS(SELECT 1 FROM slack_channel_subscriptions m WHERE m.installation_id=r.installation_id AND m.channel_id=r.channel_id AND m.notification_blocked_at IS NULL AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=${Date.now()})`;
+    destinationPause = `EXISTS(SELECT 1 FROM slack_channel_events event JOIN slack_channel_subscriptions m ON m.id=event.subscription_id
+      WHERE event.summary_id=r.id AND event.delivered_at IS NULL AND event.suppressed_at IS NULL AND event.round2_state='pending'
+        AND m.installation_id=r.installation_id AND m.channel_id=r.channel_id)
+    AND NOT EXISTS(SELECT 1 FROM slack_channel_events event JOIN slack_channel_subscriptions m ON m.id=event.subscription_id
+      WHERE event.summary_id=r.id AND event.delivered_at IS NULL AND event.suppressed_at IS NULL AND event.round2_state='pending'
+        AND m.installation_id=r.installation_id AND m.channel_id=r.channel_id
+        AND m.notification_blocked_at IS NULL AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=${Date.now()})`;
   else if (topic === "slack_file_upload")
     destinationPause = `EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) WHERE p.id=r.page_id AND m.installation_id=r.installation_id)
     AND NOT EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) WHERE p.id=r.page_id AND m.installation_id=r.installation_id AND m.notification_blocked_at IS NULL)`;

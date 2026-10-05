@@ -5254,59 +5254,68 @@ describe("Slack documents and tasks", () => {
       warned.mockRestore();
     }
   });
-  it.each([false, true])("recovers copy commit evidence after access is revoked (lost response=%s)", async (lost) => {
-    const id = await open("new");
-    const payload = submission(id, "document", "space:workspace-general", "Receipt recovery");
-    (payload.view.state.values as Record<string, unknown>).body = { value: { value: "Unique copied content" } };
-    await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500);
-    let mutations = 0;
-    const responses: unknown[] = [];
-    const document = new Proxy(env.DOCUMENT, {
-      get(target, key) {
-        if (key === "getByName")
-          return (name: string) => {
-            const stub = target.getByName(name);
-            return {
-              fetch: async (request: Request) => {
-                const response = await stub.fetch(request);
-                if (new URL(request.url).pathname === "/api-mutate") {
-                  mutations++;
-                  responses.push(await response.clone().json());
-                  await env.DB.batch([
-                    env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'"),
-                    env.DB.prepare(
-                      "UPDATE slack_product_sessions SET state_json=json_set(state_json,'$.concurrentValue','preserved') WHERE id=?",
-                    ).bind(id),
-                  ]);
-                  if (lost) throw new Error("Lost mutation response");
-                }
-                return response;
-              },
+  it.each([false, true].flatMap((lost) => [false, true].map((revoke) => ({ lost, revoke }))))(
+    "recovers copy commit evidence (lost response=$lost, revoked=$revoke)",
+    async ({ lost, revoke }) => {
+      const id = await open("new");
+      const payload = submission(id, "document", "space:workspace-general", "Receipt recovery");
+      (payload.view.state.values as Record<string, unknown>).body = { value: { value: "Unique copied content" } };
+      await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500);
+      let mutations = 0;
+      const responses: unknown[] = [];
+      const document = new Proxy(env.DOCUMENT, {
+        get(target, key) {
+          if (key === "getByName")
+            return (name: string) => {
+              const stub = target.getByName(name);
+              return {
+                fetch: async (request: Request) => {
+                  const response = await stub.fetch(request);
+                  if (new URL(request.url).pathname === "/api-mutate") {
+                    mutations++;
+                    responses.push(await response.clone().json());
+                    await env.DB.batch([
+                      ...(revoke ? [env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'")] : []),
+                      env.DB.prepare(
+                        "UPDATE slack_product_sessions SET state_json=json_set(state_json,'$.concurrentValue','preserved') WHERE id=?",
+                      ).bind(id),
+                    ]);
+                    if (lost) throw new Error("Lost mutation response");
+                  }
+                  return response;
+                },
+              };
             };
-          };
-        const value: unknown = Reflect.get(target, key, target);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    }) as Env["DOCUMENT"];
-    calls = [];
-    const failure = await deliverSlackProductCopy({ ...runtime(), DOCUMENT: document }, id).then(
-      () => null,
-      (error: Error) => error.message,
-    );
-    expect(failure).toBe(lost ? "Lost mutation response" : null);
-    await deliverSlackProductCopy({ ...runtime(), DOCUMENT: document }, id);
-    expect(mutations).toBe(1);
-    expect(responses).toEqual([{ committed: true, operationId: `slack-${id}` }]);
-    expect(calls.filter((call) => call.method === "views.update")).toHaveLength(0);
-    const session = (await env.DB.prepare("SELECT state_json,result_page_id FROM slack_product_sessions WHERE id=?")
-      .bind(id)
-      .first<{ state_json: string; result_page_id: string }>())!;
-    expect(JSON.parse(session.state_json)).toMatchObject({ copied: true, concurrentValue: "preserved" });
-    const page = (await env.DB.prepare("SELECT plain_text FROM pages WHERE id=?")
-      .bind(session.result_page_id)
-      .first<{ plain_text: string }>())!;
-    expect(page.plain_text.split("Unique copied content")).toHaveLength(2);
-  });
+          const value: unknown = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }) as Env["DOCUMENT"];
+      calls = [];
+      const failure = await deliverSlackProductCopy({ ...runtime(), DOCUMENT: document }, id).then(
+        () => null,
+        (error: Error) => error.message,
+      );
+      expect(failure).toBe(lost ? "Lost mutation response" : null);
+      await deliverSlackProductCopy({ ...runtime(), DOCUMENT: document }, id);
+      expect(mutations).toBe(1);
+      expect(responses).toEqual([{ committed: true, operationId: `slack-${id}` }]);
+      const updates = calls.filter((call) => call.method === "views.update");
+      expect(updates).toHaveLength(revoke ? 0 : lost ? 2 : 1);
+      expect(JSON.stringify(updates[0]?.payload.view) ?? "").toContain(
+        lost && !revoke ? "The source could not be copied" : "",
+      );
+      expect(JSON.stringify(updates.at(-1)?.payload.view) ?? "").toContain(revoke ? "" : "Open in NoteFlare");
+      expect(JSON.stringify(updates.at(-1)?.payload.view) ?? "").not.toContain("Retry copy");
+      const session = (await env.DB.prepare("SELECT state_json,result_page_id FROM slack_product_sessions WHERE id=?")
+        .bind(id)
+        .first<{ state_json: string; result_page_id: string }>())!;
+      expect(JSON.parse(session.state_json)).toMatchObject({ copied: true, concurrentValue: "preserved" });
+      const page = (await env.DB.prepare("SELECT plain_text FROM pages WHERE id=?")
+        .bind(session.result_page_id)
+        .first<{ plain_text: string }>())!;
+      expect(page.plain_text.split("Unique copied content")).toHaveLength(2);
+    },
+  );
 
   it("rechecks a queued copy inside the document after Slack access is revoked", async () => {
     const id = await open("new");
