@@ -59,14 +59,14 @@ refuses to deploy when Wrangler's migration listing is not in a recognized empty
 the fixtures in `scripts/check-page-move-migration.test.mjs` alongside any intentional Wrangler-output parser
 change.
 
-Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, or `0072_slack_link_authorization_started_at.sql` also block automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, or `0073_slack_membership_revocation.sql` also block automatic deployment.
 Pause the shared delivery queue, disable live Slack channel validation, and allow 16 minutes for
 existing invocations to finish before dispatching with `confirm_slack_review_migration_safe` checked.
 Keep both paused through migration and deployment. Follow the exact
 [Slack release sequence](DEPLOYMENT.md#slack-review-follow-up-migration) to verify the release and resume
 delivery. The confirmation is accepted only on manual dispatch and is passed as
 `SLACK_REVIEW_MIGRATION_SAFE=true` to the remote migration wrapper. Local releases require the same
-environment confirmation; local database migrations do not. Once 0069, 0070, and 0071 are applied, later
+environment confirmation; local database migrations do not. Once 0069, 0070, 0071, 0072, and 0073 are applied, later
 automatic deployments resume without this confirmation.
 
 ## The release gate

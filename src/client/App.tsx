@@ -699,6 +699,13 @@ function clearPendingInvite() {
 
 const SLACK_AUTH_ERRORS: Record<string, string> = {
   access_denied: "Slack sign-in was cancelled.",
+  security_required: "Verify an authenticator code or passkey in Account protection, then connect Slack again.",
+  unauthorized: "Your session expired. Sign in again before connecting Slack.",
+  slack_link_changed: "Slack authorization changed. Verify your account protection and connect Slack again.",
+  slack_identity_invalid: "Slack could not verify your identity. Sign in again.",
+  slack_bot_forbidden: "Use your personal Slack member account, rather than a bot account.",
+  slack_not_connected: "Ask the workspace owner to connect Slack first.",
+  slack_unavailable: "Slack is temporarily unavailable. Try again or sign in normally.",
   account_not_linked: "Sign in normally, then connect Slack from Settings.",
   oauth_account_not_linked: "Sign in normally, then connect Slack from Settings.",
   registration_closed: "Open a valid invitation before creating an account with Slack.",
@@ -715,7 +722,9 @@ function consumeSlackAuthError() {
   const url = new URL(window.location.href);
   const raw = url.searchParams.get("error")?.toLowerCase() ?? "";
   if (!raw && !url.searchParams.has("slackAuth")) return "";
-  const message = SLACK_AUTH_ERRORS[raw] ?? "Slack sign-in could not be completed. Try again or sign in normally.";
+  const message =
+    (Object.hasOwn(SLACK_AUTH_ERRORS, raw) ? SLACK_AUTH_ERRORS[raw] : undefined) ??
+    "Slack sign-in could not be completed. Try again or sign in normally.";
   url.searchParams.delete("error");
   url.searchParams.delete("error_description");
   url.searchParams.delete("slackAuth");

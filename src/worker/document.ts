@@ -950,13 +950,9 @@ export class Document extends YServer {
         return Response.json({ error: "Invalid operation ID." }, { status: 400 });
       if (!this.document.getMap<string>("api-operation-receipts").has(operationId))
         return Response.json({ found: false }, { status: 404 });
-      this.flushPendingUpdates();
-      if (this.metadata.dirty) await this.compact();
-      return Response.json({
-        found: true,
-        document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")),
-        sequence: this.metadata.snapshot_seq,
-      });
+      const content = this.captureApiContent();
+      if (this.metadata.snapshot_seq < content.sequence) await this.compact();
+      return Response.json({ found: true, ...content });
     }
     if (request.method === "POST" && url.pathname.endsWith("/api-mutate")) {
       if (this.metadata.content_kind !== "document") {
@@ -1004,10 +1000,11 @@ export class Document extends YServer {
         this.flushPendingUpdates();
         if (this.metadata.dirty) await this.compact();
       }
-      if (body.slackProductSessionId !== undefined) {
-        if (typeof body.slackProductSessionId !== "string")
-          return Response.json({ error: "Invalid Slack authorization." }, { status: 400 });
-        const authorized = await this.bindings.DB.prepare(`SELECT 1 FROM slack_product_sessions product_session
+      if (body.slackProductSessionId !== undefined && typeof body.slackProductSessionId !== "string")
+        return Response.json({ error: "Invalid Slack authorization." }, { status: 400 });
+      const authorized = async () => {
+        if (body.slackProductSessionId === undefined) return true;
+        return await this.bindings.DB.prepare(`SELECT 1 FROM slack_product_sessions product_session
           JOIN pages destination ON destination.id=product_session.result_page_id
           JOIN workspace_members member ON member.workspace_id=destination.workspace_id AND member.user_id=?
           LEFT JOIN space_members space_member ON space_member.space_id=destination.space_id AND space_member.user_id=member.user_id
@@ -1021,8 +1018,8 @@ export class Document extends YServer {
             AND ${SLACK_PRODUCT_SESSION_ACCESS_SQL}`)
           .bind(body.actorId, body.slackProductSessionId, this.ids.pageId)
           .first();
-        if (!authorized) return Response.json({ error: "slack_identity_required" }, { status: 403 });
-      }
+      };
+      if (!(await authorized())) return Response.json({ error: "slack_identity_required" }, { status: 403 });
       this.flushPendingUpdates();
       if (
         this.purged ||
@@ -1036,11 +1033,11 @@ export class Document extends YServer {
       if (operationId && receipts?.has(operationId)) {
         if (receipts.get(operationId) !== requestHash)
           return Response.json({ error: "idempotency_key_reused" }, { status: 409 });
-        if (this.metadata.dirty) await this.compact(true, body.suppressExternalEffects === true);
-        return Response.json({
-          document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")),
-          sequence: this.metadata.snapshot_seq,
-        });
+        const content = this.captureApiContent();
+        if (this.metadata.snapshot_seq < content.sequence)
+          await this.compact(true, body.suppressExternalEffects === true);
+        if (!(await authorized())) return Response.json({ error: "slack_identity_required" }, { status: 403 });
+        return Response.json(content);
       }
       if (
         body.expectedSequence !== undefined &&
@@ -1093,12 +1090,11 @@ export class Document extends YServer {
         for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(this.document, operation);
         if (operationId && requestHash) receipts!.set(operationId, requestHash);
       }, "api-mutation");
-      this.flushPendingUpdates();
-      if (this.metadata.dirty) await this.compact(true, body.suppressExternalEffects === true);
-      return Response.json({
-        document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")),
-        sequence: this.metadata.snapshot_seq,
-      });
+      const content = this.captureApiContent();
+      if (this.metadata.snapshot_seq < content.sequence)
+        await this.compact(true, body.suppressExternalEffects === true);
+      if (!(await authorized())) return Response.json({ error: "slack_identity_required" }, { status: 403 });
+      return Response.json(content);
     }
     if (request.method === "GET" && url.pathname.endsWith("/legacy-comments")) {
       if (this.metadata.content_kind !== "document") return Response.json({ threads: [] });
@@ -1309,6 +1305,20 @@ export class Document extends YServer {
       return Response.json({ purged: true });
     }
     return new Response("Not found", { status: 404 });
+  }
+
+  // Capture both values without yielding; compaction may include later websocket edits.
+  private captureApiContent() {
+    this.flushPendingUpdates();
+    return {
+      document: yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson,
+      sequence: this.state.storage.sql
+        .exec<{ sequence: number }>(
+          `SELECT max(?,coalesce(MAX(seq),0)) sequence FROM update_events`,
+          this.metadata.snapshot_seq,
+        )
+        .one().sequence,
+    };
   }
 
   private captureMentionTargets(events: Y.YEvent<any>[], transaction: Y.Transaction) {

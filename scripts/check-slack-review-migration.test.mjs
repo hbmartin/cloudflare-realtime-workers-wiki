@@ -12,6 +12,7 @@ describe("Slack review migration deployment gate", () => {
     "0070_slack_review_fences.sql",
     "0071_slack_authorization_cleanup.sql",
     "0072_slack_link_authorization_started_at.sql",
+    "0073_slack_membership_revocation.sql",
   ])("requires confirmation while %s is pending", (migration) => {
     const pending = listing([migration]);
     expect(() => checkSlackReviewMigration(pending)).toThrow("manually confirmed safe upgrade");
@@ -20,7 +21,7 @@ describe("Slack review migration deployment gate", () => {
 
   it.each([false, true])("accepts later releases regardless of confirmation: %s", (confirmed) => {
     expect(checkSlackReviewMigration("No migrations to apply!", confirmed)).toEqual([]);
-    expect(checkSlackReviewMigration(listing(["0073_future.sql"]), confirmed)).toEqual(["0073_future.sql"]);
+    expect(checkSlackReviewMigration(listing(["0074_future.sql"]), confirmed)).toEqual(["0074_future.sql"]);
   });
 
   it.each(["", "Unexpected Wrangler output", "Migrations to be applied:\n(no table)"])(

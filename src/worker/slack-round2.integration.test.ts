@@ -3424,6 +3424,83 @@ describe("review follow-up permissions and recovery", () => {
     },
   );
 
+  it.each([
+    { mode: "changed", boundary: "status read" },
+    { mode: "added", boundary: "status read" },
+    { mode: "removed", boundary: "status read" },
+    { mode: "changed", boundary: "retirement batch" },
+    { mode: "added", boundary: "retirement batch" },
+    { mode: "removed", boundary: "retirement batch" },
+  ])("does not exhaust after another sibling is $mode at $boundary", async ({ mode, boundary }) => {
+    const m = await mapping("immediate");
+    await page();
+    const row = (await env.DB.prepare("SELECT id FROM outbox WHERE topic='slack_channel'").first<{ id: string }>())!;
+    await env.DB.prepare(
+      "UPDATE outbox SET enqueued_at=1,available_at=1,slack_redrive_count=8,slack_redrive_due_at=1 WHERE id=?",
+    )
+      .bind(row.id)
+      .run();
+    await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_redrive_count)
+      SELECT 'sibling',workspace_id,topic,payload_json,1,1,1,8 FROM outbox WHERE id=?`)
+      .bind(row.id)
+      .run();
+    let changed = false;
+    const changeSibling = async () => {
+      if (!changed) {
+        changed = true;
+        if (mode === "changed")
+          await env.DB.prepare(
+            "UPDATE outbox SET enqueued_at=NULL,last_error='slack_validation_stale',slack_claim_recheck_at=? WHERE id='sibling'",
+          )
+            .bind(Date.now() + 60_000)
+            .run();
+        else if (mode === "removed") await env.DB.prepare("DELETE FROM outbox WHERE id='sibling'").run();
+        else
+          await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
+    SELECT 'new-sibling',workspace_id,topic,payload_json,1,1 FROM outbox WHERE id=?`)
+            .bind(row.id)
+            .run();
+      }
+    };
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            if (boundary === "retirement batch") await changeSibling();
+            return target.batch(statements);
+          };
+        if (key === "prepare")
+          return (sql: string) => {
+            const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+              new Proxy(statement, {
+                get(prepared, method) {
+                  if (method === "bind") return (...args: unknown[]) => wrap(prepared.bind(...args));
+                  if (method === "first" && sql.includes("outcome,state,claimed_at,attempted_at,paused,blocked_child"))
+                    return async () => {
+                      const status = await prepared.first();
+                      if (boundary === "status read") await changeSibling();
+                      return status;
+                    };
+                  const value: unknown = Reflect.get(prepared, method, prepared);
+                  return typeof value === "function" ? value.bind(prepared) : value;
+                },
+              });
+            return wrap(target.prepare(sql));
+          };
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await redriveRound2Outbox({ ...runtime(), DB: db });
+    expect(changed).toBe(true);
+    expect(
+      await env.DB.prepare("SELECT round2_state FROM slack_channel_events WHERE subscription_id=?").bind(m.id).first(),
+    ).toEqual({ round2_state: "pending" });
+    expect(
+      await env.DB.prepare("SELECT 1 FROM slack_delivery_failures WHERE reason='redrive_exhausted'").first(),
+    ).toBeNull();
+  });
+
   it("exhausts ordinary retryable work after its coordination exemption is consumed", async () => {
     const m = await mapping("immediate");
     await page();

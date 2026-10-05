@@ -2987,6 +2987,110 @@ describe("Worker integration", () => {
     });
   });
 
+  it.each(["fresh", "existing", "receipt", "fresh authorization", "existing authorization"])(
+    "returns a captured mutation revision after compaction: %s",
+    async (mode) => {
+      const installed = await bootstrap();
+      const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+      await stub.fetch(internalWarmupRequest());
+      await runInDurableObject(stub, async (instance, state) => {
+        const room = instance as unknown as TestDocument;
+        installDocumentBlocks(room.document, documentBlock("response-block", "Before").container);
+        const originalDb = room.bindings.DB;
+        let permitted = true;
+        room.bindings.DB = new Proxy(originalDb, {
+          get(target, key) {
+            if (key === "prepare")
+              return (sql: string) =>
+                sql.includes("SELECT 1 FROM slack_product_sessions")
+                  ? {
+                      bind() {
+                        return this;
+                      },
+                      async first() {
+                        return permitted ? { allowed: 1 } : null;
+                      },
+                    }
+                  : target.prepare(sql);
+            const value: unknown = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        const mutation = () =>
+          new Request("https://document.internal/api-mutate", {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+            body: JSON.stringify({
+              actorId: installed.userId,
+              operationId: "captured-operation",
+              ...(mode.includes("authorization") ? { slackProductSessionId: "test-session" } : {}),
+              operations: [
+                {
+                  type: "update_block",
+                  internalId: "response-block",
+                  node: {
+                    type: "paragraph",
+                    content: [{ type: "text", text: "Mutation result" }],
+                  },
+                },
+              ],
+            }),
+          });
+        const originalCompact = room.compact.bind(room);
+        let capturedSequence = 0;
+        let restoreCompact: (() => void) | undefined;
+        try {
+          let seedStatus = 200;
+          if (mode.startsWith("existing") || mode === "receipt") {
+            seedStatus = (await room.onRequest(mutation())).status;
+            room.document.getMap("test-dirty").set("value", 1);
+          }
+          expect(seedStatus).toBe(200);
+          const spy = vi.spyOn(room, "compact").mockImplementation(async (forceVersion) => {
+            capturedSequence = state.storage.sql
+              .exec<{ seq: number }>("SELECT MAX(seq) seq FROM update_events")
+              .one().seq;
+            // A websocket deletion arrives after the response revision was captured.
+            const group = room.document.getXmlFragment("document-store").get(0) as Y.XmlElement;
+            group.delete(0, 1);
+            permitted = false;
+            await originalCompact(forceVersion);
+          });
+          restoreCompact = () => spy.mockRestore();
+          const request =
+            mode === "receipt"
+              ? new Request("https://document.internal/api-mutate-receipt?operationId=captured-operation", {
+                  headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+                })
+              : mutation();
+          const response = await room.onRequest(request);
+          const result = await response.json<{ document?: unknown; sequence?: number; error?: string }>();
+          expect(response.status).toBe(mode.includes("authorization") ? 403 : 200);
+          expect(Object.keys(result).sort()).toEqual(
+            mode.includes("authorization")
+              ? ["error"]
+              : mode === "receipt"
+                ? ["document", "found", "sequence"]
+                : ["document", "sequence"],
+          );
+          expect(JSON.stringify(result)).toContain(
+            mode.includes("authorization") ? "slack_identity_required" : "Mutation result",
+          );
+          expect(result.sequence ?? capturedSequence).toBe(capturedSequence);
+          expect(
+            state.storage.sql.exec<{ snapshot_seq: number }>("SELECT snapshot_seq FROM document_meta").one()
+              .snapshot_seq,
+          ).toBeGreaterThan(capturedSequence);
+          expect(room.document.getMap("api-operation-receipts").size).toBe(1);
+          expect((room.document.getXmlFragment("document-store").get(0) as Y.XmlElement).length).toBe(0);
+        } finally {
+          restoreCompact?.();
+          room.bindings.DB = originalDb;
+        }
+      });
+    },
+  );
+
   it.each(["identical", "conflicting hash", "date token", "block limit", "byte limit"])(
     "rechecks document mutation state after concurrent authorization: %s",
     async (mode) => {

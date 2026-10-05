@@ -638,6 +638,29 @@ describe("App error handling", () => {
     expect(await screen.findByText("Slack sign-up could not be started.")).toBeInTheDocument();
   });
 
+  it.each([
+    ["__proto__", "Slack sign-in could not be completed. Try again or sign in normally."],
+    ["constructor", "Slack sign-in could not be completed. Try again or sign in normally."],
+    ["unknown", "Slack sign-in could not be completed. Try again or sign in normally."],
+    ["SECURITY_REQUIRED", "Verify an authenticator code or passkey in Account protection, then connect Slack again."],
+    ["unauthorized", "Your session expired. Sign in again before connecting Slack."],
+    ["slack_link_changed", "Slack authorization changed. Verify your account protection and connect Slack again."],
+    ["slack_identity_invalid", "Slack could not verify your identity. Sign in again."],
+    ["slack_bot_forbidden", "Use your personal Slack member account, rather than a bot account."],
+    ["slack_not_connected", "Ask the workspace owner to connect Slack first."],
+    ["slack_unavailable", "Slack is temporarily unavailable. Try again or sign in normally."],
+  ])("renders bounded Slack callback errors for %s", async (code, message) => {
+    history.replaceState(null, "", `/?slackAuth=callback&error=${code}&error_description=secret-detail`);
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/install") return { initialized: true, slackIdentityAvailable: true };
+      if (path === "/api/security/status") return { state: "signed_out" };
+      throw new Error(`Unexpected API request: ${path}`);
+    });
+    render(<App />);
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    expect(window.location.search).toBe("");
+  });
+
   it("starts returning-user Slack sign-in and scrubs bounded OAuth errors", async () => {
     history.replaceState(
       null,

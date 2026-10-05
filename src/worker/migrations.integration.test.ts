@@ -7,6 +7,75 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it.each(["legacy", "verified"])(
+    "revokes %s workspace links on removal without restoring them on rejoin",
+    async (kind) => {
+      await applyD1Migrations(
+        env.DB,
+        env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0073"),
+      );
+      await env.DB.batch([
+        env.DB.prepare(
+          "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('member','Member','member@example.test',1,1),('admin','Admin','admin@example.test',1,1),('orphan','Orphan','orphan@example.test',1,1)",
+        ),
+        env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('first','First',1),('second','Second',1)"),
+        env.DB.prepare(
+          "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('first','admin','owner',1),('second','admin','owner',1),('first','member','editor',1),('second','member','editor',1)",
+        ),
+        env.DB.prepare(
+          "INSERT INTO twoFactor(id,userId,secret,backupCodes,verified) VALUES('factor','member','secret','[]',1)",
+        ),
+        env.DB.prepare("UPDATE account_security SET codes_saved=1 WHERE user_id='member'"),
+        env.DB
+          .prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at)
+        VALUES('first-installation','first','TFIRST','First','B123','unused','users:read','admin',1,1),('second-installation','second','TSECOND','Second','B123','unused','users:read','admin',1,1)`),
+        env.DB.prepare(
+          "INSERT INTO account(id,userId,providerId,accountId,createdAt,updatedAt) VALUES('oauth','member','slack','TFIRST:UMEMBER',1,1),('second-oauth','member','slack','TSECOND:UMEMBER',1,1)",
+        ),
+        env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,authorization_started_at,security_generation,better_auth_account_id,verification_method,migration_state,verified_at)
+        VALUES('first-installation','member','UMEMBER',1,1,0,'oauth',?,?,1),('second-installation','member','UMEMBER',1,1,0,'second-oauth',?,?,1),('first-installation','orphan','UORPHAN',1,1,0,NULL,'legacy_command','legacy',NULL)`).bind(
+          kind === "verified" ? "slack_openid" : "legacy_command",
+          kind,
+          kind === "verified" ? "slack_openid" : "legacy_command",
+          kind,
+        ),
+      ]);
+      await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+      expect(await env.DB.prepare("SELECT 1 FROM slack_user_links WHERE user_id='orphan'").first()).toBeNull();
+      expect(
+        (await env.DB.prepare("SELECT installation_id FROM slack_authorized_user_links WHERE user_id='member'").all())
+          .results,
+      ).toHaveLength(2);
+      await env.DB.prepare("DELETE FROM workspace_members WHERE workspace_id='first' AND user_id='member'").run();
+      expect(
+        (await env.DB.prepare("SELECT installation_id FROM slack_user_links WHERE user_id='member'").all()).results,
+      ).toEqual([{ installation_id: "second-installation" }]);
+      expect(await env.DB.prepare("SELECT 1 FROM account WHERE id='oauth'").first()).not.toBeNull();
+      await env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('first','member','editor',2)",
+      ).run();
+      expect(
+        await env.DB.prepare(
+          "SELECT 1 FROM slack_authorized_user_links WHERE installation_id='first-installation' AND user_id='member'",
+        ).first(),
+      ).toBeNull();
+      // Explicit relinking starts a new grant; historical work is outside that grant.
+      await env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,authorization_started_at,security_generation,better_auth_account_id,verification_method,migration_state,verified_at)
+      VALUES('first-installation','member','UMEMBER',10,10,0,'oauth','slack_openid','verified',10)`).run();
+      expect(
+        await env.DB.prepare(
+          "SELECT authorization_started_at FROM slack_authorized_user_links WHERE installation_id='first-installation'",
+        ).first(),
+      ).toEqual({ authorization_started_at: 10 });
+      expect(
+        await env.DB.prepare(
+          "SELECT 1 FROM slack_authorized_user_links WHERE installation_id='first-installation' AND authorization_started_at<=1",
+        ).first(),
+      ).toBeNull();
+      await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    },
+  );
+
   it("grandfathers protected bindings, rejects older writes and revokes access on reset or unlink", async () => {
     await applyD1Migrations(
       env.DB,
