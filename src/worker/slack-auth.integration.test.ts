@@ -248,7 +248,7 @@ describe("Slack OAuth authorization boundaries", () => {
     const migrations = env.TEST_MIGRATIONS!;
     await applyD1Migrations(
       env.DB,
-      migrations.filter((migration) => !migration.name.startsWith("0072")),
+      migrations.filter((migration) => migration.name < "0072"),
     );
     const user = "migration-owner";
     await env.DB.batch([
@@ -297,6 +297,21 @@ describe("Slack OAuth authorization boundaries", () => {
     await expect(
       slackAccessAuthorization(configured(), { id: "installation", generation: 0 }, { userId: user }, 30)(),
     ).rejects.toMatchObject({ code: "slack_identity_required" });
+    await env.DB.prepare(
+      "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('migration-workspace',?,'editor',1)",
+    )
+      .bind(user)
+      .run();
+    await applyD1Migrations(
+      env.DB,
+      migrations.filter((migration) => migration.name.startsWith("0073")),
+    );
+    expect(
+      await env.DB.prepare("SELECT 1 FROM slack_user_links WHERE user_id='migration-verified'").first(),
+    ).toBeNull();
+    expect(await env.DB.prepare("SELECT 1 FROM slack_user_links WHERE user_id=?").bind(user).first()).not.toBeNull();
+    await env.DB.prepare("DELETE FROM workspace_members WHERE user_id=?").bind(user).run();
+    expect(await env.DB.prepare("SELECT 1 FROM slack_user_links WHERE user_id=?").bind(user).first()).toBeNull();
   });
 
   it.each([false, true])("redirects a completion race with an existing account %s", async (relink) => {
@@ -557,6 +572,11 @@ describe("Slack OAuth authorization boundaries", () => {
     const { cookie, user, workspace } = await account();
     await callback(await start(cookie));
     const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?").bind(user).first<{ id: string }>())!;
+    const link = env.DB.prepare(
+      "SELECT * FROM slack_user_links WHERE installation_id='installation' AND user_id=?",
+    ).bind(user);
+    let expectedLink = await link.first();
+    expect(expectedLink).not.toBeNull();
     const db = new Proxy(env.DB, {
       get(target, property) {
         if (property === "batch")
@@ -567,11 +587,15 @@ describe("Slack OAuth authorization boundaries", () => {
               await env.DB.prepare("UPDATE account_security SET generation=generation+1 WHERE user_id=?")
                 .bind(user)
                 .run();
+              // The generation-revocation trigger removes the original link before reconnection.
+              expect(await link.first()).toBeNull();
               // A newly connected link must survive the stale revocation request.
               await env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,security_generation)
               VALUES('installation',?,'UNEWER',?,1)`)
                 .bind(user, Date.now())
                 .run();
+              expectedLink = await link.first();
+              expect(expectedLink).not.toBeNull();
             }
             return target.batch(statements);
           };
@@ -582,7 +606,7 @@ describe("Slack OAuth authorization boundaries", () => {
     await expect(
       disconnectSlackIdentity({ ...configured(), DB: db }, user, session.id, workspace),
     ).rejects.toMatchObject({ status: 409, code: "slack_link_changed" });
-    expect(await env.DB.prepare("SELECT 1 FROM slack_user_links WHERE user_id=?").bind(user).first()).not.toBeNull();
+    expect(await link.first()).toEqual(expectedLink);
   });
 
   it("completes linking and relinking without creating a primary proof or changing assurance", async () => {

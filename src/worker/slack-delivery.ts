@@ -107,3 +107,6 @@ export async function retireObsoleteReceipt(
     ).bind(id, token),
   ]);
 }
+
+// The dispatch hook has already classified unsent work as paused or retired.
+export class SlackDispatchSkippedError extends Error {}

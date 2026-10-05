@@ -2237,58 +2237,74 @@ describe("interactive Slack workspace", () => {
       await env.DB.prepare(`SELECT outcome FROM slack_interaction_receipts WHERE id = ?`).bind(receipt!.id).first(),
     ).toEqual({ outcome: "accepted" });
   });
-  it("privately replaces a revoked pinned share without changing its public reference", async () => {
-    await activeThread();
-    const refreshEnv = { ...runtime(), SLACK_SHARE_REFRESH_ENABLED: "true" } as Env;
-    const old = await createShare(refreshEnv, owner, "page", "http://example.test", {});
-    await handleSlackEvent(refreshEnv, {
-      type: "event_callback",
-      event_id: "revoked-action",
-      team_id: "T123",
-      event: {
-        type: "link_shared",
-        user: "UOWNER",
-        channel: "CSPACE",
-        message_ts: "1700000700.000001",
-        links: [{ url: old.url }],
-      },
-    });
-    await revokeShare(refreshEnv, owner, "page");
-    const ref = (await env.DB.prepare(
-      "SELECT id,share_link_id FROM slack_share_references WHERE reference_kind='share'",
-    ).first<{ id: string; share_link_id: string }>())!;
-    await acceptSlackWorkspaceInteraction(refreshEnv, {
-      type: "block_actions",
-      team: { id: "T123" },
-      user: { id: "UOWNER" },
-      container: { channel_id: "CSPACE", message_ts: "1700000700.000001", app_unfurl_url: old.url },
-      app_unfurl: { app_unfurl_url: old.url },
-      actions: [{ action_id: "noteflare_unfurl_share_create", action_ts: "1700000909.000001", value: ref.id }],
-    });
-    const receipt = (await env.DB.prepare(
-      "SELECT id FROM slack_interaction_receipts WHERE callback_id='noteflare_unfurl_share_create'",
-    ).first<{ id: string }>())!;
-    await deliverSlackWorkspaceAction(refreshEnv, receipt.id);
-    expect(
-      await env.DB.prepare("SELECT outcome FROM slack_interaction_receipts WHERE id=?").bind(receipt.id).first(),
-    ).toEqual({ outcome: "accepted" });
-    expect(
-      await env.DB.prepare("SELECT share_link_id FROM slack_share_references WHERE id=?").bind(ref.id).first(),
-    ).toEqual({ share_link_id: ref.share_link_id });
-    expect(
-      await env.DB.prepare("SELECT revoked_at IS NOT NULL revoked FROM share_links WHERE id=?")
-        .bind(ref.share_link_id)
-        .first(),
-    ).toEqual({ revoked: 1 });
-    expect(
-      await env.DB.prepare(
-        "SELECT count(*) n FROM share_links WHERE root_page_id='page' AND revoked_at IS NULL",
-      ).first(),
-    ).toEqual({ n: 1 });
-    expect(await env.DB.prepare("SELECT count(*) n FROM outbox WHERE topic='slack_share_response'").first()).toEqual({
-      n: 1,
-    });
-  });
+  it.each([false, true])(
+    "privately replaces a revoked pinned share and checks reference retirement before responding (retired=%s)",
+    async (retired) => {
+      await activeThread();
+      const refreshEnv = { ...runtime(), SLACK_SHARE_REFRESH_ENABLED: "true" } as Env;
+      const old = await createShare(refreshEnv, owner, "page", "http://example.test", {});
+      await handleSlackEvent(refreshEnv, {
+        type: "event_callback",
+        event_id: "revoked-action",
+        team_id: "T123",
+        event: {
+          type: "link_shared",
+          user: "UOWNER",
+          channel: "CSPACE",
+          message_ts: "1700000700.000001",
+          links: [{ url: old.url }],
+        },
+      });
+      await revokeShare(refreshEnv, owner, "page");
+      const ref = (await env.DB.prepare(
+        "SELECT id,share_link_id FROM slack_share_references WHERE reference_kind='share'",
+      ).first<{ id: string; share_link_id: string }>())!;
+      await acceptSlackWorkspaceInteraction(refreshEnv, {
+        type: "block_actions",
+        team: { id: "T123" },
+        user: { id: "UOWNER" },
+        container: { channel_id: "CSPACE", message_ts: "1700000700.000001", app_unfurl_url: old.url },
+        app_unfurl: { app_unfurl_url: old.url },
+        actions: [{ action_id: "noteflare_unfurl_share_create", action_ts: "1700000909.000001", value: ref.id }],
+      });
+      const receipt = (await env.DB.prepare(
+        "SELECT id FROM slack_interaction_receipts WHERE callback_id='noteflare_unfurl_share_create'",
+      ).first<{ id: string }>())!;
+      await deliverSlackWorkspaceAction(refreshEnv, receipt.id);
+      expect(
+        await env.DB.prepare("SELECT outcome FROM slack_interaction_receipts WHERE id=?").bind(receipt.id).first(),
+      ).toEqual({ outcome: "accepted" });
+      expect(
+        await env.DB.prepare("SELECT share_link_id FROM slack_share_references WHERE id=?").bind(ref.id).first(),
+      ).toEqual({ share_link_id: ref.share_link_id });
+      expect(
+        await env.DB.prepare("SELECT revoked_at IS NOT NULL revoked FROM share_links WHERE id=?")
+          .bind(ref.share_link_id)
+          .first(),
+      ).toEqual({ revoked: 1 });
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) n FROM share_links WHERE root_page_id='page' AND revoked_at IS NULL",
+        ).first(),
+      ).toEqual({ n: 1 });
+      expect(await env.DB.prepare("SELECT count(*) n FROM outbox WHERE topic='slack_share_response'").first()).toEqual({
+        n: 1,
+      });
+      const queued = (await env.DB.prepare("SELECT payload_json FROM outbox WHERE topic='slack_share_response'").first<{
+        payload_json: string;
+      }>())!;
+      if (retired)
+        await env.DB.prepare("UPDATE slack_share_references SET state='retired' WHERE id=?").bind(ref.id).run();
+      calls = [];
+      await deliverSlackShareResponse(refreshEnv, JSON.parse(queued.payload_json) as Record<string, unknown>);
+      expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(retired ? 0 : 1);
+      expect(
+        await env.DB.prepare("SELECT response_delivery_state state FROM slack_interaction_receipts WHERE id=?")
+          .bind(receipt.id)
+          .first(),
+      ).toEqual({ state: retired ? "blocked" : "sent" });
+    },
+  );
   it("defers an unfurl through auth failure and redrives it after reauthorization", async () => {
     await env.DB.batch([
       env.DB.prepare(`UPDATE slack_installations SET credential_revision=7 WHERE id='installation'`),
@@ -2433,7 +2449,10 @@ describe("interactive Slack workspace", () => {
                 new Proxy(statement, {
                   get(prepared, method) {
                     if (method === "bind") return (...args: unknown[]) => wrap(prepared.bind(...args));
-                    if (method === "run" && sql.includes("response_delivery_state = 'sending'"))
+                    if (
+                      method === "run" &&
+                      sql.includes("UPDATE slack_interaction_receipts SET response_delivery_state='sending'")
+                    )
                       return async () => {
                         const result = await prepared.run();
                         if (mode === "during token refresh") clock.mockReturnValue(now + 2000);
@@ -2462,6 +2481,126 @@ describe("interactive Slack workspace", () => {
     }
   });
 
+  it.each([
+    "database failure",
+    "owner demotion",
+    "share revoked",
+    "page archived",
+    "page template",
+    "mapping removed",
+    "mirror disabled",
+    "thread retired",
+    "identity replaced",
+    "rejoined",
+    "old payload",
+  ])("fences a share response after %s", async (mode) => {
+    const { link } = await activeThread();
+    if (mode === "owner demotion" || mode === "rejoined") {
+      await env.DB.prepare("UPDATE workspace_members SET role='owner' WHERE user_id='viewer'").run();
+    }
+    const receiptId = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
+    await deliverSlackWorkspaceAction(runtime(), receiptId);
+    const queued = (await env.DB.prepare(
+      "SELECT payload_json FROM outbox WHERE topic='slack_share_response' ORDER BY rowid LIMIT 1",
+    ).first<{ payload_json: string }>())!;
+    const payload = JSON.parse(queued.payload_json) as Record<string, unknown>;
+    if (mode === "old payload") delete payload.identity;
+    let changed = false;
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) => {
+            const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+              new Proxy(statement, {
+                get(prepared, method) {
+                  if (method === "bind") return (...args: unknown[]) => wrap(prepared.bind(...args));
+                  if (
+                    method === "run" &&
+                    sql.includes("UPDATE slack_interaction_receipts SET response_delivery_state='sending'")
+                  )
+                    return async () => {
+                      const result = await prepared.run();
+                      if (!changed) {
+                        changed = true;
+                        if (mode === "owner demotion")
+                          await env.DB.prepare(
+                            "UPDATE workspace_members SET role='editor' WHERE user_id='owner'",
+                          ).run();
+                        if (mode === "share revoked")
+                          await env.DB.prepare("UPDATE share_links SET revoked_at=1 WHERE id=?")
+                            .bind(payload.shareId)
+                            .run();
+                        if (mode === "page archived")
+                          await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(payload.pageId).run();
+                        if (mode === "page template")
+                          await env.DB.prepare("UPDATE pages SET is_template=1 WHERE id=?").bind(payload.pageId).run();
+                        if (mode === "mirror disabled")
+                          await env.DB.prepare("UPDATE slack_channel_subscriptions SET mirror_enabled=0").run();
+                        if (mode === "mapping removed")
+                          await env.DB.prepare("DELETE FROM slack_channel_subscriptions").run();
+                        if (mode === "thread retired")
+                          await env.DB.prepare("UPDATE slack_thread_links SET state='retired' WHERE id=?")
+                            .bind(link.id)
+                            .run();
+                        if (mode === "identity replaced")
+                          await env.DB.prepare(
+                            "UPDATE slack_user_links SET verified_at=verified_at+1 WHERE user_id='owner'",
+                          ).run();
+                      }
+                      return result;
+                    };
+                  if (method === "first" && sql.includes("SELECT share.url_key"))
+                    return async () => {
+                      if (changed && mode === "database failure") {
+                        changed = false;
+                        throw new Error("Transient final authorization failure");
+                      }
+                      return prepared.first();
+                    };
+                  const value: unknown = Reflect.get(prepared, method, prepared);
+                  return typeof value === "function" ? value.bind(prepared) : value;
+                },
+              });
+            return wrap(target.prepare(sql));
+          };
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    if (mode === "rejoined") {
+      const original = (await env.DB.prepare("SELECT * FROM slack_user_links WHERE user_id='owner'").first<
+        Record<string, unknown>
+      >())!;
+      await env.DB.prepare("DELETE FROM workspace_members WHERE user_id='owner'").run();
+      await env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace','owner','owner',?)",
+      )
+        .bind(Date.now())
+        .run();
+      const keys = Object.keys(original);
+      original.authorization_started_at = Date.now() + 1;
+      await env.DB.prepare(`INSERT INTO slack_user_links(${keys.join(",")}) VALUES(${keys.map(() => "?").join(",")})`)
+        .bind(...Object.values(original))
+        .run();
+    }
+    calls = [];
+    const failure = await deliverSlackShareResponse({ ...runtime(), DB: db }, payload).then(
+      () => null,
+      (error: Error) => error.message,
+    );
+    expect(failure).toBe(mode === "database failure" ? "Transient final authorization failure" : null);
+    expect(
+      await env.DB.prepare("SELECT response_delivery_state state FROM slack_interaction_receipts WHERE id=?")
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ state: mode === "database failure" ? "pending" : "blocked" });
+    expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(0);
+    if (mode === "database failure") await deliverSlackShareResponse(runtime(), payload);
+    expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(
+      mode === "database failure" ? 1 : 0,
+    );
+  });
+
   it("sends share links outside the thread and distinguishes rate limits from uncertain sends", async () => {
     const { link } = await activeThread();
     const create = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
@@ -2477,7 +2616,9 @@ describe("interactive Slack workspace", () => {
         .bind(create)
         .first(),
     ).toEqual({ state: "pending" });
-    await env.DB.prepare(`UPDATE slack_installations SET token_expires_at = NULL WHERE id = 'installation'`).run();
+    await env.DB.prepare(
+      `UPDATE slack_installations SET token_expires_at = NULL,auth_error=NULL WHERE id = 'installation'`,
+    ).run();
     ephemeralFailure = "rate";
     await expect(deliverSlackShareResponse(runtime(), payload)).rejects.toBeInstanceOf(SlackRateLimitError);
     expect(
@@ -5113,6 +5254,60 @@ describe("Slack documents and tasks", () => {
       warned.mockRestore();
     }
   });
+  it.each([false, true])("recovers copy commit evidence after access is revoked (lost response=%s)", async (lost) => {
+    const id = await open("new");
+    const payload = submission(id, "document", "space:workspace-general", "Receipt recovery");
+    (payload.view.state.values as Record<string, unknown>).body = { value: { value: "Unique copied content" } };
+    await acceptSlackProductInteraction(runtime(), payload, Date.now() + 2500);
+    let mutations = 0;
+    const responses: unknown[] = [];
+    const document = new Proxy(env.DOCUMENT, {
+      get(target, key) {
+        if (key === "getByName")
+          return (name: string) => {
+            const stub = target.getByName(name);
+            return {
+              fetch: async (request: Request) => {
+                const response = await stub.fetch(request);
+                if (new URL(request.url).pathname === "/api-mutate") {
+                  mutations++;
+                  responses.push(await response.clone().json());
+                  await env.DB.batch([
+                    env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'"),
+                    env.DB.prepare(
+                      "UPDATE slack_product_sessions SET state_json=json_set(state_json,'$.concurrentValue','preserved') WHERE id=?",
+                    ).bind(id),
+                  ]);
+                  if (lost) throw new Error("Lost mutation response");
+                }
+                return response;
+              },
+            };
+          };
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as Env["DOCUMENT"];
+    calls = [];
+    const failure = await deliverSlackProductCopy({ ...runtime(), DOCUMENT: document }, id).then(
+      () => null,
+      (error: Error) => error.message,
+    );
+    expect(failure).toBe(lost ? "Lost mutation response" : null);
+    await deliverSlackProductCopy({ ...runtime(), DOCUMENT: document }, id);
+    expect(mutations).toBe(1);
+    expect(responses).toEqual([{ committed: true, operationId: `slack-${id}` }]);
+    expect(calls.filter((call) => call.method === "views.update")).toHaveLength(0);
+    const session = (await env.DB.prepare("SELECT state_json,result_page_id FROM slack_product_sessions WHERE id=?")
+      .bind(id)
+      .first<{ state_json: string; result_page_id: string }>())!;
+    expect(JSON.parse(session.state_json)).toMatchObject({ copied: true, concurrentValue: "preserved" });
+    const page = (await env.DB.prepare("SELECT plain_text FROM pages WHERE id=?")
+      .bind(session.result_page_id)
+      .first<{ plain_text: string }>())!;
+    expect(page.plain_text.split("Unique copied content")).toHaveLength(2);
+  });
+
   it("rechecks a queued copy inside the document after Slack access is revoked", async () => {
     const id = await open("new");
     const payload = submission(id, "document", "space:workspace-general", "Revoked queued copy");
@@ -5125,7 +5320,8 @@ describe("Slack documents and tasks", () => {
             const stub = target.getByName(name);
             return {
               fetch: async (request: Request) => {
-                await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'").run();
+                if (request.method === "POST" && new URL(request.url).pathname === "/api-mutate")
+                  await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'").run();
                 return stub.fetch(request);
               },
             };

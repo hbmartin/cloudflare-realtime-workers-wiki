@@ -76,18 +76,19 @@ type Round2OutboxSnapshot = {
   slack_redrive_count: number;
   slack_scope_paused_at: number | null;
 };
-const recoverySnapshotSql = `id=? AND enqueued_at IS ? AND available_at=? AND last_error IS ?
-  AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ? AND slack_redrive_count=? AND slack_scope_paused_at IS NULL`;
+const recoverySnapshotFields = [
+  "id",
+  "enqueued_at",
+  "available_at",
+  "last_error",
+  "slack_redrive_due_at",
+  "slack_claim_recheck_at",
+  "slack_redrive_count",
+  "slack_scope_paused_at",
+] as const satisfies readonly (keyof Round2OutboxSnapshot)[];
+const recoverySnapshotSql = `${recoverySnapshotFields.map((field) => `${field} IS ?`).join(" AND ")} AND slack_scope_paused_at IS NULL`;
 function recoverySnapshotBinds(sibling: Round2OutboxSnapshot) {
-  return [
-    sibling.id,
-    sibling.enqueued_at,
-    sibling.available_at,
-    sibling.last_error,
-    sibling.slack_redrive_due_at,
-    sibling.slack_claim_recheck_at,
-    sibling.slack_redrive_count,
-  ];
+  return recoverySnapshotFields.map((field) => sibling[field]);
 }
 
 export async function redriveRound2Outbox(env: Env) {
@@ -134,8 +135,9 @@ export async function redriveRound2Outbox(env: Env) {
     const key = `${row.topic}:${id}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const siblings = await env.DB.prepare(`SELECT id,enqueued_at,available_at,last_error,slack_redrive_due_at,
-      slack_claim_recheck_at,slack_redrive_count,slack_scope_paused_at FROM outbox WHERE topic=? AND slack_round2_receipt_id=?`)
+    const siblings = await env.DB.prepare(
+      `SELECT ${recoverySnapshotFields.join(",")} FROM outbox WHERE topic=? AND slack_round2_receipt_id=?`,
+    )
       .bind(row.topic, id)
       .all<Round2OutboxSnapshot>();
     const current = siblings.results.find((sibling) => sibling.id === row.id);
@@ -202,14 +204,7 @@ export async function redriveRound2Outbox(env: Env) {
     if (recoveries >= 50) continue;
     recoveries++;
     if (status.outcome === "retryable" && !coordinationRecheck && budget >= 8) {
-      if (await exhaustRound2Receipt(env, row.topic, id, siblings.results))
-        await env.DB.batch(
-          siblings.results.map((sibling) =>
-            env.DB.prepare(
-              `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error='redrive_exhausted' WHERE ${fence}`,
-            ).bind(...recoverySnapshotBinds(sibling)),
-          ),
-        );
+      await exhaustRound2Receipt(env, row.topic, id, siblings.results);
       continue;
     }
     try {
@@ -250,20 +245,16 @@ async function exhaustRound2Receipt(
   snapshots: Round2OutboxSnapshot[],
 ) {
   const contract = round2Receipts[topic];
+  if (snapshots.some((snapshot) => snapshot.slack_scope_paused_at !== null)) return;
   const token = crypto.randomUUID();
   const claim = env.DB.prepare(`UPDATE ${contract.table} SET claim_token=?,claimed_at=? WHERE id=?
     AND (SELECT ${outcomeSql()} FROM (${receiptStatusSql(topic, "?")}))='retryable'
     AND (SELECT count(*) FROM outbox WHERE topic=? AND slack_round2_receipt_id=?)=?
+    AND NOT EXISTS(SELECT 1 FROM outbox WHERE topic=? AND slack_round2_receipt_id=? AND slack_scope_paused_at IS NOT NULL)
     AND NOT EXISTS(SELECT 1 FROM json_each(?) expected LEFT JOIN outbox actual
       ON actual.id=json_extract(expected.value,'$.id')
       WHERE actual.id IS NULL OR actual.topic IS NOT ? OR actual.slack_round2_receipt_id IS NOT ?
-        OR actual.enqueued_at IS NOT json_extract(expected.value,'$.enqueued_at')
-        OR actual.available_at IS NOT json_extract(expected.value,'$.available_at')
-        OR actual.last_error IS NOT json_extract(expected.value,'$.last_error')
-        OR actual.slack_redrive_due_at IS NOT json_extract(expected.value,'$.slack_redrive_due_at')
-        OR actual.slack_claim_recheck_at IS NOT json_extract(expected.value,'$.slack_claim_recheck_at')
-        OR actual.slack_redrive_count IS NOT json_extract(expected.value,'$.slack_redrive_count')
-        OR actual.slack_scope_paused_at IS NOT json_extract(expected.value,'$.slack_scope_paused_at'))`).bind(
+        OR ${recoverySnapshotFields.map((field) => `actual.${field} IS NOT json_extract(expected.value,'$.${field}')`).join(" OR ")})`).bind(
     token,
     Date.now(),
     id,
@@ -271,6 +262,8 @@ async function exhaustRound2Receipt(
     topic,
     id,
     snapshots.length,
+    topic,
+    id,
     JSON.stringify(snapshots),
     topic,
     id,
@@ -314,6 +307,9 @@ async function exhaustRound2Receipt(
       ),
     );
   statements.push(
+    env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error='redrive_exhausted'
+      WHERE topic=? AND slack_round2_receipt_id=? AND slack_scope_paused_at IS NULL
+        AND EXISTS(SELECT 1 FROM ${contract.table} WHERE id=? AND claim_token=?)`).bind(topic, id, id, token),
     env.DB.prepare(`UPDATE ${contract.table} SET ${contract.state}=?,claim_token=NULL,claimed_at=NULL
     ${topic === "slack_channel" ? ",suppressed_at=coalesce(suppressed_at,?)" : ",last_error='redrive_exhausted'"}
     WHERE id=? AND claim_token=?`).bind(
@@ -323,8 +319,7 @@ async function exhaustRound2Receipt(
       token,
     ),
   );
-  const results = await env.DB.batch(statements);
-  return results[0]!.meta.changes > 0;
+  await env.DB.batch(statements);
 }
 
 // Owner recovery reconciles evidence only; it never resets an uncertain post for blind delivery.

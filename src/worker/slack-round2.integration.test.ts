@@ -3428,9 +3428,11 @@ describe("review follow-up permissions and recovery", () => {
     { mode: "changed", boundary: "status read" },
     { mode: "added", boundary: "status read" },
     { mode: "removed", boundary: "status read" },
+    { mode: "scope paused", boundary: "status read" },
     { mode: "changed", boundary: "retirement batch" },
     { mode: "added", boundary: "retirement batch" },
     { mode: "removed", boundary: "retirement batch" },
+    { mode: "scope paused", boundary: "retirement batch" },
   ])("does not exhaust after another sibling is $mode at $boundary", async ({ mode, boundary }) => {
     const m = await mapping("immediate");
     await page();
@@ -3455,6 +3457,8 @@ describe("review follow-up permissions and recovery", () => {
             .bind(Date.now() + 60_000)
             .run();
         else if (mode === "removed") await env.DB.prepare("DELETE FROM outbox WHERE id='sibling'").run();
+        else if (mode === "scope paused")
+          await env.DB.prepare("UPDATE outbox SET slack_scope_paused_at=1 WHERE id='sibling'").run();
         else
           await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
     SELECT 'new-sibling',workspace_id,topic,payload_json,1,1 FROM outbox WHERE id=?`)
@@ -4192,5 +4196,227 @@ describe("durable abandoned thumbnail cleanup", () => {
     ).toEqual({ n: 1 });
     await processDueSlackFileCleanup(runtime());
     expect(calls.filter((call) => call.method === "files.delete")).toHaveLength(26);
+  });
+});
+
+describe("final Round 2 dispatch authorization", () => {
+  function afterWrite(check: (sql: string) => boolean, hook: () => Promise<void>) {
+    const statements = new WeakMap<D1PreparedStatement, { sql: string; raw: D1PreparedStatement }>();
+    const wrap = (raw: D1PreparedStatement, sql: string): D1PreparedStatement => {
+      const proxy = new Proxy(raw, {
+        get(target, key) {
+          if (key === "bind") return (...values: unknown[]) => wrap(target.bind(...values), sql);
+          if (key === "run")
+            return async () => {
+              const result = await target.run();
+              if (check(sql)) await hook();
+              return result;
+            };
+          const value: unknown = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      statements.set(proxy, { sql, raw });
+      return proxy;
+    };
+    return new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare") return (sql: string) => wrap(target.prepare(sql), sql);
+        if (key === "batch")
+          return async (batch: D1PreparedStatement[]) => {
+            const result = await target.batch(batch.map((statement) => statements.get(statement)?.raw ?? statement));
+            if (batch.some((statement) => check(statements.get(statement)?.sql ?? ""))) await hook();
+            return result;
+          };
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
+  it.each(
+    ["channel", "digest", "bulk"].flatMap((path) =>
+      ["refresh", "checkpoint"].flatMap((boundary) =>
+        ["actor revoked", "claim stolen", "temporary pause", "transient failure"].map((change) => ({
+          path,
+          boundary,
+          change,
+        })),
+      ),
+    ),
+  )("fences $path at $boundary after $change", async ({ path, boundary, change }) => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const m = await mapping(path === "digest" ? "digest" : "immediate");
+    await env.DB.prepare("UPDATE slack_channel_subscriptions SET digest_open_work=0 WHERE id=?").bind(m.id).run();
+    await page();
+    await env.DB.prepare("UPDATE slack_channel_events SET suppressed_at=1").run();
+    const window = digestWindow(now, "09:00", "America/Chicago");
+    await event(m.id, "page", window.start + 1000, path === "bulk" ? "page_archived" : "page_edit", "dispatch-event");
+    await env.DB.prepare("UPDATE slack_channel_events SET actor_id='viewer',cadence=? WHERE id='dispatch-event'")
+      .bind(path === "digest" ? "digest" : "immediate")
+      .run();
+    const table =
+      path === "channel" ? "slack_channel_events" : path === "digest" ? "slack_digest_receipts" : "slack_bulk_receipts";
+    const id = path === "channel" ? "dispatch-event" : path === "digest" ? (await receipt(m.id)).id : "bulk-dispatch";
+    if (path === "bulk") {
+      await env.DB.prepare(`INSERT INTO slack_bulk_receipts(id,operation_id,installation_id,installation_generation,channel_id,event_type,event_ids_json,created_at)
+        VALUES(?,'bulk-operation','installation',1,'C123','page_archived','["dispatch-event"]',1)`)
+        .bind(id)
+        .run();
+      await env.DB.prepare("UPDATE slack_channel_events SET summary_id=? WHERE id='dispatch-event'").bind(id).run();
+    }
+    let failed = false;
+    const changeAuthority = async () => {
+      if (change === "transient failure" && !failed) {
+        failed = true;
+        throw new Error("Transient dispatch checkpoint failure");
+      }
+      if (change === "actor revoked")
+        await env.DB.prepare("DELETE FROM workspace_members WHERE user_id='viewer'").run();
+      if (change === "claim stolen")
+        await env.DB.prepare(`UPDATE ${table} SET claim_token='other',claimed_at=? WHERE id=?`)
+          .bind(now + 2000, id)
+          .run();
+      if (change === "temporary pause")
+        await env.DB.prepare("UPDATE slack_channel_subscriptions SET muted_at=1 WHERE id=?").bind(m.id).run();
+    };
+    let changed = false;
+    const db = afterWrite(
+      (sql) =>
+        boundary === "refresh"
+          ? sql.includes("UPDATE slack_channel_subscriptions SET channel_name=")
+          : sql.includes(`UPDATE ${table} SET ${path === "channel" ? "round2_state" : "state"}='sending'`),
+      async () => {
+        if (changed) return;
+        changed = true;
+        if (boundary === "refresh") vi.mocked(Date.now).mockReturnValue(now + 2000);
+        else await changeAuthority();
+      },
+    );
+    if (boundary === "refresh") {
+      await env.DB.prepare("UPDATE slack_installations SET token_expires_at=?,bot_refresh_token_ciphertext=?")
+        .bind(now + 61000, await encryptSlackToken(runtime(), "refresh-token"))
+        .run();
+      const remote = vi.mocked(fetch).getMockImplementation()!;
+      vi.mocked(fetch).mockImplementation(async (input, init) => {
+        if (String(input).endsWith("/oauth.v2.access")) {
+          await changeAuthority();
+          return Response.json({ ok: true, access_token: "new-token", refresh_token: "new-refresh", expires_in: 3600 });
+        }
+        return remote(input, init);
+      });
+    }
+    calls = [];
+    const deliver = () =>
+      path === "channel"
+        ? deliverRound2ChannelEvent({ ...runtime(), DB: db }, id)
+        : path === "digest"
+          ? deliverDigest({ ...runtime(), DB: db }, id)
+          : deliverBulkSummary({ ...runtime(), DB: db }, id);
+    const failure: unknown = await deliver().catch((error: unknown) => error);
+    const expectedError = change === "transient failure" ? Error : DeliveryInProgressError;
+    expect(failure === undefined || failure instanceof expectedError).toBe(true);
+    expect(
+      change !== "transient failure" ||
+        (failure instanceof Error && failure.message === "Transient dispatch checkpoint failure"),
+    ).toBe(true);
+    expect(changed).toBe(true);
+    expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(0);
+    const result = await env.DB.prepare(
+      `SELECT ${path === "channel" ? "round2_state" : "state"} state,attempted_at FROM ${table} WHERE id=?`,
+    )
+      .bind(id)
+      .first<{ state: string; attempted_at: number | null }>();
+    // A stolen claim retains its new owner's checkpoint; only the losing worker's own claim can be reset.
+    expect(change === "claim stolen" || result!.state !== "sending").toBe(true);
+    expect(change === "claim stolen" || result!.attempted_at === null).toBe(true);
+    if (change === "transient failure") await deliver();
+    expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(
+      change === "transient failure" ? 1 : 0,
+    );
+  });
+
+  it("dispatches and acknowledges only the remaining authorized digest candidates", async () => {
+    const m = await mapping();
+    await env.DB.prepare("UPDATE slack_channel_subscriptions SET digest_open_work=0 WHERE id=?").bind(m.id).run();
+    await page("allowed", { title: "Allowed title" });
+    await page("revoked", { title: "Secret title" });
+    const window = digestWindow(Date.now(), "09:00", "America/Chicago");
+    await event(m.id, "allowed", window.start + 1000, "page_edit", "allowed-event");
+    await event(m.id, "revoked", window.start + 1000, "page_edit", "revoked-event");
+    await env.DB.prepare("UPDATE slack_channel_events SET actor_id='viewer' WHERE id='revoked-event'").run();
+    const r = await receipt(m.id);
+    let changed = false;
+    const db = afterWrite(
+      (sql) => sql.includes("UPDATE slack_channel_subscriptions SET channel_name="),
+      async () => {
+        if (!changed) {
+          changed = true;
+          await env.DB.prepare("DELETE FROM workspace_members WHERE user_id='viewer'").run();
+        }
+      },
+    );
+    calls = [];
+    await deliverDigest({ ...runtime(), DB: db }, r.id);
+    const post = calls.find((call) => call.method === "chat.postMessage")!;
+    expect(JSON.stringify(post.body)).toContain("Allowed title");
+    expect(JSON.stringify(post.body)).not.toContain("Secret title");
+    const child = await env.DB.prepare(
+      "SELECT event_ids_json,page_ids_json FROM slack_digest_messages WHERE receipt_id=?",
+    )
+      .bind(r.id)
+      .first();
+    expect(child).toEqual({ event_ids_json: '["allowed-event"]', page_ids_json: '["allowed"]' });
+    expect(
+      await env.DB.prepare(
+        "SELECT delivered_at IS NOT NULL delivered FROM slack_channel_events WHERE id='allowed-event'",
+      ).first(),
+    ).toEqual({ delivered: 1 });
+    expect(
+      await env.DB.prepare(
+        "SELECT delivered_at IS NOT NULL delivered FROM slack_channel_events WHERE id='revoked-event'",
+      ).first(),
+    ).toEqual({ delivered: 0 });
+  });
+
+  it("rolls back exhaustion records and sibling retirement when the transaction fails", async () => {
+    const m = await mapping("immediate");
+    await page();
+    const row = (await env.DB.prepare("SELECT id FROM outbox WHERE topic='slack_channel'").first<{ id: string }>())!;
+    await env.DB.prepare(
+      "UPDATE outbox SET enqueued_at=1,available_at=1,slack_redrive_count=8,slack_redrive_due_at=1 WHERE id=?",
+    )
+      .bind(row.id)
+      .run();
+    await env.DB.prepare(`CREATE TRIGGER reject_sibling_retirement BEFORE UPDATE OF last_error ON outbox
+      WHEN NEW.last_error='redrive_exhausted' BEGIN SELECT RAISE(ABORT,'retirement unavailable'); END`).run();
+    try {
+      await expect(redriveRound2Outbox(runtime())).rejects.toThrow("retirement unavailable");
+      expect(
+        await env.DB.prepare("SELECT round2_state,claim_token FROM slack_channel_events WHERE subscription_id=?")
+          .bind(m.id)
+          .first(),
+      ).toEqual({ round2_state: "pending", claim_token: null });
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) count FROM slack_delivery_failures WHERE reason='redrive_exhausted'",
+        ).first(),
+      ).toEqual({ count: 0 });
+      expect(
+        await env.DB.prepare("SELECT last_error,slack_redrive_due_at FROM outbox WHERE id=?").bind(row.id).first(),
+      ).toEqual({ last_error: null, slack_redrive_due_at: 1 });
+    } finally {
+      await env.DB.prepare("DROP TRIGGER reject_sibling_retirement").run();
+    }
+    await redriveRound2Outbox(runtime());
+    expect(
+      await env.DB.prepare("SELECT round2_state,claim_token FROM slack_channel_events WHERE subscription_id=?")
+        .bind(m.id)
+        .first(),
+    ).toEqual({ round2_state: "retired", claim_token: null });
+    expect(
+      await env.DB.prepare("SELECT last_error,slack_redrive_due_at FROM outbox WHERE id=?").bind(row.id).first(),
+    ).toEqual({ last_error: "redrive_exhausted", slack_redrive_due_at: null });
   });
 });

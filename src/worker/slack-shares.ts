@@ -213,12 +213,12 @@ export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = 
           ts: row.message_ts,
           unfurls: { [row.url]: { blocks: rendered.blocks } },
         },
-        undefined,
-        undefined,
-        undefined,
-        rendered.state !== "unavailable" && row.observed_user_id
-          ? slackAccessAuthorization(env, installation, { userId: row.observed_user_id }, reference?.created_at)
-          : undefined,
+        {
+          beforeDispatch:
+            rendered.state !== "unavailable" && row.observed_user_id
+              ? slackAccessAuthorization(env, installation, { userId: row.observed_user_id }, reference?.created_at)
+              : undefined,
+        },
       );
       await finish(hash, rendered.state === "unavailable" ? "retired" : "sent");
     } catch (error) {

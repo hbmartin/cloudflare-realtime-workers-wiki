@@ -1,3 +1,4 @@
+import { slackAuthErrorMessage } from "./slack-auth-errors";
 import { SlackChannelPicker } from "./SlackChannelPicker";
 import { ACTIVITY_LABELS, CHANNEL_EVENT_TYPES } from "../shared/activity";
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
@@ -34,19 +35,14 @@ function initialSlackOAuthError() {
   const oauthError = params.get("error");
   if (!oauthError) return "";
   const known: Record<string, string> = {
-    security_required: "Verify an authenticator code or passkey in Account protection, then connect Slack again.",
-    unauthorized: "Your session expired. Sign in again before connecting Slack.",
-    slack_team_mismatch: "Use an account from the connected Slack workspace.",
     slack_scope_missing:
       "Ask the workspace owner to reauthorize Slack with users:read, then connect your identity again.",
     slack_member_removed: "Use an active member account from the connected Slack workspace.",
-    slack_bot_forbidden: "Use your personal Slack member account, rather than a bot account.",
     slack_guest_forbidden: "Use a full member account from the connected Slack workspace.",
     slack_external_forbidden: "Use a member account from the connected Slack workspace, rather than Slack Connect.",
-    slack_link_changed: "Slack authorization changed. Verify your account protection and connect Slack again.",
   };
   const message =
-    (Object.hasOwn(known, oauthError.toLowerCase()) ? known[oauthError.toLowerCase()] : undefined) ??
+    slackAuthErrorMessage(oauthError, known) ??
     (oauthError.toLowerCase().includes("link")
       ? "Slack could not be connected to this account. Sign in normally and try again."
       : "Slack authorization could not be completed.");
