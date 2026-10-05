@@ -69,6 +69,10 @@ delivery. The confirmation is accepted only on manual dispatch and is passed as
 environment confirmation; local database migrations do not. Once 0069, 0070, 0071, 0072, and 0073 are applied, later
 automatic deployments resume without this confirmation.
 
+Slack account-link callbacks started before the authorization binding fences were deployed must be restarted from
+Settings if they captured an existing link. The callback returns `slack_link_changed` and does not write a grant.
+Permits with no existing bindings and complete current permits remain valid.
+
 ## The release gate
 
 The `gate` job must pass before the `deploy` job starts, rather than running alongside it, because

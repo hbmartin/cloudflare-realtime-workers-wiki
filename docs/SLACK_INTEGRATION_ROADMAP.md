@@ -131,6 +131,15 @@ the affected capability without breaking existing notification delivery.
 - Slack Settings shows whether the current member is unlinked, legacy-linked, or OpenID-verified and provides the
   appropriate connect or migration action.
 
+Historical channel events retire when their actor loses membership, account protection, or the continuous Slack
+grant. Restoring authority does not replay those events. Temporary destination, credential, and scope pauses keep
+work pending. Legacy digest cleanup examines at most 50 subscriptions and 40 candidate events per subscription.
+
+Stale channel-validation retries retain `slack_validation_stale` as a durable coordination exemption from the eight
+ordinary redrives. Enqueue acceptance, queue loss, wakeups, competing claims, pauses, and unresolved uncertain sends
+do not consume it. A runnable consumer attempt consumes it when work completes or remains retryable; another stale
+validation failure establishes a new exemption.
+
 #### Failure behavior
 
 - Unlinked and legacy-only users receive an ephemeral authentication prompt for interactive actions.

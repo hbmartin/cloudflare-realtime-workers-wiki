@@ -162,7 +162,7 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
         timestamp - 60_000,
         ...filter.binds,
       ),
-      env.DB.prepare(`UPDATE outbox SET enqueued_at=CASE WHEN id='outbox:'||? THEN NULL ELSE coalesce(enqueued_at,?) END,
+      env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=CASE WHEN id='outbox:'||? THEN NULL ELSE coalesce(enqueued_at,?) END,
         available_at=CASE WHEN id='outbox:'||? THEN ? ELSE available_at END,
         slack_redrive_due_at=CASE WHEN id='outbox:'||? THEN ? ELSE NULL END,slack_claim_recheck_at=NULL,slack_redrive_count=0
         WHERE topic='slack_digest' AND slack_round2_receipt_id=?

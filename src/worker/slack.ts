@@ -1,4 +1,4 @@
-import { slackAccessAuthorization } from "./slack-identity";
+import { slackAccessAuthorization, slackGrantStartSql } from "./slack-identity";
 import type { ChannelEventType } from "../shared/activity";
 import { defaultDigestTimezone, digestWindow, channelInvalidReason } from "./slack-schedule";
 import type {
@@ -598,6 +598,7 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
       .bind(timestamp, member.workspace.id, JSON.stringify(SLACK_MIRROR_SCOPES), grantedScopes)
       .run();
     await env.DB.prepare(`UPDATE outbox SET
+      attempts=attempts+CASE WHEN ${ROUND2_OUTBOX_SQL} THEN 1 ELSE 0 END,
       slack_scope_paused_ms=slack_scope_paused_ms+MAX(0,?-slack_scope_paused_at),
       slack_scope_paused_at=NULL,slack_scope_required_json=NULL,
       slack_redrive_count=CASE WHEN ${ROUND2_OUTBOX_SQL} THEN slack_redrive_count ELSE 0 END,
@@ -605,7 +606,7 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
       WHERE workspace_id=? AND slack_scope_paused_at IS NOT NULL AND ${slackScopesGrantedSql(SLACK_PAUSED_SCOPES_SQL, "?")}`)
       .bind(timestamp, timestamp, member.workspace.id, grantedScopes)
       .run();
-    await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
+    await env.DB.prepare(`UPDATE outbox SET attempts=attempts+CASE WHEN ${ROUND2_OUTBOX_SQL} THEN 1 ELSE 0 END,enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
       WHERE workspace_id=? AND slack_scope_paused_at IS NULL AND
         (((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl') OR topic IN (${ROUND2_NON_CHANNEL_TOPICS_SQL}))
           AND (slack_redrive_due_at IS NOT NULL OR id IN
@@ -1857,12 +1858,7 @@ export async function consumeSlackLink(env: Env, member: MemberContext, rawToken
            ON member.workspace_id=installation.workspace_id WHERE installation.id=? AND installation.generation=?
            AND installation.disconnected_at IS NULL AND member.user_id=?)
        ON CONFLICT(installation_id, user_id) DO UPDATE SET
-         authorization_started_at=CASE WHEN slack_user_links.slack_user_id=excluded.slack_user_id
-           AND slack_user_links.installation_generation=excluded.installation_generation
-           AND slack_user_links.security_generation=excluded.security_generation
-           AND EXISTS(SELECT 1 FROM slack_authorized_user_links authorized
-             WHERE authorized.installation_id=slack_user_links.installation_id AND authorized.user_id=slack_user_links.user_id)
-           THEN slack_user_links.authorization_started_at ELSE excluded.authorization_started_at END,
+         authorization_started_at=${slackGrantStartSql(false)},
          slack_user_id = excluded.slack_user_id, linked_at = excluded.linked_at,
          security_generation=excluded.security_generation,installation_generation=excluded.installation_generation
        WHERE slack_user_links.migration_state <> 'verified'
@@ -2127,24 +2123,17 @@ export const channelActivityActorAccessSql = channelActorAccessSql.replace(
     OR (event.event_type IN ('page_created','page_edit','page_moved','page_archived','task_status_changed') AND bot.read_content=1 AND (bot.insert_content=1 OR bot.update_content=1)))`,
 );
 
-function deniedLegacyChannelEventsStatement(
-  env: Env,
-  ids: readonly string[] | null,
-  claimToken: string | null = null,
-  digestBefore?: number,
-) {
+function deniedLegacyChannelEventsStatement(env: Env, ids: readonly string[], claimToken: string | null = null) {
   return env.DB.prepare(`UPDATE slack_channel_events SET suppressed_at=?,claim_token=NULL,claimed_at=NULL
     WHERE delivered_at IS NULL AND suppressed_at IS NULL AND claim_token IS ?
       AND id IN (SELECT event.id FROM slack_channel_events event JOIN pages page ON page.id=event.page_id
         JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
         WHERE (page.is_template=1 OR NOT ${channelActorAccessSql})
-          ${ids === null ? "" : "AND event.id IN (SELECT value FROM json_each(?))"}
-          ${digestBefore === undefined ? "" : "AND event.cadence='digest' AND event.created_at<?"}
+          AND event.id IN (SELECT value FROM json_each(?))
           AND (?=0 OR subscription.round2_initialized=0))`).bind(
     Date.now(),
     claimToken,
-    ...(ids === null ? [] : [JSON.stringify(ids)]),
-    ...(digestBefore === undefined ? [] : [digestBefore]),
+    JSON.stringify(ids),
     env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0,
   );
 }
@@ -2186,7 +2175,6 @@ async function authorizedClaimedChannelEvents(
 }
 
 export async function deliverSlackChannelEvent(env: Env, eventId: string) {
-  await deniedLegacyChannelEventsStatement(env, [eventId]).run();
   const claim = await claimSlackRows(env, "slack_channel_events", [eventId]);
   if (!claim.ids.length) return;
   const row = await channelEvent(env, eventId);
@@ -2683,7 +2671,6 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
   const date = new Date(timestamp);
   if (date.getUTCHours() < 9) return;
   const cutoff = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 9);
-  await deniedLegacyChannelEventsStatement(env, null, null, cutoff).run();
   const subscriptions = await env.DB.prepare(
     `SELECT event.subscription_id, subscription.installation_id
        FROM slack_channel_events event
@@ -2696,10 +2683,9 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
         AND (?=0 OR subscription.round2_initialized=0)
         AND subscription.muted_at IS NULL
         AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
-        AND page.archived_at IS NULL AND page.import_job_id IS NULL AND page.is_template = 0
+        AND page.archived_at IS NULL AND page.import_job_id IS NULL
         AND page.space_id = subscription.space_id
         AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
-        AND ${channelActorAccessSql}
       GROUP BY event.subscription_id, subscription.installation_id
       ORDER BY MIN(event.created_at), event.subscription_id LIMIT 50`,
   )
@@ -2720,13 +2706,13 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
          JOIN slack_channel_subscriptions subscription ON subscription.id = event.subscription_id
          JOIN slack_installations installation ON installation.id = subscription.installation_id
          JOIN pages page ON page.id = event.page_id AND page.archived_at IS NULL
-           AND page.import_job_id IS NULL AND page.is_template = 0
+           AND page.import_job_id IS NULL
          LEFT JOIN user actor ON actor.id = event.actor_id
         WHERE event.subscription_id = ? AND event.cadence = 'digest'
           AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
           AND event.created_at < ? AND installation.disconnected_at IS NULL
           AND page.space_id = subscription.space_id AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
-          AND subscription.notification_blocked_at IS NULL AND installation.auth_error IS NULL AND ${channelActorAccessSql}
+          AND subscription.notification_blocked_at IS NULL AND installation.auth_error IS NULL
           AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= unixepoch('subsec') * 1000)
         ORDER BY event.created_at LIMIT 40`,
       )
@@ -2744,6 +2730,10 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
         >();
       const [first] = events.results;
       if (!first) continue;
+      await deniedLegacyChannelEventsStatement(
+        env,
+        events.results.map((event) => event.id),
+      ).run();
       const claim = await claimSlackRows(
         env,
         "slack_channel_events",

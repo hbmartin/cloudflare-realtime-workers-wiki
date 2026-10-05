@@ -161,7 +161,7 @@ export function round2WakeStatement(
   generation: number | null = null,
 ) {
   const now = Date.now();
-  return env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL
+  return env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL
     WHERE slack_scope_paused_at IS NULL AND EXISTS(SELECT 1 FROM slack_channel_subscriptions m
       JOIN slack_installations i ON i.id=m.installation_id WHERE (? IS NULL OR m.id=?) AND (? IS NULL OR i.id=?)
       AND (? IS NULL OR i.generation=?) AND m.notification_blocked_at IS NULL

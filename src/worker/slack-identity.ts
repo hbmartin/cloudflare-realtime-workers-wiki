@@ -1,6 +1,11 @@
 import type { Env } from "./env";
 import { HttpError } from "./http";
-import { freshSecurityAuthorization, freshSecurityGuard, type FreshSecurityAuthorization } from "./security";
+import {
+  freshSecurityAuthorization,
+  freshSecurityGuard,
+  protectedSessionGuard,
+  type FreshSecurityAuthorization,
+} from "./security";
 import type { VerifiedSlackIdentity } from "./slack";
 
 export type SlackLinkAuthorization = FreshSecurityAuthorization & {
@@ -15,6 +20,17 @@ export type SlackLinkAuthorization = FreshSecurityAuthorization & {
     authorization_started_at: number | null;
   }[];
 };
+
+export function slackGrantStartSql(verified: boolean) {
+  return `CASE WHEN slack_user_links.authorization_started_at IS NOT NULL
+    AND slack_user_links.slack_user_id=excluded.slack_user_id
+    AND slack_user_links.installation_generation=excluded.installation_generation
+    AND slack_user_links.security_generation=excluded.security_generation
+    ${verified ? "AND (slack_user_links.migration_state='legacy' OR slack_user_links.better_auth_account_id=excluded.better_auth_account_id)" : ""}
+    AND EXISTS(SELECT 1 FROM slack_authorized_user_links authorized
+      WHERE authorized.installation_id=slack_user_links.installation_id AND authorized.user_id=slack_user_links.user_id)
+    THEN slack_user_links.authorization_started_at ELSE excluded.authorization_started_at END`;
+}
 
 export const SLACK_PRODUCT_SESSION_ACCESS_SQL = `EXISTS(SELECT 1 FROM slack_authorized_user_links link
   WHERE link.installation_id=product_session.installation_id AND link.installation_generation=product_session.generation
@@ -134,13 +150,7 @@ export async function recordVerifiedSlackIdentity(
     ON CONFLICT(installation_id,user_id) DO UPDATE SET
       slack_user_id=excluded.slack_user_id,better_auth_account_id=excluded.better_auth_account_id,
       verification_method='slack_openid',migration_state='verified',linked_at=excluded.linked_at,
-      authorization_started_at=CASE WHEN slack_user_links.slack_user_id=excluded.slack_user_id
-        AND slack_user_links.installation_generation=excluded.installation_generation
-        AND slack_user_links.security_generation=excluded.security_generation
-        AND (slack_user_links.migration_state='legacy' OR slack_user_links.better_auth_account_id=excluded.better_auth_account_id)
-        AND EXISTS(SELECT 1 FROM slack_authorized_user_links authorized
-          WHERE authorized.installation_id=slack_user_links.installation_id AND authorized.user_id=slack_user_links.user_id)
-        THEN slack_user_links.authorization_started_at ELSE excluded.authorization_started_at END,
+      authorization_started_at=${slackGrantStartSql(true)},
       verified_at=CASE WHEN slack_user_links.slack_user_id=excluded.slack_user_id
         AND slack_user_links.better_auth_account_id=excluded.better_auth_account_id
         AND slack_user_links.installation_generation=excluded.installation_generation
@@ -229,23 +239,13 @@ export async function recordSlackPrimaryFactorProof(
 }
 
 export async function disconnectSlackIdentity(env: Env, userId: string, sessionId: string, workspaceId: string) {
-  const sessionSql = `FROM session live JOIN session_security proof ON proof.session_id=live.id AND proof.user_id=live.userId
-    JOIN slack_protected_accounts security ON security.user_id=live.userId AND security.generation=proof.generation
-    WHERE live.userId=? AND live.id=? AND live.expiresAt>? AND proof.expires_at>?
-      AND proof.method IN ('totp','passkey','trust')
-      AND (proof.method<>'trust' OR EXISTS(SELECT 1 FROM trusted_browsers browser
-        WHERE browser.id=proof.trust_id AND browser.user_id=live.userId
-          AND browser.generation=security.generation AND browser.expires_at>?))`;
-  const sessionBinds = (now: number) => [userId, sessionId, new Date(now).toISOString(), now, now];
-  const permit = await env.DB.prepare(`SELECT security.generation ${sessionSql}`)
-    .bind(...sessionBinds(Date.now()))
+  const sessionGuard = protectedSessionGuard({ userId, sessionId }, "active");
+  const permit = await env.DB.prepare(`SELECT generation FROM account_security WHERE user_id=? AND ${sessionGuard.sql}`)
+    .bind(userId, ...sessionGuard.binds)
     .first<{ generation: number }>();
   if (!permit)
     throw new HttpError(403, "SECURITY_REQUIRED", "Sign in with account protection before disconnecting Slack.");
-  const guard = {
-    sql: `EXISTS(SELECT 1 ${sessionSql} AND security.generation=?)`,
-    binds: [...sessionBinds(Date.now()), permit.generation],
-  };
+  const guard = protectedSessionGuard({ userId, sessionId, generation: permit.generation }, "active");
   const results = await env.DB.batch([
     env.DB.prepare(`DELETE FROM slack_user_links WHERE user_id=? AND installation_id IN
       (SELECT id FROM slack_installations WHERE workspace_id=?) AND ${guard.sql}`).bind(

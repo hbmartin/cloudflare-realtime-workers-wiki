@@ -3,6 +3,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import { enrollAccount, responseCookies, securityRequest } from "../../tests/helpers/security";
 import { bytesToBase64Url } from "../shared/security";
 import worker from "./index";
+import * as authApi from "better-auth/api";
+import { HttpError } from "./http";
 import type { Env, MemberContext } from "./env";
 import { consumeSlackLink, encryptSlackToken } from "./slack";
 import { disconnectSlackIdentity, slackAccessAuthorization } from "./slack-identity";
@@ -132,14 +134,19 @@ async function auth(cookie: string, path: string, body?: Record<string, unknown>
   await waitOnExecutionContext(context);
   return response;
 }
-async function start(cookie: string, body: Record<string, unknown> = {}, path = "/link-social") {
-  const response = await auth(cookie, path, {
-    provider: "slack",
-    callbackURL: "/?view=settings&slack=verified",
-    errorCallbackURL: "/?view=settings&slackAuth=callback",
-    disableRedirect: true,
-    ...body,
-  });
+async function start(cookie: string, body: Record<string, unknown> = {}, path = "/link-social", database = env.DB) {
+  const response = await auth(
+    cookie,
+    path,
+    {
+      provider: "slack",
+      callbackURL: "/?view=settings&slack=verified",
+      errorCallbackURL: "/?view=settings&slackAuth=callback",
+      disableRedirect: true,
+      ...body,
+    },
+    database,
+  );
   expect(response.status).toBe(200);
   const url = new URL((await response.json<{ url: string }>()).url);
   nonce = url.searchParams.get("nonce");
@@ -177,6 +184,261 @@ function beforeAuthWrite(pattern: string, before: () => Promise<void>) {
 }
 
 describe("Slack OAuth authorization boundaries", () => {
+  it.each(["verified", "legacy"])(
+    "repairs a NULL grant start through %s relinking without admitting historical work",
+    async (mode) => {
+      const { cookie, user } = await account();
+      await callback(await start(cookie));
+      await env.DB.prepare("UPDATE slack_user_links SET authorization_started_at=NULL").run();
+      let location: string | null = null;
+      if (mode === "verified") {
+        const response = await callback(await start(cookie));
+        location = response.headers.get("location");
+      } else {
+        const raw = "repair-null-link-token";
+        const hash = Array.from(
+          new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw))),
+          (byte) => byte.toString(16).padStart(2, "0"),
+        ).join("");
+        await env.DB.prepare(
+          "INSERT INTO slack_link_tokens(token_hash,installation_id,slack_user_id,expires_at,created_at) VALUES(?,'installation','UOWNER',?,1)",
+        )
+          .bind(hash, Date.now() + 60000)
+          .run();
+        const member = await (await securityRequest(cookie, "/api/me")).json<MemberContext>();
+        const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?")
+          .bind(user)
+          .first<{ id: string }>())!;
+        await consumeSlackLink(
+          configured(),
+          { ...member, session: { id: session.id, expiresAt: new Date(Date.now() + 60000) } },
+          raw,
+        );
+      }
+      expect(location?.includes("slack=verified") ?? false).toBe(mode === "verified");
+      const link = (await env.DB.prepare("SELECT authorization_started_at,linked_at FROM slack_user_links").first<{
+        authorization_started_at: number;
+        linked_at: number;
+      }>())!;
+      expect(link.authorization_started_at).toBe(link.linked_at);
+      expect(link.authorization_started_at).toBeGreaterThan(2);
+      await expect(
+        slackAccessAuthorization(configured(), { id: "installation", generation: 0 }, { userId: user }, 2)(),
+      ).rejects.toMatchObject({ code: "slack_identity_required" });
+      await expect(
+        slackAccessAuthorization(
+          configured(),
+          { id: "installation", generation: 0 },
+          { userId: user },
+          link.authorization_started_at,
+        )(),
+      ).resolves.toBeUndefined();
+    },
+  );
+
+  it.each(["old", "malformed"])("rejects a %s populated OAuth permit before changing its grant", async (mode) => {
+    const { cookie, user } = await account();
+    await callback(await start(cookie));
+    const before = await env.DB.prepare("SELECT * FROM slack_user_links").first();
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+              new Proxy(statement, {
+                get(prepared, method) {
+                  if (method === "bind") return (...binds: unknown[]) => wrap(prepared.bind(...binds));
+                  if (method === "all" && sql.includes("SELECT installation_id,slack_user_id,better_auth_account_id"))
+                    return async () => {
+                      const rows = await prepared.all<Record<string, unknown>>();
+                      return {
+                        ...rows,
+                        results: rows.results.map((row) => {
+                          const binding = { ...row };
+                          delete binding.installation_generation;
+                          delete binding.authorization_started_at;
+                          if (mode === "malformed") binding.linked_at = "invalid";
+                          return binding;
+                        }),
+                      };
+                    };
+                  const value: unknown = Reflect.get(prepared, method, prepared);
+                  return typeof value === "function" ? value.bind(prepared) : value;
+                },
+              });
+            return wrap(target.prepare(sql));
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const flow = await start(cookie, {}, "/link-social", database);
+    const response = await callback(flow);
+    expect(response.status).toBe(302);
+    expect(
+      new URL(response.headers.get("location")!, "http://example.test").searchParams.get("error")?.toLowerCase(),
+    ).toBe(mode === "old" ? "slack_link_changed" : "unauthorized");
+    expect(await env.DB.prepare("SELECT * FROM slack_user_links WHERE user_id=?").bind(user).first()).toEqual(before);
+  });
+
+  it.each(["default", "custom", "custom query"])(
+    "routes completion errors to the %s application destination",
+    async (mode) => {
+      const { cookie } = await account();
+      const flow = await start(cookie, {
+        errorCallbackURL:
+          mode === "default"
+            ? undefined
+            : mode === "custom query"
+              ? "/api/auth/error?keep=1"
+              : "/custom-error?keep=1&slackAuth=callback",
+      });
+      const database = beforeAuthWrite("INSERT INTO slack_user_links", async () => {
+        await env.DB.prepare("UPDATE slack_installations SET generation=generation+1").run();
+      });
+      const response = await callback(flow, database);
+      const destination = new URL(response.headers.get("location")!, "http://example.test");
+      expect(destination.pathname).toBe(
+        mode === "default" ? "/" : mode === "custom query" ? "/api/auth/error" : "/custom-error",
+      );
+      expect(destination.searchParams.get("error")).toBe("slack_link_changed");
+      expect(destination.searchParams.get(mode === "default" ? "view" : "keep")).toBe(
+        mode === "default" ? "settings" : "1",
+      );
+    },
+  );
+
+  it.each(["D1", "TypeError", "server"])(
+    "logs a sanitized %s completion failure before returning a friendly error",
+    async (kind) => {
+      const { cookie } = await account();
+      const flow = await start(cookie);
+      const secret = "xoxb-test-log-secret";
+      const failure =
+        kind === "server"
+          ? new HttpError(503, "server_failure", `Failure ${secret}`)
+          : kind === "TypeError"
+            ? new TypeError(`Failure ${secret}`)
+            : new Error(`D1 failure ${secret}`);
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      const response = await callback(
+        flow,
+        beforeAuthWrite("INSERT INTO slack_user_links", async () => {
+          throw failure;
+        }),
+      );
+      expect(response.status).toBe(302);
+      expect(new URL(response.headers.get("location")!, "http://example.test").searchParams.get("error")).toBe(
+        "slack_unavailable",
+      );
+      expect(log.mock.calls).toEqual(
+        expect.arrayContaining([
+          [expect.objectContaining({ event: "auth.slack.failed", operation: "callback", severity: "error" })],
+        ]),
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+      expect(await env.DB.prepare("SELECT 1 FROM slack_user_links").first()).toBeNull();
+    },
+  );
+
+  it.each(["D1", "TypeError", "server"])(
+    "logs unexpected %s identity-policy failures while keeping expected denials ordinary",
+    async (kind) => {
+      const { cookie } = await account();
+      const flow = await start(cookie, { errorCallbackURL: undefined });
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      const failure =
+        kind === "server"
+          ? new HttpError(503, "unexpected_server_error", "Internal policy detail")
+          : kind === "TypeError"
+            ? new TypeError("Injected identity policy failure")
+            : new Error("Injected D1 failure");
+      const database = new Proxy(env.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+                new Proxy(statement, {
+                  get(prepared, method) {
+                    if (method === "bind") return (...binds: unknown[]) => wrap(prepared.bind(...binds));
+                    if (method === "first" && sql.includes("SELECT * FROM slack_installations"))
+                      return async () => {
+                        throw failure;
+                      };
+                    const value: unknown = Reflect.get(prepared, method, prepared);
+                    return typeof value === "function" ? value.bind(prepared) : value;
+                  },
+                });
+              return wrap(target.prepare(sql));
+            };
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const response = await callback(flow, database);
+      expect(new URL(response.headers.get("location")!, "http://example.test").searchParams.get("error")).toBe(
+        "slack_unavailable",
+      );
+      expect(new URL(response.headers.get("location")!, "http://example.test").searchParams.get("view")).toBe(
+        "settings",
+      );
+      expect(log.mock.calls).toEqual(
+        expect.arrayContaining([
+          [expect.objectContaining({ event: "auth.slack.failed", operation: "identity_validation" })],
+        ]),
+      );
+      log.mockClear();
+      userFlags = { deleted: true };
+      await callback(await start(cookie));
+      expect(log.mock.calls.filter(([record]) => (record as { event?: string }).event === "auth.slack.failed")).toEqual(
+        [],
+      );
+    },
+  );
+
+  it.each(["http://[invalid", "https://foreign.example/error?keep=1"])(
+    "normalizes an old callback error destination %s",
+    async (errorURL) => {
+      const { cookie } = await account();
+      const flow = await start(cookie);
+      const getState = authApi.getOAuthState;
+      vi.spyOn(authApi, "getOAuthState").mockImplementation(async () => {
+        const state = await getState();
+        return state ? { ...state, errorURL } : state;
+      });
+      const response = await callback(
+        flow,
+        beforeAuthWrite("INSERT INTO slack_user_links", async () => {
+          await env.DB.prepare("UPDATE slack_installations SET generation=generation+1").run();
+        }),
+      );
+      const destination = new URL(response.headers.get("location")!, "http://example.test");
+      expect(destination.origin).toBe("http://example.test");
+      expect(destination.pathname).toBe("/");
+      expect(destination.searchParams.get("view")).toBe("settings");
+      expect(destination.searchParams.get("error")).toBe("slack_link_changed");
+      expect(destination.searchParams.has("keep")).toBe(false);
+    },
+  );
+
+  it("routes a default sign-in completion failure to the sign-in callback screen", async () => {
+    const { cookie } = await account();
+    await callback(await start(cookie));
+    const flow = await start("", { errorCallbackURL: undefined }, "/sign-in/social");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const response = await callback(
+      flow,
+      beforeAuthWrite("INSERT INTO slack_primary_factor_proofs", async () => {
+        throw new Error("D1 unavailable");
+      }),
+    );
+    const destination = new URL(response.headers.get("location")!, "http://example.test");
+    expect(destination.pathname).toBe("/");
+    expect(destination.searchParams.get("slackAuth")).toBe("callback");
+    expect(destination.searchParams.get("error")).toBe("slack_unavailable");
+    expect(destination.searchParams.has("view")).toBe(false);
+  });
+
   it.each([
     "legacy relink",
     "legacy verification",

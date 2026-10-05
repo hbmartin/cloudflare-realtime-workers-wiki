@@ -241,7 +241,7 @@ describe("legacy channel event settlement", () => {
         query.sql.startsWith("UPDATE slack_channel_events SET suppressed_at=") ||
         query.sql.includes("SELECT event.id event_id"),
     );
-    expect(checks).toHaveLength(4);
+    expect(checks).toHaveLength(3);
     for (const query of checks) {
       const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${query.sql}`)
         .bind(...query.binds)
@@ -322,6 +322,104 @@ describe("legacy channel event settlement", () => {
         "SELECT suppressed_at,delivered_at FROM slack_channel_events WHERE id='actor-event'",
       ).first(),
     ).toEqual({ suppressed_at: expect.any(Number), delivered_at: null });
+    await env.DB.prepare("UPDATE account_security SET codes_saved=1 WHERE user_id=?")
+      .bind(fixture.member.user.id)
+      .run();
+    if (cadence === "immediate") await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+    else await sendDueSlackChannelDigests(fixture.bindings, Date.UTC(2026, 9, 4, 10));
+    expect(remote).not.toHaveBeenCalled();
+  });
+
+  it("cleans only 40 legacy digest candidates from a large pending backlog", async () => {
+    const fixture = await legacyChannelFixture("digest");
+    await env.DB.prepare("UPDATE account_security SET codes_saved=0 WHERE user_id=?")
+      .bind(fixture.member.user.id)
+      .run();
+    await env.DB.prepare(`WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<10000)
+      INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+      SELECT 'pending:'||n,?,?,'mention',?,?,'digest',1 FROM history`)
+      .bind(fixture.mapping.id, fixture.member.workspace.id, fixture.member.user.id, fixture.page.id)
+      .run();
+    const remote = vi.fn();
+    vi.stubGlobal("fetch", remote);
+    await sendDueSlackChannelDigests(fixture.bindings, Date.UTC(2026, 9, 4, 10));
+    expect(remote).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM slack_channel_events WHERE suppressed_at IS NOT NULL").first(),
+    ).toEqual({ count: 40 });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM slack_channel_events WHERE suppressed_at IS NULL AND delivered_at IS NULL",
+      ).first(),
+    ).toEqual({ count: 9961 });
+  });
+
+  it("limits legacy template cleanup to 50 subscriptions per tick", async () => {
+    const fixture = await legacyChannelFixture("digest");
+    await env.DB.prepare("UPDATE pages SET is_template=1 WHERE id=?").bind(fixture.page.id).run();
+    await env.DB.prepare(`WITH RECURSIVE mappings(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM mappings WHERE n<50)
+      INSERT INTO slack_channel_subscriptions(id,installation_id,space_id,channel_id,channel_name,event_types_json,cadence,created_by,created_at,updated_at)
+      SELECT 'extra-mapping:'||n,installation_id,space_id,'CEXTRA'||n,'template',event_types_json,'digest',created_by,1,1
+      FROM slack_channel_subscriptions,mappings WHERE id=?`)
+      .bind(fixture.mapping.id)
+      .run();
+    await env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+      SELECT 'extra-event:'||id,id,?,'mention',?,?,'digest',1 FROM slack_channel_subscriptions WHERE id LIKE 'extra-mapping:%'`)
+      .bind(fixture.member.workspace.id, fixture.member.user.id, fixture.page.id)
+      .run();
+    const remote = vi.fn();
+    vi.stubGlobal("fetch", remote);
+    await sendDueSlackChannelDigests(fixture.bindings, Date.UTC(2026, 9, 4, 10));
+    expect(remote).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM slack_channel_events WHERE suppressed_at IS NOT NULL").first(),
+    ).toEqual({ count: 50 });
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM slack_channel_events WHERE suppressed_at IS NULL").first(),
+    ).toEqual({ count: 1 });
+  });
+
+  it("cleans templates from partial legacy digests without including denied content", async () => {
+    const fixture = await legacyChannelFixture("digest");
+    const viewer = await inviteViewer(fixture.cookie);
+    await env.DB.prepare("UPDATE account_security SET codes_saved=0 WHERE user_id=?")
+      .bind(fixture.member.user.id)
+      .run();
+    await env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,is_template)
+      SELECT 'queued-template',workspace_id,space_id,kind,'a1','Never disclose template',created_by,1,1,1 FROM pages WHERE id=?`)
+      .bind(fixture.page.id)
+      .run();
+    await env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+      VALUES('template-event',?,?,'mention',?,'queued-template','digest',1),('allowed-event',?,?,'mention',?,?,'digest',1)`)
+      .bind(
+        fixture.mapping.id,
+        fixture.member.workspace.id,
+        viewer.member.user.id,
+        fixture.mapping.id,
+        fixture.member.workspace.id,
+        viewer.member.user.id,
+        fixture.page.id,
+      )
+      .run();
+    const remote = vi.fn().mockResolvedValue(Response.json({ ok: true, ts: "1700000000.000001" }));
+    vi.stubGlobal("fetch", remote);
+    await sendDueSlackChannelDigests(fixture.bindings, Date.UTC(2026, 9, 4, 10));
+    expect(remote).toHaveBeenCalledOnce();
+    const body = String(remote.mock.calls[0]![1].body);
+    expect(body).toContain("1 NoteFlare update");
+    expect(body).not.toContain("Never disclose template");
+    expect(body).not.toContain(fixture.member.user.name);
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT id,delivered_at IS NOT NULL delivered,suppressed_at IS NOT NULL suppressed FROM slack_channel_events ORDER BY id",
+        ).all()
+      ).results,
+    ).toEqual([
+      { id: "actor-event", delivered: 0, suppressed: 1 },
+      { id: "allowed-event", delivered: 1, suppressed: 0 },
+      { id: "template-event", delivered: 0, suppressed: 1 },
+    ]);
   });
 
   it("leaves a live competing claim untouched for an authorized event", async () => {

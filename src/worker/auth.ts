@@ -15,6 +15,7 @@ import type { MemberContext } from "./env";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import { consumeFixedWindow } from "./rate-limit";
+import { logger } from "./observability";
 import { validateSlackIdentity, type VerifiedSlackIdentity } from "./slack";
 import {
   authorizeSlackLink,
@@ -61,12 +62,30 @@ function slackLinkContext(value: unknown): SlackLinkAuthorization | null {
         (binding.better_auth_account_id === null || typeof binding.better_auth_account_id === "string") &&
         (binding.verified_at === null || Number.isFinite(binding.verified_at)) &&
         (binding.security_generation === null || Number.isSafeInteger(binding.security_generation)) &&
-        Number.isSafeInteger(binding.installation_generation) &&
-        (binding.authorization_started_at === null || Number.isFinite(binding.authorization_started_at)),
+        (!Object.hasOwn(binding, "installation_generation") || Number.isSafeInteger(binding.installation_generation)) &&
+        (!Object.hasOwn(binding, "authorization_started_at") ||
+          binding.authorization_started_at === null ||
+          Number.isFinite(binding.authorization_started_at)),
     )
   )
     return null;
+  if (
+    source.bindings.some(
+      (binding) =>
+        !Object.hasOwn(binding, "installation_generation") || !Object.hasOwn(binding, "authorization_started_at"),
+    )
+  )
+    throw new HttpError(
+      409,
+      "slack_link_changed",
+      "Slack authorization changed. Verify your account protection and connect Slack again.",
+    );
   return source;
+}
+
+function logSlackAuthFailure(error: unknown, operation: "callback" | "identity_validation") {
+  if ((error instanceof HttpError && error.status < 500) || (isAPIError(error) && error.statusCode < 500)) return;
+  logger.error("auth.slack.failed", "auth", "Slack authentication failed unexpectedly.", { operation }, error);
 }
 
 function slackAuthError(error: unknown): never {
@@ -82,21 +101,36 @@ function isSlackCallback(ctx: GenericEndpointContext) {
   return ctx.path === "/callback/slack" || (ctx.path === "/callback/:id" && ctx.params?.id === "slack");
 }
 
-async function slackCallbackFailure(env: Env, ctx: GenericEndpointContext, error: unknown): Promise<never> {
-  if (!isSlackCallback(ctx)) slackAuthError(error);
-  const state = await getOAuthState();
+function slackCallbackDestination(
+  env: Env,
+  ctx: GenericEndpointContext,
+  state: { link?: unknown; errorURL?: unknown } | null,
+) {
   const origin = new URL(env.BETTER_AUTH_URL);
   const fallback = state?.link ? "/?view=settings&slackAuth=callback" : "/?slackAuth=callback";
   let destination = new URL(fallback, origin);
   if (typeof state?.errorURL === "string") {
     try {
       const requested = new URL(state.errorURL, origin);
-      if (requested.origin === origin.origin) destination = requested;
+      const defaultError = new URL(`${ctx.context.baseURL}/error`);
+      if (requested.origin === origin.origin && requested.href !== defaultError.href) destination = requested;
     } catch {
       // Malformed destinations use the local callback screen.
     }
   }
-  const code = error instanceof HttpError ? error.code : isAPIError(error) ? error.body?.code : undefined;
+  return destination;
+}
+
+async function slackCallbackFailure(env: Env, ctx: GenericEndpointContext, error: unknown): Promise<never> {
+  if (!isSlackCallback(ctx)) slackAuthError(error);
+  logSlackAuthFailure(error, "callback");
+  const destination = slackCallbackDestination(env, ctx, await getOAuthState());
+  const code =
+    error instanceof HttpError && error.status < 500
+      ? error.code
+      : isAPIError(error) && error.statusCode < 500
+        ? error.body?.code
+        : undefined;
   destination.searchParams.set("error", typeof code === "string" ? code.toLowerCase() : "slack_unavailable");
   throw ctx.redirect(destination.toString());
 }
@@ -271,7 +305,9 @@ export function createAuth(env: Env, allowRegistration = false) {
           policy.notesSlackIdentity = identity;
           if (invite) policy.notesSlackInvite = invite;
         } catch (error) {
-          if (error instanceof HttpError) return { error: error.code, errorDescription: error.message };
+          logSlackAuthFailure(error, "identity_validation");
+          if (error instanceof HttpError && error.status < 500)
+            return { error: error.code, errorDescription: error.message };
           return {
             error: "slack_unavailable",
             errorDescription: "Slack identity validation is temporarily unavailable.",
@@ -394,15 +430,39 @@ export function createAuth(env: Env, allowRegistration = false) {
             await slackCallbackFailure(env, ctx, error);
           }
         }
-        if (policy.notesSlackInviteClaimed) return;
-        const invite = policy.notesSlackInvite ?? (await trustedSlackInvite());
-        if (!invite) return;
-        await env.DB.prepare(
-          `UPDATE invites SET claimed_email = NULL, claim_token = NULL, claim_expires_at = NULL
+        if (!policy.notesSlackInviteClaimed) {
+          const invite = policy.notesSlackInvite ?? (await trustedSlackInvite());
+          if (invite) {
+            await env.DB.prepare(
+              `UPDATE invites SET claimed_email = NULL, claim_token = NULL, claim_expires_at = NULL
             WHERE id = ? AND workspace_id = ? AND claim_token = ? AND claimed_by IS NULL AND used_at IS NULL`,
-        )
-          .bind(invite.inviteId, invite.workspaceId, invite.reservationToken)
-          .run();
+            )
+              .bind(invite.inviteId, invite.workspaceId, invite.reservationToken)
+              .run();
+          }
+        }
+        const context = ctx.context as typeof ctx.context & { returned?: unknown; responseHeaders?: Headers };
+        const returned = context.returned;
+        if (isAPIError(returned) && returned.statusCode >= 300 && returned.statusCode < 400) {
+          const location = new Headers(returned.headers).get("location") ?? context.responseHeaders?.get("location");
+          if (location) {
+            let redirected: URL | null = null;
+            try {
+              redirected = new URL(location, env.BETTER_AUTH_URL);
+            } catch {
+              /* Normalize malformed error destinations below. */
+            }
+            const parameters = redirected?.searchParams ?? new URLSearchParams(location.split("?").slice(1).join("?"));
+            if (parameters.has("error")) {
+              const destination = slackCallbackDestination(env, ctx, await getOAuthState());
+              for (const name of ["error", "error_description"]) {
+                const value = parameters.get(name);
+                if (value !== null) destination.searchParams.set(name, value);
+              }
+              if (destination.href !== redirected?.href) throw ctx.redirect(destination.href);
+            }
+          }
+        }
       }),
     },
     plugins: [

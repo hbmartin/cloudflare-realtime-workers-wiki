@@ -1,6 +1,6 @@
 import { deliverBulkSummary } from "./slack-bulk";
 import { deliverRound2ChannelEvent } from "./slack-channel-events";
-import { redriveRound2Outbox, round2DeliveryStatus, type round2Receipts } from "./slack-recovery";
+import { enqueueRound2Outbox, redriveRound2Outbox, round2DeliveryStatus, round2Receipts } from "./slack-recovery";
 import { deliverDigest } from "./slack-digests";
 import { deliverShareRefresh } from "./slack-shares";
 import { deliverThumbnail } from "./slack-files";
@@ -1519,9 +1519,26 @@ export async function recoverQueuedJobs(env: Env) {
   }
 }
 
-async function enqueueOutbox(env: Env, outboxId: string, storedCorrelationId: string | null) {
+type SweepOutboxRow = {
+  id: string;
+  correlation_id: string | null;
+  topic: string;
+  receipt_id: string | null;
+  attempts: number;
+  round2: number;
+};
+async function enqueueOutbox(env: Env, row: SweepOutboxRow) {
+  const outboxId = row.id;
+  const correlationId = row.correlation_id ?? currentObservabilityContext()?.correlationId ?? undefined;
+  if (row.round2 && row.receipt_id) {
+    await enqueueRound2Outbox(env, outboxId, row.topic as keyof typeof round2Receipts, row.receipt_id, {
+      dueAt: Date.now() + SLACK_REDRIVE_STALE_MS,
+      correlationId,
+      expectedVersion: row.attempts,
+    });
+    return;
+  }
   try {
-    const correlationId = storedCorrelationId ?? currentObservabilityContext()?.correlationId ?? undefined;
     await env.DELIVERY_QUEUE.send({ outboxId, ...(correlationId ? { correlationId } : {}) });
     const now = Date.now();
     await env.DB.prepare(`UPDATE outbox SET enqueued_at = ?, attempts = attempts + 1,
@@ -1583,7 +1600,7 @@ async function pauseSlackScopeOutbox(env: Env, outboxId: string, topic: string, 
   );
   await env.DB.prepare(`UPDATE outbox SET slack_scope_paused_at=COALESCE(slack_scope_paused_at,?),slack_scope_required_json=?,
     enqueued_at=COALESCE(enqueued_at,?),slack_claim_recheck_at=NULL,
-    slack_redrive_due_at=CASE WHEN ${ROUND2_OUTBOX_SQL} THEN coalesce(slack_redrive_due_at,?+1800000) ELSE NULL END,last_error='slack_scope_missing'
+    slack_redrive_due_at=CASE WHEN ${ROUND2_OUTBOX_SQL} THEN coalesce(slack_redrive_due_at,?+1800000) ELSE NULL END,last_error=CASE WHEN ${ROUND2_OUTBOX_SQL} AND last_error='slack_validation_stale' THEN last_error ELSE 'slack_scope_missing' END
     WHERE id=?`)
     .bind(now, JSON.stringify(scopes), now, now, outboxId)
     .run();
@@ -1670,16 +1687,17 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
     for (let batch = 0; batch < OUTBOX_SWEEP_MAX_BATCHES; batch += 1) {
       if (!(await renewLease("before-batch"))) return "lease-lost";
       const rows = await env.DB.prepare(
-        `SELECT id, correlation_id FROM outbox WHERE enqueued_at IS NULL AND slack_scope_paused_at IS NULL AND available_at <= ?
+        `SELECT id,correlation_id,topic,slack_round2_receipt_id receipt_id,attempts,${ROUND2_OUTBOX_SQL} round2
+          FROM outbox WHERE enqueued_at IS NULL AND slack_scope_paused_at IS NULL AND available_at <= ?
           AND (topic<>'slack_file_upload' OR ?=1)
           ORDER BY available_at, created_at, id LIMIT ?`,
       )
         .bind(Date.now(), thumbnailDeliveryEnabled(env) ? 1 : 0, OUTBOX_SWEEP_BATCH_SIZE)
-        .all<{ id: string; correlation_id: string | null }>();
+        .all<SweepOutboxRow>();
       for (const row of rows.results) {
         if (!(await renewLease("before-row"))) return "lease-lost";
         try {
-          await enqueueOutbox(env, row.id, row.correlation_id);
+          await enqueueOutbox(env, row);
         } catch (error) {
           logger.error("outbox.enqueue.failed", "outbox", "Outbox enqueue failed.", { outboxId: row.id }, error);
         }
@@ -2041,19 +2059,22 @@ export async function consumeDeliveryMessage(
     return "retried";
   }
   const outboxId = body.outboxId;
-  const row = await env.DB.prepare(`SELECT id, topic, payload_json, available_at,last_error,enqueued_at,
+  const row =
+    await env.DB.prepare(`SELECT id, topic, payload_json, available_at,last_error,enqueued_at,attempts,correlation_id,
     slack_redrive_due_at,slack_claim_recheck_at FROM outbox WHERE id = ?`)
-    .bind(outboxId)
-    .first<{
-      id: string;
-      topic: string;
-      payload_json: string;
-      available_at: number;
-      last_error: string | null;
-      enqueued_at: number | null;
-      slack_redrive_due_at: number | null;
-      slack_claim_recheck_at: number | null;
-    }>();
+      .bind(outboxId)
+      .first<{
+        id: string;
+        topic: string;
+        payload_json: string;
+        available_at: number;
+        last_error: string | null;
+        enqueued_at: number | null;
+        attempts: number;
+        correlation_id: string | null;
+        slack_redrive_due_at: number | null;
+        slack_claim_recheck_at: number | null;
+      }>();
   if (!row) {
     message.ack();
     return "acknowledged";
@@ -2065,21 +2086,38 @@ export async function consumeDeliveryMessage(
     return "retried";
   }
   const payload = jsonRecord(row.payload_json);
-  const retryFence = `id=? AND available_at=? AND enqueued_at IS ? AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ?`;
+  const retryFence = `id=? AND attempts=? AND available_at=? AND enqueued_at IS ? AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ?`;
   const retryBinds = [
     outboxId,
+    row.attempts,
     row.available_at,
     row.enqueued_at,
     row.slack_redrive_due_at,
     row.slack_claim_recheck_at,
   ];
+  let round2Work = false;
+  let coordinationSiblings: Array<{ id: string; attempts: number }> = [];
+  const clearSiblingCoordination = () =>
+    coordinationSiblings
+      .filter((sibling) => sibling.id !== outboxId)
+      .map((sibling) =>
+        env.DB.prepare(`UPDATE outbox SET last_error=NULL WHERE id=? AND attempts=?
+      AND last_error='slack_validation_stale' AND slack_scope_paused_at IS NULL`).bind(sibling.id, sibling.attempts),
+      );
+  const updateRound2Retention = async (statement: D1PreparedStatement, consumeExemption = false) => {
+    const siblings = consumeExemption ? clearSiblingCoordination() : [];
+    if (siblings.length) await env.DB.batch([statement, ...siblings]);
+    else await statement.run();
+  };
   const clearValidationStale = async () => {
-    if (row.last_error !== "slack_validation_stale") return;
-    await env.DB.prepare(
-      `UPDATE outbox SET last_error=NULL WHERE ${retryFence} AND last_error='slack_validation_stale'`,
-    )
-      .bind(...retryBinds)
-      .run();
+    const statements = clearSiblingCoordination();
+    if (row.last_error === "slack_validation_stale")
+      statements.unshift(
+        env.DB.prepare(
+          `UPDATE outbox SET last_error=NULL WHERE ${retryFence} AND last_error='slack_validation_stale' AND slack_scope_paused_at IS NULL`,
+        ).bind(...retryBinds),
+      );
+    if (statements.length) await env.DB.batch(statements);
   };
   // A payload that fails validation will never become valid, so record it and ack
   // instead of retrying. An unknown topic still throws: a rolling deploy can leave an
@@ -2093,37 +2131,49 @@ export async function consumeDeliveryMessage(
     message.ack();
     return "discarded";
   };
-  const retainRound2 = async (status: Awaited<ReturnType<typeof round2DeliveryStatus>>) => {
-    await clearValidationStale();
+  const retainRound2 = async (status: Awaited<ReturnType<typeof round2DeliveryStatus>>, attempted = false) => {
+    const now = Date.now();
     if (status.outcome === "competing") {
       await env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=? WHERE ${retryFence}`)
-        .bind(Math.max(Date.now() + 1_000, (status.claimed_at ?? Date.now()) + 60_000), ...retryBinds)
+        .bind(Math.max(now + 1_000, (status.claimed_at ?? now) + 60_000), ...retryBinds)
         .run();
     } else {
-      await env.DB.prepare(
-        `UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=NULL WHERE ${retryFence}`,
-      )
-        .bind(
-          Date.now() + (status.outcome === "paused" || status.outcome === "uncertain" ? 30 * 60_000 : 60_000),
-          ...retryBinds,
-        )
-        .run();
+      const consumeExemption = attempted && status.outcome === "retryable";
+      const due = now + (status.outcome === "paused" || status.outcome === "uncertain" ? 30 * 60_000 : 60_000);
+      await updateRound2Retention(
+        env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),
+        slack_claim_recheck_at=CASE WHEN last_error='slack_validation_stale' AND (?=0 OR slack_scope_paused_at IS NOT NULL)
+          THEN max(coalesce(slack_claim_recheck_at,0),?) ELSE NULL END,
+        last_error=CASE WHEN last_error='slack_validation_stale' AND ?=1 AND slack_scope_paused_at IS NULL THEN NULL ELSE last_error END
+        WHERE ${retryFence}`).bind(due, consumeExemption ? 1 : 0, due, consumeExemption ? 1 : 0, ...retryBinds),
+        consumeExemption,
+      );
     }
     message.ack();
   };
   const keepRound2 = async (topic: keyof typeof round2Receipts, id: string) => {
     const status = await round2DeliveryStatus(env, topic, id);
     if (status.outcome === "completed") return false;
-    await retainRound2(status);
+    await retainRound2(status, true);
     return true;
   };
   const deferRound2 = async (topic: keyof typeof round2Receipts, id: string) => {
+    round2Work = true;
+    coordinationSiblings = (
+      await env.DB.prepare(`SELECT id,attempts FROM outbox WHERE topic=? AND slack_round2_receipt_id=?
+      AND last_error='slack_validation_stale'`)
+        .bind(topic, id)
+        .all<{ id: string; attempts: number }>()
+    ).results;
     const status = await round2DeliveryStatus(env, topic, id);
     if (status.outcome === "retryable" || status.outcome === "uncertain") return false;
     if (status.outcome === "completed") {
-      await env.DB.prepare("UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL WHERE id=?")
-        .bind(outboxId)
-        .run();
+      await updateRound2Retention(
+        env.DB.prepare(
+          `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error=CASE WHEN last_error='slack_validation_stale' THEN NULL ELSE last_error END WHERE ${retryFence}`,
+        ).bind(...retryBinds),
+        true,
+      );
       message.ack();
     } else await retainRound2(status);
     return true;
@@ -2131,24 +2181,28 @@ export async function consumeDeliveryMessage(
   const round2Failure = async (error: unknown) => {
     if (error instanceof StaleSlackValidationError) {
       const now = Date.now();
-      await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,available_at=?,slack_claim_recheck_at=?,
-        slack_redrive_due_at=NULL,last_error='slack_validation_stale' WHERE id=?`)
-        .bind(now + 2000, now + 2000, outboxId)
-        .run();
-      try {
-        await env.DELIVERY_QUEUE.send({ outboxId }, { delaySeconds: 2 });
-        await env.DB.prepare(`UPDATE outbox SET enqueued_at=?,slack_redrive_due_at=?,slack_claim_recheck_at=NULL,last_error=NULL
-          WHERE id=? AND last_error='slack_validation_stale' AND available_at=? AND slack_claim_recheck_at=?
-            AND enqueued_at IS NULL AND slack_redrive_due_at IS NULL`)
-          .bind(now, now + SLACK_REDRIVE_STALE_MS, outboxId, now + 2000, now + 2000)
+      const retry =
+        await env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=NULL,available_at=?,slack_claim_recheck_at=?,
+        slack_redrive_due_at=NULL,last_error='slack_validation_stale' WHERE ${retryFence}`)
+          .bind(now + 2000, now + 2000, ...retryBinds)
           .run();
-      } catch {
-        // Durable claim recheck recovers an enqueue failure without queue retries.
+      if (retry.meta.changes) {
+        const id = payload[round2Receipts[row.topic as keyof typeof round2Receipts]?.key];
+        if (typeof id === "string")
+          try {
+            await enqueueRound2Outbox(env, outboxId, row.topic as keyof typeof round2Receipts, id, {
+              dueAt: now + SLACK_REDRIVE_STALE_MS,
+              delaySeconds: 2,
+              expectedVersion: row.attempts + 1,
+              correlationId: body.correlationId ?? row.correlation_id ?? undefined,
+            });
+          } catch {
+            // Durable scheduling recovers a failed delayed enqueue without queue retries.
+          }
       }
       message.ack();
       return "acknowledged" as const;
     }
-    await clearValidationStale();
     if (slackMissingScope(error)) await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
     else if (error instanceof DeliveryInProgressError) {
       await env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=? WHERE ${retryFence}`)
@@ -2160,7 +2214,15 @@ export async function consumeDeliveryMessage(
       )
         .bind(Date.now() + 60_000, ...retryBinds)
         .run();
-    } else throw error;
+    } else {
+      const contract = round2Receipts[row.topic as keyof typeof round2Receipts];
+      const id = contract ? payload[contract.key] : undefined;
+      if (typeof id === "string") {
+        const status = await round2DeliveryStatus(env, row.topic as keyof typeof round2Receipts, id);
+        if (status.outcome === "retryable") await clearValidationStale();
+      }
+      throw error;
+    }
     message.ack();
     return "acknowledged" as const;
   };
@@ -2411,9 +2473,13 @@ export async function consumeDeliveryMessage(
     if (typeof deliveryId !== "string") return await rejectPayload("Webhook delivery outbox payload is invalid.");
     await deliverWebhook(env, deliveryId);
   } else throw new Error(`Unsupported outbox topic: ${row.topic}`);
-  await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL WHERE id=?`)
-    .bind(outboxId)
-    .run();
+  await updateRound2Retention(
+    env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,
+    last_error=CASE WHEN last_error='slack_validation_stale' THEN NULL ELSE last_error END WHERE ${round2Work ? retryFence : "id=?"}`).bind(
+      ...(round2Work ? retryBinds : [outboxId]),
+    ),
+    true,
+  );
   message.ack();
   return "acknowledged";
 }
