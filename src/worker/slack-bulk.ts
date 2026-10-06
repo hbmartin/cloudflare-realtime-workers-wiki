@@ -1,4 +1,5 @@
 import type { Env } from "./env";
+import { sha256Hex } from "../shared/import-integrity";
 import { DeliveryInProgressError } from "./notifications";
 import { round2Installation, validateMapping } from "./slack-channels";
 import { reconcileBotPost } from "./slack-digests";
@@ -41,8 +42,12 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
   const finish = async (state: string, ts: string | null = null) =>
     env.DB.batch([
       env.DB.prepare(
-        `UPDATE slack_channel_events SET delivered_at=?,round2_state=? WHERE id IN (SELECT value FROM json_each((SELECT event_ids_json FROM slack_bulk_receipts WHERE id=? AND claim_token=?)))`,
-      ).bind(Date.now(), state, id, token),
+        `UPDATE slack_channel_events SET delivered_at=CASE WHEN ?='sent' THEN ? ELSE delivered_at END,
+          round2_state=?,suppressed_at=CASE WHEN ?='retired' THEN coalesce(suppressed_at,?) ELSE suppressed_at END
+          WHERE summary_id=? AND delivered_at IS NULL AND (?='sent' OR suppressed_at IS NULL)
+            AND (?='retired' OR id IN (SELECT value FROM json_each((SELECT event_ids_json FROM slack_bulk_receipts WHERE id=? AND claim_token=?))))
+            AND EXISTS(SELECT 1 FROM slack_bulk_receipts WHERE id=? AND claim_token=?)`,
+      ).bind(state, Date.now(), state, state, Date.now(), id, state, state, id, token, id, token),
       env.DB.prepare(`UPDATE slack_bulk_receipts SET state=?,message_ts=? WHERE id=? AND claim_token=?`).bind(
         state,
         ts,
@@ -67,48 +72,53 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
           .run();
       return;
     }
-    const pausedSql = `SELECT 1 FROM slack_channel_events event
-      JOIN slack_channel_subscriptions m ON m.id=event.subscription_id JOIN slack_installations i ON i.id=m.installation_id
-      WHERE event.summary_id=? AND i.id=? AND i.generation=? AND i.disconnected_at IS NULL AND m.channel_id=?
-        AND (i.auth_error IS NOT NULL OR m.notification_blocked_at IS NOT NULL OR m.muted_at IS NOT NULL OR coalesce(m.snoozed_until,0)>?)`;
-    const pauseBinds = () => [id, installation.id, installation.generation, row!.channel_id, Date.now()];
-    const paused = () =>
-      env.DB.prepare(pausedSql)
-        .bind(...pauseBinds())
-        .first();
-    const loadEvents = (expectedState = "pending") =>
-      env.DB.prepare(`SELECT e.id,e.page_id,m.id mapping_id,EXISTS(${pausedSql}) paused FROM slack_channel_events e
+    const pauseSql = `installation.auth_error IS NOT NULL OR m.notification_blocked_at IS NOT NULL
+      OR m.muted_at IS NOT NULL OR coalesce(m.snoozed_until,0)>?`;
+    const candidateSql = `FROM slack_channel_events e
       JOIN slack_channel_subscriptions m ON m.id=e.subscription_id JOIN pages page ON page.id=e.page_id
       JOIN slack_installations installation ON installation.id=m.installation_id
       WHERE e.summary_id=? AND EXISTS(SELECT 1 FROM slack_bulk_receipts receipt WHERE receipt.id=e.summary_id AND receipt.claim_token=? AND receipt.state=? AND receipt.installation_generation=? AND receipt.installation_id=installation.id AND receipt.channel_id=? AND receipt.event_type=?) AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
-      AND installation.generation=? AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
-      AND m.installation_id=? AND m.channel_id=? AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=?
-      AND m.notification_blocked_at IS NULL AND page.import_job_id IS NULL AND page.is_template=0
+      AND installation.generation=? AND installation.disconnected_at IS NULL
+      AND m.installation_id=? AND m.channel_id=? AND page.import_job_id IS NULL AND page.is_template=0
       AND EXISTS(SELECT 1 FROM workspace_members w WHERE w.workspace_id=? AND w.user_id=m.created_by AND w.role='owner')
       AND (${channelActivityActorAccessSql.replaceAll("event.", "e.")} OR page.archived_at IS NOT NULL OR page.space_id<>m.space_id)
-      AND m.validation_state='valid' AND EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type) ORDER BY e.id`)
-        .bind(
-          ...pauseBinds(),
-          id,
-          token,
-          expectedState,
-          installation.generation,
-          row!.channel_id,
-          row!.event_type,
-          installation.generation,
-          installation.id,
-          row!.channel_id,
-          Date.now(),
-          installation.workspace_id,
-        )
-        .all<{ id: string; page_id: string; mapping_id: string; paused: number }>();
+      AND EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type)`;
+    const candidateBinds = (expectedState: string) => [
+      id,
+      token,
+      expectedState,
+      installation.generation,
+      row!.channel_id,
+      row!.event_type,
+      installation.generation,
+      installation.id,
+      row!.channel_id,
+      installation.workspace_id,
+    ];
+    const loadCandidates = (expectedState: string) =>
+      env.DB.prepare(
+        `SELECT e.id,e.page_id,m.id mapping_id,m.validation_state,(${pauseSql}) paused ${candidateSql} ORDER BY e.id`,
+      )
+        .bind(Date.now(), ...candidateBinds(expectedState))
+        .all<{ id: string; page_id: string; mapping_id: string; validation_state: string; paused: number }>();
+    const loadEvents = async (expectedState = "pending", pausedOnly = false) => {
+      const candidates = await loadCandidates(expectedState);
+      return {
+        ...candidates,
+        results: candidates.results.filter((event) =>
+          pausedOnly
+            ? Boolean(event.paused) || event.validation_state !== "valid"
+            : !event.paused && event.validation_state === "valid",
+        ),
+      };
+    };
+    const paused = async () => (await loadEvents("pending", true)).results.length > 0;
+    const candidates = await loadCandidates("pending");
+    for (const mappingId of new Set(
+      candidates.results.filter((event) => !event.paused).map((event) => event.mapping_id),
+    ))
+      await validateMapping(env, installation, mappingId, row.channel_id);
     let events = await loadEvents();
-    if (!events.results.length) {
-      if (!(await paused())) await finish("retired");
-      return;
-    }
-    if (!(await validateMapping(env, installation, events.results[0]!.mapping_id, row.channel_id))) return;
-    events = await loadEvents();
     if (!events.results.length) {
       if (!(await paused())) await finish("retired");
       return;
@@ -126,29 +136,69 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
           },
           beforeDispatch: async () => {
             events = await loadEvents();
-            if (events.results.some((event) => event.paused)) throw new SlackDispatchSkippedError();
             if (!events.results.length) {
               if (!(await paused())) await finish("retired");
               throw new SlackDispatchSkippedError();
             }
             const ids = JSON.stringify(events.results.map((e) => e.id));
+            const pausedIds = JSON.stringify((await loadEvents("pending", true)).results.map((e) => e.id));
+            // Persist a separate delivery ID before posting the eligible subset.
+            const deferredId = pausedIds === "[]" ? null : `${id}:deferred:${await sha256Hex(pausedIds)}`;
             const [checkpoint] = await env.DB.batch([
               env.DB.prepare(`UPDATE slack_bulk_receipts SET state='sending',attempted_at=?,event_ids_json=?
                 WHERE id=? AND state='pending' AND claim_token=?`).bind(Date.now(), ids, id, token),
+              ...(deferredId
+                ? [
+                    env.DB.prepare(`INSERT OR IGNORE INTO slack_bulk_receipts
+                  (id,installation_id,installation_generation,channel_id,operation_id,event_type,event_ids_json,created_at)
+                  SELECT ?,installation_id,installation_generation,channel_id,operation_id,event_type,?,created_at
+                  FROM slack_bulk_receipts WHERE id=? AND claim_token=? AND state='sending'`).bind(
+                      deferredId,
+                      pausedIds,
+                      id,
+                      token,
+                    ),
+                    env.DB.prepare(`UPDATE slack_channel_events SET summary_id=?
+                  WHERE summary_id=? AND delivered_at IS NULL AND suppressed_at IS NULL AND id IN (SELECT value FROM json_each(?))
+                    AND EXISTS(SELECT 1 FROM slack_bulk_receipts WHERE id=? AND claim_token=? AND state='sending')
+                    AND EXISTS(SELECT 1 FROM slack_bulk_receipts WHERE id=? AND state='pending')`).bind(
+                      deferredId,
+                      id,
+                      pausedIds,
+                      id,
+                      token,
+                      deferredId,
+                    ),
+                    env.DB.prepare(`INSERT OR IGNORE INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
+                  SELECT ?,?,'slack_bulk',json_object('summaryId',?),?,?
+                  WHERE EXISTS(SELECT 1 FROM slack_bulk_receipts WHERE id=? AND claim_token=? AND state='sending')
+                    AND EXISTS(SELECT 1 FROM slack_channel_events WHERE summary_id=? AND delivered_at IS NULL AND suppressed_at IS NULL)`).bind(
+                      `outbox:${deferredId}`,
+                      installation.workspace_id,
+                      deferredId,
+                      Date.now(),
+                      Date.now(),
+                      id,
+                      token,
+                      deferredId,
+                    ),
+                  ]
+                : []),
               env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
-                WHERE summary_id=? AND id NOT IN (SELECT value FROM json_each(?))
+                WHERE summary_id=? AND delivered_at IS NULL AND suppressed_at IS NULL
+                  AND id NOT IN (SELECT e.id ${candidateSql})
                   AND EXISTS(SELECT 1 FROM slack_bulk_receipts WHERE id=? AND claim_token=? AND state='sending')`).bind(
                 Date.now(),
                 id,
-                ids,
+                ...candidateBinds("sending"),
                 id,
                 token,
               ),
             ]);
             if (!checkpoint!.meta.changes) throw new DeliveryInProgressError();
-            const finalEvents = await loadEvents("sending");
+            const finalEvents = await loadCandidates("sending");
             if (
-              finalEvents.results.some((event) => event.paused) ||
+              finalEvents.results.some((event) => event.paused || event.validation_state !== "valid") ||
               JSON.stringify(finalEvents.results.map((e) => e.id)) !== ids
             )
               throw new DeliveryInProgressError();

@@ -2123,12 +2123,23 @@ export const channelActivityActorAccessSql = channelActorAccessSql.replace(
     OR (event.event_type IN ('page_created','page_edit','page_moved','page_archived','task_status_changed') AND bot.read_content=1 AND (bot.insert_content=1 OR bot.update_content=1)))`,
 );
 
+// A departure may hide page details, but its actor must still hold the original
+// workspace authority and the capabilities required for this activity.
+export const channelActivityActorAuthoritySql = channelActivityActorAccessSql
+  .replace("AND (wm.role = 'owner' OR sp.visibility = 'workspace' OR sm.user_id IS NOT NULL)", "")
+  .replace("JOIN pages grant_page ON grant_page.id = grant_row.root_page_id AND grant_page.archived_at IS NULL", "");
+
+const legacyChannelEligibilitySql = `page.is_template=0 AND ${channelActorAccessSql}
+  AND EXISTS(SELECT 1 FROM workspace_members owner JOIN slack_installations owner_installation
+    ON owner_installation.workspace_id=owner.workspace_id AND owner_installation.id=subscription.installation_id
+    WHERE owner.user_id=subscription.created_by AND owner.role='owner')`;
+
 function deniedLegacyChannelEventsStatement(env: Env, ids: readonly string[], claimToken: string | null = null) {
   return env.DB.prepare(`UPDATE slack_channel_events SET suppressed_at=?,claim_token=NULL,claimed_at=NULL
     WHERE delivered_at IS NULL AND suppressed_at IS NULL AND claim_token IS ?
       AND id IN (SELECT event.id FROM slack_channel_events event JOIN pages page ON page.id=event.page_id
         JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
-        WHERE (page.is_template=1 OR NOT ${channelActorAccessSql})
+        WHERE NOT (${legacyChannelEligibilitySql})
           AND event.id IN (SELECT value FROM json_each(?))
           AND (?=0 OR subscription.round2_initialized=0))`).bind(
     Date.now(),
@@ -2671,6 +2682,18 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
   const date = new Date(timestamp);
   if (date.getUTCHours() < 9) return;
   const cutoff = Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 9);
+  const denied = await env.DB.prepare(`SELECT event.id FROM slack_channel_events event
+    JOIN pages page ON page.id=event.page_id JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
+    WHERE event.cadence='digest' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL AND event.claim_token IS NULL
+      AND event.created_at<? AND (?=0 OR subscription.round2_initialized=0)
+      AND NOT (${legacyChannelEligibilitySql}) ORDER BY event.created_at,event.id LIMIT 200`)
+    .bind(cutoff, env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0)
+    .all<{ id: string }>();
+  if (denied.results.length)
+    await deniedLegacyChannelEventsStatement(
+      env,
+      denied.results.map((event) => event.id),
+    ).run();
   const subscriptions = await env.DB.prepare(
     `SELECT event.subscription_id, subscription.installation_id
        FROM slack_channel_events event
@@ -2684,6 +2707,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
         AND subscription.muted_at IS NULL
         AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
         AND page.archived_at IS NULL AND page.import_job_id IS NULL
+        AND ${legacyChannelEligibilitySql}
         AND page.space_id = subscription.space_id
         AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
       GROUP BY event.subscription_id, subscription.installation_id
@@ -2711,6 +2735,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
         WHERE event.subscription_id = ? AND event.cadence = 'digest'
           AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
           AND event.created_at < ? AND installation.disconnected_at IS NULL
+          AND ${legacyChannelEligibilitySql}
           AND page.space_id = subscription.space_id AND (subscription.page_id IS NULL OR subscription.page_id = page.id)
           AND subscription.notification_blocked_at IS NULL AND installation.auth_error IS NULL
           AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= unixepoch('subsec') * 1000)

@@ -454,7 +454,14 @@ export function createAuth(env: Env, allowRegistration = false) {
             }
             const parameters = redirected?.searchParams ?? new URLSearchParams(location.split("?").slice(1).join("?"));
             if (parameters.has("error")) {
-              const destination = slackCallbackDestination(env, ctx, await getOAuthState());
+              const state = await getOAuthState();
+              let destination = slackCallbackDestination(env, ctx, state);
+              if (!state && redirected?.origin === new URL(env.BETTER_AUTH_URL).origin) {
+                const selected = new URL(redirected);
+                selected.searchParams.delete("error");
+                selected.searchParams.delete("error_description");
+                if (selected.href !== new URL(`${ctx.context.baseURL}/error`).href) destination = new URL(redirected);
+              }
               for (const name of ["error", "error_description"]) {
                 const value = parameters.get(name);
                 if (value !== null) destination.searchParams.set(name, value);

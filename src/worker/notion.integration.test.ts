@@ -321,6 +321,126 @@ describe("Notion-compatible API", () => {
     }
   });
 
+  it.each(["blocks", "pages"])("reports a retired %s mutation as an unknown outcome", async (kind) => {
+    const installed = await bootstrap();
+    const createdIntegration = await integration(installed.cookie, installed.pageId);
+    let mutations = 0;
+    const bindings = new Proxy(env, {
+      get(target, key, receiver) {
+        if (key === "DOCUMENT")
+          return {
+            getByName(name: string) {
+              const stub = env.DOCUMENT.getByName(name);
+              return {
+                fetch: async (request: Request) => {
+                  if (new URL(request.url).pathname === "/api-mutate") {
+                    mutations++;
+                    return Response.json({ error: "document_retired" }, { status: 410 });
+                  }
+                  return stub.fetch(request);
+                },
+              };
+            },
+          };
+        return Reflect.get(target, key, receiver);
+      },
+    }) as Cloudflare.Env;
+    const context = createExecutionContext();
+    const children = [{ paragraph: { rich_text: [{ text: { content: "New content" } }] } }];
+    const response = await worker.fetch(
+      notionRequest(createdIntegration.token, kind === "blocks" ? `/blocks/${installed.pageId}/children` : "/pages", {
+        method: kind === "blocks" ? "PATCH" : "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(
+          kind === "blocks"
+            ? { children }
+            : {
+                parent: { type: "page_id", page_id: installed.pageId },
+                properties: { title: { title: [{ text: { content: "New page" } }] } },
+                children,
+              },
+        ),
+      }),
+      bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      code: "conflict_error",
+      message: "The mutation outcome is unknown. Fetch the page before retrying.",
+    });
+    expect(mutations).toBe(1);
+  });
+
+  it.each([false, true].flatMap((async) => ["mutation", "receipt"].map((boundary) => ({ async, boundary }))))(
+    "reports retirement at $boundary as an unknown outcome in Markdown (async=$async)",
+    async ({ async, boundary }) => {
+      const installed = await bootstrap();
+      const createdIntegration = await integration(installed.cookie, installed.pageId);
+      const client = notion(createdIntegration.token);
+      await client.blocks.children.append({
+        block_id: installed.pageId,
+        children: [{ paragraph: { rich_text: [{ text: { content: "Before" } }] } }] as never,
+      });
+      let mutations = 0;
+      const document = {
+        getByName(name: string) {
+          const stub = env.DOCUMENT.getByName(name);
+          return {
+            fetch: async (request: Request) => {
+              const path = new URL(request.url).pathname;
+              if (path === "/api-mutate") mutations++;
+              if (
+                (boundary === "mutation" && path === "/api-mutate") ||
+                (boundary === "receipt" && path === "/api-mutate-receipt")
+              )
+                return Response.json({ error: "document_retired" }, { status: 410 });
+              return stub.fetch(request);
+            },
+          };
+        },
+      } as unknown as Cloudflare.Env["DOCUMENT"];
+      const bindings = new Proxy(env, {
+        get(target, key, receiver) {
+          if (key === "DOCUMENT") return document;
+          return Reflect.get(target, key, receiver);
+        },
+      }) as Cloudflare.Env;
+      const context = createExecutionContext();
+      const response = await worker.fetch(
+        notionRequest(createdIntegration.token, `/pages/${installed.pageId}/markdown`, {
+          method: "PATCH",
+          headers: { "content-type": "application/json", "idempotency-key": "retirement-test" },
+          body: JSON.stringify({
+            type: "update_content",
+            update_content: { content_updates: [{ old_str: "Before", new_str: "After" }] },
+            allow_async: async,
+          }),
+        }),
+        bindings,
+        context,
+      );
+      await waitOnExecutionContext(context);
+      const failure = async
+        ? (await env.DB.prepare("SELECT status,error_json FROM notion_markdown_tasks").first<{
+            status: string;
+            error_json: string;
+          }>())!
+        : null;
+      expect(response.status).toBe(async ? 202 : 409);
+      expect(failure?.status ?? null).toBe(async ? "failed" : null);
+      const outcome = async ? JSON.parse(failure!.error_json) : await response.json();
+      expect(outcome).toMatchObject({
+        code: "conflict_error",
+        message: "The mutation outcome is unknown. Fetch the page before retrying.",
+      });
+      expect(mutations).toBe(boundary === "mutation" ? 1 : 0);
+      if (async) await recoverNotionMarkdownTasks(bindings);
+      expect(mutations).toBe(boundary === "mutation" ? 1 : 0);
+    },
+  );
+
   it("runs an async Markdown task once and scopes polling to its integration", async () => {
     const installed = await bootstrap();
     const createdIntegration = await integration(installed.cookie, installed.pageId);

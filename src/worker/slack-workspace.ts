@@ -1,7 +1,7 @@
 import { slackAccessAuthorization } from "./slack-identity";
 import { round2WakeStatement } from "./slack-delivery-contracts";
 import { listTasks } from "./tasks";
-import { listNotifications } from "./notifications";
+import { DeliveryInProgressError, listNotifications } from "./notifications";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { mentionsInbox, type MentionCursor } from "./mentions-inbox";
@@ -1589,7 +1589,7 @@ export async function deliverSlackWorkspaceAction(env: Env, receiptId: string): 
   return "completed";
 }
 
-export async function deliverSlackShareResponse(env: Env, payload: Record<string, unknown>) {
+export async function deliverSlackShareResponse(env: Env, payload: Record<string, unknown>, outboxId?: string) {
   if (
     typeof payload.receiptId !== "string" ||
     typeof payload.installationId !== "string" ||
@@ -1612,6 +1612,79 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
     (storedReceipt.response_delivery_state !== null && storedReceipt.response_delivery_state !== "pending")
   )
     return;
+  if (!Object.hasOwn(payload, "identity")) {
+    const proof = await env.DB.prepare(`SELECT o.payload_json,o.attempts,link.user_id userId,
+      link.better_auth_account_id accountId,link.verified_at verifiedAt,link.slack_user_id slackUserId
+      FROM outbox o JOIN slack_interaction_receipts receipt ON receipt.id=json_extract(o.payload_json,'$.receiptId')
+      JOIN slack_installations installation ON installation.id=receipt.installation_id
+      JOIN slack_authorized_user_links link ON link.installation_id=installation.id
+      WHERE o.id=? AND o.topic='slack_share_response' AND json_valid(o.payload_json)
+        AND json_type(o.payload_json,'$.identity') IS NULL AND o.slack_scope_paused_at IS NULL
+        AND json_extract(o.payload_json,'$.receiptId')=? AND json_extract(o.payload_json,'$.installationId')=?
+        AND json_extract(o.payload_json,'$.generation')=? AND json_extract(o.payload_json,'$.userId')=?
+        AND installation.id=? AND installation.generation=? AND installation.auth_error IS NULL
+        AND link.slack_user_id=? AND link.installation_generation=installation.generation
+        AND link.migration_state='verified' AND link.verification_method='slack_openid'
+        AND link.verified_at<=receipt.received_at AND link.authorization_started_at<=receipt.received_at
+        AND receipt.outcome='accepted' AND (receipt.response_delivery_state IS NULL OR receipt.response_delivery_state='pending')
+        AND (SELECT count(*) FROM slack_authorized_user_links candidate WHERE candidate.installation_id=installation.id
+          AND candidate.slack_user_id=link.slack_user_id)=1`)
+      .bind(
+        outboxId ?? `outbox:slack-share-response:${payload.receiptId}`,
+        payload.receiptId,
+        payload.installationId,
+        payload.generation,
+        payload.userId,
+        payload.installationId,
+        payload.generation,
+        payload.userId,
+      )
+      .first<{
+        payload_json: string;
+        attempts: number;
+        userId: string;
+        accountId: string;
+        verifiedAt: number;
+        slackUserId: string;
+      }>();
+    if (proof) {
+      const identity = {
+        userId: proof.userId,
+        accountId: proof.accountId,
+        verifiedAt: proof.verifiedAt,
+        slackUserId: proof.slackUserId,
+      };
+      const persisted = await env.DB.prepare(`UPDATE outbox SET payload_json=json_set(payload_json,'$.identity',json(?))
+        WHERE id=? AND attempts=? AND payload_json=? AND slack_scope_paused_at IS NULL
+          AND EXISTS(SELECT 1 FROM slack_interaction_receipts receipt JOIN slack_authorized_user_links link
+            ON link.installation_id=receipt.installation_id
+            WHERE receipt.id=? AND receipt.outcome='accepted' AND (receipt.response_delivery_state IS NULL OR receipt.response_delivery_state='pending')
+              AND link.user_id=? AND link.slack_user_id=? AND link.better_auth_account_id=? AND link.verified_at=?
+              AND link.installation_generation=? AND link.migration_state='verified' AND link.verification_method='slack_openid'
+              AND link.verified_at<=receipt.received_at AND link.authorization_started_at<=receipt.received_at)`)
+        .bind(
+          JSON.stringify(identity),
+          outboxId ?? `outbox:slack-share-response:${payload.receiptId}`,
+          proof.attempts,
+          proof.payload_json,
+          payload.receiptId,
+          identity.userId,
+          identity.slackUserId,
+          identity.accountId,
+          identity.verifiedAt,
+          payload.generation,
+        )
+        .run();
+      if (!persisted.meta.changes) throw new DeliveryInProgressError();
+      // Dispatch the persisted source, so an interrupted recovery resumes with
+      // the same identity and cannot replace an earlier authorization snapshot.
+      return deliverSlackShareResponse(
+        env,
+        { ...(JSON.parse(proof.payload_json) as Record<string, unknown>), identity },
+        outboxId,
+      );
+    }
+  }
   const expected = payload.identity as Partial<NonNullable<ActionInput["identity"]>> | null;
   if (
     !expected ||

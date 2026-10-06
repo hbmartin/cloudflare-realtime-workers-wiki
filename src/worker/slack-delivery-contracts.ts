@@ -168,7 +168,9 @@ export function round2WakeStatement(
       AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=? AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND (
       (topic='slack_channel' AND EXISTS(SELECT 1 FROM slack_channel_events r WHERE r.id=slack_round2_receipt_id AND r.subscription_id=m.id AND r.round2_state='pending' AND r.suppressed_at IS NULL AND r.delivered_at IS NULL AND coalesce(r.claimed_at,0)<?)) OR
       (topic='slack_digest' AND (outbox.id='outbox:'||slack_round2_receipt_id OR enqueued_at IS NULL OR slack_redrive_due_at IS NOT NULL OR slack_claim_recheck_at IS NOT NULL) AND EXISTS(SELECT 1 FROM slack_digest_receipts r WHERE r.id=slack_round2_receipt_id AND r.subscription_id=m.id AND r.state='pending' AND coalesce(r.claimed_at,0)<? AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state IN ('sending','blocked')))) OR
-      (topic='slack_bulk' AND EXISTS(SELECT 1 FROM slack_bulk_receipts r WHERE r.id=slack_round2_receipt_id AND r.installation_id=i.id AND r.channel_id=m.channel_id AND r.state='pending' AND coalesce(r.claimed_at,0)<?)) OR
+      (topic='slack_bulk' AND EXISTS(SELECT 1 FROM slack_bulk_receipts r WHERE r.id=slack_round2_receipt_id AND r.installation_id=i.id AND r.channel_id=m.channel_id AND r.state='pending' AND coalesce(r.claimed_at,0)<?
+        AND EXISTS(SELECT 1 FROM slack_channel_events event WHERE event.summary_id=r.id AND event.subscription_id=m.id
+          AND event.round2_state='pending' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL))) OR
       (topic='slack_share_refresh' AND EXISTS(SELECT 1 FROM slack_share_refreshes r WHERE r.id=slack_round2_receipt_id AND r.installation_id=i.id AND r.channel_id=m.channel_id AND r.state='pending' AND coalesce(r.claimed_at,0)<?)) OR
       (topic='slack_file_upload' AND EXISTS(SELECT 1 FROM slack_file_artifacts r JOIN pages p ON p.id=r.page_id WHERE r.id=slack_round2_receipt_id AND r.installation_id=i.id AND p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) AND r.state='pending' AND coalesce(r.claimed_at,0)<?))))`).bind(
     now,

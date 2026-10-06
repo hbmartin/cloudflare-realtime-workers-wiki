@@ -31,6 +31,12 @@ export function definiteSlackRejection(error: unknown): error is SlackApiError {
   );
 }
 
+export function permanentSlackValidationError(error: string | null | undefined) {
+  return ["channel_not_found", "not_in_channel", "is_archived", "shared_channel", "unsupported_channel_type"].includes(
+    error ?? "",
+  );
+}
+
 export function retryableSlackError(error: unknown) {
   return error instanceof SlackRateLimitError || (error instanceof SlackApiError && !definiteSlackRejection(error));
 }
@@ -84,6 +90,25 @@ export function invalidSlackDestination(error: unknown): error is SlackApiError 
   );
 }
 
+export function retireDigestReceiptStatements(env: Env, id: string, token: string, error: string | null = null) {
+  const guard = `EXISTS(SELECT 1 FROM slack_digest_receipts root WHERE root.id=? AND root.claim_token=?
+    AND NOT EXISTS(SELECT 1 FROM slack_digest_messages uncertain WHERE uncertain.receipt_id=root.id AND uncertain.state IN ('sending','blocked')))`;
+  return [
+    env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
+      WHERE delivered_at IS NULL AND id IN (SELECT value FROM slack_digest_messages child,json_each(child.event_ids_json)
+        WHERE child.receipt_id=? AND child.state='pending') AND ${guard}`).bind(Date.now(), id, id, token),
+    env.DB.prepare(`UPDATE slack_digest_messages SET state='retired',claim_token=NULL,claimed_at=NULL
+      WHERE receipt_id=? AND state='pending' AND ${guard}`).bind(id, id, token),
+    env.DB.prepare(`UPDATE slack_digest_receipts SET state='retired',last_error=? WHERE id=? AND claim_token=?
+      AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=? AND child.state IN ('sending','blocked'))`).bind(
+      error,
+      id,
+      token,
+      id,
+    ),
+  ];
+}
+
 export async function retireObsoleteReceipt(
   env: Env,
   table: "slack_digest_receipts" | "slack_bulk_receipts" | "slack_share_refreshes" | "slack_file_artifacts",
@@ -94,7 +119,8 @@ export async function retireObsoleteReceipt(
   const token = crypto.randomUUID();
   await env.DB.batch([
     env.DB.prepare(`UPDATE ${table} SET claim_token=?,claimed_at=? WHERE id=? AND state IN ('pending'${table === "slack_file_artifacts" ? ",'uploading'" : ""})
-      AND (claimed_at IS NULL OR claimed_at<?) AND NOT EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)`).bind(
+      AND (claimed_at IS NULL OR claimed_at<?) AND NOT EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)
+      ${table === "slack_digest_receipts" ? "AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=slack_digest_receipts.id AND child.state IN ('sending','blocked'))" : ""}`).bind(
       token,
       Date.now(),
       id,
@@ -102,6 +128,7 @@ export async function retireObsoleteReceipt(
       installationId,
       generation,
     ),
+    ...(table === "slack_digest_receipts" ? retireDigestReceiptStatements(env, id, token) : []),
     env.DB.prepare(
       `UPDATE ${table} SET state='retired',claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
     ).bind(id, token),
