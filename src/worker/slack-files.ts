@@ -1,5 +1,5 @@
 import { processSlackFileCleanup } from "./slack-file-cleanup";
-import { mappingDeliveryPauseSql } from "./slack-delivery-contracts";
+import { thumbnailEligibilitySql } from "./slack-delivery-contracts";
 import { logger } from "./observability";
 import { DeliveryInProgressError } from "./notifications";
 import {
@@ -48,6 +48,23 @@ export async function deliverThumbnail(env: Env, id: string) {
     attempt_count: number;
   }>();
   if (!row || ["uploaded", "failed", "retired"].includes(row.state)) return;
+  const eligibility = await env.DB.prepare(
+    `SELECT ${thumbnailEligibilitySql()} eligibility FROM slack_file_artifacts r WHERE r.id=?`,
+  )
+    .bind(id)
+    .first<{ eligibility: "ready" | "paused" | "obsolete" }>();
+  if (eligibility?.eligibility === "paused") return;
+  if (eligibility?.eligibility === "obsolete") {
+    const retired =
+      await env.DB.prepare(`UPDATE slack_file_artifacts AS r SET state='retired',claim_token=NULL,claimed_at=NULL,updated_at=?
+      WHERE id=? AND state IN ('pending','uploading') AND (claimed_at IS NULL OR claimed_at<?)
+        AND (${thumbnailEligibilitySql()})='obsolete'`)
+        .bind(Date.now(), id, Date.now() - 60_000)
+        .run();
+    if (!retired.meta.changes) throw new DeliveryInProgressError();
+    await cleanupAllocation(env, row.installation_id, id, row.slack_file_id);
+    return;
+  }
   const installation = await round2Installation(env, row.installation_id, row.installation_generation);
   if (!installation) {
     if (
@@ -82,44 +99,29 @@ export async function deliverThumbnail(env: Env, id: string) {
       .bind(id, token)
       .first<NonNullable<typeof row>>();
     if (!row) throw new DeliveryInProgressError();
-    const allowed =
-      await env.DB.prepare(`SELECT 1 FROM pages p JOIN diagram_projections d ON d.page_id=p.id AND d.content_epoch=p.content_epoch
-    JOIN slack_channel_subscriptions m ON m.space_id=p.space_id AND (m.page_id IS NULL OR m.page_id=p.id)
-    JOIN slack_installations i ON i.id=m.installation_id
-    WHERE p.id=? AND p.content_epoch=? AND d.thumbnail_hash=? AND d.thumbnail_r2_key=? AND p.archived_at IS NULL
-    AND p.import_job_id IS NULL AND p.is_template=0 AND i.id=? AND i.generation=? AND i.disconnected_at IS NULL
-    AND m.cadence='digest' AND m.validation_state='valid' AND m.notification_blocked_at IS NULL
-    AND NOT ${mappingDeliveryPauseSql("m", Date.now())}
-    AND EXISTS(SELECT 1 FROM workspace_members wm WHERE wm.workspace_id=p.workspace_id AND wm.user_id=m.created_by AND wm.role='owner')`)
+    const eligible = async () => {
+      const status = await env.DB.prepare(
+        `SELECT ${thumbnailEligibilitySql()} eligibility FROM slack_file_artifacts r WHERE r.id=? AND r.claim_token=?`,
+      )
+        .bind(id, token)
+        .first<{ eligibility: "ready" | "paused" | "obsolete" }>();
+      if (!status) throw new DeliveryInProgressError();
+      if (status.eligibility === "ready") return true;
+      await env.DB.prepare(
+        `UPDATE slack_file_artifacts SET state=?,updated_at=?,attempt_count=MAX(0,attempt_count-?) WHERE id=? AND claim_token=?`,
+      )
         .bind(
-          row.page_id,
-          row.content_epoch,
-          row.content_sha256,
-          row.thumbnail_r2_key,
-          row.installation_id,
-          row.installation_generation,
+          status.eligibility === "paused" ? "pending" : "retired",
+          Date.now(),
+          status.eligibility === "paused" ? 1 : 0,
+          id,
+          token,
         )
-        .first();
-    if (!allowed) {
-      const paused =
-        await env.DB.prepare(`SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id)
-        WHERE p.id=? AND m.installation_id=? AND ${mappingDeliveryPauseSql("m", Date.now())}`)
-          .bind(row.page_id, row.installation_id)
-          .first();
-      if (paused) {
-        await env.DB.prepare(
-          "UPDATE slack_file_artifacts SET state='pending',attempt_count=MAX(0,attempt_count-1) WHERE id=? AND claim_token=?",
-        )
-          .bind(id, token)
-          .run();
-        return;
-      }
-      await env.DB.prepare(`UPDATE slack_file_artifacts SET state='retired',updated_at=? WHERE id=? AND claim_token=?`)
-        .bind(Date.now(), id, token)
         .run();
-      await cleanupAllocation(env, installation.id, id, row.slack_file_id);
-      return;
-    }
+      if (status.eligibility === "obsolete") await cleanupAllocation(env, installation.id, id, row!.slack_file_id);
+      return false;
+    };
+    if (!(await eligible())) return;
     if (!env.BROWSER) throw new Error("thumbnail_unavailable");
     if (
       (installation.file_scope_error_revision !== null && installation.file_scope_error_revision !== undefined) ||
@@ -156,15 +158,7 @@ export async function deliverThumbnail(env: Env, id: string) {
     const png = await rendered.arrayBuffer();
     if (png.byteLength > 5 * 1024 * 1024) throw new Error("thumbnail_too_large");
     // Recheck after rasterization, before transferring content outside NoteFlare.
-    const current = await env.DB.prepare(`SELECT 1 FROM pages p JOIN diagram_projections d ON d.page_id=p.id
-      WHERE p.id=? AND p.content_epoch=? AND p.archived_at IS NULL AND p.import_job_id IS NULL AND d.thumbnail_hash=?
-      AND EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
-        JOIN workspace_members wm ON wm.workspace_id=i.workspace_id AND wm.user_id=m.created_by AND wm.role='owner'
-        WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL AND m.space_id=p.space_id AND (m.page_id IS NULL OR m.page_id=p.id)
-        AND m.validation_state='valid' AND m.notification_blocked_at IS NULL)`)
-      .bind(row.page_id, row.content_epoch, row.content_sha256, installation.id, installation.generation)
-      .first();
-    if (!current) throw new Error("thumbnail_unavailable");
+    if (!(await eligible())) return;
     const upload = await slackApi(env, installation, "files.getUploadURLExternal", {
       filename: "diagram.png",
       length: png.byteLength,

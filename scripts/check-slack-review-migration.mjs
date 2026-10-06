@@ -10,6 +10,7 @@ const GUARDED_MIGRATIONS = [
   "0074_slack_enqueue_recovery.sql",
   "0075_slack_delivery_recovery.sql",
   "0076_slack_delivery_recovery_followup.sql",
+  "0077_slack_recovery_query_indexes.sql",
 ];
 
 export function checkSlackReviewMigration(output, confirmed = false) {

@@ -14,7 +14,12 @@ import type { Env } from "./env";
 import { outboxEnqueueRetryAt, reportPersistentEnqueueFailure } from "./outbox-retry";
 import { logger, safeTelemetryErrorMessage } from "./observability";
 
-import { ROUND2_TOPICS_SQL, round2Receipts, mappingDeliveryPauseSql } from "./slack-delivery-contracts";
+import {
+  ROUND2_TOPICS_SQL,
+  round2Receipts,
+  mappingDeliveryPauseSql,
+  thumbnailEligibilitySql,
+} from "./slack-delivery-contracts";
 export { round2Receipts } from "./slack-delivery-contracts";
 
 // Both consumers and redrive use the same receipt and destination evidence.
@@ -32,9 +37,7 @@ function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string) {
     AND NOT EXISTS(SELECT 1 FROM slack_channel_events e JOIN slack_channel_subscriptions m ON m.id=e.subscription_id
       JOIN pages page ON page.id=e.page_id JOIN slack_installations installation ON installation.id=m.installation_id
       WHERE e.summary_id=r.id AND ${slackBulkCandidateSql} AND NOT ${mappingDeliveryPauseSql("m", Date.now())})`;
-  else if (topic === "slack_file_upload")
-    destinationPause = `EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) WHERE p.id=r.page_id AND m.installation_id=r.installation_id AND ${mappingDeliveryPauseSql("m", Date.now())})
-    AND NOT EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) WHERE p.id=r.page_id AND m.installation_id=r.installation_id AND m.cadence='digest' AND m.validation_state='valid' AND m.notification_blocked_at IS NULL AND NOT ${mappingDeliveryPauseSql("m", Date.now())})`;
+  else if (topic === "slack_file_upload") destinationPause = `(${thumbnailEligibilitySql()})='paused'`;
   const childClaim = `(SELECT max(child.claimed_at) FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state='pending')`;
   const claimed =
     topic === "slack_digest"
@@ -44,7 +47,7 @@ function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string) {
     ${channel ? "r.delivered_at IS NOT NULL OR r.suppressed_at IS NOT NULL" : "0"} completed,
     ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state IN ('sending','blocked'))" : "0"} uncertain_child,
     ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state='blocked')" : "0"} blocked_child,
-    i.disconnected_at IS NULL AND i.generation=r.installation_generation AND (i.auth_error IS NOT NULL OR (${destinationPause})) paused
+    ${topic === "slack_file_upload" ? destinationPause : `i.disconnected_at IS NULL AND i.generation=r.installation_generation AND (i.auth_error IS NOT NULL OR (${destinationPause}))`} paused
     FROM ${contract.table} r ${mapping ? "JOIN slack_channel_subscriptions m ON m.id=r.subscription_id" : ""}
     JOIN slack_installations i ON i.id=${installation} WHERE r.id=${idSql}`;
 }
@@ -448,7 +451,8 @@ async function exhaustRound2Receipt(
       FROM ${contract.table} r LEFT JOIN slack_channel_subscriptions m ON ${mappingJoin}
       JOIN slack_installations i ON i.id=${installation} WHERE r.id=? AND r.claim_token=?`).bind(Date.now(), id, token),
   ];
-  if (topic === "slack_digest") statements.push(...retireDigestReceiptStatements(env, id, token, "redrive_exhausted"));
+  if (topic === "slack_digest")
+    statements.push(...retireDigestReceiptStatements(env, id, token, "terminal", "redrive_exhausted"));
   if (topic === "slack_bulk")
     statements.push(
       env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)

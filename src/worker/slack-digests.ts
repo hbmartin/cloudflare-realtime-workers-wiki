@@ -88,6 +88,7 @@ async function retireDeniedDigestEvents(
   receipt?: DigestReceipt,
   token?: string,
   permanentRevision: number | null = null,
+  deferredStatements?: D1PreparedStatement[],
 ) {
   const now = Date.now();
   const cursor = receipt
@@ -125,11 +126,12 @@ async function retireDeniedDigestEvents(
     }
   });
   const ids = candidates.results.map((row) => row.id);
-  const result =
-    await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
-    WHERE id IN (SELECT event.id FROM slack_channel_events event JOIN pages page ON page.id=event.page_id
+  const statement =
+    env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
+    WHERE id IN (SELECT event.id FROM json_each(?) candidate CROSS JOIN slack_channel_events event ON event.id=candidate.value
+      JOIN pages page ON page.id=event.page_id
       JOIN slack_channel_subscriptions m ON m.id=event.subscription_id JOIN slack_installations i ON i.id=m.installation_id
-      WHERE event.id IN (SELECT value FROM json_each(?)) AND m.round2_initialized=1
+      WHERE m.round2_initialized=1
         AND event.summary_id IS NULL AND event.round2_state='pending' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
         AND (event.claimed_at IS NULL OR event.claimed_at<=?)
         AND (page.is_template=1 OR NOT ${channelActivityActorAuthoritySql}
@@ -150,24 +152,31 @@ async function retireDeniedDigestEvents(
                 WHERE o.topic='slack_digest' AND o.slack_scope_paused_at IS NOT NULL AND root.subscription_id=m.id
                 AND event.created_at>=root.window_start AND event.created_at<root.window_end)))))
         AND NOT EXISTS(SELECT 1 FROM slack_digest_message_events reserved JOIN slack_digest_messages child ON child.id=reserved.message_id
-          WHERE reserved.event_id=event.id AND (child.state IN ('sending','blocked') OR (child.claimed_at>? AND child.claim_token IS NOT ?)))
+          WHERE reserved.event_id=event.id AND (child.state IN ('sending','blocked') OR child.attempted_at IS NOT NULL OR (child.claimed_at>? AND child.claim_token IS NOT ?)))
         AND NOT EXISTS(SELECT 1 FROM slack_digest_receipts root WHERE root.subscription_id=event.subscription_id
           AND event.created_at>=root.window_start AND event.created_at<root.window_end
           AND ((root.state IN ('sending','blocked') AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=root.id)
-            AND event.id IN (SELECT value FROM json_each(root.event_ids_json))) OR (root.claimed_at>? AND root.claim_token IS NOT ?))))`)
-      .bind(
-        now,
-        JSON.stringify(ids),
-        now - 60_000,
-        JSON.stringify(expired),
-        permanentRevision,
-        permanentRevision,
-        now - 60_000,
-        token ?? null,
-        now - 60_000,
-        token ?? null,
-      )
-      .run();
+            AND event.id IN (SELECT value FROM json_each(root.event_ids_json))) OR (root.claimed_at>? AND root.claim_token IS NOT ?))))
+      AND (? IS NULL OR EXISTS(SELECT 1 FROM slack_digest_receipts retirement WHERE retirement.id=? AND retirement.claim_token=?))`).bind(
+      now,
+      JSON.stringify(ids),
+      now - 60_000,
+      JSON.stringify(expired),
+      permanentRevision,
+      permanentRevision,
+      now - 60_000,
+      token ?? null,
+      now - 60_000,
+      token ?? null,
+      permanentRevision,
+      receipt?.id ?? null,
+      token ?? null,
+    );
+  if (deferredStatements) {
+    deferredStatements.push(statement);
+    return;
+  }
+  const result = await statement.run();
   if (!receipt) {
     const last = candidates.results.at(-1);
     logger.info("slack.digest.cleanup", "slack", "Examined pending channel events.", {
@@ -185,7 +194,6 @@ async function retireDeniedDigestEvents(
       )
       .run();
   }
-  return result;
 }
 
 function digestEventFilter(
@@ -606,8 +614,8 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
     )
       .bind(state, ts, error, id, token)
       .run();
-  const retireRoot = (error: string | null = null) =>
-    env.DB.batch(retireDigestReceiptStatements(env, id, token, error));
+  const retireRoot = (mode: "obsolete" | "terminal", error: string | null = null) =>
+    env.DB.batch(retireDigestReceiptStatements(env, id, token, mode, error));
   try {
     receipt = (await env.DB.prepare(`SELECT * FROM slack_digest_receipts WHERE id=? AND claim_token=?`)
       .bind(id, token)
@@ -729,14 +737,14 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
     } else {
       if (!mapping || mapping.channel_id !== receipt.channel_id || !eligible(mapping, Date.now())) {
         if (mapping && mapping.delivery_paused) return;
-        await retireRoot();
+        await retireRoot("obsolete");
         return;
       }
       if (
         receipt.window_end <= Math.max(mapping.digest_not_before, mapping.snoozed_until ?? 0) ||
         digestWindow(Date.now(), mapping.digest_time, mapping.digest_timezone!).end !== receipt.window_end
       ) {
-        await retireRoot();
+        await retireRoot("obsolete");
         return;
       }
       const validation = await validateMappingEvidence(env, installation, mapping.id, mapping.channel_id);
@@ -744,8 +752,9 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
         if (validation.outcome === "permanent") {
           const current = await digestMapping(env, receipt.subscription_id);
           if (!current || current.validation_revision !== validation.revision) throw new StaleSlackValidationError();
-          await retireDeniedDigestEvents(env, receipt, token, validation.revision);
           const retirementToken = crypto.randomUUID();
+          const retirementStatements: D1PreparedStatement[] = [];
+          await retireDeniedDigestEvents(env, receipt, retirementToken, validation.revision, retirementStatements);
           const [retired] = await env.DB.batch([
             env.DB.prepare(`UPDATE slack_digest_receipts SET claim_token=? WHERE id=? AND claim_token=?
               AND EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
@@ -758,7 +767,8 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
               receipt.subscription_id,
               validation.revision,
             ),
-            ...retireDigestReceiptStatements(env, id, retirementToken, validation.error),
+            ...retirementStatements,
+            ...retireDigestReceiptStatements(env, id, retirementToken, "terminal", validation.error),
             env.DB.prepare(
               "UPDATE slack_digest_receipts SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?",
             ).bind(id, retirementToken),
@@ -801,7 +811,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
                     .bind(installation.id, installation.generation)
                     .first();
                   if (paused) throw new SlackDispatchSkippedError();
-                  await retireRoot();
+                  await retireRoot("obsolete");
                   throw new SlackDispatchSkippedError();
                 }
                 if (currentMapping.validation_revision !== validation.revision) throw new StaleSlackValidationError();
@@ -812,7 +822,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
                   digestWindow(Date.now(), currentMapping.digest_time, currentMapping.digest_timezone!).end !==
                     receipt!.window_end
                 ) {
-                  await retireRoot();
+                  await retireRoot("obsolete");
                   throw new SlackDispatchSkippedError();
                 }
                 await retireDeniedDigestEvents(env, receipt!, token);
@@ -957,7 +967,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
             } else {
               if (invalidSlackDestination(error)) {
                 await finishMessage("retired", null);
-                await retireRoot(error.code);
+                await retireRoot("terminal", error.code);
                 return;
               }
               if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
@@ -979,7 +989,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
       !eligible(mapping, Date.now()) ||
       digestWindow(Date.now(), mapping.digest_time, mapping.digest_timezone!).end !== receipt.window_end
     ) {
-      await retireRoot();
+      await retireRoot("obsolete");
       return;
     }
     const next = await nextMessage(env, receipt, mapping, installation, token);

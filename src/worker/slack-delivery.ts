@@ -91,30 +91,45 @@ export function invalidSlackDestination(error: unknown): error is SlackApiError 
 export function digestRetirementGuardSql(root = "root") {
   const stale = Date.now() - 60_000;
   return `NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=${root}.id
-    AND (child.state IN ('sending','blocked') OR (child.claimed_at>${stale} AND child.claim_token IS NOT ${root}.claim_token)))
+    AND (child.state IN ('sending','blocked') OR (child.state='pending' AND child.attempted_at IS NOT NULL)
+      OR (child.claimed_at>${stale} AND child.claim_token IS NOT ${root}.claim_token)))
     AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child JOIN json_each(child.event_ids_json) reservation
       JOIN slack_channel_events event ON event.id=reservation.value WHERE child.receipt_id=${root}.id
       AND event.claimed_at>${stale} AND event.claim_token IS NOT ${root}.claim_token)`;
 }
 
-export function retireDigestReceiptStatements(env: Env, id: string, token: string, error: string | null = null) {
+export function retireDigestReceiptStatements(
+  env: Env,
+  id: string,
+  token: string,
+  mode: "obsolete" | "terminal",
+  error: string | null = null,
+) {
   const guard = `EXISTS(SELECT 1 FROM slack_digest_receipts root WHERE root.id=? AND root.claim_token=?
     AND ${digestRetirementGuardSql()})`;
   return [
-    env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
+    ...(mode === "terminal"
+      ? [
+          env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
       WHERE delivered_at IS NULL AND suppressed_at IS NULL AND round2_state='pending'
         AND id IN (SELECT value FROM slack_digest_messages child,json_each(child.event_ids_json)
-          WHERE child.receipt_id=? AND child.state='pending')
+          WHERE child.receipt_id=? AND child.state='pending' AND child.attempted_at IS NULL)
         AND (claimed_at IS NULL OR claimed_at<=? OR claim_token=?) AND ${guard}`).bind(
-      Date.now(),
-      id,
-      Date.now() - 60_000,
-      token,
-      id,
-      token,
-    ),
+            Date.now(),
+            id,
+            Date.now() - 60_000,
+            token,
+            id,
+            token,
+          ),
+        ]
+      : [
+          env.DB.prepare(`DELETE FROM slack_digest_message_events WHERE message_id IN (
+      SELECT child.id FROM slack_digest_messages child WHERE child.receipt_id=? AND child.state='pending'
+        AND child.attempted_at IS NULL) AND ${guard}`).bind(id, id, token),
+        ]),
     env.DB.prepare(`UPDATE slack_digest_messages SET state='retired',claim_token=NULL,claimed_at=NULL,last_error=?
-      WHERE receipt_id=? AND state='pending' AND ${guard}`).bind(error, id, id, token),
+      WHERE receipt_id=? AND state='pending' AND attempted_at IS NULL AND ${guard}`).bind(error, id, id, token),
     env.DB.prepare(
       `UPDATE slack_digest_receipts SET state='retired',last_error=? WHERE id=? AND claim_token=? AND ${guard}`,
     ).bind(error, id, token, id, token),
@@ -140,7 +155,7 @@ export async function retireObsoleteReceipt(
       installationId,
       generation,
     ),
-    ...(table === "slack_digest_receipts" ? retireDigestReceiptStatements(env, id, token) : []),
+    ...(table === "slack_digest_receipts" ? retireDigestReceiptStatements(env, id, token, "obsolete") : []),
     env.DB.prepare(
       `UPDATE ${table} SET ${table === "slack_digest_receipts" ? "" : "state='retired',"}claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
     ).bind(id, token),
