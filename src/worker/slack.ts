@@ -12,6 +12,7 @@ import { tracing } from "cloudflare:workers";
 import { base64UrlToBytes, bytesToBase64Url, constantTimeEqual, hmacSha256 } from "../shared/security";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
+import { DeliveryInProgressError } from "./delivery-claim";
 import { freshSecurityAuthorization, freshSecurityGuard } from "./security";
 import { safeSlackText, unfurlBlocks } from "./slack-blocks";
 import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
@@ -2153,7 +2154,11 @@ function deniedLegacyChannelEventsStatement(env: Env, ids: readonly string[], cl
         JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
         WHERE NOT (${legacyChannelEligibilitySql})
           AND event.id IN (SELECT value FROM json_each(?))
-          AND event.id NOT LIKE 'activity:%')`).bind(Date.now(), claimToken, JSON.stringify(ids));
+          AND subscription.round2_initialized=0 AND event.id NOT LIKE 'activity:%')`).bind(
+    Date.now(),
+    claimToken,
+    JSON.stringify(ids),
+  );
 }
 
 class SlackChannelDispatchUnavailable extends Error {}
@@ -2657,7 +2662,15 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
   }
   if (Object.keys(unfurls).length) {
     const claim = await claimSlackRows(env, "slack_unfurls", [unfurlId]);
-    if (!claim.ids.length) return;
+    if (!claim.ids.length) {
+      const live = await env.DB.prepare(
+        "SELECT 1 FROM slack_unfurls WHERE id=? AND delivered_at IS NULL AND retired_at IS NULL",
+      )
+        .bind(unfurlId)
+        .first();
+      if (live) throw new DeliveryInProgressError();
+      return;
+    }
     try {
       await slackApi(
         env,
@@ -2692,7 +2705,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
   const denied = await env.DB.prepare(`SELECT event.id FROM slack_channel_events event
     JOIN pages page ON page.id=event.page_id JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
     WHERE event.cadence='digest' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL AND event.claim_token IS NULL
-      AND event.created_at<? AND event.id NOT LIKE 'activity:%'
+      AND event.created_at<? AND subscription.round2_initialized=0 AND event.id NOT LIKE 'activity:%'
       AND NOT (${legacyChannelEligibilitySql}) ORDER BY event.created_at,event.id LIMIT 200`)
     .bind(cutoff)
     .all<{ id: string }>();

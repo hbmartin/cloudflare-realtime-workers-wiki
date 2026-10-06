@@ -7,6 +7,8 @@ import type {
   WatchState,
 } from "../shared/types";
 import { tracing } from "cloudflare:workers";
+import { DELIVERY_CLAIM_STALE_MS, DeliveryInProgressError } from "./delivery-claim";
+export { DeliveryInProgressError } from "./delivery-claim";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
 import { sendPersonalSlackNotification, SlackRateLimitError, slackChannelFanoutStatements } from "./slack";
@@ -76,16 +78,6 @@ function uniqueIds(ids: string[]) {
 // Continuous editing compacts every ~30s; edits by the same actor on the same page within this window,
 // or while the previous edit notification is still unread, collapse into one notification.
 const PAGE_EDIT_COALESCE_MS = 60 * 60 * 1000;
-// A pending delivery claim older than this belongs to a consumer that died mid-send and may be reclaimed.
-const DELIVERY_CLAIM_STALE_MS = 60_000;
-
-export class DeliveryInProgressError extends Error {
-  readonly retryAfter = Math.ceil(DELIVERY_CLAIM_STALE_MS / 1000);
-  constructor() {
-    super("Delivery is already in progress.");
-  }
-}
-
 export function notificationFanoutStatements(database: D1Database, fanout: NotificationFanout) {
   const recipients = uniqueIds(fanout.recipientIds);
   const coalesceAfter = fanout.eventType === "page_edit" ? fanout.createdAt - PAGE_EDIT_COALESCE_MS : null;

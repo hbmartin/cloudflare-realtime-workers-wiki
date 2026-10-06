@@ -1595,6 +1595,13 @@ export async function deliverSlackShareResponse(
   env: Env,
   payload: Record<string, unknown>,
   outboxId?: string,
+  captured?: {
+    attempts: number;
+    available_at: number;
+    enqueued_at: number | null;
+    slack_redrive_due_at: number | null;
+    slack_claim_recheck_at: number | null;
+  },
 ): Promise<"deferred" | void> {
   if (
     typeof payload.receiptId !== "string" ||
@@ -1625,12 +1632,36 @@ export async function deliverSlackShareResponse(
     return;
   const durableId = outboxId ?? `outbox:slack-share-response:${payload.receiptId}`;
   const durable =
-    await env.DB.prepare(`SELECT payload_json,attempts FROM outbox WHERE id=? AND topic='slack_share_response'
+    await env.DB.prepare(`SELECT payload_json,attempts,available_at,enqueued_at,slack_redrive_due_at,slack_claim_recheck_at FROM outbox WHERE id=? AND topic='slack_share_response'
     AND slack_scope_paused_at IS NULL`)
       .bind(durableId)
-      .first<{ payload_json: string; attempts: number }>();
+      .first<{
+        payload_json: string;
+        attempts: number;
+        available_at: number;
+        enqueued_at: number | null;
+        slack_redrive_due_at: number | null;
+        slack_claim_recheck_at: number | null;
+      }>();
   if (!durable) return;
+  if (
+    captured &&
+    (durable.attempts !== captured.attempts ||
+      durable.available_at !== captured.available_at ||
+      durable.enqueued_at !== captured.enqueued_at ||
+      durable.slack_redrive_due_at !== captured.slack_redrive_due_at ||
+      durable.slack_claim_recheck_at !== captured.slack_claim_recheck_at)
+  )
+    throw new DeliveryInProgressError();
   const source = JSON.parse(durable.payload_json) as Record<string, unknown>;
+  if (
+    captured &&
+    JSON.stringify(source) !== JSON.stringify(payload) &&
+    (Object.hasOwn(payload, "identity") ||
+      !Object.hasOwn(source, "identity") ||
+      JSON.stringify({ ...source, identity: undefined }) !== JSON.stringify({ ...payload, identity: undefined }))
+  )
+    throw new DeliveryInProgressError();
   if (
     ["receiptId", "installationId", "generation", "userId", "channelId", "messageTs", "pageId", "shareId"].some(
       (key) => source[key] !== payload[key],
@@ -1648,6 +1679,28 @@ export async function deliverSlackShareResponse(
       .bind(payload.installationId, payload.generation)
       .first());
   if (await authPaused()) return "deferred";
+  if (storedReceipt.response_delivery_state === "pending" && storedReceipt.response_delivery_attempted_at !== null) {
+    // Older consumers retained this timestamp after a definite rejection or a
+    // failure before dispatch. Pending is the evidence that this send can retry.
+    const normalized = await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_attempted_at=NULL
+      WHERE id=? AND outcome='accepted' AND denial_sent_at IS NULL AND response_delivery_state='pending'
+        AND response_delivery_attempted_at=? AND EXISTS(SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL}
+          AND available_at=? AND enqueued_at IS ? AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ?)`)
+      .bind(
+        payload.receiptId,
+        storedReceipt.response_delivery_attempted_at,
+        durableId,
+        durable.attempts,
+        durable.payload_json,
+        durable.available_at,
+        durable.enqueued_at,
+        durable.slack_redrive_due_at,
+        durable.slack_claim_recheck_at,
+      )
+      .run();
+    if (!normalized.meta.changes) throw new DeliveryInProgressError();
+    storedReceipt.response_delivery_attempted_at = null;
+  }
   if (storedReceipt.response_delivery_attempted_at !== null) {
     const blocked =
       await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error='send_unconfirmed'
@@ -1674,19 +1727,28 @@ export async function deliverSlackShareResponse(
       .first<{ identity_json: string }>();
     if (proof) {
       const persisted = await env.DB.prepare(`UPDATE outbox SET payload_json=json_set(payload_json,'$.identity',json(?))
-        WHERE ${SHARE_OUTBOX_GUARD_SQL}
+        WHERE ${SHARE_OUTBOX_GUARD_SQL} AND available_at=? AND enqueued_at IS ? AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ?
         AND EXISTS(SELECT 1 FROM (${legacyShareRecoverySelectSql}) proof WHERE proof.id=outbox.id AND proof.identity_json=? AND proof.response_delivery_state IS ?)`)
         .bind(
           proof.identity_json,
           durableId,
           durable.attempts,
           durable.payload_json,
+          durable.available_at,
+          durable.enqueued_at,
+          durable.slack_redrive_due_at,
+          durable.slack_claim_recheck_at,
           proof.identity_json,
           storedReceipt.response_delivery_state,
         )
         .run();
       if (!persisted.meta.changes) throw new DeliveryInProgressError();
-      return deliverSlackShareResponse(env, { ...source, identity: JSON.parse(proof.identity_json) }, durableId);
+      return deliverSlackShareResponse(
+        env,
+        { ...source, identity: JSON.parse(proof.identity_json) },
+        durableId,
+        durable,
+      );
     }
     if (await authPaused()) return "deferred";
   }
@@ -1818,6 +1880,15 @@ export async function deliverSlackShareResponse(
   } catch (error) {
     if (error instanceof SlackApiError && slackInstallationError(error))
       await recordSlackInstallationError(env, installationId, error, generation);
+    if (error instanceof SlackApiError && error.code === "missing_scope") {
+      if (claimed)
+        await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='pending',response_delivery_attempted_at=NULL
+        WHERE id=? AND response_delivery_state='sending' AND response_delivery_attempted_at=?
+          AND EXISTS(SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL})`)
+          .bind(payload.receiptId, attemptedAt, durableId, durable.attempts, durable.payload_json)
+          .run();
+      throw error;
+    }
     if (
       error instanceof SlackRateLimitError ||
       (!dispatched && (!deniedError(error) || slackInstallationError(error)))

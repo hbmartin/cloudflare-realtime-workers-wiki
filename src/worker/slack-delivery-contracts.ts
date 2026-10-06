@@ -31,8 +31,14 @@ export const ROUND2_NON_CHANNEL_TOPICS_SQL = Object.keys(round2Receipts)
   .filter((topic) => topic !== "slack_channel")
   .map((topic) => `'${topic}'`)
   .join(",");
+export function round2ChannelOwnershipSql(eventId: string) {
+  return `(coalesce(${eventId} LIKE 'activity:%',0) OR EXISTS(
+    SELECT 1 FROM slack_channel_events owned JOIN slack_channel_subscriptions mapping ON mapping.id=owned.subscription_id
+    WHERE owned.id=${eventId} AND mapping.round2_initialized=1))`;
+}
+
 export const ROUND2_OUTBOX_SQL = `(topic IN (${ROUND2_NON_CHANNEL_TOPICS_SQL})
- OR (topic='slack_channel' AND slack_round2_receipt_id LIKE 'activity:%'))`;
+ OR (topic='slack_channel' AND ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")}))`;
 
 export function thumbnailDeliveryEnabled(env: Env) {
   return (
@@ -47,13 +53,31 @@ export function runnableOutboxSql(env: Env) {
   return `slack_scope_paused_at IS NULL
     AND (topic<>'slack_file_upload' OR ${thumbnailDeliveryEnabled(env) ? 1 : 0}=1)
     AND (${env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0}=1
-      OR NOT (topic='slack_channel' AND coalesce(slack_round2_receipt_id LIKE 'activity:%',0)))`;
+      OR NOT (topic='slack_channel' AND ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")}))`;
 }
 
 export function mappingDeliveryPauseSql(alias: string, now: string | number) {
   return `(${alias}.muted_at IS NOT NULL OR coalesce(${alias}.snoozed_until,0)>${now}
     OR (${alias}.notification_blocked_at IS NOT NULL AND NOT coalesce(
       ${alias}.notification_error=${alias}.validation_error AND ${alias}.validation_error IN (${PERMANENT_SLACK_VALIDATION_ERRORS.map((error) => `'${error}'`).join(",")}),0)))`;
+}
+
+// Pauses preserve only a current artifact with an otherwise usable destination.
+// Use the same evidence in delivery and recovery, including mixed mappings.
+export function thumbnailEligibilitySql(artifact = "r", now = Date.now()) {
+  const destination = `SELECT 1 FROM pages p JOIN diagram_projections d ON d.page_id=p.id AND d.content_epoch=p.content_epoch
+    JOIN slack_channel_subscriptions m ON m.space_id=p.space_id AND (m.page_id IS NULL OR m.page_id=p.id)
+    JOIN slack_installations installation ON installation.id=m.installation_id
+    WHERE p.id=${artifact}.page_id AND p.content_epoch=${artifact}.content_epoch AND d.thumbnail_hash=${artifact}.content_sha256
+      AND d.thumbnail_r2_key=${artifact}.thumbnail_r2_key AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0
+      AND installation.id=${artifact}.installation_id AND installation.generation=${artifact}.installation_generation
+      AND installation.disconnected_at IS NULL AND m.cadence='digest'
+      AND (m.validation_state='valid' OR (m.notification_blocked_at IS NOT NULL AND NOT coalesce(
+        m.validation_error IN (${PERMANENT_SLACK_VALIDATION_ERRORS.map((error) => `'${error}'`).join(",")}),0)))
+      AND EXISTS(SELECT 1 FROM workspace_members owner WHERE owner.workspace_id=p.workspace_id AND owner.user_id=m.created_by AND owner.role='owner')`;
+  return `CASE WHEN NOT EXISTS(${destination}) THEN 'obsolete'
+    WHEN EXISTS(${destination} AND installation.auth_error IS NULL AND m.validation_state='valid' AND m.notification_blocked_at IS NULL
+      AND NOT ${mappingDeliveryPauseSql("m", now)}) THEN 'ready' ELSE 'paused' END`;
 }
 
 function slackDeliveryScopes(topic: string, method?: string): readonly string[] {
@@ -224,11 +248,16 @@ export const PENDING_SHARE_RESPONSE_SQL = `EXISTS(SELECT 1 FROM slack_installati
     AND i.generation=json_extract(outbox.payload_json,'$.generation') AND i.workspace_id=outbox.workspace_id
     AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND instr(','||i.scopes||',',',chat:write,')>0
     AND receipt.id=json_extract(outbox.payload_json,'$.receiptId') AND receipt.outcome='accepted' AND receipt.denial_sent_at IS NULL
-    AND receipt.response_delivery_attempted_at IS NULL AND (receipt.response_delivery_state IS NULL OR receipt.response_delivery_state='pending'))`;
+    AND (receipt.response_delivery_state='pending' OR (receipt.response_delivery_state IS NULL AND receipt.response_delivery_attempted_at IS NULL)))`;
 
-export function startSlackShareEligibleClockStatement(env: Env, id: string, now: number) {
+export function startSlackShareEligibleClockStatement(
+  env: Env,
+  id: string,
+  now: number,
+  fence?: { sql: string; binds: unknown[] },
+) {
   return env.DB.prepare(`UPDATE outbox SET slack_eligible_started_at=?,slack_scope_paused_ms=0,
     slack_auth_pause_baseline_ms=(SELECT i.auth_paused_ms FROM slack_installations i WHERE i.workspace_id=outbox.workspace_id AND i.disconnected_at IS NULL)
     WHERE id=? AND topic='slack_share_response' AND json_valid(payload_json) AND slack_eligible_started_at IS NULL AND slack_scope_paused_at IS NULL
-      AND ${PENDING_SHARE_RESPONSE_SQL}`).bind(now, id);
+      AND ${PENDING_SHARE_RESPONSE_SQL} AND (${fence?.sql ?? "1"})`).bind(now, id, ...(fence?.binds ?? []));
 }

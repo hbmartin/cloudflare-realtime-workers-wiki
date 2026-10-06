@@ -15,6 +15,7 @@ describe("Slack migration safety in the deployment wrapper", () => {
     "0074_slack_enqueue_recovery.sql",
     "0075_slack_delivery_recovery.sql",
     "0076_slack_delivery_recovery_followup.sql",
+    "0077_slack_recovery_query_indexes.sql",
   ])("stops remote %s before preflight or migration application", (migration) => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const execute = vi

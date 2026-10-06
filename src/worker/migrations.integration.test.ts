@@ -12,7 +12,7 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
-  it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076"])(
+  it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076", "0077"])(
     "upgrades a database before %s through the additive follow-up",
     async (foundation) => {
       await applyD1Migrations(
@@ -23,6 +23,15 @@ describe("D1 migrations", () => {
       expect(
         await env.DB.prepare("SELECT name FROM sqlite_master WHERE name='slack_digest_reservations_message'").first(),
       ).toEqual({ name: "slack_digest_reservations_message" });
+      expect(
+        await env.DB.prepare("SELECT sql FROM sqlite_master WHERE name='slack_digest_unsent_children'").first<{
+          sql: string;
+        }>(),
+      ).toEqual({
+        sql: expect.stringMatching(
+          /ON slack_digest_messages\(receipt_id,id\)\s+WHERE state='pending' AND attempted_at IS NULL/,
+        ),
+      });
     },
   );
   it.each([
@@ -35,7 +44,7 @@ describe("D1 migrations", () => {
     { preflight: true, foundation: "0068" },
     { preflight: true, foundation: "0069" },
   ])(
-    "repairs only proven work through 0076 with $foundation foundation and preflight=$preflight",
+    "repairs only proven work through 0077 with $foundation foundation and preflight=$preflight",
     async ({ preflight, foundation }) => {
       await applyD1Migrations(
         env.DB,
