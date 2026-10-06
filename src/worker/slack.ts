@@ -2129,6 +2129,15 @@ export const channelActivityActorAuthoritySql = channelActivityActorAccessSql
   .replace("AND (wm.role = 'owner' OR sp.visibility = 'workspace' OR sm.user_id IS NOT NULL)", "")
   .replace("JOIN pages grant_page ON grant_page.id = grant_row.root_page_id AND grant_page.archived_at IS NULL", "");
 
+export const slackBulkCandidateSql = `e.round2_state='pending' AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
+  AND installation.generation=r.installation_generation AND installation.disconnected_at IS NULL
+  AND m.installation_id=r.installation_id AND m.channel_id=r.channel_id AND e.event_type=r.event_type
+  AND page.import_job_id IS NULL AND page.is_template=0
+  AND EXISTS(SELECT 1 FROM workspace_members owner WHERE owner.workspace_id=installation.workspace_id AND owner.user_id=m.created_by AND owner.role='owner')
+  AND ${channelActivityActorAuthoritySql.replaceAll("event.", "e.")}
+  AND (${channelActivityActorAccessSql.replaceAll("event.", "e.")} OR page.archived_at IS NOT NULL OR page.space_id<>m.space_id)
+  AND EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type)`;
+
 const legacyChannelEligibilitySql = `page.is_template=0 AND ${channelActorAccessSql}
   AND EXISTS(SELECT 1 FROM workspace_members owner JOIN slack_installations owner_installation
     ON owner_installation.workspace_id=owner.workspace_id AND owner_installation.id=subscription.installation_id
@@ -2141,11 +2150,10 @@ function deniedLegacyChannelEventsStatement(env: Env, ids: readonly string[], cl
         JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
         WHERE NOT (${legacyChannelEligibilitySql})
           AND event.id IN (SELECT value FROM json_each(?))
-          AND (?=0 OR subscription.round2_initialized=0))`).bind(
+          AND subscription.round2_initialized=0 AND event.id NOT LIKE 'activity:%')`).bind(
     Date.now(),
     claimToken,
     JSON.stringify(ids),
-    env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0,
   );
 }
 
@@ -2685,9 +2693,9 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
   const denied = await env.DB.prepare(`SELECT event.id FROM slack_channel_events event
     JOIN pages page ON page.id=event.page_id JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
     WHERE event.cadence='digest' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL AND event.claim_token IS NULL
-      AND event.created_at<? AND (?=0 OR subscription.round2_initialized=0)
+      AND event.created_at<? AND subscription.round2_initialized=0 AND event.id NOT LIKE 'activity:%'
       AND NOT (${legacyChannelEligibilitySql}) ORDER BY event.created_at,event.id LIMIT 200`)
-    .bind(cutoff, env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0)
+    .bind(cutoff)
     .all<{ id: string }>();
   if (denied.results.length)
     await deniedLegacyChannelEventsStatement(
@@ -2703,7 +2711,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
       WHERE event.cadence = 'digest' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
         AND event.created_at < ? AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
         AND subscription.notification_blocked_at IS NULL
-        AND (?=0 OR subscription.round2_initialized=0)
+        AND subscription.round2_initialized=0 AND event.id NOT LIKE 'activity:%'
         AND subscription.muted_at IS NULL
         AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
         AND page.archived_at IS NULL AND page.import_job_id IS NULL
@@ -2713,7 +2721,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
       GROUP BY event.subscription_id, subscription.installation_id
       ORDER BY MIN(event.created_at), event.subscription_id LIMIT 50`,
   )
-    .bind(cutoff, env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0, timestamp)
+    .bind(cutoff, timestamp)
     .all<{ subscription_id: string; installation_id: string }>();
   const rateLimitedInstallations = new Set<string>();
   for (const { subscription_id: subscriptionId, installation_id: installationId } of subscriptions.results) {
@@ -2733,6 +2741,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
            AND page.import_job_id IS NULL
          LEFT JOIN user actor ON actor.id = event.actor_id
         WHERE event.subscription_id = ? AND event.cadence = 'digest'
+          AND subscription.round2_initialized=0 AND event.id NOT LIKE 'activity:%'
           AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
           AND event.created_at < ? AND installation.disconnected_at IS NULL
           AND ${legacyChannelEligibilitySql}

@@ -189,7 +189,7 @@ hand. Before upgrading an existing installation, take a D1 export and stop any r
 then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
 new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
 
-Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, or `0074` require
+Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, or `0075` require
 `SLACK_REVIEW_MIGRATION_SAFE=true` after the [Slack rollout pause](#slack-review-follow-up-migration).
 This guard applies to both `pnpm db:remote` and `pnpm run deploy`; local database migrations do not
 require confirmation. The confirmation acknowledges an operator-completed pause and drain, rather
@@ -398,7 +398,7 @@ before making changes. Quiesce page moves or verify that the live Worker already
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
 until that manually dispatched run has deployed the new Worker.
 
-Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, or `0074_slack_enqueue_recovery.sql` also stop automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, or `0075_slack_delivery_recovery.sql` also stop automatic deployment.
 Follow the [Slack rollout pause](#slack-review-follow-up-migration), then manually dispatch with
 `confirm_slack_review_migration_safe` checked. The workflow passes this confirmation to the guarded
 remote migration command. Once these migrations are applied, later automatic releases need no Slack
@@ -428,6 +428,26 @@ legacy recovery, and backfills missing share-response identities only from verif
 since before the accepted request. It requeues responses blocked solely by `request_identity_unavailable`.
 Scope-paused, completed, sending, uncertain, and actively claimed work is preserved. Apply this migration before
 the updated Worker, using the same queue pause and validation drain below.
+
+`0075_slack_delivery_recovery.sql` adds the independent enqueue-failure counter, bounded digest cleanup
+cursor, and recovery indexes. Migration 0074 stays unchanged. When 0074 is pending on an existing
+Round 2 schema, the guarded runner first captures proven share repairs in an indexed ledger,
+persists identities by captured outbox ID and version, and resets blocked receipts only after that
+write succeeds. For pending 0071/0072, it uses their equivalent protection and grant-start predicates.
+Fresh migration chains build the required schema normally.
+
+The updated maintenance pass repairs up to 50 Activity outbox rows and 50 proven identity candidates,
+even while delivery flags are disabled. Pending Activity work becomes enqueueable; sending work
+receives a reconciliation deadline with its send evidence intact. Authentication failures defer
+identity recovery. Explicit malformed identities, attempted ephemeral responses, active claims,
+scope pauses, changed identities, and notifications without an explicit repair signature stay intact.
+Digest cleanup examines at most 200 events per pass and advances a durable cursor that wraps.
+
+Inspect `slack.legacy.repair` for bounded repair counts, remaining explicit candidates, and rows with
+nonzero enqueue-failure counts. Inspect `slack.digest.cleanup` for examined and retired event counts.
+`outbox.slack_enqueue_failure_count` drives enqueue backoff and persistent failure alerts;
+`outbox.attempts` remains the scheduling version. A cached destination error preserves work until
+revalidation; a fresh permanent destination failure retires unsent work in all three delivery modes.
 
 Existing failed/retired allocations are backfilled; allocations whose original Slack identity cannot be verified
 are reported for manual cleanup rather than deleted. Existing migrations remain unchanged.
@@ -461,8 +481,9 @@ When any of these migrations is pending, perform this sequence **before applying
    keeping the queue paused and channel validation disabled. Any pending page-move migration still
    requires its separate safety procedure.
 
-5. Verify the deployed revision and health check, and inspect Slack delivery health and cleanup
-   records. Restore the intended Slack flags, synchronize configuration, and resume delivery:
+5. Verify the deployed revision and readiness, then inspect Slack repair counts, remaining explicit
+   candidates, enqueue-failure counts, and cleanup records before restoring flags or queue delivery.
+   Allow maintenance to repair recoverable damage while the flags remain disabled. Restore the intended Slack flags, synchronize configuration, and resume delivery:
 
    ```sh
    pnpm wrangler queues resume-delivery cloudflare-realtime-notes-delivery --env production

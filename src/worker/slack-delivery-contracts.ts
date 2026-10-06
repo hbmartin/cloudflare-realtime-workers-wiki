@@ -34,6 +34,20 @@ export function thumbnailDeliveryEnabled(env: Env) {
   );
 }
 
+// Keep health and enqueue selection aligned during deliberate feature pauses.
+export function runnableOutboxSql(env: Env) {
+  return `slack_scope_paused_at IS NULL
+    AND (topic<>'slack_file_upload' OR ${thumbnailDeliveryEnabled(env) ? 1 : 0}=1)
+    AND (${env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0}=1
+      OR NOT (topic='slack_channel' AND coalesce(slack_round2_receipt_id LIKE 'activity:%',0)))`;
+}
+
+export function mappingDeliveryPauseSql(alias: string, now: string | number) {
+  return `(${alias}.muted_at IS NOT NULL OR coalesce(${alias}.snoozed_until,0)>${now}
+    OR (${alias}.notification_blocked_at IS NOT NULL AND NOT coalesce(
+      ${alias}.notification_error=${alias}.validation_error AND ${alias}.validation_error IN ('channel_not_found','not_in_channel','is_archived','shared_channel','unsupported_channel_type'),0)))`;
+}
+
 function slackDeliveryScopes(topic: string, method?: string): readonly string[] {
   if (["slack_thread_reply", "slack_inbound_reply", "slack_thread_action"].includes(topic)) return SLACK_MIRROR_SCOPES;
   if (method?.startsWith("files.") || topic === "slack_file_upload") return ["files:write"];

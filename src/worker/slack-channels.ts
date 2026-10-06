@@ -1,4 +1,4 @@
-import { retryableSlackError, wakeRound2Mapping } from "./slack-delivery";
+import { permanentSlackValidationError, retryableSlackError, wakeRound2Mapping } from "./slack-delivery";
 import { channelInvalidReason } from "./slack-schedule";
 import { validTimezone } from "../shared/date-mentions";
 import type { Env, MemberContext } from "./env";
@@ -24,7 +24,20 @@ export class StaleSlackValidationError extends Error {
     super("Slack mapping changed during validation.");
   }
 }
+export type MappingValidation = {
+  outcome: "valid" | "permanent" | "temporary";
+  error: string | null;
+  revision: number;
+};
 export async function validateMapping(env: Env, installation: SlackInstallation, mappingId: string, channelId: string) {
+  return (await validateMappingEvidence(env, installation, mappingId, channelId)).outcome === "valid";
+}
+export async function validateMappingEvidence(
+  env: Env,
+  installation: SlackInstallation,
+  mappingId: string,
+  channelId: string,
+): Promise<MappingValidation> {
   const prior =
     await env.DB.prepare(`SELECT m.created_by,m.validation_revision,m.validation_scope_error_revision,m.notification_blocked_at,m.notification_error
     FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
@@ -68,7 +81,7 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
         .run();
     if (!saved.meta.changes) throw new StaleSlackValidationError();
     if (prior.notification_blocked_at) await wakeRound2Mapping(env, mappingId);
-    return true;
+    return { outcome: "valid", error: null, revision: prior.validation_revision + 1 };
   } catch (error) {
     if (retryableSlackError(error)) throw error;
     if (!(error instanceof HttpError || error instanceof SlackApiError)) throw error;
@@ -97,7 +110,11 @@ export async function validateMapping(env: Env, installation: SlackInstallation,
         .bind(error.code, Date.now(), Date.now(), error.code, ...fenceBinds())
         .run();
     if (!saved.meta.changes) throw new StaleSlackValidationError();
-    return false;
+    return {
+      outcome: permanentSlackValidationError(error.code) ? "permanent" : "temporary",
+      error: error.code,
+      revision: prior.validation_revision + 1,
+    };
   }
 }
 export async function channelDirectory(env: Env, member: MemberContext, cursor?: string) {

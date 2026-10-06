@@ -92,20 +92,32 @@ export function invalidSlackDestination(error: unknown): error is SlackApiError 
 
 export function retireDigestReceiptStatements(env: Env, id: string, token: string, error: string | null = null) {
   const guard = `EXISTS(SELECT 1 FROM slack_digest_receipts root WHERE root.id=? AND root.claim_token=?
-    AND NOT EXISTS(SELECT 1 FROM slack_digest_messages uncertain WHERE uncertain.receipt_id=root.id AND uncertain.state IN ('sending','blocked')))`;
+    AND NOT EXISTS(SELECT 1 FROM slack_digest_messages uncertain WHERE uncertain.receipt_id=root.id
+      AND (uncertain.state IN ('sending','blocked') OR (uncertain.claimed_at>${Date.now() - 60_000} AND uncertain.claim_token IS NOT root.claim_token))))`;
   return [
     env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
-      WHERE delivered_at IS NULL AND id IN (SELECT value FROM slack_digest_messages child,json_each(child.event_ids_json)
-        WHERE child.receipt_id=? AND child.state='pending') AND ${guard}`).bind(Date.now(), id, id, token),
-    env.DB.prepare(`UPDATE slack_digest_messages SET state='retired',claim_token=NULL,claimed_at=NULL
-      WHERE receipt_id=? AND state='pending' AND ${guard}`).bind(id, id, token),
-    env.DB.prepare(`UPDATE slack_digest_receipts SET state='retired',last_error=? WHERE id=? AND claim_token=?
-      AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=? AND child.state IN ('sending','blocked'))`).bind(
-      error,
+      WHERE delivered_at IS NULL AND suppressed_at IS NULL AND round2_state='pending'
+        AND (id IN (SELECT value FROM slack_digest_messages child,json_each(child.event_ids_json)
+          WHERE child.receipt_id=? AND child.state='pending') OR (
+          cadence='digest' AND summary_id IS NULL
+          AND EXISTS(SELECT 1 FROM slack_digest_receipts root WHERE root.id=?
+            AND root.subscription_id=slack_channel_events.subscription_id
+            AND slack_channel_events.created_at>=root.window_start AND slack_channel_events.created_at<root.window_end)
+          AND NOT EXISTS(SELECT 1 FROM slack_digest_message_events reserved WHERE reserved.event_id=slack_channel_events.id)))
+        AND (claimed_at IS NULL OR claimed_at<=? OR claim_token=?) AND ${guard}`).bind(
+      Date.now(),
       id,
+      id,
+      Date.now() - 60_000,
       token,
       id,
+      token,
     ),
+    env.DB.prepare(`UPDATE slack_digest_messages SET state='retired',claim_token=NULL,claimed_at=NULL,last_error=?
+      WHERE receipt_id=? AND state='pending' AND ${guard}`).bind(error, id, id, token),
+    env.DB.prepare(
+      `UPDATE slack_digest_receipts SET state='retired',last_error=? WHERE id=? AND claim_token=? AND ${guard}`,
+    ).bind(error, id, token, id, token),
   ];
 }
 

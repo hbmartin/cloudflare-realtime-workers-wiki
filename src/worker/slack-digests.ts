@@ -1,3 +1,4 @@
+import { mappingDeliveryPauseSql } from "./slack-delivery-contracts";
 import {
   SlackDispatchSkippedError,
   definiteSlackRejection,
@@ -15,7 +16,12 @@ import { OPEN_THREAD_COUNT_SQL, TASK_STATUS_SQL } from "./activity";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import { digestBlocks, type DigestPage } from "./slack-blocks";
-import { round2Installation, validateMapping, revalidateMappings } from "./slack-channels";
+import {
+  round2Installation,
+  validateMappingEvidence,
+  revalidateMappings,
+  StaleSlackValidationError,
+} from "./slack-channels";
 import {
   slackApi,
   SlackApiError,
@@ -56,9 +62,11 @@ export type Mapping = {
   snoozed_until: number | null;
   notification_blocked_at: number | null;
   created_by: string;
+  delivery_paused: number;
+  validation_revision: number;
 };
 export async function digestMapping(env: Env, id: string) {
-  return env.DB.prepare(`SELECT m.* FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
+  return env.DB.prepare(`SELECT m.*,${mappingDeliveryPauseSql("m", Date.now())} delivery_paused FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
     WHERE m.id=? AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND EXISTS(SELECT 1 FROM workspace_members w
       WHERE w.workspace_id=i.workspace_id AND w.user_id=m.created_by AND w.role='owner')`)
     .bind(id)
@@ -69,17 +77,34 @@ function eligible(mapping: Mapping | null, now: number): boolean {
     mapping &&
     mapping.cadence === "digest" &&
     mapping.digest_timezone &&
-    !mapping.notification_blocked_at &&
+    !mapping.delivery_paused &&
     !mapping.muted_at &&
     (!mapping.snoozed_until || mapping.snoozed_until <= now),
   );
 }
 
-function retireDeniedDigestEvents(env: Env, receipt?: DigestReceipt, token?: string) {
-  return env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
+async function retireDeniedDigestEvents(env: Env, receipt?: DigestReceipt, token?: string) {
+  let ids: string[] | null = null;
+  let cursor: { digest_cleanup_created_at: number; digest_cleanup_event_id: string } | null = null;
+  let last: { id: string; created_at: number } | undefined;
+  if (!receipt) {
+    cursor = await env.DB.prepare(
+      "SELECT digest_cleanup_created_at,digest_cleanup_event_id FROM round2_runtime WHERE id=1",
+    ).first();
+    const candidates =
+      await env.DB.prepare(`SELECT id,created_at FROM slack_channel_events INDEXED BY slack_digest_pending_cleanup
+      WHERE cadence='digest' AND summary_id IS NULL AND round2_state='pending' AND delivered_at IS NULL AND suppressed_at IS NULL
+      AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT 200`)
+        .bind(cursor?.digest_cleanup_created_at ?? 0, cursor?.digest_cleanup_event_id ?? "")
+        .all<{ id: string; created_at: number }>();
+    ids = candidates.results.map((row) => row.id);
+    last = candidates.results.at(-1);
+  }
+  const result =
+    await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
     WHERE id IN (SELECT event.id FROM slack_channel_events event JOIN pages page ON page.id=event.page_id
       JOIN slack_channel_subscriptions m ON m.id=event.subscription_id JOIN slack_installations i ON i.id=m.installation_id
-      WHERE m.round2_initialized=1 AND event.cadence='digest' AND event.summary_id IS NULL AND event.round2_state='pending'
+      WHERE ${ids === null ? "1" : "event.id IN (SELECT value FROM json_each(?))"} AND m.round2_initialized=1 AND event.cadence='digest' AND event.summary_id IS NULL AND event.round2_state='pending'
         AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
         AND (event.claimed_at IS NULL OR event.claimed_at<=?)
         AND (? IS NULL OR (event.subscription_id=? AND event.created_at>=? AND event.created_at<?))
@@ -87,23 +112,43 @@ function retireDeniedDigestEvents(env: Env, receipt?: DigestReceipt, token?: str
           OR (NOT ${channelActivityActorAccessSql} AND page.archived_at IS NULL AND page.space_id=m.space_id)
           OR NOT EXISTS(SELECT 1 FROM workspace_members owner WHERE owner.workspace_id=i.workspace_id AND owner.user_id=m.created_by AND owner.role='owner'))
         AND NOT EXISTS(SELECT 1 FROM slack_digest_message_events reserved JOIN slack_digest_messages child ON child.id=reserved.message_id
-          WHERE reserved.event_id=event.id AND child.state IN ('sending','blocked'))
+          WHERE reserved.event_id=event.id AND (child.state IN ('sending','blocked') OR (child.claimed_at>? AND child.claim_token IS NOT ?)))
         AND NOT EXISTS(SELECT 1 FROM slack_digest_receipts root WHERE root.subscription_id=event.subscription_id
           AND event.created_at>=root.window_start AND event.created_at<root.window_end
           AND ((root.state IN ('sending','blocked') AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=root.id)
             AND event.id IN (SELECT value FROM json_each(root.event_ids_json)))
             OR (root.claimed_at>? AND root.claim_token IS NOT ?))))`)
-    .bind(
-      Date.now(),
-      Date.now() - 60_000,
-      receipt?.id ?? null,
-      receipt?.subscription_id ?? null,
-      receipt?.window_start ?? null,
-      receipt?.window_end ?? null,
-      Date.now() - 60_000,
-      token ?? null,
-    )
-    .run();
+      .bind(
+        Date.now(),
+        ...(ids === null ? [] : [JSON.stringify(ids)]),
+        Date.now() - 60_000,
+        receipt?.id ?? null,
+        receipt?.subscription_id ?? null,
+        receipt?.window_start ?? null,
+        receipt?.window_end ?? null,
+        Date.now() - 60_000,
+        token ?? null,
+        Date.now() - 60_000,
+        token ?? null,
+      )
+      .run();
+  if (!receipt)
+    logger.info("slack.digest.cleanup", "slack", "Examined pending digest events.", {
+      examined: ids?.length ?? 0,
+      retired: result.meta.changes,
+      cursor: last?.id ?? "",
+    });
+  if (!receipt)
+    await env.DB.prepare(`UPDATE round2_runtime SET digest_cleanup_created_at=?,digest_cleanup_event_id=?
+    WHERE id=1 AND digest_cleanup_created_at=? AND digest_cleanup_event_id=?`)
+      .bind(
+        last?.created_at ?? 0,
+        last?.id ?? "",
+        cursor?.digest_cleanup_created_at ?? 0,
+        cursor?.digest_cleanup_event_id ?? "",
+      )
+      .run();
+  return result;
 }
 
 function digestEventFilter(
@@ -635,13 +680,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
       await updateRoot("pending", ts);
     } else {
       if (!mapping || mapping.channel_id !== receipt.channel_id || !eligible(mapping, Date.now())) {
-        if (
-          mapping &&
-          (mapping.notification_blocked_at ||
-            mapping.muted_at ||
-            (mapping.snoozed_until && mapping.snoozed_until > Date.now()))
-        )
-          return;
+        if (mapping && mapping.delivery_paused) return;
         await retireRoot();
         return;
       }
@@ -652,9 +691,36 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
         await retireRoot();
         return;
       }
-      if (!(await validateMapping(env, installation, mapping.id, mapping.channel_id))) return;
+      const validation = await validateMappingEvidence(env, installation, mapping.id, mapping.channel_id);
+      if (validation.outcome !== "valid") {
+        if (validation.outcome === "permanent") {
+          const current = await digestMapping(env, receipt.subscription_id);
+          if (!current || current.validation_revision !== validation.revision) throw new StaleSlackValidationError();
+          const retirementToken = crypto.randomUUID();
+          const [retired] = await env.DB.batch([
+            env.DB.prepare(`UPDATE slack_digest_receipts SET claim_token=? WHERE id=? AND claim_token=?
+              AND EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
+                WHERE m.id=? AND m.validation_revision=? AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=${Date.now()}
+                  AND i.auth_error IS NULL AND i.disconnected_at IS NULL)
+              AND NOT EXISTS(SELECT 1 FROM outbox o WHERE o.topic='slack_digest' AND o.slack_round2_receipt_id=slack_digest_receipts.id AND o.slack_scope_paused_at IS NOT NULL)`).bind(
+              retirementToken,
+              id,
+              token,
+              receipt.subscription_id,
+              validation.revision,
+            ),
+            ...retireDigestReceiptStatements(env, id, retirementToken, validation.error),
+            env.DB.prepare(
+              "UPDATE slack_digest_receipts SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?",
+            ).bind(id, retirementToken),
+          ]);
+          if (!retired?.meta.changes) throw new StaleSlackValidationError();
+        }
+        return;
+      }
       mapping = await digestMapping(env, receipt.subscription_id);
       if (!mapping || mapping.channel_id !== receipt.channel_id || !eligible(mapping, Date.now())) return;
+      if (mapping.validation_revision !== validation.revision) throw new StaleSlackValidationError();
       await retireDeniedDigestEvents(env, receipt, token);
       message ??= await nextMessage(env, receipt, mapping, installation, token);
       if (!message) {
@@ -689,6 +755,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
                   await retireRoot();
                   throw new SlackDispatchSkippedError();
                 }
+                if (currentMapping.validation_revision !== validation.revision) throw new StaleSlackValidationError();
                 if (!eligible(currentMapping, Date.now())) throw new SlackDispatchSkippedError();
                 if (
                   receipt!.window_end <=
@@ -748,7 +815,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
                   AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL AND mapping.installation_id=installation.id
                   AND receipt.channel_id=mapping.channel_id AND mapping.digest_open_work=? AND mapping.channel_id=? AND mapping.cadence='digest' AND mapping.validation_state='valid' AND mapping.notification_blocked_at IS NULL AND mapping.muted_at IS NULL
                   AND coalesce(mapping.snoozed_until,0)<=? AND mapping.digest_time=? AND mapping.digest_timezone=?
-                  AND mapping.digest_not_before<? AND mapping.space_id=? AND mapping.page_id IS ?
+                  AND mapping.digest_not_before<? AND mapping.space_id=? AND mapping.page_id IS ? AND mapping.validation_revision=?
                   AND NOT EXISTS(SELECT 1 FROM json_each(?) candidate LEFT JOIN pages page ON page.id=json_extract(candidate.value,'$.pageId')
                     WHERE page.id IS NULL OR page.is_template=1 OR page.import_job_id IS NOT NULL
                       OR EXISTS(SELECT 1 FROM json_each(json_extract(candidate.value,'$.eventIds')) expected
@@ -778,10 +845,16 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
                     receipt!.window_end,
                     currentMapping.space_id,
                     currentMapping.page_id,
+                    validation.revision,
                     JSON.stringify(currentPages),
                   )
                   .first();
-                if (!allowed) throw new DeliveryInProgressError();
+                if (!allowed) {
+                  const latest = await digestMapping(env, receipt!.subscription_id);
+                  if (latest && latest.validation_revision !== validation.revision)
+                    throw new StaleSlackValidationError();
+                  throw new DeliveryInProgressError();
+                }
                 return {
                   channel: currentMapping.channel_id,
                   text: `NoteFlare daily digest: ${currentPages.length} pages`,

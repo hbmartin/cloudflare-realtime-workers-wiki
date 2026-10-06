@@ -1,3 +1,5 @@
+import { readiness } from "./health";
+import { repairLegacySlackDelivery } from "./slack-legacy-recovery";
 import { protectSlackFixtureUsers } from "../../tests/helpers/security";
 import { processSlackFileCleanup, processDueSlackFileCleanup, slackFileCleanupHealth } from "./slack-file-cleanup";
 import {
@@ -30,6 +32,7 @@ import {
   repairSlackChannelNotifications,
   handleSlackEvent,
   deliverSlackUnfurl,
+  sendDueSlackChannelDigests,
   deliverSlackControlsExpiry,
   listSlackChannelSubscriptions,
   listSlackDeliveryFailureGroups,
@@ -4709,7 +4712,7 @@ describe("final Round 2 dispatch authorization", () => {
           .run();
       if (mode === "destination blocked")
         await env.DB.prepare(
-          "UPDATE slack_channel_subscriptions SET muted_at=NULL,notification_blocked_at=1,notification_error='not_in_channel',validation_state='invalid',validation_error='not_in_channel' WHERE id=?",
+          "UPDATE slack_channel_subscriptions SET muted_at=NULL,notification_blocked_at=1,notification_error='no_permission',validation_state='invalid',validation_error='not_in_channel' WHERE id=?",
         )
           .bind(paused.id)
           .run();
@@ -4764,9 +4767,15 @@ describe("final Round 2 dispatch authorization", () => {
           .bind(deferred.id)
           .first(),
       ).toEqual(beforeWake);
-      if (mode === "destination blocked")
+      if (mode === "destination blocked") {
+        await env.DB.prepare(
+          "UPDATE slack_channel_subscriptions SET notification_blocked_at=NULL,notification_error=NULL WHERE id=?",
+        )
+          .bind(paused.id)
+          .run();
         await validateMapping(runtime(), (await round2Installation(runtime(), "installation", 1))!, paused.id, "C123");
-      else await setSlackChannelPause(runtime(), owner, paused.id, "unmute");
+        await wakeRound2Mapping(runtime(), paused.id);
+      } else await setSlackChannelPause(runtime(), owner, paused.id, "unmute");
       expect(
         await env.DB.prepare("SELECT enqueued_at FROM outbox WHERE slack_round2_receipt_id=?")
           .bind(deferred.id)
@@ -5386,7 +5395,7 @@ describe("remaining delivery recovery regressions", () => {
   it("logs and measures persistent Round 2 enqueue failures with sanitized error text", async () => {
     await mapping("immediate");
     await page();
-    await env.DB.prepare("UPDATE outbox SET available_at=1,attempts=9").run();
+    await env.DB.prepare("UPDATE outbox SET available_at=1,attempts=9,slack_enqueue_failure_count=9").run();
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const writeDataPoint = vi.fn();
     const send = vi.fn(async () => {
@@ -5562,7 +5571,9 @@ describe("remaining delivery recovery regressions", () => {
         return typeof value === "function" ? value.bind(target) : value;
       },
     });
-    await deliverRound2ChannelEvent({ ...runtime(), DB: db }, e.id);
+    await expect(deliverRound2ChannelEvent({ ...runtime(), DB: db }, e.id)).rejects.toBeInstanceOf(
+      StaleSlackValidationError,
+    );
     expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(0);
     expect(
       await env.DB.prepare("SELECT round2_state,attempted_at,delivered_at FROM slack_channel_events WHERE id=?")
@@ -5628,4 +5639,417 @@ describe("remaining delivery recovery regressions", () => {
       expect(await env.DB.prepare("SELECT state FROM slack_digest_receipts").first()).toEqual({ state: "skipped" });
     },
   );
+});
+
+describe("Slack delivery regression fixes", () => {
+  async function work(path: "channel" | "bulk" | "digest") {
+    const m = await mapping(path === "digest" ? "digest" : "immediate");
+    await page();
+    await env.DB.prepare("DELETE FROM outbox").run();
+    await env.DB.prepare("DELETE FROM slack_channel_events").run();
+    const window = digestWindow(Date.now(), "09:00", "America/Chicago");
+    await event(m.id, "page", window.start + 1, "page_moved", "activity:regression");
+    if (path !== "digest") await env.DB.prepare("UPDATE slack_channel_events SET cadence='immediate'").run();
+    let id = "activity:regression";
+    if (path === "bulk") {
+      id = "bulk-regression";
+      await env.DB.prepare(`INSERT INTO slack_bulk_receipts(id,installation_id,installation_generation,channel_id,operation_id,event_type,created_at)
+        VALUES(?,'installation',1,'C123','op','page_moved',?)`)
+        .bind(id, Date.now())
+        .run();
+      await env.DB.prepare("UPDATE slack_channel_events SET summary_id=?").bind(id).run();
+    }
+    if (path === "digest") id = (await receipt(m.id)).id;
+    const key = path === "channel" ? "eventId" : path === "bulk" ? "summaryId" : "digestId";
+    await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
+      VALUES('regression-outbox','workspace',?,?,1,1)`)
+      .bind(`slack_${path}`, JSON.stringify({ [key]: id }))
+      .run();
+    return {
+      m,
+      id,
+      deliver: () =>
+        path === "channel"
+          ? deliverRound2ChannelEvent(runtime(), id)
+          : path === "bulk"
+            ? deliverBulkSummary(runtime(), id)
+            : deliverDigest(runtime(), id),
+    };
+  }
+  it.each(["channel", "bulk", "digest"] as const)(
+    "revalidates cached permanent failure before %s delivery",
+    async (path) => {
+      const { deliver } = await work(path);
+      await env.DB.prepare(`UPDATE slack_channel_subscriptions SET validation_state='invalid',validation_error='channel_not_found',
+      notification_error='channel_not_found',notification_blocked_at=1`).run();
+      calls = [];
+      await deliver();
+      expect(calls.filter((call) => call.method === "conversations.info")).toHaveLength(1);
+      expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(1);
+      expect(
+        await env.DB.prepare("SELECT delivered_at IS NOT NULL delivered FROM slack_channel_events").first(),
+      ).toEqual({ delivered: 1 });
+    },
+  );
+  it.each(["channel", "bulk", "digest"] as const)(
+    "retires unsent work after fresh permanent %s failure",
+    async (path) => {
+      const { deliver } = await work(path);
+      responses["conversations.info"] = { ok: false, error: "channel_not_found" };
+      await deliver();
+      expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(0);
+      expect(await env.DB.prepare("SELECT round2_state FROM slack_channel_events").first()).toEqual({
+        round2_state: "retired",
+      });
+    },
+  );
+  it.each(["channel", "bulk"] as const)("requires actor authority for %s departures", async (path) => {
+    const { deliver } = await work(path);
+    await env.DB.prepare(
+      "INSERT INTO spaces(id,workspace_id,name,slug,position,created_by,created_at,updated_at) VALUES('destination','workspace','Elsewhere','elsewhere','b0','owner',1,1)",
+    ).run();
+    await env.DB.prepare("UPDATE pages SET space_id='destination' WHERE id='page'").run();
+    await env.DB.prepare(
+      "UPDATE slack_channel_events SET actor_id='viewer',previous_space_id='workspace-general'",
+    ).run();
+    await env.DB.prepare("DELETE FROM workspace_members WHERE user_id='viewer'").run();
+    await deliver();
+    expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(0);
+    expect(await env.DB.prepare("SELECT round2_state FROM slack_channel_events").first()).toEqual({
+      round2_state: "retired",
+    });
+  });
+  it("preserves paused bulk work while retiring denied candidates before recovery exhaustion", async () => {
+    const { m, id } = await work("bulk");
+    await env.DB.prepare("UPDATE slack_channel_subscriptions SET muted_at=1 WHERE id=?").bind(m.id).run();
+    await event(m.id, "page", Date.now(), "page_moved", "denied-bulk");
+    await env.DB.prepare(
+      "UPDATE slack_channel_events SET summary_id=?,cadence='immediate',actor_id='viewer' WHERE id='denied-bulk'",
+    )
+      .bind(id)
+      .run();
+    await env.DB.prepare("DELETE FROM workspace_members WHERE user_id='viewer'").run();
+    await env.DB.prepare("UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1,slack_redrive_count=8").run();
+    await redriveRound2Outbox(runtime());
+    expect(
+      (await env.DB.prepare("SELECT id,round2_state FROM slack_channel_events ORDER BY id").all()).results,
+    ).toEqual([
+      { id: "activity:regression", round2_state: "pending" },
+      { id: "denied-bulk", round2_state: "retired" },
+    ]);
+    expect(await round2DeliveryOutcome(runtime(), "slack_bulk", id)).toBe("paused");
+  });
+  it("uses enqueue failures independently of the lifetime scheduling version", async () => {
+    await work("channel");
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await env.DB.prepare("UPDATE outbox SET attempts=40").run();
+    const send = vi.fn<() => Promise<void>>(async () => {
+      throw new Error("unavailable");
+    });
+    const bindings = { ...runtime(), DELIVERY_QUEUE: { send } } as unknown as Env;
+    await sweepOutbox(bindings);
+    expect(
+      await env.DB.prepare("SELECT attempts,slack_enqueue_failure_count,available_at FROM outbox").first(),
+    ).toEqual({ attempts: 41, slack_enqueue_failure_count: 1, available_at: now + 10000 });
+    await env.DB.prepare("UPDATE outbox SET available_at=1").run();
+    send.mockImplementation(async () => {});
+    await sweepOutbox(bindings);
+    expect(await env.DB.prepare("SELECT slack_enqueue_failure_count FROM outbox").first()).toEqual({
+      slack_enqueue_failure_count: 0,
+    });
+  });
+  it("clears completed unpaused siblings before scope deferral", async () => {
+    const { id } = await work("channel");
+    await env.DB.prepare("UPDATE slack_channel_events SET round2_state='sent',delivered_at=1").run();
+    await env.DB.prepare(
+      "UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1,slack_enqueue_redrive_pending=1",
+    ).run();
+    await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,slack_scope_paused_at,slack_redrive_due_at)
+      VALUES('paused-sibling','workspace','slack_channel',?,1,1,1,1)`)
+      .bind(JSON.stringify({ eventId: id }))
+      .run();
+    await redriveRound2Outbox(runtime());
+    expect(
+      await env.DB.prepare(
+        "SELECT slack_redrive_due_at,slack_claim_recheck_at,slack_enqueue_redrive_pending,available_at FROM outbox WHERE id='regression-outbox'",
+      ).first(),
+    ).toEqual({
+      slack_redrive_due_at: null,
+      slack_claim_recheck_at: null,
+      slack_enqueue_redrive_pending: 0,
+      available_at: 1,
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT slack_scope_paused_at,slack_redrive_due_at FROM outbox WHERE id='paused-sibling'",
+      ).first(),
+    ).toEqual({ slack_scope_paused_at: 1, slack_redrive_due_at: 1 });
+  });
+  it.each(["pending", "sending"])("repeatedly repairs delayed-rollout %s Activity damage", async (state) => {
+    await work("channel");
+    const bindings = { ...runtime(), SLACK_CHANNEL_VALIDATION_ENABLED: "false" as const };
+    await env.DB.prepare("UPDATE slack_channel_events SET round2_state=?,attempted_at=?")
+      .bind(state, state === "sending" ? 123 : null)
+      .run();
+    const damage = () =>
+      env.DB.prepare(
+        "UPDATE outbox SET enqueued_at=1,last_error='Invalid Slack redrive payload',slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL",
+      ).run();
+    await damage();
+    await repairLegacySlackDelivery(bindings);
+    const first = await env.DB.prepare(
+      "SELECT attempts,enqueued_at,slack_redrive_due_at,last_error FROM outbox",
+    ).first();
+    await repairLegacySlackDelivery(bindings);
+    expect(
+      await env.DB.prepare("SELECT attempts,enqueued_at,slack_redrive_due_at,last_error FROM outbox").first(),
+    ).toEqual(first);
+    await damage();
+    await repairLegacySlackDelivery(bindings);
+    expect(await env.DB.prepare("SELECT attempts FROM outbox").first()).toEqual({ attempts: 2 });
+    expect(await env.DB.prepare("SELECT round2_state,attempted_at FROM slack_channel_events").first()).toEqual({
+      round2_state: state,
+      attempted_at: state === "sending" ? 123 : null,
+    });
+    const deadline = expect.any(Number);
+    expect(first).toMatchObject({
+      last_error: null,
+      enqueued_at: state === "sending" ? 1 : null,
+      slack_redrive_due_at: state === "sending" ? deadline : null,
+    });
+  });
+  it("ignores disabled Activity and thumbnails in readiness while detecting runnable overdue work", async () => {
+    await work("channel");
+    await env.DB.prepare("UPDATE outbox SET available_at=1").run();
+    const bindings = {
+      ...runtime(),
+      SLACK_CHANNEL_VALIDATION_ENABLED: "false" as const,
+      SLACK_RICH_DIGESTS_ENABLED: "false" as const,
+    };
+    await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
+      VALUES('disabled-thumbnail','workspace','slack_file_upload','{"artifactId":"paused"}',1,1)`).run();
+    let health = await readiness(bindings);
+    expect(health.checks.find((check) => check.name === "durable_queues")).toMatchObject({ ok: true });
+    await env.DB.prepare(
+      "INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at) VALUES('runnable','workspace','notification','{}',1,1)",
+    ).run();
+    health = await readiness(bindings);
+    expect(health.checks.find((check) => check.name === "durable_queues")).toMatchObject({
+      ok: false,
+      code: "outbox_delivery_overdue",
+    });
+  });
+  it.each([false, true])(
+    "retires reserved digest events transactionally on exhaustion (rollback=%s)",
+    async (rollback) => {
+      const { id } = await work("digest");
+      await env.DB.prepare(`INSERT INTO slack_digest_messages(id,receipt_id,sequence,page_ids_json,event_ids_json)
+      VALUES('child',?,0,'["page"]','["activity:regression"]')`)
+        .bind(id)
+        .run();
+      await env.DB.prepare(
+        "INSERT INTO slack_digest_message_events(event_id,message_id) VALUES('activity:regression','child')",
+      ).run();
+      await env.DB.prepare("UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1,slack_redrive_count=8").run();
+      if (rollback)
+        await env.DB.prepare(`CREATE TRIGGER fail_digest_retirement BEFORE UPDATE ON slack_digest_messages
+        WHEN NEW.state='retired' BEGIN SELECT RAISE(ABORT,'retirement failed'); END`).run();
+      const failure = await redriveRound2Outbox(runtime()).then(
+        () => null,
+        (error: Error) => error.message,
+      );
+      expect(failure?.includes("retirement failed") ?? false).toBe(rollback);
+      expect(
+        await env.DB.prepare(
+          "SELECT round2_state,suppressed_at IS NOT NULL suppressed FROM slack_channel_events",
+        ).first(),
+      ).toEqual({ round2_state: rollback ? "pending" : "retired", suppressed: rollback ? 0 : 1 });
+      expect(await env.DB.prepare("SELECT state,claim_token FROM slack_digest_receipts").first()).toEqual({
+        state: rollback ? "pending" : "retired",
+        claim_token: null,
+      });
+      if (rollback) await env.DB.prepare("DROP TRIGGER fail_digest_retirement").run();
+      await redriveRound2Outbox(runtime());
+      expect(
+        await env.DB.prepare(
+          "SELECT round2_state,suppressed_at IS NOT NULL suppressed FROM slack_channel_events",
+        ).first(),
+      ).toEqual({ round2_state: "retired", suppressed: 1 });
+      expect(await env.DB.prepare("SELECT state,last_error FROM slack_digest_messages").first()).toEqual({
+        state: "retired",
+        last_error: "redrive_exhausted",
+      });
+    },
+  );
+  it("repairs only stranded exhausted digest reservations and preserves uncertain evidence", async () => {
+    const { id } = await work("digest");
+    await event(
+      (await env.DB.prepare("SELECT subscription_id FROM slack_digest_receipts").first<{ subscription_id: string }>())!
+        .subscription_id,
+      "page",
+      1,
+      "page_moved",
+      "uncertain",
+    );
+    await env.DB.prepare(`INSERT INTO slack_digest_messages(id,receipt_id,sequence,state,page_ids_json,event_ids_json,last_error)
+      VALUES('old',?,0,'retired','["page"]','["activity:regression"]','redrive_exhausted'),
+      ('uncertain-child',?,1,'blocked','["page"]','["uncertain"]','send_unconfirmed')`)
+      .bind(id, id)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO slack_digest_message_events(event_id,message_id) VALUES('activity:regression','old'),('uncertain','uncertain-child')",
+    ).run();
+    await repairLegacySlackDelivery(runtime());
+    expect(
+      (await env.DB.prepare("SELECT id,round2_state FROM slack_channel_events ORDER BY id").all()).results,
+    ).toEqual([
+      { id: "activity:regression", round2_state: "retired" },
+      { id: "uncertain", round2_state: "pending" },
+    ]);
+    await repairLegacySlackDelivery(runtime());
+    expect(
+      await env.DB.prepare("SELECT state,last_error FROM slack_digest_messages WHERE id='uncertain-child'").first(),
+    ).toEqual({ state: "blocked", last_error: "send_unconfirmed" });
+  });
+  it("bounds global digest cleanup by examined events and wraps past allowed and reserved candidates", async () => {
+    const { m, id } = await work("digest");
+    await env.DB.prepare("DELETE FROM slack_channel_events").run();
+    const rows = Array.from({ length: 405 }, (_, n) =>
+      env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+      VALUES(?,?,'workspace','page_moved',?,'page','digest',?)`).bind(
+        `candidate-${String(n).padStart(3, "0")}`,
+        m.id,
+        n < 200 ? "owner" : "viewer",
+        n + 1,
+      ),
+    );
+    for (let offset = 0; offset < rows.length; offset += 100) await env.DB.batch(rows.slice(offset, offset + 100));
+    await env.DB.prepare("DELETE FROM workspace_members WHERE user_id='viewer'").run();
+    await env.DB.prepare(`INSERT INTO slack_digest_messages(id,receipt_id,sequence,state,page_ids_json,event_ids_json)
+      VALUES('protected',?,0,'blocked','["page"]','["candidate-200"]')`)
+      .bind(id)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO slack_digest_message_events(event_id,message_id) VALUES('candidate-200','protected')",
+    ).run();
+    await dueRound2Digests(runtime());
+    expect(
+      await env.DB.prepare("SELECT count(*) retired FROM slack_channel_events WHERE suppressed_at IS NOT NULL").first(),
+    ).toEqual({ retired: 0 });
+    expect(await env.DB.prepare("SELECT digest_cleanup_event_id FROM round2_runtime WHERE id=1").first()).toEqual({
+      digest_cleanup_event_id: "candidate-199",
+    });
+    await dueRound2Digests(runtime());
+    expect(
+      await env.DB.prepare("SELECT count(*) retired FROM slack_channel_events WHERE suppressed_at IS NOT NULL").first(),
+    ).toEqual({ retired: 199 });
+    await dueRound2Digests(runtime());
+    expect(
+      await env.DB.prepare("SELECT count(*) retired FROM slack_channel_events WHERE suppressed_at IS NOT NULL").first(),
+    ).toEqual({ retired: 204 });
+    await dueRound2Digests(runtime());
+    expect(await env.DB.prepare("SELECT digest_cleanup_event_id FROM round2_runtime WHERE id=1").first()).toEqual({
+      digest_cleanup_event_id: "",
+    });
+    await dueRound2Digests(runtime());
+    expect(await env.DB.prepare("SELECT digest_cleanup_event_id FROM round2_runtime WHERE id=1").first()).toEqual({
+      digest_cleanup_event_id: "candidate-199",
+    });
+    expect(
+      await env.DB.prepare("SELECT suppressed_at FROM slack_channel_events WHERE id='candidate-200'").first(),
+    ).toEqual({ suppressed_at: null });
+    const plan =
+      await env.DB.prepare(`EXPLAIN QUERY PLAN SELECT id,created_at FROM slack_channel_events INDEXED BY slack_digest_pending_cleanup
+      WHERE cadence='digest' AND summary_id IS NULL AND round2_state='pending' AND delivered_at IS NULL AND suppressed_at IS NULL
+      AND (created_at,id)>(?,?) ORDER BY created_at,id LIMIT 200`)
+        .bind(0, "")
+        .all<{ detail: string }>();
+    expect(plan.results.some((row) => row.detail.includes("slack_digest_pending_cleanup"))).toBe(true);
+  });
+  it.each(["claim", "scope", "version"])("preserves %s fences during legacy Activity repair", async (mode) => {
+    await work("channel");
+    await env.DB.prepare("UPDATE outbox SET last_error='Invalid Slack redrive payload',enqueued_at=1").run();
+    if (mode === "claim")
+      await env.DB.prepare("UPDATE slack_channel_events SET claimed_at=?,claim_token=?")
+        .bind(Date.now(), "active")
+        .run();
+    if (mode === "scope") await env.DB.prepare("UPDATE outbox SET slack_scope_paused_at=1").run();
+    if (mode === "version") await env.DB.prepare("UPDATE outbox SET last_error='newer schedule',attempts=7").run();
+    const before = await env.DB.prepare(
+      "SELECT attempts,enqueued_at,last_error,slack_redrive_due_at FROM outbox",
+    ).first();
+    await repairLegacySlackDelivery(runtime());
+    expect(
+      await env.DB.prepare("SELECT attempts,enqueued_at,last_error,slack_redrive_due_at FROM outbox").first(),
+    ).toEqual(before);
+  });
+  it.each([
+    ["activity", 0],
+    ["activity", 1],
+    ["legacy", 1],
+  ] as const)(
+    "excludes %s events on initialized=%s mappings from legacy digest cleanup during a flag pause",
+    async (kind, initialized) => {
+      const { m } = await work("digest");
+      await env.DB.prepare("UPDATE slack_channel_subscriptions SET round2_initialized=? WHERE id=?")
+        .bind(initialized, m.id)
+        .run();
+      await env.DB.prepare("UPDATE slack_channel_events SET actor_id='viewer'").run();
+      if (kind === "legacy") await env.DB.prepare("UPDATE slack_channel_events SET id='legacy-event'").run();
+      await env.DB.prepare("DELETE FROM workspace_members WHERE user_id='viewer'").run();
+      await sendDueSlackChannelDigests({ ...runtime(), SLACK_CHANNEL_VALIDATION_ENABLED: "false" });
+      expect(await env.DB.prepare("SELECT suppressed_at,delivered_at FROM slack_channel_events").first()).toEqual({
+        suppressed_at: null,
+        delivered_at: null,
+      });
+      expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(0);
+    },
+  );
+  it("limits legacy Activity repairs to 50 receipts per maintenance pass", async () => {
+    const { m } = await work("channel");
+    const statements = Array.from({ length: 60 }, (_, n) => [
+      env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+        VALUES(?,?,'workspace','page_created','owner','page','immediate',1)`).bind(`activity:bounded-${n}`, m.id),
+      env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,last_error)
+        VALUES(?,'workspace','slack_channel',?,1,1,'Invalid Slack redrive payload')`).bind(
+        `bounded-${n}`,
+        JSON.stringify({ eventId: `activity:bounded-${n}` }),
+      ),
+    ]).flat();
+    await env.DB.batch(statements);
+    await repairLegacySlackDelivery(runtime());
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) remaining FROM outbox WHERE last_error='Invalid Slack redrive payload'",
+      ).first(),
+    ).toEqual({ remaining: 10 });
+    await repairLegacySlackDelivery(runtime());
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) remaining FROM outbox WHERE last_error='Invalid Slack redrive payload'",
+      ).first(),
+    ).toEqual({ remaining: 0 });
+    await repairLegacySlackDelivery(runtime());
+    expect(await env.DB.prepare("SELECT max(attempts) attempts FROM outbox").first()).toEqual({ attempts: 1 });
+  });
+  it.each(["sending", "blocked", "claim"])("preserves digest %s reservations during exhaustion", async (state) => {
+    const { id } = await work("digest");
+    await env.DB.prepare(`INSERT INTO slack_digest_messages(id,receipt_id,sequence,state,page_ids_json,event_ids_json,claimed_at,claim_token,attempted_at)
+      VALUES('protected',?,0,?,'["page"]','["activity:regression"]',?, 'other',123)`)
+      .bind(id, state === "claim" ? "pending" : state, state === "claim" ? Date.now() : null)
+      .run();
+    await env.DB.prepare(
+      "INSERT INTO slack_digest_message_events(event_id,message_id) VALUES('activity:regression','protected')",
+    ).run();
+    await env.DB.prepare("UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1,slack_redrive_count=8").run();
+    await redriveRound2Outbox(runtime());
+    expect(await env.DB.prepare("SELECT round2_state,suppressed_at FROM slack_channel_events").first()).toEqual({
+      round2_state: "pending",
+      suppressed_at: null,
+    });
+    expect(
+      await env.DB.prepare("SELECT state,attempted_at FROM slack_digest_messages WHERE id='protected'").first(),
+    ).toEqual({ state: state === "claim" ? "pending" : state, attempted_at: 123 });
+  });
 });

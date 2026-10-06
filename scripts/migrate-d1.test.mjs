@@ -1,3 +1,4 @@
+import { legacyShareRecoveryPreflightSql, shareRecoveryPreflightSql } from "../src/shared/slack-share-recovery.ts";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { digestCollisionSql, main } from "./migrate-d1.mjs";
@@ -12,6 +13,7 @@ describe("Slack migration safety in the deployment wrapper", () => {
     "0070_slack_review_fences.sql",
     "0072_slack_link_authorization_started_at.sql",
     "0074_slack_enqueue_recovery.sql",
+    "0075_slack_delivery_recovery.sql",
   ])("stops remote %s before preflight or migration application", (migration) => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const execute = vi
@@ -238,5 +240,77 @@ describe("0067 migration deployment guard", () => {
     const execute = vi.fn().mockReturnValue({ status: 0, stdout });
     expect(main(["--local"], execute)).toBe(1);
     expect(execute).toHaveBeenCalledOnce();
+  });
+});
+
+describe("indexed share recovery before unchanged 0074", () => {
+  it.each([true, false])("runs the indexed repair only while 0074 is pending (%s)", (pending74) => {
+    const execute = vi
+      .fn()
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: `Migrations to be applied:\n${pending74 ? "0074_slack_enqueue_recovery.sql\n" : ""}0075_slack_delivery_recovery.sql\n`,
+      })
+      .mockReturnValue({ status: 0 });
+    expect(main(["--local"], execute)).toBe(0);
+    const repairs = execute.mock.calls.filter(([args]) => args[1] === "execute");
+    expect(repairs).toHaveLength(pending74 ? 1 : 0);
+    expect(repairs.map(([args]) => args.at(-1))).toEqual(pending74 ? [legacyShareRecoveryPreflightSql] : []);
+    expect(execute.mock.calls.at(-1)[0][2]).toBe("apply");
+  });
+  it("stops when indexed recovery fails", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const execute = vi
+      .fn()
+      .mockReturnValueOnce({
+        status: 0,
+        stdout: "Migrations to be applied:\n0074_slack_enqueue_recovery.sql\n0075_slack_delivery_recovery.sql\n",
+      })
+      .mockReturnValueOnce({ status: 1, stderr: "repair failed" });
+    expect(main(["--local"], execute)).toBe(1);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("indexed legacy share recovery"));
+  });
+});
+
+describe("share repair on older authorization foundations", () => {
+  it.each([false, true])("uses the pending grant-start and protection backfills (protected=%s)", (protectedAccount) => {
+    const db = new DatabaseSync(":memory:");
+    try {
+      db.exec(`CREATE TABLE outbox(id TEXT PRIMARY KEY,topic TEXT,payload_json TEXT,attempts INTEGER,enqueued_at INTEGER,available_at INTEGER,
+        slack_redrive_due_at INTEGER,slack_claim_recheck_at INTEGER,slack_scope_paused_at INTEGER,last_error TEXT);
+        CREATE TABLE slack_interaction_receipts(id TEXT PRIMARY KEY,installation_id TEXT,outcome TEXT,denial_sent_at INTEGER,
+          response_delivery_state TEXT,response_delivery_error TEXT,response_delivery_attempted_at INTEGER,received_at INTEGER);
+        CREATE TABLE slack_installations(id TEXT PRIMARY KEY,generation INTEGER,auth_error TEXT,disconnected_at INTEGER,workspace_id TEXT,team_id TEXT);
+        CREATE TABLE slack_user_links(installation_id TEXT,user_id TEXT,slack_user_id TEXT,installation_generation INTEGER,migration_state TEXT,
+          verification_method TEXT,verified_at INTEGER,linked_at INTEGER,better_auth_account_id TEXT);
+        CREATE TABLE account_security(user_id TEXT,recovery_required INTEGER,codes_saved INTEGER);
+        CREATE TABLE twoFactor(userId TEXT,verified INTEGER);
+        CREATE TABLE passkey(userId TEXT);
+        CREATE TABLE workspace_members(workspace_id TEXT,user_id TEXT);
+        CREATE TABLE account(id TEXT,userId TEXT,providerId TEXT,accountId TEXT);
+        INSERT INTO slack_installations VALUES('installation',1,NULL,NULL,'workspace','T123');
+        INSERT INTO slack_interaction_receipts VALUES('receipt','installation','accepted',NULL,'blocked','request_identity_unavailable',NULL,10);
+        INSERT INTO slack_user_links VALUES('installation','owner','UOWNER',1,'verified','slack_openid',1,1,'oauth');
+        INSERT INTO workspace_members VALUES('workspace','owner');
+        INSERT INTO account_security VALUES('owner',0,${protectedAccount ? 1 : 0});
+        INSERT INTO twoFactor VALUES('owner',1);
+        INSERT INTO account VALUES('oauth','owner','slack','T123:UOWNER');`);
+      db.prepare("INSERT INTO outbox VALUES('outbox','slack_share_response',?,40,1,1,NULL,NULL,NULL,NULL)").run(
+        JSON.stringify({ receiptId: "receipt", installationId: "installation", generation: 1, userId: "UOWNER" }),
+      );
+      db.exec(
+        shareRecoveryPreflightSql([
+          "0071_slack_authorization_cleanup.sql",
+          "0072_slack_link_authorization_started_at.sql",
+        ]),
+      );
+      expect(db.prepare("SELECT attempts FROM outbox").get()).toMatchObject({ attempts: protectedAccount ? 41 : 40 });
+      expect(db.prepare("SELECT response_delivery_state FROM slack_interaction_receipts").get()).toMatchObject({
+        response_delivery_state: protectedAccount ? "pending" : "blocked",
+      });
+    } finally {
+      db.close();
+    }
   });
 });
