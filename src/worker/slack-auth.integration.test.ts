@@ -282,6 +282,25 @@ describe("Slack OAuth authorization boundaries", () => {
   });
 
   it.each(["default", "custom", "custom query"])(
+    "preserves the %s error destination when OAuth state is rejected",
+    async (mode) => {
+      const { cookie } = await account();
+      const flow = await start(cookie, {
+        errorCallbackURL:
+          mode === "default" ? undefined : mode === "custom" ? "/custom-error?keep=1" : "/api/auth/error?keep=1",
+      });
+      const response = await callback({ ...flow, cookie: "" });
+      const destination = new URL(response.headers.get("location")!, "http://example.test");
+      expect(destination.pathname).toBe(
+        mode === "default" ? "/" : mode === "custom" ? "/custom-error" : "/api/auth/error",
+      );
+      expect(destination.searchParams.get("error")).toBe("state_mismatch");
+      expect(destination.searchParams.get("keep")).toBe(mode === "default" ? null : "1");
+      expect(destination.origin).toBe("http://example.test");
+    },
+  );
+
+  it.each(["default", "custom", "custom query"])(
     "routes completion errors to the %s application destination",
     async (mode) => {
       const { cookie } = await account();

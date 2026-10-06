@@ -82,7 +82,6 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
       AND m.installation_id=? AND m.channel_id=? AND page.import_job_id IS NULL AND page.is_template=0
       AND EXISTS(SELECT 1 FROM workspace_members w WHERE w.workspace_id=? AND w.user_id=m.created_by AND w.role='owner')
       AND (${channelActivityActorAccessSql.replaceAll("event.", "e.")} OR page.archived_at IS NOT NULL OR page.space_id<>m.space_id)
-      AND (m.validation_state='valid' OR (${pauseSql}))
       AND EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type)`;
     const candidateBinds = (expectedState: string) => [
       id,
@@ -95,24 +94,31 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
       installation.id,
       row!.channel_id,
       installation.workspace_id,
-      Date.now(),
     ];
     const loadCandidates = (expectedState: string) =>
-      env.DB.prepare(`SELECT e.id,e.page_id,m.id mapping_id,(${pauseSql}) paused ${candidateSql} ORDER BY e.id`)
+      env.DB.prepare(
+        `SELECT e.id,e.page_id,m.id mapping_id,m.validation_state,(${pauseSql}) paused ${candidateSql} ORDER BY e.id`,
+      )
         .bind(Date.now(), ...candidateBinds(expectedState))
-        .all<{ id: string; page_id: string; mapping_id: string; paused: number }>();
+        .all<{ id: string; page_id: string; mapping_id: string; validation_state: string; paused: number }>();
     const loadEvents = async (expectedState = "pending", pausedOnly = false) => {
       const candidates = await loadCandidates(expectedState);
-      return { ...candidates, results: candidates.results.filter((event) => Boolean(event.paused) === pausedOnly) };
+      return {
+        ...candidates,
+        results: candidates.results.filter((event) =>
+          pausedOnly
+            ? Boolean(event.paused) || event.validation_state !== "valid"
+            : !event.paused && event.validation_state === "valid",
+        ),
+      };
     };
     const paused = async () => (await loadEvents("pending", true)).results.length > 0;
+    const candidates = await loadCandidates("pending");
+    for (const mappingId of new Set(
+      candidates.results.filter((event) => !event.paused).map((event) => event.mapping_id),
+    ))
+      await validateMapping(env, installation, mappingId, row.channel_id);
     let events = await loadEvents();
-    if (!events.results.length) {
-      if (!(await paused())) await finish("retired");
-      return;
-    }
-    if (!(await validateMapping(env, installation, events.results[0]!.mapping_id, row.channel_id))) return;
-    events = await loadEvents();
     if (!events.results.length) {
       if (!(await paused())) await finish("retired");
       return;
@@ -192,7 +198,7 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
             if (!checkpoint!.meta.changes) throw new DeliveryInProgressError();
             const finalEvents = await loadCandidates("sending");
             if (
-              finalEvents.results.some((event) => event.paused) ||
+              finalEvents.results.some((event) => event.paused || event.validation_state !== "valid") ||
               JSON.stringify(finalEvents.results.map((e) => e.id)) !== ids
             )
               throw new DeliveryInProgressError();

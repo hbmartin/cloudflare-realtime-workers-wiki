@@ -318,7 +318,28 @@ ephemeral to the acting user while they are active in Slack; an uncertain send i
 recheck current identity, membership, mapping, and page permissions when delayed work runs; old buttons and
 saved modal state do not grant access. Owners may create a replacement share privately from a revoked pinned reference; its old public URL stays revoked.
 
-For Round 2 activation, follow the [Slack rollout sequence](DEPLOYMENT.md#slack-review-follow-up-migration) before applying pending production migrations: pause the delivery queue, disable scheduled channel validation, and wait the documented 16-minute drain interval. Apply all required forward migrations, including `0072_slack_link_authorization_started_at.sql` and `0073_slack_membership_revocation.sql`, and keep delivery paused and validation disabled through deployment. After deployment verification, restore the intended flags, configure `SLACK_DIGEST_DEFAULT_TIMEZONE`, run the channel-validation dry run, and call owner-only `POST /api/slack/configuration/sync` before resuming delivery. The cron also synchronizes release configuration; authentication and Slack acknowledgment paths do not. The sync endpoint reports missing/invalid activation defaults. Channel revalidation preserves delivery permission blocks until explicit recovery establishes permission. Production release flags remain off until deployment and the live exit matrix are separately verified.
+For Round 2 activation, follow the [Slack rollout sequence](DEPLOYMENT.md#slack-review-follow-up-migration) before applying pending production migrations: pause the delivery queue, disable scheduled channel validation, and wait the documented 16-minute drain interval. Apply all required forward migrations, including `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, and `0074_slack_enqueue_recovery.sql`, and keep delivery paused and validation disabled through deployment. After deployment verification, restore the intended flags, configure `SLACK_DIGEST_DEFAULT_TIMEZONE`, run the channel-validation dry run, and call owner-only `POST /api/slack/configuration/sync` before resuming delivery. The cron also synchronizes release configuration; authentication and Slack acknowledgment paths do not. The sync endpoint reports missing/invalid activation defaults. Channel revalidation preserves delivery permission blocks until explicit recovery establishes permission. Production release flags remain off until deployment and the live exit matrix are separately verified.
+
+Queue transport failures retry with sanitized error text and exponential backoff from ten seconds to one hour.
+They spend no delivery redrive budget. An ordinary recovery enqueue keeps its intent through transport failures
+and charges the eight-redrive budget once after a successful enqueue; validation coordination stays exempt.
+Recovery deduplicates sibling rows by receipt. A scope-paused sibling defers its unpaused siblings for thirty
+minutes without consuming a recovery attempt. Stale checkpoints receive a fenced two-second recheck;
+newer consumer schedules and scope pauses remain intact. Activity outbox rows retain Round 2 ownership
+while validation is disabled and resume when it is enabled.
+
+Legacy digests filter actor access, templates, and mapping ownership before selection limits, with at most 200
+denied events retired per pass. Bulk summaries validate each unpaused contributing mapping before selection.
+Temporary validation failures preserve pending events and undo sending checkpoints before dispatch. Only
+`channel_not_found`, `not_in_channel`, `is_archived`, `shared_channel`, and `unsupported_channel_type` permanently
+invalidate a channel during validation. Pending digest events lose replay eligibility when their actor loses
+membership, account protection, or applicable integration authority, including events never assigned to a
+message. Uncertain sends retain their evidence. Page departures can still use sanitized messages.
+
+Missing legacy share identities recover only for accepted receipts under the same installation generation and
+Slack user, using a currently authorized verified binding whose verification and continuous authorization predate
+the request. Recovery persists the identity before dispatch. Malformed identities or incomplete evidence remain
+blocked, and all current owner, page, share, channel membership, and final authorization checks still apply.
 
 Reauthorization resumes each scope-paused operation only when its required permissions are present.
 Text notifications can resume without `files:write`; mirroring retains all mirror permissions and unfurls
@@ -374,6 +395,10 @@ ORDER BY updated_at, id;
 ## Documents, task lists, and Slack capture
 
 Use the sidebar's contextual creation menu to create a Document, Table, Task List, or Diagram at the displayed destination. Document width is saved per page; sidebar width, collapse state, recent pages, and task view are saved per user in the browser. Home lists recent pages, and normal startup restores the last accessible page. The unified Inbox contains notifications and mentions. Background work is listed under **Imports & exports**.
+
+Retirement or purge during a pending Notion write or receipt lookup returns `409 conflict_error` with
+“The mutation outcome is unknown. Fetch the page before retrying.” The document room retains its `410` response.
+Synchronous and asynchronous Markdown handlers stop without automatically repeating that mutation.
 
 Task lists use existing table rows and linked documents. **Edit tasks** acquires the table's exclusive lease; **Finish editing** releases it. Table and Board show the same assignee, status, and due date. **My Tasks** lists assignments across accessible spaces. Task descriptions and comments use normal document collaboration. Task property changes from My Tasks or Slack acquire a short lease and return an actionable conflict while any table editor holds the lease. Retry is explicit; metadata changes are never silently queued. Due-date filters currently use UTC. Anonymous public task-list shares show “Assigned” without exposing account names or IDs.
 

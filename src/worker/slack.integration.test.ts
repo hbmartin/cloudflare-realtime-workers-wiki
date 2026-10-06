@@ -374,7 +374,7 @@ describe("legacy channel event settlement", () => {
     expect(remote).not.toHaveBeenCalled();
   });
 
-  it("cleans only 40 legacy digest candidates from a large pending backlog", async () => {
+  it("retires at most 200 denied legacy digest events per pass", async () => {
     const fixture = await legacyChannelFixture("digest");
     await env.DB.prepare("UPDATE account_security SET codes_saved=0 WHERE user_id=?")
       .bind(fixture.member.user.id)
@@ -390,15 +390,15 @@ describe("legacy channel event settlement", () => {
     expect(remote).not.toHaveBeenCalled();
     expect(
       await env.DB.prepare("SELECT count(*) count FROM slack_channel_events WHERE suppressed_at IS NOT NULL").first(),
-    ).toEqual({ count: 40 });
+    ).toEqual({ count: 200 });
     expect(
       await env.DB.prepare(
         "SELECT count(*) count FROM slack_channel_events WHERE suppressed_at IS NULL AND delivered_at IS NULL",
       ).first(),
-    ).toEqual({ count: 9961 });
+    ).toEqual({ count: 9801 });
   });
 
-  it("limits legacy template cleanup to 50 subscriptions per tick", async () => {
+  it("cleans denied templates across subscription selection limits", async () => {
     const fixture = await legacyChannelFixture("digest");
     await env.DB.prepare("UPDATE pages SET is_template=1 WHERE id=?").bind(fixture.page.id).run();
     await env.DB.prepare(`WITH RECURSIVE mappings(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM mappings WHERE n<50)
@@ -417,10 +417,39 @@ describe("legacy channel event settlement", () => {
     expect(remote).not.toHaveBeenCalled();
     expect(
       await env.DB.prepare("SELECT count(*) count FROM slack_channel_events WHERE suppressed_at IS NOT NULL").first(),
-    ).toEqual({ count: 50 });
+    ).toEqual({ count: 51 });
     expect(
       await env.DB.prepare("SELECT count(*) count FROM slack_channel_events WHERE suppressed_at IS NULL").first(),
-    ).toEqual({ count: 1 });
+    ).toEqual({ count: 0 });
+  });
+
+  it("delivers eligible events behind a denied backlog larger than the event and cleanup limits", async () => {
+    const fixture = await legacyChannelFixture("digest");
+    const viewer = await inviteViewer(fixture.cookie);
+    await env.DB.prepare("UPDATE account_security SET codes_saved=0 WHERE user_id=?")
+      .bind(fixture.member.user.id)
+      .run();
+    await env.DB.prepare(`WITH RECURSIVE history(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM history WHERE n<250)
+      INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+      SELECT 'denied:'||n,?,?,'mention',?,?,'digest',1 FROM history`)
+      .bind(fixture.mapping.id, fixture.member.workspace.id, fixture.member.user.id, fixture.page.id)
+      .run();
+    await env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at)
+      VALUES('eligible',?,?,'mention',?,?,'digest',2)`)
+      .bind(fixture.mapping.id, fixture.member.workspace.id, viewer.member.user.id, fixture.page.id)
+      .run();
+    const remote = vi.fn().mockResolvedValue(Response.json({ ok: true, ts: "1700000000.000001" }));
+    vi.stubGlobal("fetch", remote);
+    await sendDueSlackChannelDigests(fixture.bindings, Date.UTC(2026, 9, 4, 10));
+    expect(remote).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare(
+        "SELECT delivered_at IS NOT NULL delivered FROM slack_channel_events WHERE id='eligible'",
+      ).first(),
+    ).toEqual({ delivered: 1 });
+    expect(
+      await env.DB.prepare("SELECT count(*) n FROM slack_channel_events WHERE suppressed_at IS NOT NULL").first(),
+    ).toEqual({ n: 200 });
   });
 
   it("cleans templates from partial legacy digests without including denied content", async () => {
@@ -569,7 +598,10 @@ describe("legacy channel event settlement", () => {
         get(target, key) {
           if (key === "prepare")
             return (sql: string) => {
-              if (sql.trimStart().startsWith("SELECT event.id FROM slack_channel_events event"))
+              if (
+                sql.trimStart().startsWith("SELECT event.id FROM slack_channel_events event") &&
+                /event\.claim_token\s*=\s*\?/.test(sql)
+              )
                 throw new Error("authorization database unavailable");
               return target.prepare(sql);
             };

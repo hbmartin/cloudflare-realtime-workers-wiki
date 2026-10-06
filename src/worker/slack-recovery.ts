@@ -4,6 +4,8 @@ import { deliverShareRefresh } from "./slack-shares";
 import { deliverRound2ChannelEvent } from "./slack-channel-events";
 import { thumbnailDeliveryEnabled, wakeRound2Mapping, type DeliveryOutcome } from "./slack-delivery";
 import type { Env } from "./env";
+import { outboxEnqueueRetryAt, reportPersistentEnqueueFailure } from "./outbox-retry";
+import { safeTelemetryErrorMessage } from "./observability";
 
 import { ROUND2_TOPICS_SQL, round2Receipts } from "./slack-delivery-contracts";
 export { round2Receipts } from "./slack-delivery-contracts";
@@ -81,6 +83,7 @@ export type Round2OutboxSnapshot = {
   slack_claim_recheck_at: number | null;
   slack_redrive_count: number;
   slack_scope_paused_at: number | null;
+  slack_enqueue_redrive_pending: number;
 };
 const recoverySnapshotFields = [
   "id",
@@ -92,6 +95,7 @@ const recoverySnapshotFields = [
   "slack_claim_recheck_at",
   "slack_redrive_count",
   "slack_scope_paused_at",
+  "slack_enqueue_redrive_pending",
 ] as const satisfies readonly (keyof Round2OutboxSnapshot)[];
 const recoverySnapshotSql = `${recoverySnapshotFields.map((field) => `${field} IS ?`).join(" AND ")} AND slack_scope_paused_at IS NULL`;
 function recoverySnapshotBinds(sibling: Round2OutboxSnapshot) {
@@ -112,6 +116,19 @@ function recoverySetGuard(topic: keyof typeof round2Receipts, id: string, snapsh
   };
 }
 
+async function deferRecoverySnapshots(env: Env, snapshots: Round2OutboxSnapshot[], due: number, scopePaused = false) {
+  const unpaused = snapshots.filter((snapshot) => snapshot.slack_scope_paused_at === null);
+  if (!unpaused.length) return;
+  await env.DB.batch(
+    unpaused.map((snapshot) =>
+      env.DB.prepare(`UPDATE outbox SET available_at=max(available_at,?),
+      slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),
+      slack_claim_recheck_at=CASE WHEN ? THEN NULL ELSE max(coalesce(slack_claim_recheck_at,0),?) END
+      WHERE ${recoverySnapshotSql}`).bind(due, due, scopePaused ? 1 : 0, due, ...recoverySnapshotBinds(snapshot)),
+    ),
+  );
+}
+
 export async function enqueueRound2Outbox(
   env: Env,
   outboxId: string,
@@ -125,7 +142,7 @@ export async function enqueueRound2Outbox(
     snapshots?: Round2OutboxSnapshot[];
     ordinaryRedrive?: boolean;
   },
-) {
+): Promise<"enqueued" | "scope_paused" | "stale"> {
   const snapshots =
     options.snapshots ??
     (
@@ -136,21 +153,40 @@ export async function enqueueRound2Outbox(
         .all<Round2OutboxSnapshot>()
     ).results;
   const current = snapshots.find((snapshot) => snapshot.id === outboxId);
-  if (!current || (options.expectedVersion !== undefined && current.attempts !== options.expectedVersion)) return false;
+  if (!current || (options.expectedVersion !== undefined && current.attempts !== options.expectedVersion))
+    return "stale";
   const now = Date.now();
+  if (snapshots.some((snapshot) => snapshot.slack_scope_paused_at !== null)) {
+    await deferRecoverySnapshots(env, snapshots, now + 30 * 60_000, true);
+    return "scope_paused";
+  }
+  const existingIntent = snapshots.some((snapshot) => snapshot.slack_enqueue_redrive_pending);
+  const newIntent =
+    !existingIntent &&
+    Boolean(options.ordinaryRedrive && !snapshots.some((snapshot) => snapshot.last_error === "slack_validation_stale"));
+  const redrivePending = existingIntent || newIntent;
   const guard = recoverySetGuard(topic, receiptId, snapshots);
   const checkpoint = await env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=?,
-    slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=NULL
+    slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=NULL,slack_enqueue_redrive_pending=?
     WHERE id IN (SELECT id FROM outbox WHERE topic=? AND slack_round2_receipt_id=? AND ${guard.sql})`)
-    .bind(now, options.dueAt, topic, receiptId, ...guard.binds)
+    .bind(now, options.dueAt, redrivePending ? 1 : 0, topic, receiptId, ...guard.binds)
     .run();
-  if (checkpoint.meta.changes !== snapshots.length) return false;
+  if (checkpoint.meta.changes !== snapshots.length) {
+    const paused = await env.DB.prepare(
+      "SELECT 1 FROM outbox WHERE topic=? AND slack_round2_receipt_id=? AND slack_scope_paused_at IS NOT NULL LIMIT 1",
+    )
+      .bind(topic, receiptId)
+      .first();
+    await deferRecoverySnapshots(env, snapshots, now + (paused ? 30 * 60_000 : 2_000), Boolean(paused));
+    return paused ? "scope_paused" : "stale";
+  }
   const staged = snapshots.map((snapshot) => ({
     ...snapshot,
     attempts: snapshot.attempts + 1,
     enqueued_at: now,
     slack_redrive_due_at: Math.max(snapshot.slack_redrive_due_at ?? 0, options.dueAt),
     slack_claim_recheck_at: null,
+    slack_enqueue_redrive_pending: redrivePending ? 1 : 0,
   }));
   try {
     await env.DELIVERY_QUEUE.send(
@@ -160,25 +196,36 @@ export async function enqueueRound2Outbox(
   } catch (error) {
     // Only our untouched checkpoint can be rescheduled. A consumer, scope pause,
     // or newer retry owns its own scheduling and must survive enqueue failure.
-    const retryAt = Date.now() + 60_000;
-    await env.DB.batch(
-      staged.map((snapshot) =>
-        env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,
-      available_at=max(available_at,?),slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=?,
-      last_error=CASE WHEN last_error='slack_validation_stale' THEN last_error ELSE 'round2_enqueue_failed' END
-      WHERE ${recoverySnapshotSql}`).bind(retryAt, retryAt, retryAt, ...recoverySnapshotBinds(snapshot)),
-      ),
+    const message = safeTelemetryErrorMessage(error, "Queue enqueue failed.");
+    const failed = await env.DB.batch(
+      staged.map((snapshot) => {
+        const retryAt = outboxEnqueueRetryAt(snapshot.attempts);
+        return env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,
+          available_at=max(available_at,?),slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=?,
+          last_error=CASE WHEN last_error='slack_validation_stale' THEN last_error ELSE ? END
+          WHERE ${recoverySnapshotSql}`).bind(retryAt, retryAt, retryAt, message, ...recoverySnapshotBinds(snapshot));
+      }),
     );
+    failed.forEach((result, index) => {
+      const snapshot = staged[index]!;
+      if (result.meta.changes) reportPersistentEnqueueFailure(env, snapshot.id, snapshot.attempts, message);
+    });
     throw error;
   }
-  if (options.ordinaryRedrive && !snapshots.some((snapshot) => snapshot.last_error === "slack_validation_stale")) {
-    const count = Math.max(...snapshots.map((snapshot) => snapshot.slack_redrive_count)) + 1;
+  if (redrivePending) {
+    // A sibling can pause after enqueue while the others record this intent.
+    // Bring it up to their budget instead of charging the receipt a second time.
+    const count = Math.max(
+      ...snapshots.map(
+        (snapshot) => snapshot.slack_redrive_count + (snapshot.slack_enqueue_redrive_pending || newIntent ? 1 : 0),
+      ),
+    );
     // Fast consumers can change errors and deadlines before send() returns. Only
-    // the enqueue version and captured budget matter to this accounting update.
+    // the enqueue version, pending intent and captured budget matter to this accounting update.
     await env.DB.batch(
       staged.map((snapshot) =>
-        env.DB.prepare(`UPDATE outbox SET slack_redrive_count=?
-      WHERE id=? AND attempts=? AND slack_redrive_count=? AND slack_scope_paused_at IS NULL`).bind(
+        env.DB.prepare(`UPDATE outbox SET slack_redrive_count=?,slack_enqueue_redrive_pending=0
+      WHERE id=? AND attempts=? AND slack_redrive_count=? AND slack_enqueue_redrive_pending=1 AND slack_scope_paused_at IS NULL`).bind(
           count,
           snapshot.id,
           snapshot.attempts,
@@ -187,7 +234,7 @@ export async function enqueueRound2Outbox(
       ),
     );
   }
-  return true;
+  return "enqueued";
 }
 
 export async function redriveRound2Outbox(env: Env) {
@@ -250,25 +297,32 @@ export async function redriveRound2Outbox(env: Env) {
       ![current.slack_redrive_due_at, current.slack_claim_recheck_at].some((due) => due !== null && due <= now)
     )
       continue;
+    seen.add(key);
+    if (siblings.results.some((sibling) => sibling.slack_scope_paused_at !== null)) {
+      await deferRecoverySnapshots(env, siblings.results, now + 30 * 60_000, true);
+      continue;
+    }
+    const enqueueRetry = siblings.results.some(
+      (sibling) => sibling.enqueued_at === null || sibling.slack_enqueue_redrive_pending,
+    );
     const coordinationRecheck = siblings.results.some((sibling) => sibling.last_error === "slack_validation_stale");
     const budget = Math.max(0, ...siblings.results.map((sibling) => sibling.slack_redrive_count));
     // A queue consumer can create a newer validation retry during status reads or send().
     const fence = recoverySnapshotSql;
     const status = await round2DeliveryStatus(env, row.topic, id);
     if (status.outcome === "completed") {
-      const handled = await env.DB.batch(
+      await env.DB.batch(
         siblings.results.map((sibling) =>
           env.DB.prepare(
-            `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error=CASE WHEN last_error='slack_validation_stale' THEN NULL ELSE last_error END WHERE ${fence}`,
+            `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,slack_enqueue_redrive_pending=0,last_error=CASE WHEN last_error='slack_validation_stale' THEN NULL ELSE last_error END WHERE ${fence}`,
           ).bind(...recoverySnapshotBinds(sibling)),
         ),
       );
-      if (handled.some((result) => result.meta.changes)) seen.add(key);
       continue;
     }
     if (status.outcome === "competing") {
       const due = Math.max(now + 1_000, (status.claimed_at ?? now) + 60_000);
-      const handled = await env.DB.batch(
+      await env.DB.batch(
         siblings.results.map((sibling) =>
           env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=?,
         slack_redrive_due_at=CASE WHEN slack_redrive_due_at<=? THEN ? ELSE slack_redrive_due_at END WHERE ${fence}`).bind(
@@ -279,7 +333,6 @@ export async function redriveRound2Outbox(env: Env) {
           ),
         ),
       );
-      if (handled.some((result) => result.meta.changes)) seen.add(key);
       continue;
     }
     if (
@@ -288,7 +341,7 @@ export async function redriveRound2Outbox(env: Env) {
         (status.state !== "sending" || status.attempted_at === null || status.paused || status.blocked_child))
     ) {
       const due = now + 30 * 60_000;
-      const handled = await env.DB.batch(
+      await env.DB.batch(
         siblings.results.map((sibling) =>
           env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),
         slack_claim_recheck_at=CASE WHEN last_error='slack_validation_stale'
@@ -299,28 +352,24 @@ export async function redriveRound2Outbox(env: Env) {
           ),
         ),
       );
-      if (handled.some((result) => result.meta.changes)) seen.add(key);
       continue;
     }
     // Exhaustion also writes receipt, failure and sibling records. Bound that
     // work with enqueue attempts so a spent backlog cannot monopolize a pass.
     if (recoveries >= 50) continue;
     recoveries++;
-    if (status.outcome === "retryable" && !coordinationRecheck && budget >= 8) {
-      if (await exhaustRound2Receipt(env, row.topic, id, siblings.results)) seen.add(key);
+    if (status.outcome === "retryable" && !coordinationRecheck && !enqueueRetry && budget >= 8) {
+      await exhaustRound2Receipt(env, row.topic, id, siblings.results);
       continue;
     }
     const due = now + Math.min(6 * 60 * 60_000, 15 * 60_000 * 2 ** Math.min(budget, 5));
     try {
-      if (
-        await enqueueRound2Outbox(env, row.id, row.topic, id, {
-          dueAt: due,
-          snapshots: siblings.results,
-          correlationId: row.correlation_id ?? undefined,
-          ordinaryRedrive: status.outcome === "retryable" && !coordinationRecheck,
-        })
-      )
-        seen.add(key);
+      await enqueueRound2Outbox(env, row.id, row.topic, id, {
+        dueAt: due,
+        snapshots: siblings.results,
+        correlationId: row.correlation_id ?? undefined,
+        ordinaryRedrive: status.outcome === "retryable" && !coordinationRecheck && !enqueueRetry,
+      });
     } catch {
       // The checkpoint retains a durable retry deadline when enqueue fails.
     }

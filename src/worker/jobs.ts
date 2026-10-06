@@ -1,3 +1,4 @@
+import { outboxEnqueueRetryAt, reportPersistentEnqueueFailure } from "./outbox-retry";
 import { deliverBulkSummary } from "./slack-bulk";
 import { deliverRound2ChannelEvent } from "./slack-channel-events";
 import { enqueueRound2Outbox, redriveRound2Outbox, round2DeliveryStatus, round2Receipts } from "./slack-recovery";
@@ -56,7 +57,6 @@ import {
   correlationHeaders,
   currentObservabilityContext,
   logger,
-  recordMetric,
   safeTelemetryErrorMessage,
   traced,
   withObservabilityContext,
@@ -67,10 +67,6 @@ const OUTBOX_SWEEP_BATCH_SIZE = 50;
 const OUTBOX_SWEEP_MAX_BATCHES = 5;
 const OUTBOX_SWEEP_LEASE_MS = 5 * 60_000;
 const OUTBOX_SWEEP_CLAIM_ATTEMPTS = 2;
-const OUTBOX_POISON_WARNING_ATTEMPTS = 10;
-const OUTBOX_POISON_WARNING_INTERVAL = 24;
-const OUTBOX_RETRY_BASE_MS = 10_000;
-const OUTBOX_RETRY_MAX_MS = 60 * 60_000;
 const SLACK_REDRIVE_BASE_MS = 15 * 60_000;
 const SLACK_REDRIVE_MAX_MS = 6 * 60 * 60_000;
 const SLACK_BLOCKED_RECHECK_MS = 5 * 60_000;
@@ -1531,22 +1527,11 @@ async function enqueueOutbox(env: Env, row: SweepOutboxRow) {
   const outboxId = row.id;
   const correlationId = row.correlation_id ?? currentObservabilityContext()?.correlationId ?? undefined;
   if (row.round2 && row.receipt_id) {
-    const accepted = await enqueueRound2Outbox(
-      env,
-      outboxId,
-      row.topic as keyof typeof round2Receipts,
-      row.receipt_id,
-      {
-        dueAt: Date.now() + SLACK_REDRIVE_STALE_MS,
-        correlationId,
-        expectedVersion: row.attempts,
-      },
-    );
-    if (!accepted)
-      await env.DB.prepare(`UPDATE outbox SET available_at=max(available_at,?)
-        WHERE id=? AND attempts=? AND enqueued_at IS NULL AND slack_scope_paused_at IS NULL`)
-        .bind(Date.now() + SLACK_REDRIVE_STALE_MS, outboxId, row.attempts)
-        .run();
+    await enqueueRound2Outbox(env, outboxId, row.topic as keyof typeof round2Receipts, row.receipt_id, {
+      dueAt: Date.now() + SLACK_REDRIVE_STALE_MS,
+      correlationId,
+      expectedVersion: row.attempts,
+    });
     return;
   }
   try {
@@ -1562,36 +1547,12 @@ async function enqueueOutbox(env: Env, row: SweepOutboxRow) {
   } catch (error) {
     const failed = await env.DB.prepare(
       `UPDATE outbox SET attempts = attempts + 1, last_error = ?,
-         available_at = ? + MIN(?, ? * (1 << MIN(attempts, 8)))
+         available_at = ?
         WHERE id = ? RETURNING attempts, last_error`,
     )
-      .bind(
-        safeTelemetryErrorMessage(error, "Queue enqueue failed."),
-        Date.now(),
-        OUTBOX_RETRY_MAX_MS,
-        OUTBOX_RETRY_BASE_MS,
-        outboxId,
-      )
+      .bind(safeTelemetryErrorMessage(error, "Queue enqueue failed."), outboxEnqueueRetryAt(row.attempts + 1), outboxId)
       .first<{ attempts: number; last_error: string | null }>();
-    if (
-      failed &&
-      (failed.attempts === OUTBOX_POISON_WARNING_ATTEMPTS || failed.attempts % OUTBOX_POISON_WARNING_INTERVAL === 0)
-    ) {
-      logger.error(
-        "outbox.enqueue.persistent_failure",
-        "outbox",
-        "Outbox row has persistent enqueue failures.",
-        { outboxId, attempts: failed.attempts },
-        failed.last_error,
-      );
-      recordMetric(env, {
-        event: "outbox.delivery",
-        component: "outbox",
-        operation: "enqueue",
-        outcome: "failure",
-        attempts: failed.attempts,
-      });
-    }
+    if (failed) reportPersistentEnqueueFailure(env, outboxId, failed.attempts, failed.last_error);
     throw error;
   }
 }
@@ -1701,9 +1662,15 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
         `SELECT id,correlation_id,topic,slack_round2_receipt_id receipt_id,attempts,${ROUND2_OUTBOX_SQL} round2
           FROM outbox WHERE enqueued_at IS NULL AND slack_scope_paused_at IS NULL AND available_at <= ?
           AND (topic<>'slack_file_upload' OR ?=1)
+          AND (?=1 OR NOT (topic='slack_channel' AND coalesce(slack_round2_receipt_id LIKE 'activity:%',0)))
           ORDER BY available_at, created_at, id LIMIT ?`,
       )
-        .bind(Date.now(), thumbnailDeliveryEnabled(env) ? 1 : 0, OUTBOX_SWEEP_BATCH_SIZE)
+        .bind(
+          Date.now(),
+          thumbnailDeliveryEnabled(env) ? 1 : 0,
+          env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0,
+          OUTBOX_SWEEP_BATCH_SIZE,
+        )
         .all<SweepOutboxRow>();
       for (const row of rows.results) {
         if (!(await renewLease("before-row"))) return "lease-lost";
@@ -1725,9 +1692,10 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
       }
     }
     const remaining = await env.DB.prepare(
-      `SELECT 1 pending FROM outbox WHERE enqueued_at IS NULL AND slack_scope_paused_at IS NULL AND available_at <= ? AND (topic<>'slack_file_upload' OR ?=1) LIMIT 1`,
+      `SELECT 1 pending FROM outbox WHERE enqueued_at IS NULL AND slack_scope_paused_at IS NULL AND available_at <= ? AND (topic<>'slack_file_upload' OR ?=1)
+          AND (?=1 OR NOT (topic='slack_channel' AND coalesce(slack_round2_receipt_id LIKE 'activity:%',0))) LIMIT 1`,
     )
-      .bind(Date.now(), thumbnailDeliveryEnabled(env) ? 1 : 0)
+      .bind(Date.now(), thumbnailDeliveryEnabled(env) ? 1 : 0, env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0)
       .first<{ pending: number }>();
     if (!remaining && (await releaseIfIdle())) return "completed";
     logger.warn("outbox.sweep.capped", "outbox", "Outbox sweep cap reached; scheduling continuation.", {
@@ -1773,7 +1741,7 @@ export async function redriveStaleSlackOutbox(env: Env) {
     LEFT JOIN slack_thread_deliveries delivery ON outbox.topic='slack_thread_reply'
       AND delivery.id=json_extract(CASE WHEN json_valid(outbox.payload_json) THEN outbox.payload_json ELSE '{}' END,'$.deliveryId')
     WHERE outbox.topic NOT IN ('slack_bulk','slack_digest','slack_share_refresh','slack_file_upload')
-      AND NOT (outbox.topic='slack_channel' AND (SELECT validation_enabled FROM round2_runtime WHERE id=1)=1)
+      AND NOT (outbox.topic='slack_channel' AND ((SELECT validation_enabled FROM round2_runtime WHERE id=1)=1 OR coalesce(outbox.slack_round2_receipt_id LIKE 'activity:%',0)))
       AND outbox.slack_redrive_due_at IS NOT NULL AND outbox.slack_redrive_due_at <= ?
       AND outbox.slack_scope_paused_at IS NULL
       AND (delivery.id IS NULL OR delivery.state<>'pending' OR EXISTS
@@ -2194,7 +2162,7 @@ export async function consumeDeliveryMessage(
       const now = Date.now();
       const retry =
         await env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=NULL,available_at=?,slack_claim_recheck_at=?,
-        slack_redrive_due_at=NULL,last_error='slack_validation_stale' WHERE ${retryFence}`)
+        slack_redrive_due_at=NULL,slack_enqueue_redrive_pending=0,last_error='slack_validation_stale' WHERE ${retryFence}`)
           .bind(now + 2000, now + 2000, ...retryBinds)
           .run();
       if (retry.meta.changes) {
@@ -2386,7 +2354,7 @@ export async function consumeDeliveryMessage(
       return await deferSlackView();
     await sweepOutbox(env);
   } else if (row.topic === "slack_share_response") {
-    await deliverSlackShareResponse(env, payload);
+    await deliverSlackShareResponse(env, payload, outboxId);
   } else if (
     row.topic === "slack_bulk" ||
     row.topic === "slack_digest" ||

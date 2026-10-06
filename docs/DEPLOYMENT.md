@@ -189,7 +189,7 @@ hand. Before upgrading an existing installation, take a D1 export and stop any r
 then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
 new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
 
-Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, or `0073` require
+Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, or `0074` require
 `SLACK_REVIEW_MIGRATION_SAFE=true` after the [Slack rollout pause](#slack-review-follow-up-migration).
 This guard applies to both `pnpm db:remote` and `pnpm run deploy`; local database migrations do not
 require confirmation. The confirmation acknowledges an operator-completed pause and drain, rather
@@ -398,7 +398,7 @@ before making changes. Quiesce page moves or verify that the live Worker already
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
 until that manually dispatched run has deployed the new Worker.
 
-Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, or `0073_slack_membership_revocation.sql` also stop automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, or `0074_slack_enqueue_recovery.sql` also stop automatic deployment.
 Follow the [Slack rollout pause](#slack-review-follow-up-migration), then manually dispatch with
 `confirm_slack_review_migration_safe` checked. The workflow passes this confirmation to the guarded
 remote migration command. Once these migrations are applied, later automatic releases need no Slack
@@ -422,6 +422,12 @@ Apply additive `0069_slack_file_cleanup.sql` before deploying the Slack review f
 allocation ownership and adds an indexed cleanup ledger plus transactional capture triggers. Additive
 `0070_slack_review_fences.sql` adds a monotonically increasing channel-validation revision.
 `0071_slack_authorization_cleanup.sql` separates primary login from private Slack access, binds access and primary proofs to protection generations, records file-scope blocks and preserves explicit allocation ownership. It keeps existing links only for accounts with an enrolled factor, saved recovery codes and no recovery in progress; their original linking authorization cannot be established. Existing transient primary proofs are cleared, and proof reads reject older writes without authenticated-source metadata. `0072_slack_link_authorization_started_at.sql` separates the continuous access-grant start from verification and relink timestamps, preserving eligible earlier previews through unchanged relinking or legacy verification. It backfills only known timestamps; lost historical grant times are not reconstructed. `0073_slack_membership_revocation.sql` removes links without workspace membership and revokes workspace Slack links whenever a member is removed. Rejoining requires explicit relinking with a new access-grant start. Installation disconnect/reconnect still requires explicit relinking. OAuth login is preserved. Do not roll back to code that allows linking without fresh verification.
+
+`0074_slack_enqueue_recovery.sql` adds persistent enqueue intent, repairs pending Activity rows damaged by
+legacy recovery, and backfills missing share-response identities only from verified bindings authorized continuously
+since before the accepted request. It requeues responses blocked solely by `request_identity_unavailable`.
+Scope-paused, completed, sending, uncertain, and actively claimed work is preserved. Apply this migration before
+the updated Worker, using the same queue pause and validation drain below.
 
 Existing failed/retired allocations are backfilled; allocations whose original Slack identity cannot be verified
 are reported for manual cleanup rather than deleted. Existing migrations remain unchanged.

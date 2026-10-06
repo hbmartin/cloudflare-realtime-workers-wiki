@@ -7,6 +7,151 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("repairs only pending Activity and proven legacy share responses in migration 0074", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0074"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@example.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Notes',1)"),
+      env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace','owner','owner',1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO twoFactor(id,userId,secret,backupCodes,verified) VALUES('factor','owner','secret','[]',1)",
+      ),
+      env.DB.prepare("UPDATE account_security SET codes_saved=1 WHERE user_id='owner'"),
+      env.DB.prepare(
+        "INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at,generation) VALUES('installation','workspace','T123','Slack','B123','unused','chat:write','owner',1,1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO account(id,userId,providerId,accountId,createdAt,updatedAt) VALUES('oauth','owner','slack','T123:UOWNER',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,authorization_started_at,security_generation,better_auth_account_id,verification_method,migration_state,verified_at,installation_generation) VALUES('installation','owner','UOWNER',1,1,0,'oauth','slack_openid','verified',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at) VALUES('page','workspace','workspace-general','document','a0','Page','owner',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_channel_subscriptions(id,installation_id,space_id,channel_id,channel_name,event_types_json,cadence,created_by,created_at,updated_at) VALUES('mapping','installation','workspace-general','C123','notes','[]','immediate','owner',1,1)",
+      ),
+    ]);
+    const activityModes = ["pending", "sending", "blocked", "retired", "scope", "claimed", "newer"];
+    for (const mode of activityModes) {
+      const id = `activity:${mode}`;
+      await env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at,round2_state,claimed_at)
+        VALUES(?,'mapping','workspace','page_created','owner','page','immediate',1,?,?)`)
+        .bind(
+          id,
+          ["sending", "blocked", "retired"].includes(mode) ? mode : "pending",
+          mode === "claimed" ? Date.now() : null,
+        )
+        .run();
+      await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,last_error,slack_scope_paused_at)
+        VALUES(?,'workspace','slack_channel',?,1,1,1,?,?)`)
+        .bind(
+          id,
+          JSON.stringify({ eventId: id }),
+          mode === "newer" ? "newer_schedule" : "Invalid Slack redrive payload",
+          mode === "scope" ? 1 : null,
+        )
+        .run();
+    }
+    const modes = [
+      "pending",
+      "blocked_identity",
+      "scope",
+      "sending",
+      "sent",
+      "uncertain",
+      "future",
+      "generation",
+      "user",
+      "malformed",
+      "denied",
+    ];
+    for (const mode of modes) {
+      const state =
+        mode === "pending" || ["scope", "future", "generation", "user", "malformed", "denied"].includes(mode)
+          ? "pending"
+          : mode === "blocked_identity" || mode === "uncertain"
+            ? "blocked"
+            : mode;
+      await env.DB.prepare(`INSERT INTO slack_interaction_receipts(id,installation_id,interaction_id,callback_id,received_at,processed_at,outcome,response_delivery_state,response_delivery_error)
+        VALUES(?,'installation',?,'share',?,1,?,?,?)`)
+        .bind(
+          mode,
+          mode,
+          mode === "future" ? 0 : 10,
+          mode === "denied" ? "denied" : "accepted",
+          state,
+          mode === "blocked_identity"
+            ? "request_identity_unavailable"
+            : mode === "uncertain"
+              ? "send_unconfirmed"
+              : null,
+        )
+        .run();
+      const payload = {
+        receiptId: mode,
+        installationId: "installation",
+        generation: mode === "generation" ? 2 : 1,
+        userId: mode === "user" ? "OTHER" : "UOWNER",
+        ...(mode === "malformed" ? { identity: null } : {}),
+      };
+      await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_scope_paused_at)
+        VALUES(?,'workspace','slack_share_response',?,1,1,1,?)`)
+        .bind(`share:${mode}`, JSON.stringify(payload), mode === "scope" ? 1 : null)
+        .run();
+    }
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    for (const mode of activityModes) {
+      const row = await env.DB.prepare(
+        "SELECT enqueued_at,last_error,slack_enqueue_redrive_pending,attempts FROM outbox WHERE id=?",
+      )
+        .bind(`activity:${mode}`)
+        .first();
+      expect(row).toMatchObject({
+        enqueued_at: mode === "pending" ? null : 1,
+        last_error: mode === "pending" ? null : mode === "newer" ? "newer_schedule" : "Invalid Slack redrive payload",
+        slack_enqueue_redrive_pending: 0,
+        attempts: mode === "pending" ? 1 : 0,
+      });
+    }
+    for (const mode of modes) {
+      const repaired = ["pending", "blocked_identity"].includes(mode);
+      const row = await env.DB.prepare(
+        "SELECT enqueued_at,attempts,json_extract(payload_json,'$.identity') identity FROM outbox WHERE id=?",
+      )
+        .bind(`share:${mode}`)
+        .first<{ identity: string | null }>();
+      expect(row).toMatchObject({ enqueued_at: repaired ? null : 1, attempts: repaired ? 1 : 0 });
+      expect(row!.identity === null).toBe(!repaired);
+      expect(row!.identity ? JSON.parse(row!.identity) : null).toEqual(
+        repaired
+          ? {
+              userId: "owner",
+              accountId: "oauth",
+              verifiedAt: 1,
+              slackUserId: "UOWNER",
+            }
+          : null,
+      );
+    }
+    expect(
+      await env.DB.prepare(
+        "SELECT response_delivery_state,response_delivery_error FROM slack_interaction_receipts WHERE id='blocked_identity'",
+      ).first(),
+    ).toEqual({ response_delivery_state: "pending", response_delivery_error: null });
+    expect(
+      await env.DB.prepare("SELECT name FROM sqlite_master WHERE name='slack_share_recovery_0074'").first(),
+    ).toBeNull();
+  });
+
   it.each(["legacy", "verified"])(
     "revokes %s workspace links on removal without restoring them on rejoin",
     async (kind) => {

@@ -3,6 +3,7 @@ import {
   definiteSlackRejection,
   invalidSlackDestination,
   recordDeliveryError,
+  permanentSlackValidationError,
   recordPermanentDeliveryFailure,
 } from "./slack-delivery";
 import { DeliveryInProgressError } from "./notifications";
@@ -41,7 +42,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
   try {
     const load = () =>
       env.DB.prepare(`SELECT e.*,m.installation_id,m.channel_id,m.space_id mapping_space,m.page_id mapping_page,m.muted_at,m.snoozed_until,
-      m.notification_blocked_at,m.created_by,m.validation_state,
+      m.notification_blocked_at,m.created_by,m.validation_state,m.validation_error,
       EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type) event_enabled,
       EXISTS(SELECT 1 FROM slack_thread_links mirror WHERE mirror.installation_id=i.id AND mirror.channel_id=m.channel_id
         AND mirror.thread_id=e.thread_id AND mirror.state IN ('pending','active')) mirrored,i.disconnected_at,i.auth_error,i.generation current_generation,e.installation_generation generation,e.delivery_channel_id,p.title,p.space_id current_space,p.archived_at,p.import_job_id,p.is_template,actor.name actor_name,
@@ -80,6 +81,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
           mapped: number;
           owner_valid: number;
           validation_state: string;
+          validation_error: string | null;
           event_enabled: number;
           mirrored: number;
           archived_at: number | null;
@@ -118,6 +120,10 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       await finish(null, "retired");
       return;
     }
+    if (row.validation_state !== "valid" && permanentSlackValidationError(row.validation_error)) {
+      await finish(null, "retired");
+      return;
+    }
     if (row.notification_blocked_at || row.muted_at || (row.snoozed_until && row.snoozed_until > Date.now())) return;
     const mirrored =
       row.thread_id &&
@@ -136,12 +142,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       )
         .bind(row.subscription_id, row.channel_id)
         .first<{ validation_error: string | null }>();
-      if (
-        ["channel_not_found", "not_in_channel", "is_archived", "shared_channel", "unsupported_channel_type"].includes(
-          failure?.validation_error ?? "",
-        )
-      )
-        await finish(null, "retired");
+      if (permanentSlackValidationError(failure?.validation_error)) await finish(null, "retired");
       return;
     }
     row = await load();
@@ -153,6 +154,10 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       row.import_job_id ||
       row.is_template
     ) {
+      await finish(null, "retired");
+      return;
+    }
+    if (row.validation_state !== "valid" && permanentSlackValidationError(row.validation_error)) {
       await finish(null, "retired");
       return;
     }
@@ -180,7 +185,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
               !row.owner_valid ||
               !row.event_enabled ||
               row.mirrored ||
-              row.validation_state !== "valid" ||
+              (row.validation_state !== "valid" && permanentSlackValidationError(row.validation_error)) ||
               row.import_job_id ||
               row.is_template
             ) {
@@ -188,6 +193,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
               throw new SlackDispatchSkippedError();
             }
             if (
+              row.validation_state !== "valid" ||
               row.auth_error ||
               row.notification_blocked_at ||
               row.muted_at ||
@@ -221,7 +227,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
               !current.owner_valid ||
               !current.event_enabled ||
               current.mirrored ||
-              current.validation_state !== "valid" ||
+              (current.validation_state !== "valid" && permanentSlackValidationError(current.validation_error)) ||
               current.import_job_id ||
               current.is_template ||
               (!current.actor_access && current.archived_at === null && current.current_space === current.mapping_space)
@@ -230,6 +236,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
               throw new SlackDispatchSkippedError();
             }
             if (
+              current.validation_state !== "valid" ||
               current.auth_error ||
               current.notification_blocked_at ||
               current.muted_at ||

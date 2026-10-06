@@ -31,6 +31,12 @@ export function definiteSlackRejection(error: unknown): error is SlackApiError {
   );
 }
 
+export function permanentSlackValidationError(error: string | null | undefined) {
+  return ["channel_not_found", "not_in_channel", "is_archived", "shared_channel", "unsupported_channel_type"].includes(
+    error ?? "",
+  );
+}
+
 export function retryableSlackError(error: unknown) {
   return error instanceof SlackRateLimitError || (error instanceof SlackApiError && !definiteSlackRejection(error));
 }

@@ -626,6 +626,7 @@ async function mutateDocument(
   } catch {
     throw unknownOutcome();
   }
+  if (response.status === 410) throw new UnknownMutationOutcome();
   if (response.status === 404) throw new NotionError(404, "object_not_found", "Block not found.");
   if (response.status === 409) {
     const result = await response.json<{ error?: string }>().catch((): { error?: string } => ({}));
@@ -651,6 +652,7 @@ async function mutationReceipt(env: Env, page: IntegrationPage, operationId: str
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request(url, { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() } }),
   );
+  if (response.status === 410) throw new UnknownMutationOutcome();
   if (response.status === 404) return null;
   if (!response.ok) throw new NotionError(503, "service_unavailable", "The document receipt is unavailable.");
   return response.json<{ found: true; document: DocumentContentEnvelope["document"]; sequence: number }>();
@@ -990,7 +992,13 @@ async function runNotionMarkdownTask(env: Env, id: string) {
         await completeMarkdownTask(env, task, pageMarkdownJson(current));
         return;
       } catch (error) {
-        if (!(error instanceof NotionError) || error.status !== 409 || attempt === 1) throw error;
+        if (
+          error instanceof UnknownMutationOutcome ||
+          !(error instanceof NotionError) ||
+          error.status !== 409 ||
+          attempt === 1
+        )
+          throw error;
         current = await pageMarkdownProjection(env, principal, page, env.BETTER_AUTH_URL);
       }
     }
@@ -1374,7 +1382,7 @@ notionApi.post("/pages", async (c) => {
         .first<{ import_job_id: string | null }>();
       if (state?.import_job_id !== null) {
         await cleanupStagedPage(c.env, pageId, staged.content_epoch, stageId);
-        if (error instanceof NotionError && error.status === 409)
+        if (!(error instanceof UnknownMutationOutcome) && error instanceof NotionError && error.status === 409)
           throw new NotionError(503, "service_unavailable", "The staged page could not be initialized.");
         throw error;
       }
