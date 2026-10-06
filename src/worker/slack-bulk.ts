@@ -1,3 +1,4 @@
+import { logger } from "./observability";
 import { mappingDeliveryPauseSql } from "./slack-delivery-contracts";
 import type { Env } from "./env";
 import { sha256Hex } from "../shared/import-integrity";
@@ -24,7 +25,66 @@ type Summary = {
   event_ids_json: string;
   attempted_at: number | null;
 };
-export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = false, cleanupOnly = false) {
+// Maintenance may retire denied events, but never claims or reconciles a post.
+export async function cleanupPendingBulkEvents(env: Env) {
+  const stale = Date.now() - 60_000;
+  const cursor = await env.DB.prepare(
+    "SELECT bulk_cleanup_created_at,bulk_cleanup_event_id FROM round2_runtime WHERE id=1",
+  ).first<{ bulk_cleanup_created_at: number; bulk_cleanup_event_id: string }>();
+  const examined =
+    await env.DB.prepare(`SELECT e.id,r.id receipt_id,e.created_at,r.claim_token,r.claimed_at,r.installation_generation,r.channel_id,r.event_type,
+      r.state='pending' AND (r.claimed_at IS NULL OR r.claimed_at<=?) AND NOT coalesce((${slackBulkCandidateSql}),0) cleanable
+    FROM slack_channel_events e INDEXED BY slack_bulk_pending_cleanup LEFT JOIN slack_bulk_receipts r ON r.id=e.summary_id
+    LEFT JOIN slack_channel_subscriptions m ON m.id=e.subscription_id LEFT JOIN pages page ON page.id=e.page_id
+    LEFT JOIN slack_installations installation ON installation.id=m.installation_id
+    WHERE e.summary_id IS NOT NULL AND e.round2_state='pending' AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
+      AND (e.created_at,e.id)>(?,?) ORDER BY e.created_at,e.id LIMIT 200`)
+      .bind(stale, cursor?.bulk_cleanup_created_at ?? 0, cursor?.bulk_cleanup_event_id ?? "")
+      .all<{
+        id: string;
+        receipt_id: string | null;
+        created_at: number;
+        claim_token: string | null;
+        claimed_at: number | null;
+        installation_generation: number | null;
+        channel_id: string | null;
+        event_type: string | null;
+        cleanable: number | null;
+      }>();
+  const captured = JSON.stringify(examined.results.filter((row) => row.cleanable === 1));
+  const result = await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=?
+    WHERE id IN (SELECT json_extract(value,'$.id') FROM json_each(?))
+      AND round2_state='pending' AND delivered_at IS NULL AND suppressed_at IS NULL
+      AND EXISTS(SELECT 1 FROM json_each(?) captured JOIN slack_bulk_receipts r ON r.id=json_extract(captured.value,'$.receipt_id')
+        WHERE json_extract(captured.value,'$.id')=slack_channel_events.id AND slack_channel_events.summary_id=r.id AND r.state='pending'
+          AND r.claim_token IS json_extract(captured.value,'$.claim_token') AND r.claimed_at IS json_extract(captured.value,'$.claimed_at')
+          AND (r.claimed_at IS NULL OR r.claimed_at<=?)
+          AND r.installation_generation=json_extract(captured.value,'$.installation_generation')
+          AND r.channel_id=json_extract(captured.value,'$.channel_id') AND r.event_type=json_extract(captured.value,'$.event_type'))
+      AND NOT EXISTS(SELECT 1 FROM slack_channel_events e JOIN slack_bulk_receipts r ON r.id=e.summary_id
+        JOIN slack_channel_subscriptions m ON m.id=e.subscription_id JOIN pages page ON page.id=e.page_id
+        JOIN slack_installations installation ON installation.id=m.installation_id
+        WHERE e.id=slack_channel_events.id AND ${slackBulkCandidateSql})`)
+    .bind(Date.now(), captured, captured, stale)
+    .run();
+  const last = examined.results.at(-1);
+  await env.DB.prepare(`UPDATE round2_runtime SET bulk_cleanup_created_at=?,bulk_cleanup_event_id=?
+    WHERE id=1 AND bulk_cleanup_created_at=? AND bulk_cleanup_event_id=?`)
+    .bind(
+      last?.created_at ?? 0,
+      last?.id ?? "",
+      cursor?.bulk_cleanup_created_at ?? 0,
+      cursor?.bulk_cleanup_event_id ?? "",
+    )
+    .run();
+  logger.info("slack.bulk.cleanup", "slack", "Examined pending bulk events.", {
+    examined: examined.results.length,
+    retired: result.meta.changes,
+    cursor: last?.id ?? "",
+  });
+}
+
+export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = false) {
   let row = await env.DB.prepare("SELECT * FROM slack_bulk_receipts WHERE id=?").bind(id).first<Summary>();
   if (!row || ["sent", "retired"].includes(row.state) || (row.state === "blocked" && !reconcileOnly)) return;
   if (reconcileOnly && !["sending", "blocked"].includes(row.state)) return;
@@ -115,7 +175,6 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
     };
     const paused = async () => (await loadEvents("pending", true)).results.length > 0;
     await retireDenied("pending");
-    if (cleanupOnly) return;
     const candidates = await loadCandidates("pending");
     for (const mappingId of new Set(
       candidates.results.filter((event) => !event.paused).map((event) => event.mapping_id),

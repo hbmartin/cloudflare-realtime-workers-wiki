@@ -1,4 +1,5 @@
 import { processSlackFileCleanup } from "./slack-file-cleanup";
+import { mappingDeliveryPauseSql } from "./slack-delivery-contracts";
 import { logger } from "./observability";
 import { DeliveryInProgressError } from "./notifications";
 import {
@@ -49,6 +50,14 @@ export async function deliverThumbnail(env: Env, id: string) {
   if (!row || ["uploaded", "failed", "retired"].includes(row.state)) return;
   const installation = await round2Installation(env, row.installation_id, row.installation_generation);
   if (!installation) {
+    if (
+      await env.DB.prepare(
+        "SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL AND auth_error IS NOT NULL",
+      )
+        .bind(row.installation_id, row.installation_generation)
+        .first()
+    )
+      return;
     await retireObsoleteReceipt(env, "slack_file_artifacts", id, row.installation_id, row.installation_generation);
     await cleanupAllocation(env, row.installation_id, id, row.slack_file_id);
     return;
@@ -80,6 +89,7 @@ export async function deliverThumbnail(env: Env, id: string) {
     WHERE p.id=? AND p.content_epoch=? AND d.thumbnail_hash=? AND d.thumbnail_r2_key=? AND p.archived_at IS NULL
     AND p.import_job_id IS NULL AND p.is_template=0 AND i.id=? AND i.generation=? AND i.disconnected_at IS NULL
     AND m.cadence='digest' AND m.validation_state='valid' AND m.notification_blocked_at IS NULL
+    AND NOT ${mappingDeliveryPauseSql("m", Date.now())}
     AND EXISTS(SELECT 1 FROM workspace_members wm WHERE wm.workspace_id=p.workspace_id AND wm.user_id=m.created_by AND wm.role='owner')`)
         .bind(
           row.page_id,
@@ -91,6 +101,19 @@ export async function deliverThumbnail(env: Env, id: string) {
         )
         .first();
     if (!allowed) {
+      const paused =
+        await env.DB.prepare(`SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id)
+        WHERE p.id=? AND m.installation_id=? AND ${mappingDeliveryPauseSql("m", Date.now())}`)
+          .bind(row.page_id, row.installation_id)
+          .first();
+      if (paused) {
+        await env.DB.prepare(
+          "UPDATE slack_file_artifacts SET state='pending',attempt_count=MAX(0,attempt_count-1) WHERE id=? AND claim_token=?",
+        )
+          .bind(id, token)
+          .run();
+        return;
+      }
       await env.DB.prepare(`UPDATE slack_file_artifacts SET state='retired',updated_at=? WHERE id=? AND claim_token=?`)
         .bind(Date.now(), id, token)
         .run();

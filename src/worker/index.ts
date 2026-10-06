@@ -7231,7 +7231,7 @@ export default {
         notification_digests: () => sendDueNotificationDigests(env),
         date_reminders: () => processDueDateReminders(env),
         slack_digests: async () => {
-          if (env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await dueRound2Digests(env);
+          await dueRound2Digests(env);
           await sendDueSlackChannelDigests(env);
         },
         slack_security_records: async () => {

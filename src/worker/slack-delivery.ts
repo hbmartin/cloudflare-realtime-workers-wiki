@@ -1,4 +1,4 @@
-import { round2WakeStatement } from "./slack-delivery-contracts";
+import { round2WakeStatement, PERMANENT_SLACK_VALIDATION_ERRORS } from "./slack-delivery-contracts";
 import type { Env } from "./env";
 import {
   SlackApiError,
@@ -32,9 +32,7 @@ export function definiteSlackRejection(error: unknown): error is SlackApiError {
 }
 
 export function permanentSlackValidationError(error: string | null | undefined) {
-  return ["channel_not_found", "not_in_channel", "is_archived", "shared_channel", "unsupported_channel_type"].includes(
-    error ?? "",
-  );
+  return PERMANENT_SLACK_VALIDATION_ERRORS.includes(error ?? "");
 }
 
 export function retryableSlackError(error: unknown) {
@@ -90,23 +88,25 @@ export function invalidSlackDestination(error: unknown): error is SlackApiError 
   );
 }
 
+export function digestRetirementGuardSql(root = "root") {
+  const stale = Date.now() - 60_000;
+  return `NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=${root}.id
+    AND (child.state IN ('sending','blocked') OR (child.claimed_at>${stale} AND child.claim_token IS NOT ${root}.claim_token)))
+    AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child JOIN json_each(child.event_ids_json) reservation
+      JOIN slack_channel_events event ON event.id=reservation.value WHERE child.receipt_id=${root}.id
+      AND event.claimed_at>${stale} AND event.claim_token IS NOT ${root}.claim_token)`;
+}
+
 export function retireDigestReceiptStatements(env: Env, id: string, token: string, error: string | null = null) {
   const guard = `EXISTS(SELECT 1 FROM slack_digest_receipts root WHERE root.id=? AND root.claim_token=?
-    AND NOT EXISTS(SELECT 1 FROM slack_digest_messages uncertain WHERE uncertain.receipt_id=root.id
-      AND (uncertain.state IN ('sending','blocked') OR (uncertain.claimed_at>${Date.now() - 60_000} AND uncertain.claim_token IS NOT root.claim_token))))`;
+    AND ${digestRetirementGuardSql()})`;
   return [
     env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
       WHERE delivered_at IS NULL AND suppressed_at IS NULL AND round2_state='pending'
-        AND (id IN (SELECT value FROM slack_digest_messages child,json_each(child.event_ids_json)
-          WHERE child.receipt_id=? AND child.state='pending') OR (
-          cadence='digest' AND summary_id IS NULL
-          AND EXISTS(SELECT 1 FROM slack_digest_receipts root WHERE root.id=?
-            AND root.subscription_id=slack_channel_events.subscription_id
-            AND slack_channel_events.created_at>=root.window_start AND slack_channel_events.created_at<root.window_end)
-          AND NOT EXISTS(SELECT 1 FROM slack_digest_message_events reserved WHERE reserved.event_id=slack_channel_events.id)))
+        AND id IN (SELECT value FROM slack_digest_messages child,json_each(child.event_ids_json)
+          WHERE child.receipt_id=? AND child.state='pending')
         AND (claimed_at IS NULL OR claimed_at<=? OR claim_token=?) AND ${guard}`).bind(
       Date.now(),
-      id,
       id,
       Date.now() - 60_000,
       token,
@@ -132,7 +132,7 @@ export async function retireObsoleteReceipt(
   await env.DB.batch([
     env.DB.prepare(`UPDATE ${table} SET claim_token=?,claimed_at=? WHERE id=? AND state IN ('pending'${table === "slack_file_artifacts" ? ",'uploading'" : ""})
       AND (claimed_at IS NULL OR claimed_at<?) AND NOT EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)
-      ${table === "slack_digest_receipts" ? "AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=slack_digest_receipts.id AND child.state IN ('sending','blocked'))" : ""}`).bind(
+      ${table === "slack_digest_receipts" ? `AND ${digestRetirementGuardSql("slack_digest_receipts")}` : ""}`).bind(
       token,
       Date.now(),
       id,
@@ -142,7 +142,7 @@ export async function retireObsoleteReceipt(
     ),
     ...(table === "slack_digest_receipts" ? retireDigestReceiptStatements(env, id, token) : []),
     env.DB.prepare(
-      `UPDATE ${table} SET state='retired',claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
+      `UPDATE ${table} SET ${table === "slack_digest_receipts" ? "" : "state='retired',"}claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
     ).bind(id, token),
   ]);
 }

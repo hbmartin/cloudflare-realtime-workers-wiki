@@ -4,14 +4,16 @@ const shareRecoverySelectSql = `SELECT o.id,o.attempts,o.payload_json,o.enqueued
   link.user_id userId,link.better_auth_account_id accountId,link.verified_at verifiedAt,link.slack_user_id slackUserId,
   json_object('userId',link.user_id,'accountId',link.better_auth_account_id,
     'verifiedAt',link.verified_at,'slackUserId',link.slack_user_id) identity_json
-FROM outbox o JOIN slack_interaction_receipts receipt ON receipt.id=json_extract(CASE WHEN json_valid(o.payload_json) THEN o.payload_json ELSE '{}' END,'$.receiptId')
+FROM outbox o JOIN slack_interaction_receipts receipt ON +receipt.id=json_extract(CASE WHEN json_valid(o.payload_json) THEN o.payload_json ELSE '{}' END,'$.receiptId')
 JOIN slack_installations installation ON installation.id=receipt.installation_id
 JOIN slack_authorized_user_links link ON link.installation_id=installation.id
-WHERE o.topic='slack_share_response' AND json_valid(o.payload_json)
+WHERE o.topic='slack_share_response' AND json_valid(o.payload_json) AND json_type(o.payload_json,'$.receiptId')='text'
   AND o.slack_scope_paused_at IS NULL AND receipt.outcome='accepted' AND receipt.denial_sent_at IS NULL
+  AND receipt.response_delivery_attempted_at IS NULL
   AND (receipt.response_delivery_state IS NULL OR receipt.response_delivery_state='pending'
-    OR (receipt.response_delivery_state='blocked' AND receipt.response_delivery_error='request_identity_unavailable'
-      AND receipt.response_delivery_attempted_at IS NULL))
+    OR (receipt.response_delivery_state='blocked' AND receipt.response_delivery_error IN ('request_identity_unavailable','redrive_exhausted')
+      AND receipt.response_delivery_attempted_at IS NULL
+      AND (receipt.response_delivery_error='request_identity_unavailable' OR (o.slack_redrive_count<8 AND o.slack_eligible_started_at IS NULL))))
   AND installation.id=json_extract(o.payload_json,'$.installationId')
   AND installation.generation=json_extract(o.payload_json,'$.generation') AND installation.auth_error IS NULL
   AND link.installation_generation=installation.generation AND link.slack_user_id=json_extract(o.payload_json,'$.userId')
@@ -21,10 +23,11 @@ WHERE o.topic='slack_share_response' AND json_valid(o.payload_json)
     AND candidate.slack_user_id=link.slack_user_id)=1`;
 
 export const legacyShareRecoverySelectSql = `${shareRecoverySelectSql}
-  AND json_type(o.payload_json,'$.identity') IS NULL`;
+  AND json_type(o.payload_json,'$.identity') IS NULL
+  AND (receipt.response_delivery_state IS NULL OR receipt.response_delivery_state<>'blocked' OR receipt.response_delivery_error='request_identity_unavailable')`;
 // A previously persisted identity is recoverable only if it is the same proof.
 export const blockedShareRecoverySelectSql = `${shareRecoverySelectSql}
-  AND receipt.response_delivery_state='blocked' AND receipt.response_delivery_error='request_identity_unavailable'
+  AND receipt.response_delivery_state='blocked' AND receipt.response_delivery_error IN ('request_identity_unavailable','redrive_exhausted')
   AND receipt.response_delivery_attempted_at IS NULL
   AND (json_type(o.payload_json,'$.identity') IS NULL OR (
     json_type(o.payload_json,'$.identity')='object'
@@ -34,6 +37,8 @@ export const blockedShareRecoverySelectSql = `${shareRecoverySelectSql}
     AND json_extract(o.payload_json,'$.identity.slackUserId')=link.slack_user_id))`;
 
 export const legacyShareRecoveryPreflightSql = `
+CREATE INDEX IF NOT EXISTS slack_share_response_receipt ON outbox(json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,'$.receiptId'),id)
+ WHERE topic='slack_share_response';
 CREATE TABLE IF NOT EXISTS slack_share_recovery_preflight (
  id TEXT PRIMARY KEY,attempts INTEGER,payload_json TEXT,enqueued_at INTEGER,available_at INTEGER,
  slack_redrive_due_at INTEGER,slack_claim_recheck_at INTEGER,receipt_id TEXT,response_delivery_state TEXT,
@@ -43,7 +48,11 @@ CREATE INDEX IF NOT EXISTS slack_share_recovery_preflight_receipt ON slack_share
 DELETE FROM slack_share_recovery_preflight;
 INSERT INTO slack_share_recovery_preflight ${legacyShareRecoverySelectSql};
 UPDATE outbox SET payload_json=json_set(payload_json,'$.identity',json((SELECT identity_json FROM slack_share_recovery_preflight WHERE id=outbox.id))),
- attempts=attempts+1,enqueued_at=NULL,available_at=unixepoch('subsec')*1000,slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error=NULL
+ attempts=attempts+1,enqueued_at=NULL,available_at=unixepoch('subsec')*1000,slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error=NULL,
+ slack_redrive_count=CASE WHEN (SELECT response_delivery_state FROM slack_share_recovery_preflight WHERE id=outbox.id)='blocked' THEN 0 ELSE slack_redrive_count END,
+ slack_eligible_started_at=CASE WHEN (SELECT response_delivery_state FROM slack_share_recovery_preflight WHERE id=outbox.id)='blocked' THEN NULL ELSE slack_eligible_started_at END,
+ slack_auth_pause_baseline_ms=CASE WHEN (SELECT response_delivery_state FROM slack_share_recovery_preflight WHERE id=outbox.id)='blocked' THEN NULL ELSE slack_auth_pause_baseline_ms END,
+ slack_scope_paused_ms=CASE WHEN (SELECT response_delivery_state FROM slack_share_recovery_preflight WHERE id=outbox.id)='blocked' THEN 0 ELSE slack_scope_paused_ms END
 WHERE id IN (SELECT id FROM slack_share_recovery_preflight)
  AND slack_scope_paused_at IS NULL AND EXISTS(SELECT 1 FROM slack_share_recovery_preflight repair
  WHERE repair.id=outbox.id AND repair.attempts=outbox.attempts AND repair.payload_json=outbox.payload_json
@@ -70,6 +79,11 @@ DROP TABLE slack_share_recovery_preflight;
 // migrations will install, so older upgrades also avoid 0074's unindexed ledger.
 export function shareRecoveryPreflightSql(pending: readonly string[]) {
   let sql = legacyShareRecoveryPreflightSql;
+  if (pending.includes("0068_slack_recovery.sql"))
+    sql = sql
+      .replaceAll("o.slack_claim_recheck_at", "NULL")
+      .replaceAll(",slack_claim_recheck_at=NULL", "")
+      .replaceAll(" AND repair.slack_claim_recheck_at IS outbox.slack_claim_recheck_at", "");
   if (pending.includes("0072_slack_link_authorization_started_at.sql"))
     sql = sql.replaceAll("link.authorization_started_at", "coalesce(link.verified_at,link.linked_at)");
   if (pending.includes("0071_slack_authorization_cleanup.sql")) {

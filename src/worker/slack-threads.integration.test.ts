@@ -72,6 +72,7 @@ import {
   claimJobWorkflowRun,
   NotesJobWorkflow,
   consumeDeliveryMessage,
+  sweepOutbox,
   finishPendingJobCleanup,
   jobJson,
   redriveStaleSlackOutbox,
@@ -2482,6 +2483,338 @@ describe("interactive Slack workspace", () => {
     }
   });
 
+  async function followupShare() {
+    const { link } = await activeThread();
+    const receiptId = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
+    await deliverSlackWorkspaceAction(runtime(), receiptId);
+    const id = `outbox:slack-share-response:${receiptId}`;
+    const row = (await env.DB.prepare("SELECT payload_json FROM outbox WHERE id=?")
+      .bind(id)
+      .first<{ payload_json: string }>())!;
+    calls = [];
+    return { id, receiptId, payload: JSON.parse(row.payload_json) as Record<string, unknown> };
+  }
+  it("follow-up: starts old share budgets once at the first eligible recovery", async () => {
+    const { id, receiptId } = await followupShare();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await env.DB.prepare(
+      "UPDATE outbox SET created_at=?,enqueued_at=1,available_at=1,slack_redrive_due_at=1,slack_redrive_count=4 WHERE id=?",
+    )
+      .bind(now - 40 * 86400000, id)
+      .run();
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare("SELECT slack_eligible_started_at,slack_redrive_count FROM outbox WHERE id=?")
+        .bind(id)
+        .first(),
+    ).toEqual({ slack_eligible_started_at: now, slack_redrive_count: 5 });
+    await env.DB.prepare("UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id=?").bind(id).run();
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare("SELECT slack_eligible_started_at,slack_redrive_count FROM outbox WHERE id=?")
+        .bind(id)
+        .first(),
+    ).toEqual({ slack_eligible_started_at: now, slack_redrive_count: 6 });
+    expect(
+      await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ response_delivery_state: "pending" });
+  });
+  it("follow-up: starts the share clock at eligible enqueue", async () => {
+    const { id } = await followupShare();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await env.DB.prepare("UPDATE outbox SET available_at=1,created_at=1 WHERE id=?").bind(id).run();
+    const send = vi.fn(async () => {});
+    await sweepOutbox({ ...runtime(), DELIVERY_QUEUE: { send } } as unknown as Env);
+    expect(await env.DB.prepare("SELECT slack_eligible_started_at FROM outbox WHERE id=?").bind(id).first()).toEqual({
+      slack_eligible_started_at: now,
+    });
+    expect(send).toHaveBeenCalled();
+  });
+  it.each(["authentication", "scope"])("follow-up: excludes a %s pause from the share clock", async (mode) => {
+    const { id, receiptId } = await followupShare();
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    await env.DB.prepare(
+      "UPDATE outbox SET enqueued_at=1,available_at=1,created_at=1,slack_redrive_due_at=1,slack_redrive_count=7,slack_eligible_started_at=?,slack_auth_pause_baseline_ms=0,slack_scope_paused_ms=? WHERE id=?",
+    )
+      .bind(now - 30 * 86400000, mode === "scope" ? 30 * 86400000 : 0, id)
+      .run();
+    if (mode === "authentication")
+      await env.DB.prepare("UPDATE slack_installations SET auth_paused_ms=?")
+        .bind(30 * 86400000)
+        .run();
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ response_delivery_state: "pending" });
+    expect(await env.DB.prepare("SELECT slack_redrive_count FROM outbox WHERE id=?").bind(id).first()).toEqual({
+      slack_redrive_count: 8,
+    });
+  });
+  it.each(["safe", "budget", "attempted", "clock", "authorization"])(
+    "follow-up: reopens only creation-age share exhaustion (%s)",
+    async (mode) => {
+      const { id, receiptId } = await followupShare();
+      await env.DB.prepare(
+        "UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error='redrive_exhausted',response_delivery_attempted_at=? WHERE id=?",
+      )
+        .bind(mode === "attempted" ? 1 : null, receiptId)
+        .run();
+      await env.DB.prepare("UPDATE outbox SET slack_redrive_count=?,slack_eligible_started_at=? WHERE id=?")
+        .bind(mode === "budget" ? 8 : 7, mode === "clock" ? 1 : null, id)
+        .run();
+      if (mode === "authorization")
+        await env.DB.prepare("UPDATE slack_user_links SET authorization_started_at=? WHERE user_id='owner'")
+          .bind(Date.now() + 1000)
+          .run();
+      await repairLegacySlackDelivery(runtime());
+      expect(
+        await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+          .bind(receiptId)
+          .first(),
+      ).toEqual({ response_delivery_state: mode === "safe" ? "pending" : "blocked" });
+      expect(await env.DB.prepare("SELECT slack_redrive_count FROM outbox WHERE id=?").bind(id).first()).toEqual({
+        slack_redrive_count: mode === "safe" ? 0 : mode === "budget" ? 8 : 7,
+      });
+    },
+  );
+  it.each(["age", "count"])("follow-up: blocks genuine share budget exhaustion (%s)", async (mode) => {
+    const { id, receiptId } = await followupShare();
+    await env.DB.prepare(
+      "UPDATE outbox SET enqueued_at=1,available_at=1,slack_redrive_due_at=1,slack_redrive_count=?,slack_eligible_started_at=?,slack_auth_pause_baseline_ms=0 WHERE id=?",
+    )
+      .bind(mode === "count" ? 8 : 0, mode === "age" ? Date.now() - 25 * 3600000 : Date.now(), id)
+      .run();
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare(
+        "SELECT response_delivery_state,response_delivery_error FROM slack_interaction_receipts WHERE id=?",
+      )
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ response_delivery_state: "blocked", response_delivery_error: "redrive_exhausted" });
+  });
+  it.each(["no_scope", "generation", "eligible", "paused_generation", "paused_eligible", "no_deadline"])(
+    "follow-up: OAuth wakes only eligible shares without resetting the budget (%s)",
+    async (mode) => {
+      const { id } = await followupShare();
+      await env.DB.prepare(
+        "UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1,slack_redrive_count=7,slack_eligible_started_at=10,slack_auth_pause_baseline_ms=3 WHERE id=?",
+      )
+        .bind(id)
+        .run();
+      if (mode === "generation" || mode === "paused_generation")
+        await env.DB.prepare("UPDATE outbox SET payload_json=json_set(payload_json,'$.generation',999) WHERE id=?")
+          .bind(id)
+          .run();
+      if (mode.startsWith("paused_"))
+        await env.DB.prepare(
+          "UPDATE outbox SET slack_scope_paused_at=1,slack_scope_required_json='[[\"chat:write\"]]' WHERE id=?",
+        )
+          .bind(id)
+          .run();
+      if (mode === "no_deadline")
+        await env.DB.prepare("UPDATE outbox SET slack_redrive_due_at=NULL WHERE id=?").bind(id).run();
+      const eligible = ["eligible", "paused_eligible", "no_deadline"].includes(mode);
+      const state = new URL(await createSlackOAuthUrl(runtime(), owner)).searchParams.get("state")!;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) =>
+          String(input).endsWith("/oauth.v2.access")
+            ? Response.json({
+                ok: true,
+                access_token: "xoxb-new",
+                bot_user_id: "UBOT",
+                team: { id: "T123", name: "Slack" },
+                scope: mode === "no_scope" ? "commands" : scopes,
+              })
+            : mockSlack(input, init),
+        ),
+      );
+      await finishSlackOAuth(runtime(), owner, "code", state);
+      expect(
+        await env.DB.prepare(
+          "SELECT enqueued_at,slack_redrive_due_at,slack_redrive_count,slack_eligible_started_at FROM outbox WHERE id=?",
+        )
+          .bind(id)
+          .first(),
+      ).toEqual({
+        enqueued_at: eligible ? null : 1,
+        slack_redrive_due_at: eligible ? null : 1,
+        slack_redrive_count: 7,
+        slack_eligible_started_at: 10,
+      });
+    },
+  );
+  it("follow-up: stale share recovery cannot block or overwrite a newer schedule", async () => {
+    const { id, receiptId } = await followupShare();
+    await env.DB.prepare(
+      "UPDATE outbox SET enqueued_at=1,available_at=1,slack_redrive_due_at=1,slack_redrive_count=8,slack_eligible_started_at=? WHERE id=?",
+    )
+      .bind(Date.now(), id)
+      .run();
+    const due = Date.now() + 60000;
+    let raced = false;
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            if (!raced) {
+              raced = true;
+              await env.DB.prepare("UPDATE outbox SET attempts=attempts+1,slack_redrive_due_at=? WHERE id=?")
+                .bind(due, id)
+                .run();
+            }
+            return target.batch(statements);
+          };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    await redriveStaleSlackOutbox({ ...runtime(), DB: db });
+    expect(
+      await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ response_delivery_state: "pending" });
+    expect(await env.DB.prepare("SELECT slack_redrive_due_at FROM outbox WHERE id=?").bind(id).first()).toEqual({
+      slack_redrive_due_at: due,
+    });
+  });
+  it.each(["authorization", "payload"])(
+    "follow-up: share contention acknowledges the consumer with a fenced deadline (%s)",
+    async (mode) => {
+      const { id, payload } = await followupShare();
+      await env.DB.prepare(
+        "UPDATE outbox SET payload_json=json_remove(payload_json,'$.identity'),available_at=1 WHERE id=?",
+      )
+        .bind(id)
+        .run();
+      let raced = false;
+      const db = new Proxy(env.DB, {
+        get(target, key) {
+          if (key === "prepare")
+            return (sql: string) => {
+              const wrap = (raw: D1PreparedStatement): D1PreparedStatement =>
+                new Proxy(raw, {
+                  get(stmt, method) {
+                    if (method === "bind") return (...values: unknown[]) => wrap(stmt.bind(...values));
+                    if (method === "run" && sql.includes("UPDATE outbox SET payload_json=json_set"))
+                      return async () => {
+                        if (!raced) {
+                          raced = true;
+                          if (mode === "payload")
+                            await env.DB.prepare("UPDATE outbox SET payload_json=? WHERE id=?")
+                              .bind(JSON.stringify(payload), id)
+                              .run();
+                          else
+                            await env.DB.prepare("UPDATE slack_user_links SET verified_at=? WHERE user_id='owner'")
+                              .bind(Date.now() + 1000)
+                              .run();
+                        }
+                        return stmt.run();
+                      };
+                    const value = Reflect.get(stmt, method, stmt);
+                    return typeof value === "function" ? value.bind(stmt) : value;
+                  },
+                });
+              return wrap(target.prepare(sql));
+            };
+          const value = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const ack = vi.fn(),
+        retry = vi.fn();
+      await expect(
+        consumeDeliveryMessage({ ...runtime(), DB: db }, {
+          body: { outboxId: id },
+          ack,
+          retry,
+        } as unknown as Message<DeliveryQueueMessage>),
+      ).resolves.toBe("acknowledged");
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(
+        await env.DB.prepare("SELECT slack_redrive_due_at>? future FROM outbox WHERE id=?")
+          .bind(Date.now(), id)
+          .first(),
+      ).toEqual({ future: 1 });
+      expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(0);
+    },
+  );
+  it("follow-up: maintenance retains a fresh uncertain share deadline", async () => {
+    const { id, receiptId } = await followupShare();
+    await env.DB.prepare(
+      "UPDATE slack_interaction_receipts SET response_delivery_state='sending',response_delivery_attempted_at=? WHERE id=?",
+    )
+      .bind(Date.now(), receiptId)
+      .run();
+    await env.DB.prepare("UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1,slack_redrive_count=7 WHERE id=?")
+      .bind(id)
+      .run();
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ response_delivery_state: "sending" });
+    expect(
+      await env.DB.prepare("SELECT slack_redrive_due_at>? future,slack_redrive_count FROM outbox WHERE id=?")
+        .bind(Date.now(), id)
+        .first(),
+    ).toEqual({ future: 1, slack_redrive_count: 7 });
+  });
+  it("follow-up: acknowledges duplicate share consumers and retains recovery", async () => {
+    const { id, receiptId } = await followupShare();
+    await env.DB.prepare(
+      "UPDATE slack_interaction_receipts SET response_delivery_state='sending',response_delivery_attempted_at=? WHERE id=?",
+    )
+      .bind(Date.now(), receiptId)
+      .run();
+    await env.DB.prepare("UPDATE outbox SET available_at=1 WHERE id=?").bind(id).run();
+    const ack = vi.fn(),
+      retry = vi.fn();
+    await expect(
+      consumeDeliveryMessage(runtime(), {
+        body: { outboxId: id },
+        ack,
+        retry,
+      } as unknown as Message<DeliveryQueueMessage>),
+    ).resolves.toBe("acknowledged");
+    expect(ack).toHaveBeenCalledOnce();
+    expect(retry).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare("SELECT slack_redrive_due_at>? future FROM outbox WHERE id=?").bind(Date.now(), id).first(),
+    ).toEqual({ future: 1 });
+    expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(0);
+  });
+  it("follow-up: blocks a missing identity with an uncertain prior attempt", async () => {
+    const { id, receiptId, payload } = await followupShare();
+    await env.DB.prepare("UPDATE outbox SET payload_json=json_remove(payload_json,'$.identity') WHERE id=?")
+      .bind(id)
+      .run();
+    await env.DB.prepare("UPDATE slack_interaction_receipts SET response_delivery_attempted_at=1 WHERE id=?")
+      .bind(receiptId)
+      .run();
+    await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='owner'").run();
+    await deliverSlackShareResponse(runtime(), payload, id);
+    expect(
+      await env.DB.prepare(
+        "SELECT response_delivery_state,response_delivery_error FROM slack_interaction_receipts WHERE id=?",
+      )
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ response_delivery_state: "blocked", response_delivery_error: "send_unconfirmed" });
+    await repairLegacySlackDelivery(runtime());
+    expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(0);
+  });
   it.each([
     "proven",
     "interrupted",
@@ -2737,7 +3070,7 @@ describe("interactive Slack workspace", () => {
                   if (
                     method === "run" &&
                     boundary === "before block" &&
-                    sql.includes("response_delivery_error='request_identity_unavailable'")
+                    sql.includes("response_delivery_error=CASE WHEN response_delivery_attempted_at")
                   )
                     return async () => {
                       if (!raced) {
