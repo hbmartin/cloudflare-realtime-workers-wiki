@@ -1,3 +1,4 @@
+import { legacyShareRecoverySelectSql } from "../shared/slack-share-recovery";
 import { slackAccessAuthorization } from "./slack-identity";
 import { round2WakeStatement } from "./slack-delivery-contracts";
 import { listTasks } from "./tasks";
@@ -1589,7 +1590,11 @@ export async function deliverSlackWorkspaceAction(env: Env, receiptId: string): 
   return "completed";
 }
 
-export async function deliverSlackShareResponse(env: Env, payload: Record<string, unknown>, outboxId?: string) {
+export async function deliverSlackShareResponse(
+  env: Env,
+  payload: Record<string, unknown>,
+  outboxId?: string,
+): Promise<"deferred" | void> {
   if (
     typeof payload.receiptId !== "string" ||
     typeof payload.installationId !== "string" ||
@@ -1612,78 +1617,54 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
     (storedReceipt.response_delivery_state !== null && storedReceipt.response_delivery_state !== "pending")
   )
     return;
+  const durableId = outboxId ?? `outbox:slack-share-response:${payload.receiptId}`;
+  const durable =
+    await env.DB.prepare(`SELECT payload_json,attempts FROM outbox WHERE id=? AND topic='slack_share_response'
+    AND slack_scope_paused_at IS NULL`)
+      .bind(durableId)
+      .first<{ payload_json: string; attempts: number }>();
+  if (!durable) return;
+  const source = JSON.parse(durable.payload_json) as Record<string, unknown>;
+  if (
+    ["receiptId", "installationId", "generation", "userId", "channelId", "messageTs", "pageId", "shareId"].some(
+      (key) => source[key] !== payload[key],
+    )
+  )
+    throw new DeliveryInProgressError();
+  payload = source as typeof payload;
+  const installationId = source.installationId as string;
+  const generation = source.generation as number;
+  const slackUserId = source.userId as string;
+  const channelId = source.channelId as string;
+  const authPaused = async () =>
+    !!(await env.DB.prepare(`SELECT 1 FROM slack_installations WHERE id=? AND generation=?
+    AND disconnected_at IS NULL AND auth_error IS NOT NULL`)
+      .bind(payload.installationId, payload.generation)
+      .first());
+  if (await authPaused()) return "deferred";
   if (!Object.hasOwn(payload, "identity")) {
-    const proof = await env.DB.prepare(`SELECT o.payload_json,o.attempts,link.user_id userId,
-      link.better_auth_account_id accountId,link.verified_at verifiedAt,link.slack_user_id slackUserId
-      FROM outbox o JOIN slack_interaction_receipts receipt ON receipt.id=json_extract(o.payload_json,'$.receiptId')
-      JOIN slack_installations installation ON installation.id=receipt.installation_id
-      JOIN slack_authorized_user_links link ON link.installation_id=installation.id
-      WHERE o.id=? AND o.topic='slack_share_response' AND json_valid(o.payload_json)
-        AND json_type(o.payload_json,'$.identity') IS NULL AND o.slack_scope_paused_at IS NULL
-        AND json_extract(o.payload_json,'$.receiptId')=? AND json_extract(o.payload_json,'$.installationId')=?
-        AND json_extract(o.payload_json,'$.generation')=? AND json_extract(o.payload_json,'$.userId')=?
-        AND installation.id=? AND installation.generation=? AND installation.auth_error IS NULL
-        AND link.slack_user_id=? AND link.installation_generation=installation.generation
-        AND link.migration_state='verified' AND link.verification_method='slack_openid'
-        AND link.verified_at<=receipt.received_at AND link.authorization_started_at<=receipt.received_at
-        AND receipt.outcome='accepted' AND (receipt.response_delivery_state IS NULL OR receipt.response_delivery_state='pending')
-        AND (SELECT count(*) FROM slack_authorized_user_links candidate WHERE candidate.installation_id=installation.id
-          AND candidate.slack_user_id=link.slack_user_id)=1`)
-      .bind(
-        outboxId ?? `outbox:slack-share-response:${payload.receiptId}`,
-        payload.receiptId,
-        payload.installationId,
-        payload.generation,
-        payload.userId,
-        payload.installationId,
-        payload.generation,
-        payload.userId,
-      )
-      .first<{
-        payload_json: string;
-        attempts: number;
-        userId: string;
-        accountId: string;
-        verifiedAt: number;
-        slackUserId: string;
-      }>();
+    const proof = await env.DB.prepare(
+      `SELECT * FROM (${legacyShareRecoverySelectSql}) WHERE id=? AND attempts=? AND payload_json=?`,
+    )
+      .bind(durableId, durable.attempts, durable.payload_json)
+      .first<{ identity_json: string }>();
     if (proof) {
-      const identity = {
-        userId: proof.userId,
-        accountId: proof.accountId,
-        verifiedAt: proof.verifiedAt,
-        slackUserId: proof.slackUserId,
-      };
       const persisted = await env.DB.prepare(`UPDATE outbox SET payload_json=json_set(payload_json,'$.identity',json(?))
         WHERE id=? AND attempts=? AND payload_json=? AND slack_scope_paused_at IS NULL
-          AND EXISTS(SELECT 1 FROM slack_interaction_receipts receipt JOIN slack_authorized_user_links link
-            ON link.installation_id=receipt.installation_id
-            WHERE receipt.id=? AND receipt.outcome='accepted' AND (receipt.response_delivery_state IS NULL OR receipt.response_delivery_state='pending')
-              AND link.user_id=? AND link.slack_user_id=? AND link.better_auth_account_id=? AND link.verified_at=?
-              AND link.installation_generation=? AND link.migration_state='verified' AND link.verification_method='slack_openid'
-              AND link.verified_at<=receipt.received_at AND link.authorization_started_at<=receipt.received_at)`)
+        AND EXISTS(SELECT 1 FROM (${legacyShareRecoverySelectSql}) proof WHERE proof.id=outbox.id AND proof.identity_json=? AND proof.response_delivery_state IS ?)`)
         .bind(
-          JSON.stringify(identity),
-          outboxId ?? `outbox:slack-share-response:${payload.receiptId}`,
-          proof.attempts,
-          proof.payload_json,
-          payload.receiptId,
-          identity.userId,
-          identity.slackUserId,
-          identity.accountId,
-          identity.verifiedAt,
-          payload.generation,
+          proof.identity_json,
+          durableId,
+          durable.attempts,
+          durable.payload_json,
+          proof.identity_json,
+          storedReceipt.response_delivery_state,
         )
         .run();
       if (!persisted.meta.changes) throw new DeliveryInProgressError();
-      // Dispatch the persisted source, so an interrupted recovery resumes with
-      // the same identity and cannot replace an earlier authorization snapshot.
-      return deliverSlackShareResponse(
-        env,
-        { ...(JSON.parse(proof.payload_json) as Record<string, unknown>), identity },
-        outboxId,
-      );
+      return deliverSlackShareResponse(env, { ...source, identity: JSON.parse(proof.identity_json) }, durableId);
     }
+    if (await authPaused()) return "deferred";
   }
   const expected = payload.identity as Partial<NonNullable<ActionInput["identity"]>> | null;
   if (
@@ -1695,9 +1676,25 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
     expected.slackUserId !== payload.userId
   ) {
     await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error='request_identity_unavailable'
-      WHERE id=? AND (response_delivery_state IS NULL OR response_delivery_state='pending')`)
-      .bind(payload.receiptId)
+      WHERE id=? AND outcome='accepted' AND denial_sent_at IS NULL
+        AND response_delivery_attempted_at IS NULL AND response_delivery_state IS ?
+        AND EXISTS(SELECT 1 FROM outbox WHERE id=? AND attempts=? AND payload_json=? AND slack_scope_paused_at IS NULL)
+        AND NOT EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL AND auth_error IS NOT NULL)`)
+      .bind(
+        payload.receiptId,
+        storedReceipt.response_delivery_state,
+        durableId,
+        durable.attempts,
+        durable.payload_json,
+        payload.installationId,
+        payload.generation,
+      )
       .run();
+    if (await authPaused()) return "deferred";
+    const current = await env.DB.prepare(`SELECT 1 FROM outbox WHERE id=? AND attempts=? AND payload_json=?`)
+      .bind(durableId, durable.attempts, durable.payload_json)
+      .first();
+    if (!current) throw new DeliveryInProgressError();
     return;
   }
   const identity = expected as NonNullable<ActionInput["identity"]>;
@@ -1705,10 +1702,10 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
   let dispatched = false;
   const attemptedAt = Date.now();
   try {
-    const installation = await installationFor(env, payload.installationId, payload.generation);
-    await verifiedMember(env, installation, payload.userId, identity);
-    await validateChannel(env, installation, payload.channelId);
-    await requireChannelMember(env, installation, payload.channelId, payload.userId);
+    const installation = await installationFor(env, installationId, generation);
+    await verifiedMember(env, installation, slackUserId, identity);
+    await validateChannel(env, installation, channelId);
+    await requireChannelMember(env, installation, channelId, slackUserId);
     const authorizedShare = async () => {
       const row = await env.DB.prepare(`SELECT share.url_key FROM share_links share
         JOIN pages page ON page.id=share.root_page_id AND page.workspace_id=share.workspace_id
@@ -1734,7 +1731,8 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
               AND reference.installation_generation=installation.generation AND reference.page_id=page.id
               AND reference.channel_id=? AND reference.message_ts=? AND reference.state<>'retired'))
           AND EXISTS(SELECT 1 FROM slack_interaction_receipts receipt WHERE receipt.id=? AND receipt.outcome='accepted'
-            AND (?=0 OR (receipt.response_delivery_state='sending' AND receipt.response_delivery_attempted_at=?)))`)
+            AND (?=0 OR (receipt.response_delivery_state='sending' AND receipt.response_delivery_attempted_at=?)))
+          AND EXISTS(SELECT 1 FROM outbox WHERE id=? AND attempts=? AND payload_json=? AND slack_scope_paused_at IS NULL)`)
         .bind(
           installation.id,
           installation.generation,
@@ -1756,9 +1754,20 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
           payload.receiptId,
           claimed ? 1 : 0,
           attemptedAt,
+          durableId,
+          durable.attempts,
+          durable.payload_json,
         )
         .first<{ url_key: string }>();
-      if (!row) unavailable();
+      if (!row) {
+        const current = await env.DB.prepare(
+          `SELECT 1 FROM outbox WHERE id=? AND attempts=? AND payload_json=? AND slack_scope_paused_at IS NULL`,
+        )
+          .bind(durableId, durable.attempts, durable.payload_json)
+          .first();
+        if (!current) throw new DeliveryInProgressError();
+        unavailable();
+      }
       return {
         channel: payload.channelId as string,
         user: payload.userId as string,
@@ -1768,10 +1777,11 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
     const sharePayload = await authorizedShare();
     const receipt = await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='sending',
       response_delivery_attempted_at=?,response_delivery_error=NULL WHERE id=? AND outcome='accepted'
-      AND denial_sent_at IS NULL AND (response_delivery_state IS NULL OR response_delivery_state='pending')`)
-      .bind(attemptedAt, payload.receiptId)
+      AND denial_sent_at IS NULL AND (response_delivery_state IS NULL OR response_delivery_state='pending')
+      AND EXISTS(SELECT 1 FROM outbox WHERE id=? AND attempts=? AND payload_json=? AND slack_scope_paused_at IS NULL)`)
+      .bind(attemptedAt, payload.receiptId, durableId, durable.attempts, durable.payload_json)
       .run();
-    if (!receipt.meta.changes) return;
+    if (!receipt.meta.changes) throw new DeliveryInProgressError();
     claimed = true;
     await slackApi(env, installation, "chat.postEphemeral", sharePayload, {
       beforeDispatch: authorizedShare,
@@ -1785,7 +1795,7 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
       .run();
   } catch (error) {
     if (error instanceof SlackApiError && slackInstallationError(error))
-      await recordSlackInstallationError(env, payload.installationId, error, payload.generation);
+      await recordSlackInstallationError(env, installationId, error, generation);
     if (
       error instanceof SlackRateLimitError ||
       (!dispatched && (!deniedError(error) || slackInstallationError(error)))
@@ -1795,24 +1805,39 @@ export async function deliverSlackShareResponse(env: Env, payload: Record<string
         WHERE id=? AND response_delivery_state='sending' AND response_delivery_attempted_at=?`)
           .bind(payload.receiptId, attemptedAt)
           .run();
+      if (!dispatched && (await authPaused())) return "deferred";
       throw error;
     }
+    if (!dispatched && (await authPaused())) {
+      if (claimed)
+        await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='pending'
+        WHERE id=? AND response_delivery_state='sending' AND response_delivery_attempted_at=?`)
+          .bind(payload.receiptId, attemptedAt)
+          .run();
+      return "deferred";
+    }
     if (dispatched || deniedError(error)) {
-      await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error=?
+      const blocked =
+        await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error=?
         WHERE id=? AND ((?=1 AND response_delivery_state='sending' AND response_delivery_attempted_at=?)
-          OR (?=0 AND (response_delivery_state IS NULL OR response_delivery_state='pending')))`)
-        .bind(
-          error instanceof SlackApiError
-            ? error.code
-            : deniedError(error)
-              ? "permission_unavailable"
-              : "send_unconfirmed",
-          payload.receiptId,
-          claimed ? 1 : 0,
-          attemptedAt,
-          claimed ? 1 : 0,
-        )
-        .run();
+          OR (?=0 AND (response_delivery_state IS NULL OR response_delivery_state='pending')
+            AND EXISTS(SELECT 1 FROM outbox WHERE id=? AND attempts=? AND payload_json=? AND slack_scope_paused_at IS NULL)))`)
+          .bind(
+            error instanceof SlackApiError
+              ? error.code
+              : deniedError(error)
+                ? "permission_unavailable"
+                : "send_unconfirmed",
+            payload.receiptId,
+            claimed ? 1 : 0,
+            attemptedAt,
+            claimed ? 1 : 0,
+            durableId,
+            durable.attempts,
+            durable.payload_json,
+          )
+          .run();
+      if (!claimed && !blocked.meta.changes) throw new DeliveryInProgressError();
       return;
     }
     throw error;

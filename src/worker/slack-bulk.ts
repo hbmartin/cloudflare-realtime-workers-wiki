@@ -1,7 +1,8 @@
+import { mappingDeliveryPauseSql } from "./slack-delivery-contracts";
 import type { Env } from "./env";
 import { sha256Hex } from "../shared/import-integrity";
 import { DeliveryInProgressError } from "./notifications";
-import { round2Installation, validateMapping } from "./slack-channels";
+import { round2Installation, validateMappingEvidence, StaleSlackValidationError } from "./slack-channels";
 import { reconcileBotPost } from "./slack-digests";
 import {
   SlackDispatchSkippedError,
@@ -11,7 +12,7 @@ import {
   recordPermanentDeliveryFailure,
   retireObsoleteReceipt,
 } from "./slack-delivery";
-import { slackApi, SlackApiError, SlackRateLimitError, channelActivityActorAccessSql } from "./slack";
+import { slackApi, SlackApiError, SlackRateLimitError, slackBulkCandidateSql } from "./slack";
 
 type Summary = {
   id: string;
@@ -23,7 +24,7 @@ type Summary = {
   event_ids_json: string;
   attempted_at: number | null;
 };
-export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = false) {
+export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = false, cleanupOnly = false) {
   let row = await env.DB.prepare("SELECT * FROM slack_bulk_receipts WHERE id=?").bind(id).first<Summary>();
   if (!row || ["sent", "retired"].includes(row.state) || (row.state === "blocked" && !reconcileOnly)) return;
   if (reconcileOnly && !["sending", "blocked"].includes(row.state)) return;
@@ -72,35 +73,35 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
           .run();
       return;
     }
-    const pauseSql = `installation.auth_error IS NOT NULL OR m.notification_blocked_at IS NOT NULL
-      OR m.muted_at IS NOT NULL OR coalesce(m.snoozed_until,0)>?`;
+    const pauseSql = `installation.auth_error IS NOT NULL OR ${mappingDeliveryPauseSql("m", "?")}`;
     const candidateSql = `FROM slack_channel_events e
       JOIN slack_channel_subscriptions m ON m.id=e.subscription_id JOIN pages page ON page.id=e.page_id
       JOIN slack_installations installation ON installation.id=m.installation_id
-      WHERE e.summary_id=? AND EXISTS(SELECT 1 FROM slack_bulk_receipts receipt WHERE receipt.id=e.summary_id AND receipt.claim_token=? AND receipt.state=? AND receipt.installation_generation=? AND receipt.installation_id=installation.id AND receipt.channel_id=? AND receipt.event_type=?) AND e.delivered_at IS NULL AND e.suppressed_at IS NULL
-      AND installation.generation=? AND installation.disconnected_at IS NULL
-      AND m.installation_id=? AND m.channel_id=? AND page.import_job_id IS NULL AND page.is_template=0
-      AND EXISTS(SELECT 1 FROM workspace_members w WHERE w.workspace_id=? AND w.user_id=m.created_by AND w.role='owner')
-      AND (${channelActivityActorAccessSql.replaceAll("event.", "e.")} OR page.archived_at IS NOT NULL OR page.space_id<>m.space_id)
-      AND EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type)`;
-    const candidateBinds = (expectedState: string) => [
-      id,
-      token,
-      expectedState,
-      installation.generation,
-      row!.channel_id,
-      row!.event_type,
-      installation.generation,
-      installation.id,
-      row!.channel_id,
-      installation.workspace_id,
-    ];
+      JOIN slack_bulk_receipts r ON r.id=e.summary_id
+      WHERE e.summary_id=? AND r.claim_token=? AND r.state=? AND ${slackBulkCandidateSql}`;
+    const candidateBinds = (expectedState: string) => [id, token, expectedState];
+    const retireDenied = (expectedState: string) =>
+      env.DB.prepare(`UPDATE slack_channel_events
+      SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
+      WHERE summary_id=? AND round2_state='pending' AND delivered_at IS NULL AND suppressed_at IS NULL
+        AND id NOT IN (SELECT e.id ${candidateSql})
+        AND EXISTS(SELECT 1 FROM slack_bulk_receipts WHERE id=? AND claim_token=? AND state=?)`)
+        .bind(Date.now(), id, ...candidateBinds(expectedState), id, token, expectedState)
+        .run();
+    const revisions = new Map<string, number>();
     const loadCandidates = (expectedState: string) =>
       env.DB.prepare(
-        `SELECT e.id,e.page_id,m.id mapping_id,m.validation_state,(${pauseSql}) paused ${candidateSql} ORDER BY e.id`,
+        `SELECT e.id,e.page_id,m.id mapping_id,m.validation_state,m.validation_revision,(${pauseSql}) paused ${candidateSql} ORDER BY e.id`,
       )
         .bind(Date.now(), ...candidateBinds(expectedState))
-        .all<{ id: string; page_id: string; mapping_id: string; validation_state: string; paused: number }>();
+        .all<{
+          id: string;
+          page_id: string;
+          mapping_id: string;
+          validation_state: string;
+          validation_revision: number;
+          paused: number;
+        }>();
     const loadEvents = async (expectedState = "pending", pausedOnly = false) => {
       const candidates = await loadCandidates(expectedState);
       return {
@@ -113,11 +114,28 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
       };
     };
     const paused = async () => (await loadEvents("pending", true)).results.length > 0;
+    await retireDenied("pending");
+    if (cleanupOnly) return;
     const candidates = await loadCandidates("pending");
     for (const mappingId of new Set(
       candidates.results.filter((event) => !event.paused).map((event) => event.mapping_id),
-    ))
-      await validateMapping(env, installation, mappingId, row.channel_id);
+    )) {
+      const validation = await validateMappingEvidence(env, installation, mappingId, row.channel_id);
+      if (validation.outcome === "valid") revisions.set(mappingId, validation.revision);
+      else if (validation.outcome === "permanent") {
+        const retired =
+          await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',suppressed_at=coalesce(suppressed_at,?)
+          WHERE summary_id=? AND subscription_id=? AND round2_state='pending' AND delivered_at IS NULL AND suppressed_at IS NULL
+          AND EXISTS(SELECT 1 FROM slack_bulk_receipts WHERE id=? AND claim_token=? AND state='pending')
+          AND EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
+            WHERE m.id=? AND m.validation_revision=? AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=${Date.now()}
+              AND i.auth_error IS NULL AND i.disconnected_at IS NULL)
+          AND NOT EXISTS(SELECT 1 FROM outbox o WHERE o.topic='slack_bulk' AND o.slack_round2_receipt_id=summary_id AND o.slack_scope_paused_at IS NOT NULL)`)
+            .bind(Date.now(), id, mappingId, id, token, mappingId, validation.revision)
+            .run();
+        if (!retired.meta.changes) throw new StaleSlackValidationError();
+      }
+    }
     let events = await loadEvents();
     if (!events.results.length) {
       if (!(await paused())) await finish("retired");
@@ -135,7 +153,10 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
             dispatched = true;
           },
           beforeDispatch: async () => {
+            await retireDenied("pending");
             events = await loadEvents();
+            if (events.results.some((event) => revisions.get(event.mapping_id) !== event.validation_revision))
+              throw new StaleSlackValidationError();
             if (!events.results.length) {
               if (!(await paused())) await finish("retired");
               throw new SlackDispatchSkippedError();
@@ -197,6 +218,8 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
             ]);
             if (!checkpoint!.meta.changes) throw new DeliveryInProgressError();
             const finalEvents = await loadCandidates("sending");
+            if (finalEvents.results.some((event) => revisions.get(event.mapping_id) !== event.validation_revision))
+              throw new StaleSlackValidationError();
             if (
               finalEvents.results.some((event) => event.paused || event.validation_state !== "valid") ||
               JSON.stringify(finalEvents.results.map((e) => e.id)) !== ids

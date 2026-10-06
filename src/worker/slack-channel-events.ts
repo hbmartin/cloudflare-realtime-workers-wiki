@@ -1,9 +1,9 @@
+import { mappingDeliveryPauseSql } from "./slack-delivery-contracts";
 import {
   SlackDispatchSkippedError,
   definiteSlackRejection,
   invalidSlackDestination,
   recordDeliveryError,
-  permanentSlackValidationError,
   recordPermanentDeliveryFailure,
 } from "./slack-delivery";
 import { DeliveryInProgressError } from "./notifications";
@@ -11,13 +11,14 @@ import type { Env } from "./env";
 import type { ChannelEventType } from "../shared/activity";
 import { ACTIVITY_LABELS } from "../shared/activity";
 import { safeSlackText } from "./slack-blocks";
-import { round2Installation, validateMapping } from "./slack-channels";
+import { round2Installation, validateMappingEvidence, StaleSlackValidationError } from "./slack-channels";
 import { reconcileBotPost } from "./slack-digests";
 import {
   slackApi,
   SlackApiError,
   SlackRateLimitError,
   channelActivityActorAccessSql,
+  channelActivityActorAuthoritySql,
   type SlackInstallation,
 } from "./slack";
 
@@ -42,11 +43,13 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
   try {
     const load = () =>
       env.DB.prepare(`SELECT e.*,m.installation_id,m.channel_id,m.space_id mapping_space,m.page_id mapping_page,m.muted_at,m.snoozed_until,
-      m.notification_blocked_at,m.created_by,m.validation_state,m.validation_error,
+      m.notification_blocked_at,m.created_by,m.validation_state,m.validation_error,m.validation_revision,
+      ${mappingDeliveryPauseSql("m", Date.now())} delivery_paused,
       EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type) event_enabled,
       EXISTS(SELECT 1 FROM slack_thread_links mirror WHERE mirror.installation_id=i.id AND mirror.channel_id=m.channel_id
         AND mirror.thread_id=e.thread_id AND mirror.state IN ('pending','active')) mirrored,i.disconnected_at,i.auth_error,i.generation current_generation,e.installation_generation generation,e.delivery_channel_id,p.title,p.space_id current_space,p.archived_at,p.import_job_id,p.is_template,actor.name actor_name,
       ${channelActivityActorAccessSql.replace(/\bpage\./g, "p.").replaceAll("event.", "e.")} actor_access,
+      ${channelActivityActorAuthoritySql.replace(/\bpage\./g, "p.").replaceAll("event.", "e.")} actor_authority,
       EXISTS(SELECT 1 FROM slack_channel_subscriptions allowed WHERE allowed.installation_id=i.id AND allowed.channel_id=m.channel_id AND allowed.space_id=p.space_id
         AND (allowed.page_id IS NULL OR allowed.page_id=p.id) AND allowed.validation_state='valid') mapped,
       EXISTS(SELECT 1 FROM workspace_members w WHERE w.workspace_id=i.workspace_id AND w.user_id=m.created_by AND w.role='owner') owner_valid
@@ -78,6 +81,9 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
           actor_name: string | null;
           event_type: ChannelEventType;
           actor_access: number;
+          actor_authority: number;
+          validation_revision: number;
+          delivery_paused: number;
           mapped: number;
           owner_valid: number;
           validation_state: string;
@@ -101,12 +107,18 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       return;
     }
     const id = `channel:${eventId}`;
-    const finish = async (ts: string | null, state = "sent") =>
-      env.DB.prepare(
-        `UPDATE slack_channel_events SET round2_state=?,message_ts=?,delivered_at=?,attempted_at=CASE WHEN ?='retired' THEN NULL ELSE attempted_at END WHERE id=? AND claim_token=?`,
+    const finish = async (ts: string | null, state = "sent", revision?: number) => {
+      const result = await env.DB.prepare(
+        `UPDATE slack_channel_events SET round2_state=?,message_ts=?,delivered_at=?,attempted_at=CASE WHEN ?='retired' THEN NULL ELSE attempted_at END WHERE id=? AND claim_token=?
+          AND (? IS NULL OR EXISTS(SELECT 1 FROM slack_channel_subscriptions m WHERE m.id=slack_channel_events.subscription_id AND m.validation_revision=?
+            AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=${Date.now()}
+            AND EXISTS(SELECT 1 FROM slack_installations i WHERE i.id=m.installation_id AND i.auth_error IS NULL AND i.disconnected_at IS NULL)
+            AND NOT EXISTS(SELECT 1 FROM outbox o WHERE o.topic='slack_channel' AND o.slack_round2_receipt_id=slack_channel_events.id AND o.slack_scope_paused_at IS NOT NULL)))`,
       )
-        .bind(state, ts, Date.now(), state, eventId, token)
+        .bind(state, ts, Date.now(), state, eventId, token, revision ?? null, revision ?? null)
         .run();
+      if (revision !== undefined && !result.meta.changes) throw new StaleSlackValidationError();
+    };
     if (row.round2_state === "sending" || reconcileOnly) {
       const ts = await reconcileBotPost(env, installation, row.delivery_channel_id, id, row.attempted_at!);
       if (ts) await finish(ts);
@@ -120,11 +132,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       await finish(null, "retired");
       return;
     }
-    if (row.validation_state !== "valid" && permanentSlackValidationError(row.validation_error)) {
-      await finish(null, "retired");
-      return;
-    }
-    if (row.notification_blocked_at || row.muted_at || (row.snoozed_until && row.snoozed_until > Date.now())) return;
+    if (row.delivery_paused) return;
     const mirrored =
       row.thread_id &&
       (await env.DB.prepare(
@@ -136,17 +144,14 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       await finish(null, "retired");
       return;
     }
-    if (!(await validateMapping(env, installation, row.subscription_id, row.channel_id))) {
-      const failure = await env.DB.prepare(
-        "SELECT validation_error FROM slack_channel_subscriptions WHERE id=? AND channel_id=?",
-      )
-        .bind(row.subscription_id, row.channel_id)
-        .first<{ validation_error: string | null }>();
-      if (permanentSlackValidationError(failure?.validation_error)) await finish(null, "retired");
+    const validation = await validateMappingEvidence(env, installation, row.subscription_id, row.channel_id);
+    if (validation.outcome !== "valid") {
+      if (validation.outcome === "permanent") await finish(null, "retired", validation.revision);
       return;
     }
     row = await load();
     if (!row) return;
+    if (row.validation_revision !== validation.revision) throw new StaleSlackValidationError();
     if (
       row.current_generation !== installation.generation ||
       row.channel_id !== row.delivery_channel_id ||
@@ -157,11 +162,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       await finish(null, "retired");
       return;
     }
-    if (row.validation_state !== "valid" && permanentSlackValidationError(row.validation_error)) {
-      await finish(null, "retired");
-      return;
-    }
-    if (row.notification_blocked_at || row.muted_at || (row.snoozed_until && row.snoozed_until > Date.now())) return;
+    if (row.delivery_paused) return;
     const destination = { subscriptionId: row.subscription_id, channelId: row.channel_id };
     let dispatched = false;
     try {
@@ -178,6 +179,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
             row = await load();
             if (!row || row.claim_token !== token || row.round2_state !== "pending")
               throw new DeliveryInProgressError();
+            if (row.validation_revision !== validation.revision) throw new StaleSlackValidationError();
             if (
               row.current_generation !== installation.generation ||
               row.disconnected_at !== null ||
@@ -185,7 +187,6 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
               !row.owner_valid ||
               !row.event_enabled ||
               row.mirrored ||
-              (row.validation_state !== "valid" && permanentSlackValidationError(row.validation_error)) ||
               row.import_job_id ||
               row.is_template
             ) {
@@ -201,7 +202,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
             )
               throw new SlackDispatchSkippedError();
             const departure = row.archived_at !== null || row.current_space !== row.mapping_space;
-            if (!row.actor_access && !departure) {
+            if (!row.actor_authority || (!row.actor_access && !departure)) {
               await finish(null, "retired");
               throw new SlackDispatchSkippedError();
             }
@@ -220,6 +221,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
               current.delivered_at !== null
             )
               throw new DeliveryInProgressError();
+            if (current.validation_revision !== validation.revision) throw new StaleSlackValidationError();
             if (
               current.current_generation !== installation.generation ||
               current.disconnected_at !== null ||
@@ -227,9 +229,9 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
               !current.owner_valid ||
               !current.event_enabled ||
               current.mirrored ||
-              (current.validation_state !== "valid" && permanentSlackValidationError(current.validation_error)) ||
               current.import_job_id ||
               current.is_template ||
+              !current.actor_authority ||
               (!current.actor_access && current.archived_at === null && current.current_space === current.mapping_space)
             ) {
               await finish(null, "retired");

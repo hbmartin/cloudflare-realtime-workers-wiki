@@ -1,3 +1,4 @@
+import { repairLegacySlackDelivery } from "./slack-legacy-recovery";
 import { protectSlackFixtureUsers } from "../../tests/helpers/security";
 import { createShare, revokeShare } from "./shares";
 import { acceptSlackProductInteraction, openSlackProduct, deliverSlackProductCopy } from "./slack-product";
@@ -2695,14 +2696,204 @@ describe("interactive Slack workspace", () => {
       await env.DB.prepare("SELECT response_delivery_state state FROM slack_interaction_receipts WHERE id=?")
         .bind(receiptId)
         .first(),
-    ).toEqual({ state: mode === "database failure" ? "pending" : "blocked" });
-    expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(0);
+    ).toEqual({ state: mode === "database failure" ? "pending" : mode === "old payload" ? "sent" : "blocked" });
+    expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(mode === "old payload" ? 1 : 0);
     if (mode === "database failure") await deliverSlackShareResponse(runtime(), payload);
     expect(calls.filter((call) => call.method === "chat.postEphemeral")).toHaveLength(
-      mode === "database failure" ? 1 : 0,
+      ["database failure", "old payload"].includes(mode) ? 1 : 0,
     );
   });
 
+  it.each(["before proof", "before block"])("reuses a concurrently persisted share identity %s", async (boundary) => {
+    const { link } = await activeThread();
+    const receiptId = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
+    await deliverSlackWorkspaceAction(runtime(), receiptId);
+    const id = `outbox:slack-share-response:${receiptId}`;
+    const row = (await env.DB.prepare("SELECT payload_json FROM outbox WHERE id=?")
+      .bind(id)
+      .first<{ payload_json: string }>())!;
+    const durable = row.payload_json;
+    const stale = JSON.parse(durable) as Record<string, unknown>;
+    delete stale.identity;
+    await env.DB.prepare("UPDATE outbox SET payload_json=? WHERE id=?").bind(JSON.stringify(stale), id).run();
+    let raced = false;
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) => {
+            const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+              new Proxy(statement, {
+                get(prepared, method) {
+                  if (method === "bind") return (...args: unknown[]) => wrap(prepared.bind(...args));
+                  if (method === "first" && sql.includes("SELECT * FROM (SELECT o.id"))
+                    return async () => {
+                      if (boundary === "before block") return null;
+                      if (!raced) {
+                        raced = true;
+                        await env.DB.prepare("UPDATE outbox SET payload_json=? WHERE id=?").bind(durable, id).run();
+                      }
+                      return prepared.first();
+                    };
+                  if (
+                    method === "run" &&
+                    boundary === "before block" &&
+                    sql.includes("response_delivery_error='request_identity_unavailable'")
+                  )
+                    return async () => {
+                      if (!raced) {
+                        raced = true;
+                        await env.DB.prepare("UPDATE outbox SET payload_json=? WHERE id=?").bind(durable, id).run();
+                      }
+                      return prepared.run();
+                    };
+                  const value = Reflect.get(prepared, method, prepared);
+                  return typeof value === "function" ? value.bind(prepared) : value;
+                },
+              });
+            return wrap(target.prepare(sql));
+          };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    // The proof read can lose to a concurrent identity writer. The stale block must be fenced.
+    await expect(deliverSlackShareResponse({ ...runtime(), DB: db }, stale, id)).rejects.toBeInstanceOf(
+      DeliveryInProgressError,
+    );
+    expect(
+      await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ response_delivery_state: "pending" });
+    await deliverSlackShareResponse(runtime(), stale, id);
+    expect(
+      await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ response_delivery_state: "sent" });
+  });
+  it.each([false, true])(
+    "defers legacy share recovery during authentication failure and repairs safe blocks (%s)",
+    async (blocked) => {
+      const { link } = await activeThread();
+      const receiptId = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
+      await deliverSlackWorkspaceAction(runtime(), receiptId);
+      const id = `outbox:slack-share-response:${receiptId}`;
+      await env.DB.prepare(
+        "UPDATE outbox SET payload_json=json_remove(payload_json,'$.identity'),enqueued_at=1 WHERE id=?",
+      )
+        .bind(id)
+        .run();
+      if (blocked)
+        await env.DB.prepare(
+          "UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error='request_identity_unavailable' WHERE id=?",
+        )
+          .bind(receiptId)
+          .run();
+      await env.DB.prepare("UPDATE slack_installations SET auth_error='invalid_auth',auth_error_at=?")
+        .bind(Date.now())
+        .run();
+      await repairLegacySlackDelivery(runtime());
+      const ack = vi.fn();
+      const retry = vi.fn();
+      if (!blocked) {
+        await consumeDeliveryMessage(runtime(), {
+          body: { outboxId: id },
+          ack,
+          retry,
+        } as unknown as Message<DeliveryQueueMessage>);
+      }
+      expect(ack).toHaveBeenCalledTimes(blocked ? 0 : 1);
+      expect(retry).not.toHaveBeenCalled();
+      const deadline = expect.any(Number);
+      expect(await env.DB.prepare("SELECT slack_redrive_due_at FROM outbox WHERE id=?").bind(id).first()).toEqual({
+        slack_redrive_due_at: blocked ? null : deadline,
+      });
+      expect(
+        await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+          .bind(receiptId)
+          .first(),
+      ).toEqual({ response_delivery_state: blocked ? "blocked" : "pending" });
+      await env.DB.prepare("UPDATE slack_installations SET auth_error=NULL,auth_error_at=NULL").run();
+      await repairLegacySlackDelivery(runtime());
+      const recovered = (await env.DB.prepare("SELECT payload_json FROM outbox WHERE id=?")
+        .bind(id)
+        .first<{ payload_json: string }>())!;
+      await deliverSlackShareResponse(runtime(), JSON.parse(recovered.payload_json), id);
+      expect(
+        await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+          .bind(receiptId)
+          .first(),
+      ).toEqual({ response_delivery_state: "sent" });
+    },
+  );
+
+  it.each([
+    "missing",
+    "saved",
+    "malformed",
+    "scope",
+    "attempted",
+    "identity changed",
+    "authorization changed",
+    "rollback",
+  ])("reopens only safe historical identity blocks: %s", async (mode) => {
+    const { link } = await activeThread();
+    const receiptId = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
+    await deliverSlackWorkspaceAction(runtime(), receiptId);
+    const id = `outbox:slack-share-response:${receiptId}`;
+    await env.DB.prepare(
+      "UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error='request_identity_unavailable' WHERE id=?",
+    )
+      .bind(receiptId)
+      .run();
+    if (!["saved", "identity changed"].includes(mode))
+      await env.DB.prepare("UPDATE outbox SET payload_json=json_remove(payload_json,'$.identity') WHERE id=?")
+        .bind(id)
+        .run();
+    if (mode === "malformed")
+      await env.DB.prepare("UPDATE outbox SET payload_json=json_set(payload_json,'$.identity',NULL) WHERE id=?")
+        .bind(id)
+        .run();
+    if (mode === "scope") await env.DB.prepare("UPDATE outbox SET slack_scope_paused_at=1 WHERE id=?").bind(id).run();
+    if (mode === "attempted")
+      await env.DB.prepare("UPDATE slack_interaction_receipts SET response_delivery_attempted_at=1 WHERE id=?")
+        .bind(receiptId)
+        .run();
+    if (mode === "identity changed")
+      await env.DB.prepare(
+        "UPDATE outbox SET payload_json=json_set(payload_json,'$.identity.accountId','different') WHERE id=?",
+      )
+        .bind(id)
+        .run();
+    if (mode === "authorization changed")
+      await env.DB.prepare("UPDATE slack_user_links SET authorization_started_at=? WHERE user_id='owner'")
+        .bind(Date.now() + 1)
+        .run();
+    const before = await env.DB.prepare("SELECT attempts,payload_json FROM outbox WHERE id=?").bind(id).first();
+    if (mode === "rollback")
+      await env.DB.prepare(`CREATE TRIGGER fail_identity_repair BEFORE UPDATE OF response_delivery_state ON slack_interaction_receipts
+      WHEN NEW.response_delivery_state='pending' BEGIN SELECT RAISE(ABORT,'repair unavailable'); END`).run();
+    const failure = await repairLegacySlackDelivery(runtime()).then(
+      () => null,
+      (error: Error) => error.message,
+    );
+    expect(failure?.includes("repair unavailable") ?? false).toBe(mode === "rollback");
+    const repaired = ["missing", "saved"].includes(mode);
+    expect(
+      await env.DB.prepare("SELECT response_delivery_state FROM slack_interaction_receipts WHERE id=?")
+        .bind(receiptId)
+        .first(),
+    ).toEqual({ response_delivery_state: repaired ? "pending" : "blocked" });
+    const after = await env.DB.prepare("SELECT attempts,payload_json FROM outbox WHERE id=?").bind(id).first();
+    expect(JSON.stringify(after) !== JSON.stringify(before)).toBe(repaired);
+    if (mode === "rollback") await env.DB.prepare("DROP TRIGGER fail_identity_repair").run();
+    const snapshot = await env.DB.prepare("SELECT attempts,payload_json FROM outbox WHERE id=?").bind(id).first();
+    if (mode !== "rollback") await repairLegacySlackDelivery(runtime());
+    expect(await env.DB.prepare("SELECT attempts,payload_json FROM outbox WHERE id=?").bind(id).first()).toEqual(
+      snapshot,
+    );
+  });
   it("sends share links outside the thread and distinguishes rate limits from uncertain sends", async () => {
     const { link } = await activeThread();
     const create = await workspaceAction({ actionId: "noteflare_share_create", value: link.id, link });
@@ -2712,7 +2903,7 @@ describe("interactive Slack workspace", () => {
     const payload = JSON.parse(row!.payload_json) as Record<string, unknown>;
     await env.DB.prepare(`UPDATE slack_installations SET token_expires_at = 1,
       bot_refresh_token_ciphertext = NULL WHERE id = 'installation'`).run();
-    await expect(deliverSlackShareResponse(runtime(), payload)).rejects.toMatchObject({ code: "invalid_auth" });
+    await expect(deliverSlackShareResponse(runtime(), payload)).resolves.toBe("deferred");
     expect(
       await env.DB.prepare(`SELECT response_delivery_state state FROM slack_interaction_receipts WHERE id = ?`)
         .bind(create)

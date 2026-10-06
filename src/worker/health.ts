@@ -1,3 +1,4 @@
+import { runnableOutboxSql } from "./slack-delivery-contracts";
 import type { Env } from "./env";
 import { safeErrorMessage } from "../shared/error-log";
 import { correlationHeaders } from "./observability";
@@ -121,9 +122,9 @@ async function checkDurableQueues(env: Env, timestamp: number) {
       `SELECT COUNT(*) total FROM attachment_uploads
         WHERE next_attempt_at < ? OR (state <> 'active' AND attempts > 5)`,
     ).bind(timestamp - WORK_OVERDUE_MS),
-    env.DB.prepare(`SELECT COUNT(*) total FROM outbox WHERE enqueued_at IS NULL AND available_at < ?`).bind(
-      timestamp - OUTBOX_DUE_MS,
-    ),
+    env.DB.prepare(
+      `SELECT COUNT(*) total FROM outbox WHERE enqueued_at IS NULL AND ${runnableOutboxSql(env)} AND available_at < ?`,
+    ).bind(timestamp - OUTBOX_DUE_MS),
     env.DB.prepare(`SELECT COUNT(*) total FROM jobs WHERE status = 'queued' AND updated_at < ?`).bind(
       timestamp - WORKFLOW_QUEUED_MS,
     ),
