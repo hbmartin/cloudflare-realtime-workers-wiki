@@ -1,4 +1,3 @@
-import { DeliveryInProgressError } from "./notifications";
 import { slackBulkCandidateSql } from "./slack";
 import { deliverBulkSummary } from "./slack-bulk";
 import { deliverDigest } from "./slack-digests";
@@ -8,11 +7,12 @@ import {
   thumbnailDeliveryEnabled,
   wakeRound2Mapping,
   retireDigestReceiptStatements,
+  digestRetirementGuardSql,
   type DeliveryOutcome,
 } from "./slack-delivery";
 import type { Env } from "./env";
 import { outboxEnqueueRetryAt, reportPersistentEnqueueFailure } from "./outbox-retry";
-import { safeTelemetryErrorMessage } from "./observability";
+import { logger, safeTelemetryErrorMessage } from "./observability";
 
 import { ROUND2_TOPICS_SQL, round2Receipts, mappingDeliveryPauseSql } from "./slack-delivery-contracts";
 export { round2Receipts } from "./slack-delivery-contracts";
@@ -33,8 +33,8 @@ function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string) {
       JOIN pages page ON page.id=e.page_id JOIN slack_installations installation ON installation.id=m.installation_id
       WHERE e.summary_id=r.id AND ${slackBulkCandidateSql} AND NOT ${mappingDeliveryPauseSql("m", Date.now())})`;
   else if (topic === "slack_file_upload")
-    destinationPause = `EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) WHERE p.id=r.page_id AND m.installation_id=r.installation_id)
-    AND NOT EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) WHERE p.id=r.page_id AND m.installation_id=r.installation_id AND m.notification_blocked_at IS NULL)`;
+    destinationPause = `EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) WHERE p.id=r.page_id AND m.installation_id=r.installation_id AND ${mappingDeliveryPauseSql("m", Date.now())})
+    AND NOT EXISTS(SELECT 1 FROM slack_channel_subscriptions m JOIN pages p ON p.space_id=m.space_id AND (m.page_id IS NULL OR m.page_id=p.id) WHERE p.id=r.page_id AND m.installation_id=r.installation_id AND m.cadence='digest' AND m.validation_state='valid' AND m.notification_blocked_at IS NULL AND NOT ${mappingDeliveryPauseSql("m", Date.now())})`;
   const childClaim = `(SELECT max(child.claimed_at) FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state='pending')`;
   const claimed =
     topic === "slack_digest"
@@ -53,19 +53,6 @@ const outcomeSql = () => `CASE WHEN state IN ('sent','skipped','retired','upload
   WHEN state IN ('sending','blocked') OR uncertain_child THEN 'uncertain'
   WHEN completed THEN 'completed' WHEN paused THEN 'paused' ELSE 'retryable' END`;
 export async function round2DeliveryStatus(env: Env, topic: keyof typeof round2Receipts, id: string) {
-  if (topic === "slack_bulk") {
-    const pending = await env.DB.prepare(`SELECT 1 FROM slack_bulk_receipts WHERE id=? AND state='pending'
-      AND (claimed_at IS NULL OR claimed_at<=?)`)
-      .bind(id, Date.now() - 60_000)
-      .first();
-    if (pending) {
-      try {
-        await deliverBulkSummary(env, id, false, true);
-      } catch (error) {
-        if (!(error instanceof DeliveryInProgressError)) throw error;
-      }
-    }
-  }
   return (
     (await env.DB.prepare(
       `SELECT ${outcomeSql()} outcome,state,claimed_at,attempted_at,paused,blocked_child FROM (${receiptStatusSql(topic, "?")})`,
@@ -311,104 +298,114 @@ export async function redriveRound2Outbox(env: Env) {
   const seen = new Set<string>();
   let recoveries = 0;
   for (const row of rows.results) {
-    const id = row.receipt_id;
-    if (!id) {
-      await env.DB.prepare(
-        `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error='invalid_round2_payload' WHERE id=?`,
+    try {
+      const id = row.receipt_id;
+      if (!id) {
+        await env.DB.prepare(
+          `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error='invalid_round2_payload' WHERE id=?`,
+        )
+          .bind(row.id)
+          .run();
+        continue;
+      }
+      const key = `${row.topic}:${id}`;
+      if (seen.has(key)) continue;
+      const siblings = await env.DB.prepare(
+        `SELECT ${recoverySnapshotFields.join(",")} FROM outbox WHERE topic=? AND slack_round2_receipt_id=?`,
       )
-        .bind(row.id)
-        .run();
-      continue;
-    }
-    const key = `${row.topic}:${id}`;
-    if (seen.has(key)) continue;
-    const siblings = await env.DB.prepare(
-      `SELECT ${recoverySnapshotFields.join(",")} FROM outbox WHERE topic=? AND slack_round2_receipt_id=?`,
-    )
-      .bind(row.topic, id)
-      .all<Round2OutboxSnapshot>();
-    const current = siblings.results.find((sibling) => sibling.id === row.id);
-    if (
-      !current ||
-      current.slack_scope_paused_at !== null ||
-      ![current.slack_redrive_due_at, current.slack_claim_recheck_at].some((due) => due !== null && due <= now)
-    )
-      continue;
-    seen.add(key);
-    const enqueueRetry = siblings.results.some(
-      (sibling) => sibling.enqueued_at === null || sibling.slack_enqueue_redrive_pending,
-    );
-    const coordinationRecheck = siblings.results.some((sibling) => sibling.last_error === "slack_validation_stale");
-    const budget = Math.max(0, ...siblings.results.map((sibling) => sibling.slack_redrive_count));
-    // A queue consumer can create a newer validation retry during status reads or send().
-    const fence = recoverySnapshotSql;
-    const status = await round2DeliveryStatus(env, row.topic, id);
-    if (status.outcome === "completed") {
-      await env.DB.batch(
-        siblings.results.map((sibling) =>
-          env.DB.prepare(
-            `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,slack_enqueue_redrive_pending=0,last_error=CASE WHEN last_error='slack_validation_stale' THEN NULL ELSE last_error END WHERE ${fence}`,
-          ).bind(...recoverySnapshotBinds(sibling)),
-        ),
+        .bind(row.topic, id)
+        .all<Round2OutboxSnapshot>();
+      const current = siblings.results.find((sibling) => sibling.id === row.id);
+      if (
+        !current ||
+        current.slack_scope_paused_at !== null ||
+        ![current.slack_redrive_due_at, current.slack_claim_recheck_at].some((due) => due !== null && due <= now)
+      )
+        continue;
+      seen.add(key);
+      const enqueueRetry = siblings.results.some(
+        (sibling) => sibling.enqueued_at === null || sibling.slack_enqueue_redrive_pending,
       );
-      continue;
-    }
-    if (siblings.results.some((sibling) => sibling.slack_scope_paused_at !== null)) {
-      await deferRecoverySnapshots(env, siblings.results, now + 30 * 60_000, true);
-      continue;
-    }
-    if (status.outcome === "competing") {
-      const due = Math.max(now + 1_000, (status.claimed_at ?? now) + 60_000);
-      await env.DB.batch(
-        siblings.results.map((sibling) =>
-          env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=?,
-        slack_redrive_due_at=CASE WHEN slack_redrive_due_at<=? THEN ? ELSE slack_redrive_due_at END WHERE ${fence}`).bind(
-            due,
-            now,
-            due,
-            ...recoverySnapshotBinds(sibling),
+      const coordinationRecheck = siblings.results.some((sibling) => sibling.last_error === "slack_validation_stale");
+      const budget = Math.max(0, ...siblings.results.map((sibling) => sibling.slack_redrive_count));
+      // A queue consumer can create a newer validation retry during status reads or send().
+      const fence = recoverySnapshotSql;
+      const status = await round2DeliveryStatus(env, row.topic, id);
+      if (status.outcome === "completed") {
+        await env.DB.batch(
+          siblings.results.map((sibling) =>
+            env.DB.prepare(
+              `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,slack_enqueue_redrive_pending=0,last_error=CASE WHEN last_error='slack_validation_stale' THEN NULL ELSE last_error END WHERE ${fence}`,
+            ).bind(...recoverySnapshotBinds(sibling)),
           ),
-        ),
-      );
-      continue;
-    }
-    if (
-      status.outcome === "paused" ||
-      (status.outcome === "uncertain" &&
-        (status.state !== "sending" || status.attempted_at === null || status.paused || status.blocked_child))
-    ) {
-      const due = now + 30 * 60_000;
-      await env.DB.batch(
-        siblings.results.map((sibling) =>
-          env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),
+        );
+        continue;
+      }
+      if (siblings.results.some((sibling) => sibling.slack_scope_paused_at !== null)) {
+        await deferRecoverySnapshots(env, siblings.results, now + 30 * 60_000, true);
+        continue;
+      }
+      if (status.outcome === "competing") {
+        const due = Math.max(now + 1_000, (status.claimed_at ?? now) + 60_000);
+        await env.DB.batch(
+          siblings.results.map((sibling) =>
+            env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=?,
+        slack_redrive_due_at=CASE WHEN slack_redrive_due_at<=? THEN ? ELSE slack_redrive_due_at END WHERE ${fence}`).bind(
+              due,
+              now,
+              due,
+              ...recoverySnapshotBinds(sibling),
+            ),
+          ),
+        );
+        continue;
+      }
+      if (
+        status.outcome === "paused" ||
+        (status.outcome === "uncertain" &&
+          (status.state !== "sending" || status.attempted_at === null || status.paused || status.blocked_child))
+      ) {
+        const due = now + 30 * 60_000;
+        await env.DB.batch(
+          siblings.results.map((sibling) =>
+            env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),
         slack_claim_recheck_at=CASE WHEN last_error='slack_validation_stale'
           THEN max(coalesce(slack_claim_recheck_at,0),?) ELSE NULL END WHERE ${fence}`).bind(
-            due,
-            due,
-            ...recoverySnapshotBinds(sibling),
+              due,
+              due,
+              ...recoverySnapshotBinds(sibling),
+            ),
           ),
-        ),
+        );
+        continue;
+      }
+      // Exhaustion also writes receipt, failure and sibling records. Bound that
+      // work with enqueue attempts so a spent backlog cannot monopolize a pass.
+      if (recoveries >= 50) continue;
+      recoveries++;
+      if (status.outcome === "retryable" && !coordinationRecheck && !enqueueRetry && budget >= 8) {
+        await exhaustRound2Receipt(env, row.topic, id, siblings.results);
+        continue;
+      }
+      const due = now + Math.min(6 * 60 * 60_000, 15 * 60_000 * 2 ** Math.min(budget, 5));
+      try {
+        await enqueueRound2Outbox(env, row.id, row.topic, id, {
+          dueAt: due,
+          snapshots: siblings.results,
+          correlationId: row.correlation_id ?? undefined,
+          ordinaryRedrive: status.outcome === "retryable" && !coordinationRecheck && !enqueueRetry,
+        });
+      } catch {
+        // The checkpoint retains a durable retry deadline when enqueue fails.
+      }
+    } catch (error) {
+      logger.error(
+        "slack.round2.receipt_recovery_failed",
+        "slack",
+        "Receipt recovery failed; continuing other receipts.",
+        { outboxId: row.id },
+        error,
       );
-      continue;
-    }
-    // Exhaustion also writes receipt, failure and sibling records. Bound that
-    // work with enqueue attempts so a spent backlog cannot monopolize a pass.
-    if (recoveries >= 50) continue;
-    recoveries++;
-    if (status.outcome === "retryable" && !coordinationRecheck && !enqueueRetry && budget >= 8) {
-      await exhaustRound2Receipt(env, row.topic, id, siblings.results);
-      continue;
-    }
-    const due = now + Math.min(6 * 60 * 60_000, 15 * 60_000 * 2 ** Math.min(budget, 5));
-    try {
-      await enqueueRound2Outbox(env, row.id, row.topic, id, {
-        dueAt: due,
-        snapshots: siblings.results,
-        correlationId: row.correlation_id ?? undefined,
-        ordinaryRedrive: status.outcome === "retryable" && !coordinationRecheck && !enqueueRetry,
-      });
-    } catch {
-      // The checkpoint retains a durable retry deadline when enqueue fails.
     }
   }
 }
@@ -424,7 +421,8 @@ async function exhaustRound2Receipt(
   const token = crypto.randomUUID();
   const guard = recoverySetGuard(topic, id, snapshots);
   const claim = env.DB.prepare(`UPDATE ${contract.table} SET claim_token=?,claimed_at=? WHERE id=?
-    AND (SELECT ${outcomeSql()} FROM (${receiptStatusSql(topic, "?")}))='retryable' AND ${guard.sql}`).bind(
+    AND (SELECT ${outcomeSql()} FROM (${receiptStatusSql(topic, "?")}))='retryable' AND ${guard.sql}
+    ${topic === "slack_digest" ? `AND ${digestRetirementGuardSql(contract.table)}` : ""}`).bind(
     token,
     Date.now(),
     id,

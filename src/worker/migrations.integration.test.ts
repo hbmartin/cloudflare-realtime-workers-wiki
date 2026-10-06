@@ -1,4 +1,8 @@
-import { shareRecoveryPreflightSql } from "../shared/slack-share-recovery";
+import {
+  legacyShareRecoverySelectSql,
+  blockedShareRecoverySelectSql,
+  shareRecoveryPreflightSql,
+} from "../shared/slack-share-recovery";
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Env } from "./env";
@@ -8,13 +12,30 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076"])(
+    "upgrades a database before %s through the additive follow-up",
+    async (foundation) => {
+      await applyD1Migrations(
+        env.DB,
+        env.TEST_MIGRATIONS!.filter((migration) => migration.name < foundation),
+      );
+      await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+      expect(
+        await env.DB.prepare("SELECT name FROM sqlite_master WHERE name='slack_digest_reservations_message'").first(),
+      ).toEqual({ name: "slack_digest_reservations_message" });
+    },
+  );
   it.each([
     { preflight: false, foundation: "0074" },
     { preflight: true, foundation: "0074" },
     { preflight: true, foundation: "0072" },
     { preflight: true, foundation: "0071" },
+    { preflight: true, foundation: "0073" },
+    { preflight: true, foundation: "0067" },
+    { preflight: true, foundation: "0068" },
+    { preflight: true, foundation: "0069" },
   ])(
-    "repairs only proven work through 0075 with $foundation foundation and preflight=$preflight",
+    "repairs only proven work through 0076 with $foundation foundation and preflight=$preflight",
     async ({ preflight, foundation }) => {
       await applyD1Migrations(
         env.DB,
@@ -118,6 +139,14 @@ describe("D1 migrations", () => {
           .bind(`share:${mode}`, JSON.stringify(payload), mode === "scope" ? 1 : null)
           .run();
       }
+      if (preflight && foundation === "0074")
+        await env.DB.prepare(`WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<5000)
+        INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
+        SELECT 'unrelated:'||n,'workspace','slack_unfurl','{}',1,1 FROM numbers`).run();
+      if (preflight)
+        await env.DB.prepare(
+          "UPDATE outbox SET slack_redrive_count=7,slack_eligible_started_at=1 WHERE id='share:blocked_identity'",
+        ).run();
       let preflightPlan: string[] = [];
       if (preflight) {
         const statements = shareRecoveryPreflightSql(
@@ -126,10 +155,12 @@ describe("D1 migrations", () => {
           .split(";")
           .map((sql) => sql.trim())
           .filter(Boolean);
-        await env.DB.batch(statements.slice(0, 4).map((sql) => env.DB.prepare(sql)));
-        const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${statements[4]}`).all<{ detail: string }>();
+        const update = statements.findIndex((sql) => sql.startsWith("UPDATE outbox"));
+        await env.DB.batch(statements.slice(0, update).map((sql) => env.DB.prepare(sql)));
+        const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${statements[update]}`).all<{ detail: string }>();
         preflightPlan = plan.results.map((row) => row.detail);
-        await env.DB.batch(statements.slice(4).map((sql) => env.DB.prepare(sql)));
+        await env.DB.batch(statements.slice(update).map((sql) => env.DB.prepare(sql)));
+        await env.DB.batch(statements.map((sql) => env.DB.prepare(sql)));
       }
       expect(
         preflightPlan.some((detail) => detail.includes("SEARCH outbox USING INDEX sqlite_autoindex_outbox_1")),
@@ -151,8 +182,21 @@ describe("D1 migrations", () => {
           "slack_digest_pending_cleanup",
           "slack_activity_legacy_repair",
           "slack_share_response_receipt",
+          "slack_digest_pending_subscription",
+          "slack_digest_reservations_message",
+          "slack_share_recoverable_receipts",
         ]),
       );
+      const sharePlan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${legacyShareRecoverySelectSql}`).all<{
+        detail: string;
+      }>();
+      expect(sharePlan.results.some((row) => row.detail.includes("slack_share_response_receipt (<expr>=?)"))).toBe(
+        true,
+      );
+      const blockedPlan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${blockedShareRecoverySelectSql}`).all<{
+        detail: string;
+      }>();
+      expect(blockedPlan.results.some((row) => row.detail.includes("slack_share_recoverable_receipts"))).toBe(true);
       const receiptPlan = await env.DB.prepare(
         "EXPLAIN QUERY PLAN SELECT id FROM slack_digest_receipts WHERE subscription_id=? AND window_start<=? AND window_end>?",
       )
@@ -194,6 +238,10 @@ describe("D1 migrations", () => {
             : null,
         );
       }
+      const clock = await env.DB.prepare(
+        "SELECT slack_redrive_count,slack_eligible_started_at FROM outbox WHERE id='share:blocked_identity'",
+      ).first();
+      expect(clock).toEqual({ slack_redrive_count: 0, slack_eligible_started_at: null });
       expect(
         await env.DB.prepare(
           "SELECT response_delivery_state,response_delivery_error FROM slack_interaction_receipts WHERE id='blocked_identity'",

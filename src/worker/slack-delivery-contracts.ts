@@ -1,5 +1,13 @@
 import type { Env } from "./env";
 
+export const PERMANENT_SLACK_VALIDATION_ERRORS = [
+  "channel_not_found",
+  "not_in_channel",
+  "is_archived",
+  "shared_channel",
+  "unsupported_channel_type",
+];
+
 export const SLACK_MIRROR_SCOPES = [
   "chat:write",
   "channels:read",
@@ -45,7 +53,7 @@ export function runnableOutboxSql(env: Env) {
 export function mappingDeliveryPauseSql(alias: string, now: string | number) {
   return `(${alias}.muted_at IS NOT NULL OR coalesce(${alias}.snoozed_until,0)>${now}
     OR (${alias}.notification_blocked_at IS NOT NULL AND NOT coalesce(
-      ${alias}.notification_error=${alias}.validation_error AND ${alias}.validation_error IN ('channel_not_found','not_in_channel','is_archived','shared_channel','unsupported_channel_type'),0)))`;
+      ${alias}.notification_error=${alias}.validation_error AND ${alias}.validation_error IN (${PERMANENT_SLACK_VALIDATION_ERRORS.map((error) => `'${error}'`).join(",")}),0)))`;
 }
 
 function slackDeliveryScopes(topic: string, method?: string): readonly string[] {
@@ -207,4 +215,20 @@ export async function resumeSlackFileCleanup(env: Env, workspaceId: string) {
       AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND i.file_scope_error_revision IS NULL AND instr(','||i.scopes||',',',files:write,')>0)`)
     .bind(Date.now(), Date.now(), workspaceId)
     .run();
+}
+
+export const SHARE_OUTBOX_GUARD_SQL = "id=? AND attempts=? AND payload_json=? AND slack_scope_paused_at IS NULL";
+
+export const PENDING_SHARE_RESPONSE_SQL = `EXISTS(SELECT 1 FROM slack_installations i JOIN slack_interaction_receipts receipt ON receipt.installation_id=i.id
+  WHERE json_valid(outbox.payload_json) AND i.id=json_extract(outbox.payload_json,'$.installationId')
+    AND i.generation=json_extract(outbox.payload_json,'$.generation') AND i.workspace_id=outbox.workspace_id
+    AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND instr(','||i.scopes||',',',chat:write,')>0
+    AND receipt.id=json_extract(outbox.payload_json,'$.receiptId') AND receipt.outcome='accepted' AND receipt.denial_sent_at IS NULL
+    AND receipt.response_delivery_attempted_at IS NULL AND (receipt.response_delivery_state IS NULL OR receipt.response_delivery_state='pending'))`;
+
+export function startSlackShareEligibleClockStatement(env: Env, id: string, now: number) {
+  return env.DB.prepare(`UPDATE outbox SET slack_eligible_started_at=?,slack_scope_paused_ms=0,
+    slack_auth_pause_baseline_ms=(SELECT i.auth_paused_ms FROM slack_installations i WHERE i.workspace_id=outbox.workspace_id AND i.disconnected_at IS NULL)
+    WHERE id=? AND topic='slack_share_response' AND json_valid(payload_json) AND slack_eligible_started_at IS NULL AND slack_scope_paused_at IS NULL
+      AND ${PENDING_SHARE_RESPONSE_SQL}`).bind(now, id);
 }

@@ -17,6 +17,7 @@ import { safeSlackText, unfurlBlocks } from "./slack-blocks";
 import { currentObservabilityContext, logger, recordMetric, traced } from "./observability";
 
 import {
+  PENDING_SHARE_RESPONSE_SQL,
   SLACK_MIRROR_SCOPES,
   ROUND2_OUTBOX_SQL,
   ROUND2_NON_CHANNEL_TOPICS_SQL,
@@ -598,18 +599,20 @@ export async function finishSlackOAuth(env: Env, member: MemberContext, code: st
       .bind(timestamp, member.workspace.id, JSON.stringify(SLACK_MIRROR_SCOPES), grantedScopes)
       .run();
     await env.DB.prepare(`UPDATE outbox SET
-      attempts=attempts+CASE WHEN ${ROUND2_OUTBOX_SQL} THEN 1 ELSE 0 END,
+      attempts=attempts+CASE WHEN ${ROUND2_OUTBOX_SQL} OR topic='slack_share_response' THEN 1 ELSE 0 END,
       slack_scope_paused_ms=slack_scope_paused_ms+MAX(0,?-slack_scope_paused_at),
       slack_scope_paused_at=NULL,slack_scope_required_json=NULL,
-      slack_redrive_count=CASE WHEN ${ROUND2_OUTBOX_SQL} THEN slack_redrive_count ELSE 0 END,
+      slack_redrive_count=CASE WHEN ${ROUND2_OUTBOX_SQL} OR topic='slack_share_response' THEN slack_redrive_count ELSE 0 END,
       enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL
-      WHERE workspace_id=? AND slack_scope_paused_at IS NOT NULL AND ${slackScopesGrantedSql(SLACK_PAUSED_SCOPES_SQL, "?")}`)
+      WHERE workspace_id=? AND slack_scope_paused_at IS NOT NULL
+        AND (topic<>'slack_share_response' OR ${PENDING_SHARE_RESPONSE_SQL}) AND ${slackScopesGrantedSql(SLACK_PAUSED_SCOPES_SQL, "?")}`)
       .bind(timestamp, timestamp, member.workspace.id, grantedScopes)
       .run();
-    await env.DB.prepare(`UPDATE outbox SET attempts=attempts+CASE WHEN ${ROUND2_OUTBOX_SQL} THEN 1 ELSE 0 END,enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
+    await env.DB.prepare(`UPDATE outbox SET attempts=attempts+CASE WHEN ${ROUND2_OUTBOX_SQL} OR topic='slack_share_response' THEN 1 ELSE 0 END,enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL
       WHERE workspace_id=? AND slack_scope_paused_at IS NULL AND
-        (((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl') OR topic IN (${ROUND2_NON_CHANNEL_TOPICS_SQL}))
-          AND (slack_redrive_due_at IS NOT NULL OR id IN
+        (((topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_unfurl','slack_share_response') OR topic IN (${ROUND2_NON_CHANNEL_TOPICS_SQL}))
+          AND (topic<>'slack_share_response' OR ${PENDING_SHARE_RESPONSE_SQL})
+          AND (topic='slack_share_response' OR slack_redrive_due_at IS NOT NULL OR id IN
             (SELECT 'outbox:' || d.id FROM slack_thread_deliveries d WHERE d.state='sending')))
         OR (topic='slack_channel' AND EXISTS (SELECT 1 FROM slack_channel_events event
           WHERE event.id=outbox.slack_round2_receipt_id
@@ -2150,11 +2153,7 @@ function deniedLegacyChannelEventsStatement(env: Env, ids: readonly string[], cl
         JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
         WHERE NOT (${legacyChannelEligibilitySql})
           AND event.id IN (SELECT value FROM json_each(?))
-          AND subscription.round2_initialized=0 AND event.id NOT LIKE 'activity:%')`).bind(
-    Date.now(),
-    claimToken,
-    JSON.stringify(ids),
-  );
+          AND event.id NOT LIKE 'activity:%')`).bind(Date.now(), claimToken, JSON.stringify(ids));
 }
 
 class SlackChannelDispatchUnavailable extends Error {}
@@ -2693,7 +2692,7 @@ export async function sendDueSlackChannelDigests(env: Env, timestamp = Date.now(
   const denied = await env.DB.prepare(`SELECT event.id FROM slack_channel_events event
     JOIN pages page ON page.id=event.page_id JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
     WHERE event.cadence='digest' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL AND event.claim_token IS NULL
-      AND event.created_at<? AND subscription.round2_initialized=0 AND event.id NOT LIKE 'activity:%'
+      AND event.created_at<? AND event.id NOT LIKE 'activity:%'
       AND NOT (${legacyChannelEligibilitySql}) ORDER BY event.created_at,event.id LIMIT 200`)
     .bind(cutoff)
     .all<{ id: string }>();

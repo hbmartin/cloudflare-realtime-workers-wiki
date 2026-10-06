@@ -189,7 +189,7 @@ hand. Before upgrading an existing installation, take a D1 export and stop any r
 then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
 new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
 
-Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, or `0075` require
+Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, `0075`, or `0076` require
 `SLACK_REVIEW_MIGRATION_SAFE=true` after the [Slack rollout pause](#slack-review-follow-up-migration).
 This guard applies to both `pnpm db:remote` and `pnpm run deploy`; local database migrations do not
 require confirmation. The confirmation acknowledges an operator-completed pause and drain, rather
@@ -398,7 +398,7 @@ before making changes. Quiesce page moves or verify that the live Worker already
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
 until that manually dispatched run has deployed the new Worker.
 
-Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, or `0075_slack_delivery_recovery.sql` also stop automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, `0075_slack_delivery_recovery.sql`, or `0076_slack_delivery_recovery_followup.sql` also stop automatic deployment.
 Follow the [Slack rollout pause](#slack-review-follow-up-migration), then manually dispatch with
 `confirm_slack_review_migration_safe` checked. The workflow passes this confirmation to the guarded
 remote migration command. Once these migrations are applied, later automatic releases need no Slack
@@ -436,15 +436,19 @@ persists identities by captured outbox ID and version, and resets blocked receip
 write succeeds. For pending 0071/0072, it uses their equivalent protection and grant-start predicates.
 Fresh migration chains build the required schema normally.
 
-The updated maintenance pass repairs up to 50 Activity outbox rows and 50 proven identity candidates,
+`0076_slack_delivery_recovery_followup.sql` adds indexes for recoverable share receipts, targeted subscription/window cleanup, and child reservations, plus a cursor and index for bounded bulk cleanup. Applied migrations remain unchanged. The preflight also supports upgrades before 0068 and creates its expression lookup index before repairing shares.
+
+The updated maintenance pass repairs up to 50 channel outbox rows and 50 proven identity candidates,
 even while delivery flags are disabled. Pending Activity work becomes enqueueable; sending work
 receives a reconciliation deadline with its send evidence intact. Authentication failures defer
 identity recovery. Explicit malformed identities, attempted ephemeral responses, active claims,
 scope pauses, changed identities, and notifications without an explicit repair signature stay intact.
-Digest cleanup examines at most 200 events per pass and advances a durable cursor that wraps.
+Digest cleanup examines at most 200 events per call and advances a durable global cursor that wraps. Authorization cleanup continues while channel validation is disabled. It expires events older than the latest closed digest window, preserving active claims and uncertain sends. Schedule edits preserve eligible overlapping events for replacement receipts.
+
+Repair categories and recovery stages run independently; failures retain deadlines for subsequent maintenance passes. Retired roots with unattempted pending children are repaired only without uncertain sends or fresh competing claims. Historical suppressed events are not automatically revived. Share budgets start at the first eligible enqueue or recovery pass, exclude authentication and scope pauses, and preserve the eight-redrive limit across credential recovery. Bulk status reads do not acquire delivery claims or clean up events.
 
 Inspect `slack.legacy.repair` for bounded repair counts, remaining explicit candidates, and rows with
-nonzero enqueue-failure counts. Inspect `slack.digest.cleanup` for examined and retired event counts.
+nonzero enqueue-failure counts. Inspect `slack.digest.cleanup` and `slack.bulk.cleanup` for examined and retired event counts. Monitor `slack.legacy.repair_failed`, recovery-stage failures, stranded counts, enqueue failures, and queue errors over subsequent passes.
 `outbox.slack_enqueue_failure_count` drives enqueue backoff and persistent failure alerts;
 `outbox.attempts` remains the scheduling version. A cached destination error preserves work until
 revalidation; a fresh permanent destination failure retires unsent work in all three delivery modes.

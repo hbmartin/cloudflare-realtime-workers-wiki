@@ -14,6 +14,7 @@ describe("Slack migration safety in the deployment wrapper", () => {
     "0072_slack_link_authorization_started_at.sql",
     "0074_slack_enqueue_recovery.sql",
     "0075_slack_delivery_recovery.sql",
+    "0076_slack_delivery_recovery_followup.sql",
   ])("stops remote %s before preflight or migration application", (migration) => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     const execute = vi
@@ -298,6 +299,9 @@ describe("share repair on older authorization foundations", () => {
         INSERT INTO account VALUES('oauth','owner','slack','T123:UOWNER');`);
       db.prepare("INSERT INTO outbox VALUES('outbox','slack_share_response',?,40,1,1,NULL,NULL,NULL,NULL)").run(
         JSON.stringify({ receiptId: "receipt", installationId: "installation", generation: 1, userId: "UOWNER" }),
+      );
+      db.exec(
+        "ALTER TABLE outbox ADD COLUMN slack_redrive_count INTEGER DEFAULT 0; ALTER TABLE outbox ADD COLUMN slack_auth_pause_baseline_ms INTEGER; ALTER TABLE outbox ADD COLUMN slack_scope_paused_ms INTEGER DEFAULT 0; ALTER TABLE outbox ADD COLUMN slack_eligible_started_at INTEGER",
       );
       db.exec(
         shareRecoveryPreflightSql([
