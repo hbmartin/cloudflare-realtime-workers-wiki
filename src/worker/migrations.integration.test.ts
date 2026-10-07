@@ -12,7 +12,7 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
-  it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076", "0077"])(
+  it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076", "0077", "0078"])(
     "upgrades a database before %s through the additive follow-up",
     async (foundation) => {
       await applyD1Migrations(
@@ -34,6 +34,89 @@ describe("D1 migrations", () => {
       });
     },
   );
+  it("0078 repairs only missing owned channel deadlines and preserves protected schedules", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((m) => m.name < "0078"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@example.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Notes',1)"),
+      env.DB.prepare(
+        "INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at,generation) VALUES('installation','workspace','T123','Slack','B123','unused','chat:write','owner',1,1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at) VALUES('page','workspace','workspace-general','document','a0','Page','owner',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_channel_subscriptions(id,installation_id,space_id,channel_id,channel_name,event_types_json,cadence,created_by,created_at,updated_at,round2_initialized) VALUES('owned','installation','workspace-general','C123','notes','[]','immediate','owner',1,1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_channel_subscriptions(id,installation_id,space_id,channel_id,channel_name,event_types_json,cadence,created_by,created_at,updated_at,round2_initialized) VALUES('legacy','installation','workspace-general','C456','legacy','[]','immediate','owner',1,1,0)",
+      ),
+    ]);
+    const cases = [
+      "pending",
+      "sending",
+      "blocked",
+      "canonical",
+      "completed",
+      "suppressed",
+      "scope",
+      "fresh_claim",
+      "due",
+      "claim_recheck",
+      "unowned",
+      "unenqueued",
+      "enqueue_retry",
+      "repair_signature",
+      "coordination",
+    ];
+    for (const kind of cases) {
+      const id = kind === "canonical" ? "activity:canonical" : kind;
+      await env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at,round2_state,attempted_at,claimed_at,delivered_at,suppressed_at)
+        VALUES(?,?,'workspace','page_edit','owner','page','immediate',1,?,?,?,?,?)`)
+        .bind(
+          id,
+          kind === "canonical" || kind === "unowned" ? "legacy" : "owned",
+          kind === "sending" || kind === "blocked" ? kind : kind === "completed" ? "sent" : "pending",
+          kind === "sending" || kind === "blocked" ? 1 : null,
+          kind === "fresh_claim" ? Date.now() : null,
+          kind === "completed" ? 1 : null,
+          kind === "suppressed" ? 1 : null,
+        )
+        .run();
+      await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,attempts,slack_redrive_count,slack_scope_paused_at,slack_redrive_due_at,slack_claim_recheck_at,slack_enqueue_redrive_pending,last_error)
+        VALUES(?,'workspace','slack_channel',?,1,1,?,7,8,?,?,?,?,?)`)
+        .bind(
+          kind,
+          JSON.stringify({ eventId: id }),
+          kind === "unenqueued" ? null : 1,
+          kind === "scope" ? 1 : null,
+          kind === "due" ? 777 : null,
+          kind === "claim_recheck" ? 888 : null,
+          kind === "enqueue_retry" ? 1 : 0,
+          kind === "repair_signature"
+            ? "Invalid Slack redrive payload"
+            : kind === "coordination"
+              ? "slack_validation_stale"
+              : null,
+        )
+        .run();
+    }
+    const before = (await env.DB.prepare("SELECT * FROM outbox ORDER BY id").all<Record<string, unknown>>()).results;
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    const after = (await env.DB.prepare("SELECT * FROM outbox ORDER BY id").all<Record<string, unknown>>()).results;
+    for (const row of after) {
+      const original = before.find((r) => r.id === row.id)!;
+      const repaired = ["pending", "sending", "blocked", "canonical"].includes(row.id as string);
+      const deadline = expect.any(Number);
+      expect(row).toEqual(repaired ? { ...original, slack_redrive_due_at: deadline } : original);
+      expect(repaired && Number(row.slack_redrive_due_at) <= 1).toBe(false);
+    }
+  });
   it.each([
     { preflight: false, foundation: "0074" },
     { preflight: true, foundation: "0074" },
@@ -44,7 +127,7 @@ describe("D1 migrations", () => {
     { preflight: true, foundation: "0068" },
     { preflight: true, foundation: "0069" },
   ])(
-    "repairs only proven work through 0077 with $foundation foundation and preflight=$preflight",
+    "repairs only proven work through 0078 with $foundation foundation and preflight=$preflight",
     async ({ preflight, foundation }) => {
       await applyD1Migrations(
         env.DB,

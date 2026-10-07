@@ -1,6 +1,13 @@
 import {
+  slackOutboxSnapshotFields,
+  slackOutboxFence,
+  slackConsumerOutboxFence,
+  slackOutboxSnapshotBinds,
+  slackOutboxSnapshotSql,
+  slackScopePauseStatement,
+  RETRYABLE_SHARE_RECEIPT_SQL,
+  type SlackOutboxSnapshot,
   startSlackShareEligibleClockStatement,
-  SHARE_OUTBOX_GUARD_SQL,
   round2ChannelOwnershipSql,
 } from "./slack-delivery-contracts";
 import { cleanupPendingBulkEvents } from "./slack-bulk";
@@ -29,6 +36,7 @@ import {
   prepareSlackCapture,
 } from "./slack-capture";
 import {
+  SlackMirrorScopeError,
   retireUncertainSlackDelivery,
   deliverSlackThread,
   deliverSlackMutation,
@@ -58,6 +66,7 @@ import {
   deliverSlackChannelEvent,
   deliverSlackControlsExpiry,
   deliverSlackUnfurl,
+  retireObsoleteSlackUnfurl,
   SlackApiError,
   slackMissingScope,
   slackInstallationError,
@@ -1527,7 +1536,7 @@ export async function recoverQueuedJobs(env: Env) {
   }
 }
 
-type SweepOutboxRow = {
+type SweepOutboxRow = SlackOutboxSnapshot & {
   id: string;
   correlation_id: string | null;
   topic: string;
@@ -1551,11 +1560,44 @@ async function enqueueOutbox(env: Env, row: SweepOutboxRow) {
   const slack = row.topic.startsWith("slack_");
   const enqueueFence = `id=? AND (?=0 OR (attempts=? AND available_at=? AND enqueued_at IS NULL AND slack_scope_paused_at IS NULL AND slack_enqueue_failure_count=?))`;
   const enqueueBinds = [outboxId, slack ? 1 : 0, row.attempts, row.available_at, row.slack_enqueue_failure_count];
-  if (row.topic === "slack_share_response")
-    await startSlackShareEligibleClockStatement(env, outboxId, Date.now(), {
-      sql: enqueueFence,
-      binds: enqueueBinds,
-    }).run();
+  // Scope-fenced consumers must see the complete enqueue schedule before publication.
+  if (
+    [
+      "slack_share_response",
+      "slack_thread_reply",
+      "slack_inbound_reply",
+      "slack_thread_action",
+      "slack_unfurl",
+    ].includes(row.topic)
+  ) {
+    const now = Date.now();
+    const staged = await env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=?,last_error=NULL,
+      slack_redrive_due_at=coalesce(slack_redrive_due_at,?),slack_claim_recheck_at=NULL,slack_enqueue_failure_count=0
+      WHERE ${slackOutboxSnapshotSql} RETURNING ${slackOutboxSnapshotFields.join(",")}`)
+      .bind(now, now + SLACK_REDRIVE_STALE_MS, ...slackOutboxSnapshotBinds(row))
+      .first<SlackOutboxSnapshot>();
+    if (!staged) return;
+    const fence = slackOutboxFence(staged);
+    if (row.topic === "slack_share_response")
+      await startSlackShareEligibleClockStatement(env, outboxId, now, fence).run();
+    try {
+      await env.DELIVERY_QUEUE.send({ outboxId, ...(correlationId ? { correlationId } : {}) });
+    } catch (error) {
+      const failed = await env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,slack_redrive_due_at=NULL,
+        available_at=?,last_error=?,slack_enqueue_failure_count=?
+        WHERE ${fence.sql} RETURNING slack_enqueue_failure_count,last_error`)
+        .bind(
+          outboxEnqueueRetryAt(row.slack_enqueue_failure_count + 1),
+          safeTelemetryErrorMessage(error, "Queue enqueue failed."),
+          row.slack_enqueue_failure_count + 1,
+          ...fence.binds,
+        )
+        .first<{ slack_enqueue_failure_count: number; last_error: string | null }>();
+      if (failed) reportPersistentEnqueueFailure(env, outboxId, failed.slack_enqueue_failure_count, failed.last_error);
+      throw error;
+    }
+    return;
+  }
   try {
     await env.DELIVERY_QUEUE.send({ outboxId, ...(correlationId ? { correlationId } : {}) });
     const now = Date.now();
@@ -1563,7 +1605,7 @@ async function enqueueOutbox(env: Env, row: SweepOutboxRow) {
       last_error = NULL,
       slack_redrive_due_at = CASE WHEN topic IN
         ('slack_bulk','slack_thread_reply','slack_inbound_reply','slack_thread_action','slack_workspace_action','slack_share_response','slack_unfurl','slack_digest','slack_share_refresh','slack_file_upload')
-        THEN ? WHEN topic='slack_channel' AND (SELECT validation_enabled FROM round2_runtime WHERE id=1)=1 THEN ? ELSE NULL END WHERE ${enqueueFence}`)
+        THEN ? WHEN topic='slack_channel' THEN ? ELSE NULL END WHERE ${enqueueFence}`)
       .bind(now, now + SLACK_REDRIVE_STALE_MS, now + SLACK_REDRIVE_STALE_MS, ...enqueueBinds)
       .run();
   } catch (error) {
@@ -1595,9 +1637,9 @@ async function pauseSlackScopeOutbox(
   outboxId: string,
   topic: string,
   error: unknown,
-  fence?: { sql: string; binds: unknown[] },
+  fence: { sql: string; binds: unknown[] },
+  extraGuard = "1",
 ) {
-  const now = Date.now();
   const destination = await env.DB.prepare(
     `SELECT ${SLACK_OUTBOX_CHANNEL_TYPE_SQL} channel_type FROM outbox WHERE id=?`,
   )
@@ -1609,12 +1651,10 @@ async function pauseSlackScopeOutbox(
     error instanceof SlackApiError ? error.neededScopes : [],
     destination?.channel_type,
   );
-  await env.DB.prepare(`UPDATE outbox SET slack_scope_paused_at=COALESCE(slack_scope_paused_at,?),slack_scope_required_json=?,
-    enqueued_at=COALESCE(enqueued_at,?),slack_claim_recheck_at=NULL,
-    slack_redrive_due_at=CASE WHEN ${ROUND2_OUTBOX_SQL} THEN coalesce(slack_redrive_due_at,?+1800000) ELSE NULL END,last_error=CASE WHEN ${ROUND2_OUTBOX_SQL} AND last_error='slack_validation_stale' THEN last_error ELSE 'slack_scope_missing' END
-    WHERE ${fence?.sql ?? "id=?"}`)
-    .bind(now, JSON.stringify(scopes), now, now, ...(fence?.binds ?? [outboxId]))
-    .run();
+  const revision =
+    error instanceof SlackApiError || error instanceof SlackMirrorScopeError ? error.credentialRevision : null;
+  if (revision === null) return;
+  await slackScopePauseStatement(env, fence, scopes, revision, extraGuard).run();
 }
 
 async function enqueueSweepContinuation(env: Env, failureMessage: string) {
@@ -1698,7 +1738,7 @@ export async function sweepOutbox(env: Env, continuation = false): Promise<Outbo
     for (let batch = 0; batch < OUTBOX_SWEEP_MAX_BATCHES; batch += 1) {
       if (!(await renewLease("before-batch"))) return "lease-lost";
       const rows = await env.DB.prepare(
-        `SELECT id,correlation_id,topic,slack_round2_receipt_id receipt_id,attempts,available_at,slack_enqueue_failure_count,${ROUND2_OUTBOX_SQL} round2
+        `SELECT ${slackOutboxSnapshotFields.join(",")},correlation_id,topic,slack_round2_receipt_id receipt_id,${ROUND2_OUTBOX_SQL} round2
           FROM outbox WHERE enqueued_at IS NULL AND ${runnableOutboxSql(env)} AND available_at <= ?
           ORDER BY available_at, created_at, id LIMIT ?`,
       )
@@ -1795,10 +1835,14 @@ async function redriveLegacySlackOutbox(env: Env) {
     await env.DB.prepare(`SELECT outbox.id, outbox.workspace_id, outbox.topic, outbox.payload_json,outbox.attempts,
       outbox.enqueued_at,outbox.available_at,outbox.slack_claim_recheck_at, outbox.created_at, outbox.slack_redrive_due_at, outbox.slack_redrive_count,
       outbox.slack_auth_pause_baseline_ms, outbox.slack_eligible_started_at,
-      outbox.slack_scope_paused_ms FROM outbox
+      outbox.slack_scope_paused_ms,outbox.last_error,outbox.slack_scope_paused_at,outbox.slack_enqueue_redrive_pending,outbox.slack_enqueue_failure_count FROM outbox
     LEFT JOIN slack_thread_deliveries delivery ON outbox.topic='slack_thread_reply'
       AND delivery.id=json_extract(CASE WHEN json_valid(outbox.payload_json) THEN outbox.payload_json ELSE '{}' END,'$.deliveryId')
-    WHERE outbox.topic NOT IN ('slack_channel','slack_bulk','slack_digest','slack_share_refresh','slack_file_upload')
+    WHERE outbox.topic NOT IN ('slack_bulk','slack_digest','slack_share_refresh','slack_file_upload')
+      AND (outbox.topic<>'slack_channel' OR (${env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0}=0 AND NOT ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")}
+        AND EXISTS(SELECT 1 FROM slack_channel_events event WHERE event.id=outbox.slack_round2_receipt_id
+          AND event.round2_state='pending' AND event.attempted_at IS NULL AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
+          AND coalesce(event.claimed_at,0)<=${now - 60_000})))
       AND (outbox.topic<>'slack_share_response' OR outbox.enqueued_at IS NOT NULL)
       AND outbox.slack_redrive_due_at IS NOT NULL AND outbox.slack_redrive_due_at <= ?
       AND outbox.slack_scope_paused_at IS NULL
@@ -1808,43 +1852,38 @@ async function redriveLegacySlackOutbox(env: Env) {
       outbox.slack_redrive_due_at, CASE WHEN delivery.operation='root' THEN 0 ELSE 1 END,
       outbox.id LIMIT 50`)
       .bind(now)
-      .all<{
-        id: string;
-        workspace_id: string;
-        topic: string;
-        payload_json: string;
-        attempts: number;
-        enqueued_at: number | null;
-        available_at: number;
-        slack_claim_recheck_at: number | null;
-        created_at: number;
-        slack_redrive_due_at: number;
-        slack_redrive_count: number;
-        slack_auth_pause_baseline_ms: number | null;
-        slack_eligible_started_at: number | null;
-        slack_scope_paused_ms: number;
-      }>();
+      .all<
+        SlackOutboxSnapshot & {
+          id: string;
+          workspace_id: string;
+          topic: string;
+          payload_json: string;
+          attempts: number;
+          enqueued_at: number | null;
+          available_at: number;
+          slack_claim_recheck_at: number | null;
+          created_at: number;
+          slack_redrive_due_at: number;
+          slack_redrive_count: number;
+          slack_auth_pause_baseline_ms: number | null;
+          slack_eligible_started_at: number | null;
+          slack_scope_paused_ms: number;
+        }
+      >();
   let redriven = 0;
   for (const row of rows.results) {
     try {
-      const outboxFence = `${SHARE_OUTBOX_GUARD_SQL} AND slack_redrive_due_at IS ? AND available_at=? AND enqueued_at IS ? AND slack_claim_recheck_at IS ? AND slack_redrive_count=?`;
-      const outboxBinds = [
-        row.id,
-        row.attempts,
-        row.payload_json,
-        row.slack_redrive_due_at,
-        row.available_at,
-        row.enqueued_at,
-        row.slack_claim_recheck_at,
-        row.slack_redrive_count,
-      ];
+      const outboxFence = slackOutboxSnapshotSql;
+      const outboxBinds = slackOutboxSnapshotBinds(row);
       const payload = jsonRecord(row.payload_json);
       const key =
         row.topic === "slack_thread_reply"
           ? payload.deliveryId
           : row.topic === "slack_unfurl"
             ? payload.unfurlId
-            : payload.receiptId;
+            : row.topic === "slack_channel"
+              ? payload.eventId
+              : payload.receiptId;
       if (typeof key !== "string") {
         await env.DB.prepare(
           `UPDATE outbox SET slack_redrive_due_at=NULL, last_error='Invalid Slack redrive payload' WHERE ${outboxFence}`,
@@ -1879,7 +1918,9 @@ async function redriveLegacySlackOutbox(env: Env) {
                 : row.topic === "slack_share_response"
                   ? `SELECT response_delivery_state state FROM slack_interaction_receipts WHERE id=? AND outcome='accepted'
                     AND denial_sent_at IS NULL AND (response_delivery_state IS NULL OR response_delivery_state IN ('pending','sending'))`
-                  : `SELECT 1 FROM ${row.topic === "slack_inbound_reply" ? "slack_inbound_receipts" : "slack_interaction_receipts"}
+                  : row.topic === "slack_channel"
+                    ? `SELECT 1 FROM slack_channel_events WHERE id=? AND round2_state='pending' AND attempted_at IS NULL AND delivered_at IS NULL AND suppressed_at IS NULL`
+                    : `SELECT 1 FROM ${row.topic === "slack_inbound_reply" ? "slack_inbound_receipts" : "slack_interaction_receipts"}
              WHERE id = ? AND processed_at IS NULL`,
             )
               .bind(key)
@@ -1891,6 +1932,46 @@ async function redriveLegacySlackOutbox(env: Env) {
           .bind(...outboxBinds)
           .run();
         continue;
+      }
+      if (row.topic === "slack_share_response") {
+        await env.DB.batch([
+          env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error='send_unconfirmed'
+            WHERE id=? AND outcome='accepted' AND denial_sent_at IS NULL AND response_delivery_state IS NULL
+              AND response_delivery_attempted_at IS NOT NULL AND EXISTS(SELECT 1 FROM outbox WHERE ${outboxFence})`).bind(
+            key,
+            ...outboxBinds,
+          ),
+          env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL WHERE ${outboxFence}
+            AND EXISTS(SELECT 1 FROM slack_interaction_receipts WHERE id=? AND response_delivery_state='blocked')`).bind(
+            ...outboxBinds,
+            key,
+          ),
+        ]);
+        if (
+          await env.DB.prepare(
+            `SELECT 1 FROM slack_interaction_receipts WHERE id=? AND response_delivery_state='blocked'`,
+          )
+            .bind(key)
+            .first()
+        )
+          continue;
+      }
+      if (row.topic === "slack_unfurl") {
+        await retireObsoleteSlackUnfurl(env, key);
+        if (
+          !(await env.DB.prepare(
+            `SELECT 1 FROM slack_unfurls WHERE id=? AND delivered_at IS NULL AND retired_at IS NULL`,
+          )
+            .bind(key)
+            .first())
+        ) {
+          await env.DB.prepare(
+            `UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL WHERE ${outboxFence}`,
+          )
+            .bind(...outboxBinds)
+            .run();
+          continue;
+        }
       }
       if (row.topic === "slack_share_response" && pending.state === "sending") {
         await env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=max(slack_redrive_due_at,?) WHERE ${outboxFence}`)
@@ -1953,19 +2034,20 @@ async function redriveLegacySlackOutbox(env: Env) {
             slack_scope_paused_ms: number;
           }>();
         if (clock?.slack_eligible_started_at === null || !clock) {
-          const target = await env.DB.prepare(`SELECT i.auth_error,i.scopes FROM outbox o
+          const target = await env.DB.prepare(`SELECT i.auth_error,i.scopes,i.credential_revision FROM outbox o
             JOIN slack_installations i ON i.id=json_extract(o.payload_json,'$.installationId')
               AND i.generation=json_extract(o.payload_json,'$.generation') AND i.workspace_id=o.workspace_id
             WHERE o.id=? AND i.disconnected_at IS NULL`)
             .bind(row.id)
-            .first<{ auth_error: string | null; scopes: string }>();
+            .first<{ auth_error: string | null; scopes: string; credential_revision: number }>();
           if (target && !target.auth_error && !target.scopes.split(",").includes("chat:write")) {
             await pauseSlackScopeOutbox(
               env,
               row.id,
               row.topic,
-              new SlackApiError("chat.postEphemeral", "missing_scope", 200, undefined, ["chat:write"]),
+              new SlackApiError("chat.postEphemeral", "missing_scope", 200, target.credential_revision, ["chat:write"]),
               { sql: outboxFence, binds: outboxBinds },
+              RETRYABLE_SHARE_RECEIPT_SQL,
             );
           } else if (!target) {
             await env.DB.batch([
@@ -2091,6 +2173,18 @@ async function redriveLegacySlackOutbox(env: Env) {
               await wakeNextSlackDelivery(env, delivery.link_id);
             }
           }
+        } else if (row.topic === "slack_channel") {
+          await env.DB.batch([
+            env.DB.prepare(`UPDATE slack_channel_events SET suppressed_at=?,round2_state='skipped'
+              WHERE id=? AND round2_state='pending' AND attempted_at IS NULL AND delivered_at IS NULL AND suppressed_at IS NULL
+                AND EXISTS(SELECT 1 FROM outbox WHERE ${outboxFence})`).bind(now, key, ...outboxBinds),
+            env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL,last_error='Slack redrive limit reached'
+              WHERE ${outboxFence} AND EXISTS(SELECT 1 FROM slack_channel_events WHERE id=? AND round2_state='skipped' AND suppressed_at IS NOT NULL)`).bind(
+              ...outboxBinds,
+              key,
+            ),
+          ]);
+          continue;
         } else if (row.topic === "slack_unfurl") {
           await env.DB.prepare(`UPDATE slack_unfurls SET retired_at=?,retirement_reason='redrive_exhausted'
           WHERE id=? AND delivered_at IS NULL AND retired_at IS NULL`)
@@ -2168,7 +2262,10 @@ async function redriveLegacySlackOutbox(env: Env) {
         await env.DB.prepare(`UPDATE outbox SET enqueued_at = NULL, available_at = ?, slack_redrive_due_at=NULL,
         slack_redrive_count=slack_redrive_count+1, last_error = 'Queue acknowledgement missing; scheduled redrive'
       WHERE ${outboxFence}
-        AND (?=0 OR EXISTS (SELECT 1 FROM slack_thread_delivery_runnable WHERE id=?))`)
+        AND (?=0 OR EXISTS (SELECT 1 FROM slack_thread_delivery_runnable WHERE id=?))
+        AND (topic<>'slack_channel' OR EXISTS(SELECT 1 FROM slack_channel_events event WHERE event.id=outbox.slack_round2_receipt_id
+          AND event.round2_state='pending' AND event.attempted_at IS NULL AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
+          AND coalesce(event.claimed_at,0)<=${now - 60_000}))`)
           .bind(now + backoff, ...outboxBinds, delivery?.state === "pending" ? 1 : 0, key)
           .run();
       if (reset.meta.changes) redriven++;
@@ -2210,20 +2307,11 @@ export async function consumeDeliveryMessage(
   const outboxId = body.outboxId;
   const row =
     await env.DB.prepare(`SELECT id, topic, payload_json, available_at,last_error,enqueued_at,attempts,correlation_id,
-    slack_redrive_due_at,slack_claim_recheck_at FROM outbox WHERE id = ?`)
+      slack_redrive_due_at,slack_claim_recheck_at,slack_redrive_count,slack_scope_paused_at,
+      slack_enqueue_redrive_pending,slack_enqueue_failure_count,
+      (topic='slack_channel' AND ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")}) channel_owned FROM outbox WHERE id = ?`)
       .bind(outboxId)
-      .first<{
-        id: string;
-        topic: string;
-        payload_json: string;
-        available_at: number;
-        last_error: string | null;
-        enqueued_at: number | null;
-        attempts: number;
-        correlation_id: string | null;
-        slack_redrive_due_at: number | null;
-        slack_claim_recheck_at: number | null;
-      }>();
+      .first<SlackOutboxSnapshot & { topic: string; correlation_id: string | null; channel_owned: number }>();
   if (!row) {
     message.ack();
     return "acknowledged";
@@ -2235,16 +2323,7 @@ export async function consumeDeliveryMessage(
     return "retried";
   }
   const payload = jsonRecord(row.payload_json);
-  const retryFence = `${SHARE_OUTBOX_GUARD_SQL} AND available_at=? AND enqueued_at IS ? AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ?`;
-  const retryBinds = [
-    outboxId,
-    row.attempts,
-    row.payload_json,
-    row.available_at,
-    row.enqueued_at,
-    row.slack_redrive_due_at,
-    row.slack_claim_recheck_at,
-  ];
+  const { sql: retryFence, binds: retryBinds } = slackConsumerOutboxFence(row);
   let round2Work = false;
   let coordinationSiblings: Array<{ id: string; attempts: number }> = [];
   const clearSiblingCoordination = () =>
@@ -2268,6 +2347,10 @@ export async function consumeDeliveryMessage(
         ).bind(...retryBinds),
       );
     if (statements.length) await env.DB.batch(statements);
+    if (row.last_error === "slack_validation_stale") {
+      row.last_error = null;
+      retryBinds.splice(0, retryBinds.length, ...slackConsumerOutboxFence(row).binds);
+    }
   };
   // A payload that fails validation will never become valid, so record it and ack
   // instead of retrying. An unknown topic still throws: a rolling deploy can leave an
@@ -2353,7 +2436,8 @@ export async function consumeDeliveryMessage(
       message.ack();
       return "acknowledged" as const;
     }
-    if (slackMissingScope(error)) await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
+    if (slackMissingScope(error))
+      await pauseSlackScopeOutbox(env, outboxId, row.topic, error, { sql: retryFence, binds: retryBinds });
     else if (error instanceof DeliveryInProgressError) {
       await env.DB.prepare(`UPDATE outbox SET slack_claim_recheck_at=? WHERE ${retryFence}`)
         .bind(Date.now() + 60_000, ...retryBinds)
@@ -2414,7 +2498,7 @@ export async function consumeDeliveryMessage(
       await deliverSlackThread(env, payload.deliveryId);
     } catch (error) {
       if (error instanceof HttpError && error.code === "slack_mirror_missing_scope") {
-        await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
+        await pauseSlackScopeOutbox(env, outboxId, row.topic, error, { sql: retryFence, binds: retryBinds });
         message.ack();
         return "acknowledged";
       }
@@ -2447,7 +2531,7 @@ export async function consumeDeliveryMessage(
       await deliverSlackMutation(env, payload.receiptId, row.topic === "slack_thread_action");
     } catch (error) {
       if (error instanceof HttpError && error.code === "slack_mirror_missing_scope") {
-        await pauseSlackScopeOutbox(env, outboxId, row.topic, error);
+        await pauseSlackScopeOutbox(env, outboxId, row.topic, error, { sql: retryFence, binds: retryBinds });
         message.ack();
         return "acknowledged";
       }
@@ -2531,18 +2615,13 @@ export async function consumeDeliveryMessage(
       binds: retryBinds,
     }).run();
     const matchingShareFence = async () => {
-      const current =
-        await env.DB.prepare(`SELECT attempts,payload_json,available_at,enqueued_at,slack_redrive_due_at,slack_claim_recheck_at
+      const current = await env.DB.prepare(`SELECT ${slackOutboxSnapshotFields.join(",")}
         FROM outbox WHERE id=? AND topic='slack_share_response' AND slack_scope_paused_at IS NULL`)
-          .bind(outboxId)
-          .first<typeof row>();
+        .bind(outboxId)
+        .first<typeof row>();
       if (
         !current ||
-        current.attempts !== row.attempts ||
-        current.available_at !== row.available_at ||
-        current.enqueued_at !== row.enqueued_at ||
-        current.slack_redrive_due_at !== row.slack_redrive_due_at ||
-        current.slack_claim_recheck_at !== row.slack_claim_recheck_at
+        !slackOutboxSnapshotFields.every((field) => field === "payload_json" || current[field] === row[field])
       )
         return null;
       const currentPayload = jsonRecord(current.payload_json);
@@ -2555,21 +2634,16 @@ export async function consumeDeliveryMessage(
             JSON.stringify({ ...payload, identity: undefined }))
       )
         return null;
-      return {
-        sql: retryFence,
-        binds: [
-          outboxId,
-          current.attempts,
-          current.payload_json,
-          row.available_at,
-          row.enqueued_at,
-          row.slack_redrive_due_at,
-          row.slack_claim_recheck_at,
-        ],
-      };
+      return slackOutboxFence(current);
     };
     try {
-      if ((await deliverSlackShareResponse(env, payload, outboxId, row)) === "deferred") {
+      const result = await deliverSlackShareResponse(env, payload, outboxId, row);
+      if (result === "scope_paused" || result === "retry_scheduled") {
+        message.ack();
+        if (result === "retry_scheduled") await sweepOutbox(env);
+        return "acknowledged";
+      }
+      if (result === "deferred") {
         const fence = await matchingShareFence();
         if (fence)
           await env.DB.prepare(
@@ -2581,10 +2655,7 @@ export async function consumeDeliveryMessage(
         return "acknowledged";
       }
     } catch (error) {
-      if (slackMissingScope(error)) {
-        const fence = await matchingShareFence();
-        if (fence) await pauseSlackScopeOutbox(env, outboxId, row.topic, error, fence);
-      } else if (error instanceof DeliveryInProgressError) {
+      if (error instanceof DeliveryInProgressError) {
         const fence = await matchingShareFence();
         if (fence && row.enqueued_at !== null) {
           await env.DB.prepare(
@@ -2664,12 +2735,12 @@ export async function consumeDeliveryMessage(
     const eventId = payload.eventId;
     if (typeof eventId !== "string") return await rejectPayload("Slack channel outbox payload is invalid.");
     if (env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true") {
-      const ownership = await env.DB.prepare(
-        `SELECT ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")} owned FROM outbox WHERE id=?`,
-      )
-        .bind(outboxId)
-        .first<{ owned: number }>();
-      if (ownership?.owned) {
+      if (row.channel_owned) {
+        await env.DB.prepare(
+          `UPDATE outbox SET slack_redrive_due_at=coalesce(slack_redrive_due_at,?) WHERE ${retryFence}`,
+        )
+          .bind(Date.now() + SLACK_REDRIVE_STALE_MS, ...retryBinds)
+          .run();
         message.ack();
         return "acknowledged";
       }

@@ -59,14 +59,14 @@ refuses to deploy when Wrangler's migration listing is not in a recognized empty
 the fixtures in `scripts/check-page-move-migration.test.mjs` alongside any intentional Wrangler-output parser
 change.
 
-Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, `0075_slack_delivery_recovery.sql`, `0076_slack_delivery_recovery_followup.sql`, or `0077_slack_recovery_query_indexes.sql` also block automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, `0075_slack_delivery_recovery.sql`, `0076_slack_delivery_recovery_followup.sql`, `0077_slack_recovery_query_indexes.sql`, or `0078_slack_delivery_recovery_repairs.sql` also block automatic deployment.
 Pause the shared delivery queue, disable live Slack channel validation, and allow 16 minutes for
 existing invocations to finish before dispatching with `confirm_slack_review_migration_safe` checked.
 Keep both paused through migration and deployment. Follow the exact
 [Slack release sequence](DEPLOYMENT.md#slack-review-follow-up-migration) to verify the release and resume
 delivery. The confirmation is accepted only on manual dispatch and is passed as
 `SLACK_REVIEW_MIGRATION_SAFE=true` to the remote migration wrapper. Local releases require the same
-environment confirmation; local database migrations do not. Once 0069 through 0077 are applied, later
+environment confirmation; local database migrations do not. Once 0069 through 0078 are applied, later
 automatic deployments resume without this confirmation.
 
 Slack account-link callbacks started before the authorization binding fences were deployed must be restarted from
@@ -78,10 +78,10 @@ Permits with no existing bindings and complete current permits remain valid.
 The `gate` job must pass before the `deploy` job starts, rather than running alongside it, because
 migrations are forward-only. What it runs depends on how the workflow was triggered:
 
-| Event                      | `pnpm check` in the gate | Deployment condition                                                                                                                                            |
-| -------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Completed CI run on `main` | Skipped                  | CI passed, its SHA is the current `main` tip, and migrations `0011`, `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, `0075`, `0076`, and `0077` are not pending |
-| `workflow_dispatch`        | Runs                     | The ref passes; pending `0011` and pending `0069`/`0070`/`0071`/`0072`/`0073`/`0074`/`0075`/`0076`/`0077` require their respective migration-safe confirmations |
+| Event                      | `pnpm check` in the gate | Deployment condition                                                                                                                                                    |
+| -------------------------- | ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Completed CI run on `main` | Skipped                  | CI passed, its SHA is the current `main` tip, and migrations `0011`, `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, `0075`, `0076`, `0077`, and `0078` are not pending |
+| `workflow_dispatch`        | Runs                     | The ref passes; pending `0011` and pending `0069`/`0070`/`0071`/`0072`/`0073`/`0074`/`0075`/`0076`/`0077`/`0078` require their respective migration-safe confirmations  |
 
 `.github/workflows/ci.yml` triggers on `on: push` with no branch filter, so every push to `main`
 starts CI on the same SHA. Its five jobs — static checks, unit, Worker integration, build, and the

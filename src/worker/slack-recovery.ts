@@ -15,6 +15,10 @@ import { outboxEnqueueRetryAt, reportPersistentEnqueueFailure } from "./outbox-r
 import { logger, safeTelemetryErrorMessage } from "./observability";
 
 import {
+  slackOutboxSnapshotFields as recoverySnapshotFields,
+  slackOutboxSnapshotSql as recoverySnapshotSql,
+  slackOutboxSnapshotBinds as recoverySnapshotBinds,
+  type SlackOutboxSnapshot,
   ROUND2_TOPICS_SQL,
   round2Receipts,
   mappingDeliveryPauseSql,
@@ -45,8 +49,8 @@ function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string) {
       : "r.claimed_at";
   return `SELECT r.${contract.state} state,${claimed} claimed_at,${topic === "slack_file_upload" ? "NULL" : "r.attempted_at"} attempted_at,
     ${channel ? "r.delivered_at IS NOT NULL OR r.suppressed_at IS NOT NULL" : "0"} completed,
-    ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state IN ('sending','blocked'))" : "0"} uncertain_child,
-    ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state='blocked')" : "0"} blocked_child,
+    ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND (child.state IN ('sending','blocked') OR (child.state='pending' AND child.attempted_at IS NOT NULL)))" : "0"} uncertain_child,
+    ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND (child.state='blocked' OR (child.state='pending' AND child.attempted_at IS NOT NULL)))" : "0"} blocked_child,
     ${topic === "slack_file_upload" ? destinationPause : `i.disconnected_at IS NULL AND i.generation=r.installation_generation AND (i.auth_error IS NOT NULL OR (${destinationPause}))`} paused
     FROM ${contract.table} r ${mapping ? "JOIN slack_channel_subscriptions m ON m.id=r.subscription_id" : ""}
     JOIN slack_installations i ON i.id=${installation} WHERE r.id=${idSql}`;
@@ -86,36 +90,7 @@ export async function round2DeliveryOutcome(
   return (await round2DeliveryStatus(env, topic, id)).outcome;
 }
 
-export type Round2OutboxSnapshot = {
-  id: string;
-  attempts: number;
-  enqueued_at: number | null;
-  available_at: number;
-  last_error: string | null;
-  slack_redrive_due_at: number | null;
-  slack_claim_recheck_at: number | null;
-  slack_redrive_count: number;
-  slack_scope_paused_at: number | null;
-  slack_enqueue_redrive_pending: number;
-  slack_enqueue_failure_count: number;
-};
-const recoverySnapshotFields = [
-  "id",
-  "attempts",
-  "enqueued_at",
-  "available_at",
-  "last_error",
-  "slack_redrive_due_at",
-  "slack_claim_recheck_at",
-  "slack_redrive_count",
-  "slack_scope_paused_at",
-  "slack_enqueue_redrive_pending",
-  "slack_enqueue_failure_count",
-] as const satisfies readonly (keyof Round2OutboxSnapshot)[];
-const recoverySnapshotSql = `${recoverySnapshotFields.map((field) => `${field} IS ?`).join(" AND ")} AND slack_scope_paused_at IS NULL`;
-function recoverySnapshotBinds(sibling: Round2OutboxSnapshot) {
-  return recoverySnapshotFields.map((field) => sibling[field]);
-}
+export type Round2OutboxSnapshot = SlackOutboxSnapshot;
 
 // Materialize the complete sibling set before changing any row in it. A producer
 // that read an older scheduling version cannot checkpoint or send that version.
@@ -182,7 +157,7 @@ export async function enqueueRound2Outbox(
   const redrivePending = existingIntent || newIntent;
   const guard = recoverySetGuard(topic, receiptId, snapshots);
   const checkpoint = await env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=?,
-    slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=NULL,slack_enqueue_redrive_pending=?
+    slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=NULL,slack_enqueue_redrive_pending=?,slack_enqueue_failure_count=0
     WHERE id IN (SELECT id FROM outbox WHERE topic=? AND slack_round2_receipt_id=? AND ${guard.sql})`)
     .bind(now, options.dueAt, redrivePending ? 1 : 0, topic, receiptId, ...guard.binds)
     .run();
@@ -202,6 +177,7 @@ export async function enqueueRound2Outbox(
     slack_redrive_due_at: Math.max(snapshot.slack_redrive_due_at ?? 0, options.dueAt),
     slack_claim_recheck_at: null,
     slack_enqueue_redrive_pending: redrivePending ? 1 : 0,
+    slack_enqueue_failure_count: 0,
   }));
   try {
     await env.DELIVERY_QUEUE.send(
@@ -213,32 +189,29 @@ export async function enqueueRound2Outbox(
     // or newer retry owns its own scheduling and must survive enqueue failure.
     const message = safeTelemetryErrorMessage(error, "Queue enqueue failed.");
     const failed = await env.DB.batch(
-      staged.map((snapshot) => {
-        const failures = snapshot.slack_enqueue_failure_count + 1;
+      staged.map((snapshot, index) => {
+        const failures = snapshots[index]!.slack_enqueue_failure_count + 1;
         const retryAt = outboxEnqueueRetryAt(failures);
-        return env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,slack_enqueue_failure_count=slack_enqueue_failure_count+1,
+        return env.DB.prepare(`UPDATE outbox SET enqueued_at=NULL,slack_enqueue_failure_count=?,
           available_at=max(available_at,?),slack_redrive_due_at=max(coalesce(slack_redrive_due_at,0),?),slack_claim_recheck_at=?,
           last_error=CASE WHEN last_error='slack_validation_stale' THEN last_error ELSE ? END
-          WHERE ${recoverySnapshotSql}`).bind(retryAt, retryAt, retryAt, message, ...recoverySnapshotBinds(snapshot));
+          WHERE ${recoverySnapshotSql}`).bind(
+          failures,
+          retryAt,
+          retryAt,
+          retryAt,
+          message,
+          ...recoverySnapshotBinds(snapshot),
+        );
       }),
     );
     failed.forEach((result, index) => {
       const snapshot = staged[index]!;
       if (result.meta.changes)
-        reportPersistentEnqueueFailure(env, snapshot.id, snapshot.slack_enqueue_failure_count + 1, message);
+        reportPersistentEnqueueFailure(env, snapshot.id, snapshots[index]!.slack_enqueue_failure_count + 1, message);
     });
     throw error;
   }
-  await env.DB.batch(
-    staged.map((snapshot) =>
-      env.DB.prepare(`UPDATE outbox SET slack_enqueue_failure_count=0
-    WHERE id=? AND attempts=? AND slack_enqueue_failure_count=?`).bind(
-        snapshot.id,
-        snapshot.attempts,
-        snapshot.slack_enqueue_failure_count,
-      ),
-    ),
-  );
   if (redrivePending) {
     // A sibling can pause after enqueue while the others record this intent.
     // Bring it up to their budget instead of charging the receipt a second time.
@@ -362,6 +335,20 @@ export async function redriveRound2Outbox(env: Env) {
           ),
         );
         continue;
+      }
+      if (
+        row.topic === "slack_digest" &&
+        status.outcome === "uncertain" &&
+        status.blocked_child &&
+        ["pending", "sending"].includes(status.state)
+      ) {
+        const ownership = recoverySetGuard(row.topic, id, siblings.results);
+        await env.DB.prepare(`UPDATE slack_digest_receipts SET state='blocked',last_error='post_unconfirmed'
+          WHERE id=? AND state IN ('pending','sending') AND coalesce(claimed_at,0)<=? AND ${ownership.sql}
+            AND EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=slack_digest_receipts.id
+              AND child.state='pending' AND child.attempted_at IS NOT NULL)`)
+          .bind(id, now - 60_000, ...ownership.binds)
+          .run();
       }
       if (
         status.outcome === "paused" ||
@@ -495,7 +482,7 @@ async function exhaustRound2Receipt(
 // Owner recovery reconciles evidence only; it never resets an uncertain post for blind delivery.
 export async function reconcileRound2Mapping(env: Env, mappingId: string) {
   const digests = await env.DB.prepare(
-    `SELECT id FROM slack_digest_receipts WHERE subscription_id=? AND state IN ('sending','blocked') AND attempted_at IS NOT NULL`,
+    `SELECT id FROM slack_digest_receipts WHERE subscription_id=? AND (state IN ('sending','blocked') OR EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=slack_digest_receipts.id AND child.attempted_at IS NOT NULL AND child.state IN ('pending','sending','blocked')))`,
   )
     .bind(mappingId)
     .all<{ id: string }>();
