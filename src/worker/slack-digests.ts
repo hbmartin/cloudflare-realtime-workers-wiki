@@ -152,7 +152,7 @@ async function retireDeniedDigestEvents(
                 WHERE o.topic='slack_digest' AND o.slack_scope_paused_at IS NOT NULL AND root.subscription_id=m.id
                 AND event.created_at>=root.window_start AND event.created_at<root.window_end)))))
         AND NOT EXISTS(SELECT 1 FROM slack_digest_message_events reserved JOIN slack_digest_messages child ON child.id=reserved.message_id
-          WHERE reserved.event_id=event.id AND (child.state IN ('sending','blocked') OR child.attempted_at IS NOT NULL OR (child.claimed_at>? AND child.claim_token IS NOT ?)))
+          WHERE reserved.event_id=event.id AND (child.state='sending' OR (child.claimed_at>? AND child.claim_token IS NOT ?)))
         AND NOT EXISTS(SELECT 1 FROM slack_digest_receipts root WHERE root.subscription_id=event.subscription_id
           AND event.created_at>=root.window_start AND event.created_at<root.window_end
           AND ((root.state IN ('sending','blocked') AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=root.id)
@@ -536,7 +536,7 @@ async function nextMessage(
   token: string,
 ) {
   const existing = await env.DB.prepare(
-    `SELECT * FROM slack_digest_messages WHERE receipt_id=? AND state NOT IN ('sent','skipped','retired') ORDER BY sequence LIMIT 1`,
+    `SELECT * FROM slack_digest_messages WHERE receipt_id=? AND state IN ('pending','sending') ORDER BY sequence LIMIT 1`,
   )
     .bind(receipt.id)
     .first<DigestMessage>();
@@ -622,7 +622,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
       .first<DigestReceipt>())!;
     if (!receipt) throw new DeliveryInProgressError();
     let message = await env.DB.prepare(
-      `SELECT * FROM slack_digest_messages WHERE receipt_id=? AND state IN ('pending','sending','blocked') ORDER BY sequence LIMIT 1`,
+      `SELECT * FROM slack_digest_messages WHERE receipt_id=? AND state IN ('pending','sending') ORDER BY sequence LIMIT 1`,
     )
       .bind(id)
       .first<DigestMessage>();
@@ -720,7 +720,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
     };
     if (legacyReconciled) {
       // Continue below by preparing the next message, without posting twice in this attempt.
-    } else if (message?.state === "sending" || (message && message.attempted_at !== null)) {
+    } else if (message?.state === "sending") {
       if (message.attempted_at === null) {
         await updateRoot("blocked", null, "post_unconfirmed");
         return;

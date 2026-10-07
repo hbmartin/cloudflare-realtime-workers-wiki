@@ -7,7 +7,7 @@ import worker from "./index";
 import { consumeDeliveryMessage } from "./jobs";
 import { syncRound2Configuration } from "./slack-channels";
 import { createShare } from "./shares";
-import { notificationFanoutStatements } from "./notifications";
+import { notificationFanoutStatements, DeliveryInProgressError } from "./notifications";
 import {
   slackApi,
   type SlackInstallation,
@@ -285,7 +285,7 @@ describe("legacy channel event settlement", () => {
         query.sql.startsWith("UPDATE slack_channel_events SET suppressed_at=") ||
         query.sql.includes("SELECT event.id event_id"),
     );
-    expect(checks).toHaveLength(3);
+    expect(checks).toHaveLength(5);
     for (const query of checks) {
       const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${query.sql}`)
         .bind(...query.binds)
@@ -503,7 +503,9 @@ describe("legacy channel event settlement", () => {
     const before = await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first();
     const remote = vi.fn();
     vi.stubGlobal("fetch", remote);
-    await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+    await expect(deliverSlackChannelEvent(fixture.bindings, "actor-event")).rejects.toBeInstanceOf(
+      DeliveryInProgressError,
+    );
     expect(remote).not.toHaveBeenCalled();
     expect(await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first()).toEqual(before);
   });
@@ -653,7 +655,9 @@ describe("legacy channel event settlement", () => {
       .bind(Date.now())
       .run();
     const before = await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first();
-    await deliverSlackChannelEvent(fixture.bindings, "actor-event");
+    const result = await deliverSlackChannelEvent(fixture.bindings, "actor-event").catch((error: unknown) => error);
+    const competing = expect.any(DeliveryInProgressError);
+    expect(result).toEqual(mode === "other claim" ? competing : "completed");
     expect(await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id='actor-event'").first()).toEqual(before);
   });
 
@@ -2303,16 +2307,18 @@ describe("Slack security and integration", () => {
     ).run();
 
     const deliveredFetch = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
-      Response.json({ ok: true }),
+      Response.json({ ok: true, ts: "1700000000.000001" }),
     );
     vi.stubGlobal("fetch", deliveredFetch);
     await deliverSlackChannelEvent(slackEnv(), event!.id);
     expect(String(deliveredFetch.mock.calls[0]![1]?.body)).toContain("Launch &lt;@UATTACK&gt;¦plan");
     expect(
-      await env.DB.prepare(`SELECT delivered_at IS NOT NULL delivered FROM slack_channel_events WHERE id = ?`)
+      await env.DB.prepare(
+        `SELECT round2_state,message_ts,delivered_at IS NOT NULL delivered FROM slack_channel_events WHERE id = ?`,
+      )
         .bind(event!.id)
         .first(),
-    ).toEqual({ delivered: 1 });
+    ).toEqual({ round2_state: "sent", message_ts: "1700000000.000001", delivered: 1 });
   });
 
   it("defers only the rate-limited Slack installation and retries it on a later tick", async () => {

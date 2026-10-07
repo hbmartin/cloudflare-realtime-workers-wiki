@@ -221,6 +221,13 @@ export async function deliverThumbnail(env: Env, id: string) {
       .bind(Date.now(), id, token)
       .run();
   } catch (error) {
+    if (error instanceof DeliveryInProgressError) {
+      await env.DB.prepare(`UPDATE slack_file_artifacts SET state='pending',attempt_count=MAX(0,attempt_count-1),updated_at=?
+        WHERE id=? AND claim_token=? AND state='uploading'`)
+        .bind(Date.now(), id, token)
+        .run();
+      throw error;
+    }
     if (error instanceof SlackApiError && error.code === "missing_scope")
       await recordSlackFileScopeError(env, installation, error);
     await recordDeliveryError(env, installation, error);
