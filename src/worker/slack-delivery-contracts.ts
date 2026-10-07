@@ -1,5 +1,115 @@
 import type { Env } from "./env";
 
+// Scheduling ownership includes payload identity. Deadline-only maintenance can
+// rebase an operation, but a new attempt or payload always belongs to a successor.
+export type SlackOutboxSnapshot = {
+  id: string;
+  attempts: number;
+  payload_json: string;
+  enqueued_at: number | null;
+  available_at: number;
+  last_error: string | null;
+  slack_redrive_due_at: number | null;
+  slack_claim_recheck_at: number | null;
+  slack_redrive_count: number;
+  slack_scope_paused_at: number | null;
+  slack_enqueue_redrive_pending: number;
+  slack_enqueue_failure_count: number;
+};
+export const slackOutboxSnapshotFields = [
+  "id",
+  "attempts",
+  "payload_json",
+  "enqueued_at",
+  "available_at",
+  "last_error",
+  "slack_redrive_due_at",
+  "slack_claim_recheck_at",
+  "slack_redrive_count",
+  "slack_scope_paused_at",
+  "slack_enqueue_redrive_pending",
+  "slack_enqueue_failure_count",
+] as const satisfies readonly (keyof SlackOutboxSnapshot)[];
+export const slackOutboxSnapshotSql = `${slackOutboxSnapshotFields.map((field) => `${field} IS ?`).join(" AND ")} AND slack_scope_paused_at IS NULL`;
+export function slackOutboxSnapshotBinds(snapshot: SlackOutboxSnapshot) {
+  return slackOutboxSnapshotFields.map((field) => snapshot[field]);
+}
+export function slackOutboxFence(snapshot: SlackOutboxSnapshot) {
+  return { sql: slackOutboxSnapshotSql, binds: slackOutboxSnapshotBinds(snapshot) };
+}
+// The producer may commit a staged redrive budget after the consumer reads it.
+// This is the same queue attempt: every other scheduling field and the payload
+// must still match. No successor attempt or enqueue-failure schedule can match.
+export function slackConsumerOutboxFence(snapshot: SlackOutboxSnapshot) {
+  const captured = slackOutboxFence(snapshot);
+  if (!snapshot.slack_enqueue_redrive_pending) return captured;
+  const fields = slackOutboxSnapshotFields.filter(
+    (field) => field !== "slack_redrive_count" && field !== "slack_enqueue_redrive_pending",
+  );
+  return {
+    sql: `(${captured.sql} OR (${fields.map((field) => `${field} IS ?`).join(" AND ")}
+      AND slack_scope_paused_at IS NULL AND slack_enqueue_redrive_pending=0 AND slack_redrive_count>=?))`,
+    binds: [...captured.binds, ...fields.map((field) => snapshot[field]), snapshot.slack_redrive_count],
+  };
+}
+
+export function sameSlackOperation(before: SlackOutboxSnapshot, after: SlackOutboxSnapshot) {
+  return slackOutboxSnapshotFields.every(
+    (field) => field === "slack_redrive_due_at" || field === "slack_claim_recheck_at" || before[field] === after[field],
+  );
+}
+
+export const RETRYABLE_SHARE_RECEIPT_SQL = `EXISTS(SELECT 1 FROM slack_interaction_receipts receipt
+  WHERE receipt.id=json_extract(outbox.payload_json,'$.receiptId') AND receipt.outcome='accepted'
+    AND receipt.denial_sent_at IS NULL AND (receipt.response_delivery_state='pending'
+      OR (receipt.response_delivery_state IS NULL AND receipt.response_delivery_attempted_at IS NULL)))`;
+
+function slackOutboxInstallationMatchSql() {
+  const receipts = [
+    ["slack_digest", "slack_digest_receipts"],
+    ["slack_bulk", "slack_bulk_receipts"],
+    ["slack_share_refresh", "slack_share_refreshes"],
+    ["slack_file_upload", "slack_file_artifacts"],
+  ];
+  return `(i.id=json_extract(outbox.payload_json,'$.installationId') AND i.generation=json_extract(outbox.payload_json,'$.generation'))
+    OR (topic='slack_channel' AND EXISTS(SELECT 1 FROM slack_channel_events r JOIN slack_channel_subscriptions m ON m.id=r.subscription_id
+      WHERE r.id=slack_round2_receipt_id AND m.installation_id=i.id AND r.installation_generation=i.generation))
+    OR ${receipts.map(([topic, table]) => `(topic='${topic}' AND EXISTS(SELECT 1 FROM ${table} r WHERE r.id=slack_round2_receipt_id AND r.installation_id=i.id AND r.installation_generation=i.generation))`).join(" OR ")}
+    OR (topic='slack_unfurl' AND EXISTS(SELECT 1 FROM slack_unfurls r WHERE r.id=json_extract(outbox.payload_json,'$.unfurlId') AND r.installation_id=i.id AND r.installation_generation=i.generation))
+    OR (topic='slack_thread_reply' AND EXISTS(SELECT 1 FROM slack_thread_deliveries d JOIN slack_thread_links r ON r.id=d.link_id
+      WHERE d.id=json_extract(outbox.payload_json,'$.deliveryId') AND r.installation_id=i.id AND r.installation_generation=i.generation))
+    OR (topic='slack_inbound_reply' AND EXISTS(SELECT 1 FROM slack_inbound_receipts r
+      WHERE r.id=json_extract(outbox.payload_json,'$.receiptId') AND r.installation_id=i.id
+        AND json_extract(r.payload_json,'$.generation')=i.generation))
+    OR (topic='slack_thread_action' AND EXISTS(SELECT 1 FROM slack_interaction_receipts r
+      WHERE r.id=json_extract(outbox.payload_json,'$.receiptId') AND r.installation_id=i.id
+        AND json_extract(r.payload_json,'$.generation')=i.generation))`;
+}
+
+export function slackScopePauseStatement(
+  env: Env,
+  fence: { sql: string; binds: unknown[] },
+  scopes: SlackScopeRequirements,
+  credentialRevision: number,
+  extraGuard = "1",
+  now = Date.now(),
+) {
+  return env.DB.prepare(`UPDATE outbox SET slack_scope_paused_at=coalesce(slack_scope_paused_at,?),slack_scope_required_json=?,
+    enqueued_at=coalesce(enqueued_at,?),slack_claim_recheck_at=NULL,
+    slack_redrive_due_at=CASE WHEN ${ROUND2_OUTBOX_SQL} THEN coalesce(slack_redrive_due_at,?+1800000) ELSE NULL END,
+    last_error=CASE WHEN ${ROUND2_OUTBOX_SQL} AND last_error='slack_validation_stale' THEN last_error ELSE 'slack_scope_missing' END
+    WHERE ${fence.sql} AND ${extraGuard} AND EXISTS(SELECT 1 FROM slack_installations i
+      WHERE i.disconnected_at IS NULL AND i.credential_revision=?
+        AND (${slackOutboxInstallationMatchSql()}))`).bind(
+    now,
+    JSON.stringify(scopes),
+    now,
+    now,
+    ...fence.binds,
+    credentialRevision,
+  );
+}
+
 export const PERMANENT_SLACK_VALIDATION_ERRORS = [
   "channel_not_found",
   "not_in_channel",
@@ -72,8 +182,7 @@ export function thumbnailEligibilitySql(artifact = "r", now = Date.now()) {
       AND d.thumbnail_r2_key=${artifact}.thumbnail_r2_key AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0
       AND installation.id=${artifact}.installation_id AND installation.generation=${artifact}.installation_generation
       AND installation.disconnected_at IS NULL AND m.cadence='digest'
-      AND (m.validation_state='valid' OR (m.notification_blocked_at IS NOT NULL AND NOT coalesce(
-        m.validation_error IN (${PERMANENT_SLACK_VALIDATION_ERRORS.map((error) => `'${error}'`).join(",")}),0)))
+      AND (m.validation_state='valid' OR ${mappingDeliveryPauseSql("m", now)})
       AND EXISTS(SELECT 1 FROM workspace_members owner WHERE owner.workspace_id=p.workspace_id AND owner.user_id=m.created_by AND owner.role='owner')`;
   return `CASE WHEN NOT EXISTS(${destination}) THEN 'obsolete'
     WHEN EXISTS(${destination} AND installation.auth_error IS NULL AND m.validation_state='valid' AND m.notification_blocked_at IS NULL
@@ -213,7 +322,7 @@ export function round2WakeStatement(
       AND (? IS NULL OR i.generation=?) AND m.notification_blocked_at IS NULL
       AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=? AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND (
       (topic='slack_channel' AND EXISTS(SELECT 1 FROM slack_channel_events r WHERE r.id=slack_round2_receipt_id AND r.subscription_id=m.id AND r.round2_state='pending' AND r.suppressed_at IS NULL AND r.delivered_at IS NULL AND coalesce(r.claimed_at,0)<?)) OR
-      (topic='slack_digest' AND (outbox.id='outbox:'||slack_round2_receipt_id OR enqueued_at IS NULL OR slack_redrive_due_at IS NOT NULL OR slack_claim_recheck_at IS NOT NULL) AND EXISTS(SELECT 1 FROM slack_digest_receipts r WHERE r.id=slack_round2_receipt_id AND r.subscription_id=m.id AND r.state='pending' AND coalesce(r.claimed_at,0)<? AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state IN ('sending','blocked')))) OR
+      (topic='slack_digest' AND (outbox.id='outbox:'||slack_round2_receipt_id OR enqueued_at IS NULL OR slack_redrive_due_at IS NOT NULL OR slack_claim_recheck_at IS NOT NULL) AND EXISTS(SELECT 1 FROM slack_digest_receipts r WHERE r.id=slack_round2_receipt_id AND r.subscription_id=m.id AND r.state='pending' AND coalesce(r.claimed_at,0)<? AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND (child.state IN ('sending','blocked') OR (child.state='pending' AND child.attempted_at IS NOT NULL))))) OR
       (topic='slack_bulk' AND EXISTS(SELECT 1 FROM slack_bulk_receipts r WHERE r.id=slack_round2_receipt_id AND r.installation_id=i.id AND r.channel_id=m.channel_id AND r.state='pending' AND coalesce(r.claimed_at,0)<?
         AND EXISTS(SELECT 1 FROM slack_channel_events event WHERE event.summary_id=r.id AND event.subscription_id=m.id
           AND event.round2_state='pending' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL))) OR
@@ -241,8 +350,6 @@ export async function resumeSlackFileCleanup(env: Env, workspaceId: string) {
     .run();
 }
 
-export const SHARE_OUTBOX_GUARD_SQL = "id=? AND attempts=? AND payload_json=? AND slack_scope_paused_at IS NULL";
-
 export const PENDING_SHARE_RESPONSE_SQL = `EXISTS(SELECT 1 FROM slack_installations i JOIN slack_interaction_receipts receipt ON receipt.installation_id=i.id
   WHERE json_valid(outbox.payload_json) AND i.id=json_extract(outbox.payload_json,'$.installationId')
     AND i.generation=json_extract(outbox.payload_json,'$.generation') AND i.workspace_id=outbox.workspace_id
@@ -254,10 +361,10 @@ export function startSlackShareEligibleClockStatement(
   env: Env,
   id: string,
   now: number,
-  fence?: { sql: string; binds: unknown[] },
+  fence: { sql: string; binds: unknown[] },
 ) {
   return env.DB.prepare(`UPDATE outbox SET slack_eligible_started_at=?,slack_scope_paused_ms=0,
     slack_auth_pause_baseline_ms=(SELECT i.auth_paused_ms FROM slack_installations i WHERE i.workspace_id=outbox.workspace_id AND i.disconnected_at IS NULL)
     WHERE id=? AND topic='slack_share_response' AND json_valid(payload_json) AND slack_eligible_started_at IS NULL AND slack_scope_paused_at IS NULL
-      AND ${PENDING_SHARE_RESPONSE_SQL} AND (${fence?.sql ?? "1"})`).bind(now, id, ...(fence?.binds ?? []));
+      AND ${PENDING_SHARE_RESPONSE_SQL} AND (${fence.sql})`).bind(now, id, ...fence.binds);
 }

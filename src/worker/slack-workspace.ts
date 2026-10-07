@@ -1,4 +1,14 @@
-import { SHARE_OUTBOX_GUARD_SQL } from "./slack-delivery-contracts";
+import {
+  slackOutboxSnapshotFields,
+  slackOutboxFence,
+  slackOutboxSnapshotSql,
+  slackOutboxSnapshotBinds,
+  sameSlackOperation,
+  slackScopePauseStatement,
+  slackScopeRequirements,
+  RETRYABLE_SHARE_RECEIPT_SQL,
+  type SlackOutboxSnapshot,
+} from "./slack-delivery-contracts";
 import { legacyShareRecoverySelectSql } from "../shared/slack-share-recovery";
 import { slackAccessAuthorization } from "./slack-identity";
 import { round2WakeStatement } from "./slack-delivery-contracts";
@@ -1595,14 +1605,8 @@ export async function deliverSlackShareResponse(
   env: Env,
   payload: Record<string, unknown>,
   outboxId?: string,
-  captured?: {
-    attempts: number;
-    available_at: number;
-    enqueued_at: number | null;
-    slack_redrive_due_at: number | null;
-    slack_claim_recheck_at: number | null;
-  },
-): Promise<"deferred" | void> {
+  captured?: SlackOutboxSnapshot,
+): Promise<"deferred" | "scope_paused" | "retry_scheduled" | void> {
   if (
     typeof payload.receiptId !== "string" ||
     typeof payload.installationId !== "string" ||
@@ -1632,25 +1636,14 @@ export async function deliverSlackShareResponse(
     return;
   const durableId = outboxId ?? `outbox:slack-share-response:${payload.receiptId}`;
   const durable =
-    await env.DB.prepare(`SELECT payload_json,attempts,available_at,enqueued_at,slack_redrive_due_at,slack_claim_recheck_at FROM outbox WHERE id=? AND topic='slack_share_response'
+    await env.DB.prepare(`SELECT ${slackOutboxSnapshotFields.join(",")} FROM outbox WHERE id=? AND topic='slack_share_response'
     AND slack_scope_paused_at IS NULL`)
       .bind(durableId)
-      .first<{
-        payload_json: string;
-        attempts: number;
-        available_at: number;
-        enqueued_at: number | null;
-        slack_redrive_due_at: number | null;
-        slack_claim_recheck_at: number | null;
-      }>();
+      .first<SlackOutboxSnapshot>();
   if (!durable) return;
   if (
     captured &&
-    (durable.attempts !== captured.attempts ||
-      durable.available_at !== captured.available_at ||
-      durable.enqueued_at !== captured.enqueued_at ||
-      durable.slack_redrive_due_at !== captured.slack_redrive_due_at ||
-      durable.slack_claim_recheck_at !== captured.slack_claim_recheck_at)
+    !slackOutboxSnapshotFields.every((field) => field === "payload_json" || durable[field] === captured[field])
   )
     throw new DeliveryInProgressError();
   const source = JSON.parse(durable.payload_json) as Record<string, unknown>;
@@ -1684,19 +1677,8 @@ export async function deliverSlackShareResponse(
     // failure before dispatch. Pending is the evidence that this send can retry.
     const normalized = await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_attempted_at=NULL
       WHERE id=? AND outcome='accepted' AND denial_sent_at IS NULL AND response_delivery_state='pending'
-        AND response_delivery_attempted_at=? AND EXISTS(SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL}
-          AND available_at=? AND enqueued_at IS ? AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ?)`)
-      .bind(
-        payload.receiptId,
-        storedReceipt.response_delivery_attempted_at,
-        durableId,
-        durable.attempts,
-        durable.payload_json,
-        durable.available_at,
-        durable.enqueued_at,
-        durable.slack_redrive_due_at,
-        durable.slack_claim_recheck_at,
-      )
+        AND response_delivery_attempted_at=? AND EXISTS(SELECT 1 FROM outbox WHERE ${slackOutboxSnapshotSql})`)
+      .bind(payload.receiptId, storedReceipt.response_delivery_attempted_at, ...slackOutboxSnapshotBinds(durable))
       .run();
     if (!normalized.meta.changes) throw new DeliveryInProgressError();
     storedReceipt.response_delivery_attempted_at = null;
@@ -1705,14 +1687,12 @@ export async function deliverSlackShareResponse(
     const blocked =
       await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error='send_unconfirmed'
       WHERE id=? AND response_delivery_state IS ? AND response_delivery_attempted_at=?
-        AND EXISTS(SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL})`)
+        AND EXISTS(SELECT 1 FROM outbox WHERE ${slackOutboxSnapshotSql})`)
         .bind(
           payload.receiptId,
           storedReceipt.response_delivery_state,
           storedReceipt.response_delivery_attempted_at,
-          durableId,
-          durable.attempts,
-          durable.payload_json,
+          ...slackOutboxSnapshotBinds(durable),
         )
         .run();
     if (!blocked.meta.changes) throw new DeliveryInProgressError();
@@ -1727,28 +1707,20 @@ export async function deliverSlackShareResponse(
       .first<{ identity_json: string }>();
     if (proof) {
       const persisted = await env.DB.prepare(`UPDATE outbox SET payload_json=json_set(payload_json,'$.identity',json(?))
-        WHERE ${SHARE_OUTBOX_GUARD_SQL} AND available_at=? AND enqueued_at IS ? AND slack_redrive_due_at IS ? AND slack_claim_recheck_at IS ?
+        WHERE ${slackOutboxSnapshotSql}
         AND EXISTS(SELECT 1 FROM (${legacyShareRecoverySelectSql}) proof WHERE proof.id=outbox.id AND proof.identity_json=? AND proof.response_delivery_state IS ?)`)
         .bind(
           proof.identity_json,
-          durableId,
-          durable.attempts,
-          durable.payload_json,
-          durable.available_at,
-          durable.enqueued_at,
-          durable.slack_redrive_due_at,
-          durable.slack_claim_recheck_at,
+          ...slackOutboxSnapshotBinds(durable),
           proof.identity_json,
           storedReceipt.response_delivery_state,
         )
         .run();
       if (!persisted.meta.changes) throw new DeliveryInProgressError();
-      return deliverSlackShareResponse(
-        env,
-        { ...source, identity: JSON.parse(proof.identity_json) },
-        durableId,
-        durable,
-      );
+      return deliverSlackShareResponse(env, { ...source, identity: JSON.parse(proof.identity_json) }, durableId, {
+        ...durable,
+        payload_json: JSON.stringify({ ...source, identity: JSON.parse(proof.identity_json) }),
+      });
     }
     if (await authPaused()) return "deferred";
   }
@@ -1764,21 +1736,19 @@ export async function deliverSlackShareResponse(
     await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error=CASE WHEN response_delivery_attempted_at IS NULL THEN 'request_identity_unavailable' ELSE 'send_unconfirmed' END
       WHERE id=? AND outcome='accepted' AND denial_sent_at IS NULL
         AND response_delivery_state IS ?
-        AND EXISTS(SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL})
+        AND EXISTS(SELECT 1 FROM outbox WHERE ${slackOutboxSnapshotSql})
         AND NOT EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL AND auth_error IS NOT NULL)`)
       .bind(
         payload.receiptId,
         storedReceipt.response_delivery_state,
-        durableId,
-        durable.attempts,
-        durable.payload_json,
+        ...slackOutboxSnapshotBinds(durable),
         payload.installationId,
         payload.generation,
       )
       .run();
     if (await authPaused()) return "deferred";
-    const current = await env.DB.prepare(`SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL}`)
-      .bind(durableId, durable.attempts, durable.payload_json)
+    const current = await env.DB.prepare(`SELECT 1 FROM outbox WHERE ${slackOutboxSnapshotSql}`)
+      .bind(...slackOutboxSnapshotBinds(durable))
       .first();
     if (!current) throw new DeliveryInProgressError();
     return;
@@ -1818,7 +1788,7 @@ export async function deliverSlackShareResponse(
               AND reference.channel_id=? AND reference.message_ts=? AND reference.state<>'retired'))
           AND EXISTS(SELECT 1 FROM slack_interaction_receipts receipt WHERE receipt.id=? AND receipt.outcome='accepted'
             AND (?=0 OR (receipt.response_delivery_state='sending' AND receipt.response_delivery_attempted_at=?)))
-          AND EXISTS(SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL})`)
+          AND EXISTS(SELECT 1 FROM outbox WHERE ${slackOutboxSnapshotSql})`)
         .bind(
           installation.id,
           installation.generation,
@@ -1840,14 +1810,12 @@ export async function deliverSlackShareResponse(
           payload.receiptId,
           claimed ? 1 : 0,
           attemptedAt,
-          durableId,
-          durable.attempts,
-          durable.payload_json,
+          ...slackOutboxSnapshotBinds(durable),
         )
         .first<{ url_key: string }>();
       if (!row) {
-        const current = await env.DB.prepare(`SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL}`)
-          .bind(durableId, durable.attempts, durable.payload_json)
+        const current = await env.DB.prepare(`SELECT 1 FROM outbox WHERE ${slackOutboxSnapshotSql}`)
+          .bind(...slackOutboxSnapshotBinds(durable))
           .first();
         if (!current) throw new DeliveryInProgressError();
         unavailable();
@@ -1862,8 +1830,8 @@ export async function deliverSlackShareResponse(
     const receipt = await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='sending',
       response_delivery_attempted_at=?,response_delivery_error=NULL WHERE id=? AND outcome='accepted'
       AND denial_sent_at IS NULL AND (response_delivery_state IS NULL OR response_delivery_state='pending')
-      AND response_delivery_attempted_at IS NULL AND EXISTS(SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL})`)
-      .bind(attemptedAt, payload.receiptId, durableId, durable.attempts, durable.payload_json)
+      AND response_delivery_attempted_at IS NULL AND EXISTS(SELECT 1 FROM outbox WHERE ${slackOutboxSnapshotSql})`)
+      .bind(attemptedAt, payload.receiptId, ...slackOutboxSnapshotBinds(durable))
       .run();
     if (!receipt.meta.changes) throw new DeliveryInProgressError();
     claimed = true;
@@ -1881,13 +1849,59 @@ export async function deliverSlackShareResponse(
     if (error instanceof SlackApiError && slackInstallationError(error))
       await recordSlackInstallationError(env, installationId, error, generation);
     if (error instanceof SlackApiError && error.code === "missing_scope") {
-      if (claimed)
-        await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='pending',response_delivery_attempted_at=NULL
-        WHERE id=? AND response_delivery_state='sending' AND response_delivery_attempted_at=?
-          AND EXISTS(SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL})`)
-          .bind(payload.receiptId, attemptedAt, durableId, durable.attempts, durable.payload_json)
-          .run();
-      throw error;
+      // A definite rejection can rewind only this sending checkpoint. The batch
+      // chooses between pausing its credentials and retrying newer credentials.
+      for (let rebase = 0; rebase < 3; rebase++) {
+        const current = await env.DB.prepare(`SELECT ${slackOutboxSnapshotFields.join(",")} FROM outbox WHERE id=?`)
+          .bind(durableId)
+          .first<SlackOutboxSnapshot>();
+        if (!current || !sameSlackOperation(durable, current)) throw new DeliveryInProgressError();
+        const fence = slackOutboxFence(current);
+        const target = `EXISTS(SELECT 1 FROM slack_installations i WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL)`;
+        const sending = `response_delivery_state='sending' AND response_delivery_attempted_at=?`;
+        const receiptGuard = `${RETRYABLE_SHARE_RECEIPT_SQL} AND EXISTS(SELECT 1 FROM slack_interaction_receipts receipt WHERE receipt.id=json_extract(outbox.payload_json,'$.receiptId') AND receipt.response_delivery_attempted_at IS ${claimed ? attemptedAt : "NULL"})`;
+        const rewound = env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='pending'
+          WHERE id=? AND outcome='accepted' AND denial_sent_at IS NULL AND ${claimed ? sending : "(response_delivery_state='pending' OR (response_delivery_state IS NULL AND response_delivery_attempted_at IS NULL))"}
+            AND ${target} AND EXISTS(SELECT 1 FROM outbox WHERE ${fence.sql})`).bind(
+          payload.receiptId,
+          ...(claimed ? [attemptedAt] : []),
+          installationId,
+          generation,
+          ...fence.binds,
+        );
+        const results = await env.DB.batch([
+          rewound,
+          slackScopePauseStatement(
+            env,
+            fence,
+            slackScopeRequirements("slack_share_response", error.method, error.neededScopes),
+            error.credentialRevision,
+            receiptGuard,
+          ),
+          env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,
+            slack_claim_recheck_at=NULL WHERE ${fence.sql} AND ${receiptGuard}
+              AND EXISTS(SELECT 1 FROM slack_installations i WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL AND i.credential_revision<>?)`).bind(
+            Date.now(),
+            ...fence.binds,
+            installationId,
+            generation,
+            error.credentialRevision,
+          ),
+          env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_attempted_at=NULL
+            WHERE id=? AND response_delivery_state='pending' AND response_delivery_attempted_at IS ?
+              AND EXISTS(SELECT 1 FROM outbox WHERE id=? AND payload_json=? AND (slack_scope_paused_at IS NOT NULL OR (attempts=? AND enqueued_at IS NULL)))`).bind(
+            payload.receiptId,
+            claimed ? attemptedAt : null,
+            durableId,
+            current.payload_json,
+            current.attempts + 1,
+          ),
+        ]);
+        if (results[1]!.meta.changes) return "scope_paused";
+        if (results[2]!.meta.changes) return "retry_scheduled";
+        if (results[0]!.meta.changes) throw new DeliveryInProgressError();
+      }
+      throw new DeliveryInProgressError();
     }
     if (
       error instanceof SlackRateLimitError ||
@@ -1914,7 +1928,7 @@ export async function deliverSlackShareResponse(
         await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error=?
         WHERE id=? AND ((?=1 AND response_delivery_state='sending' AND response_delivery_attempted_at=?)
           OR (?=0 AND (response_delivery_state IS NULL OR response_delivery_state='pending')
-            AND EXISTS(SELECT 1 FROM outbox WHERE ${SHARE_OUTBOX_GUARD_SQL})))`)
+            AND EXISTS(SELECT 1 FROM outbox WHERE ${slackOutboxSnapshotSql})))`)
           .bind(
             error instanceof SlackApiError
               ? error.code
@@ -1925,9 +1939,7 @@ export async function deliverSlackShareResponse(
             claimed ? 1 : 0,
             attemptedAt,
             claimed ? 1 : 0,
-            durableId,
-            durable.attempts,
-            durable.payload_json,
+            ...slackOutboxSnapshotBinds(durable),
           )
           .run();
       if (!claimed && !blocked.meta.changes) throw new DeliveryInProgressError();

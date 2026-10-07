@@ -189,7 +189,7 @@ hand. Before upgrading an existing installation, take a D1 export and stop any r
 then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
 new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
 
-Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, `0075`, `0076`, or `0077` require
+Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, `0075`, `0076`, `0077`, or `0078` require
 `SLACK_REVIEW_MIGRATION_SAFE=true` after the [Slack rollout pause](#slack-review-follow-up-migration).
 This guard applies to both `pnpm db:remote` and `pnpm run deploy`; local database migrations do not
 require confirmation. The confirmation acknowledges an operator-completed pause and drain, rather
@@ -398,7 +398,7 @@ before making changes. Quiesce page moves or verify that the live Worker already
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
 until that manually dispatched run has deployed the new Worker.
 
-Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, `0075_slack_delivery_recovery.sql`, `0076_slack_delivery_recovery_followup.sql`, or `0077_slack_recovery_query_indexes.sql` also stop automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, `0075_slack_delivery_recovery.sql`, `0076_slack_delivery_recovery_followup.sql`, `0077_slack_recovery_query_indexes.sql`, or `0078_slack_delivery_recovery_repairs.sql` also stop automatic deployment.
 Follow the [Slack rollout pause](#slack-review-follow-up-migration), then manually dispatch with
 `confirm_slack_review_migration_safe` checked. The workflow passes this confirmation to the guarded
 remote migration command. Once these migrations are applied, later automatic releases need no Slack
@@ -439,6 +439,10 @@ Fresh migration chains build the required schema normally.
 `0076_slack_delivery_recovery_followup.sql` adds indexes for recoverable share receipts, targeted subscription/window cleanup, and child reservations, plus a cursor and index for bounded bulk cleanup. Applied migrations remain unchanged. The preflight also supports upgrades before 0068 and creates its expression lookup index before repairing shares.
 
 `0077_slack_recovery_query_indexes.sql` adds a partial index on pending, never-attempted digest children for orphan reservation discovery. It is an index-only forward migration; it does not backfill or revive work. Apply it under the same pause, disabled-validation, backup, 16-minute drain, deployment, and verification sequence below.
+
+`0078_slack_delivery_recovery_repairs.sql` establishes missing recovery deadlines for already-enqueued Round 2-owned channel receipts, including legacy IDs on initialized mappings. It preserves completed/suppressed receipts, scope pauses, fresh claims, existing schedules, retry budgets, and explicit repair signatures. Apply it before deploying the Worker using the queue pause, validation disable, backup, and 16-minute drain sequence below. Verify the repaired rows before restoring flags and delivery.
+
+Validation rollback intentionally holds initialized mappings and all their channel events. Initialization persists, backlog and recovery markers remain, and held work is excluded from runnable health counts. Uninitialized mappings retain legacy delivery. Re-enabling validation and synchronizing configuration resumes held work without resetting budgets; uncertain sends require reconciliation. During release verification, monitor recovery, scope-pause, enqueue-failure, and exhaustion telemetry. Confirm obsolete unfurls stop redriving and resumed delivery produces no duplicate sends.
 
 The updated maintenance pass repairs up to 50 channel outbox rows and 50 proven identity candidates,
 even while delivery flags are disabled. Pending Activity work becomes enqueueable; sending work

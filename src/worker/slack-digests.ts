@@ -583,7 +583,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
   if (env.SLACK_RICH_DIGESTS_ENABLED === "true" && env.WORKSPACE_ACTIVITY_ENABLED !== "true")
     throw new HttpError(409, "activity_required", "Enable workspace activity before rich Slack digests.");
   let receipt = await env.DB.prepare(`SELECT * FROM slack_digest_receipts WHERE id=?`).bind(id).first<DigestReceipt>();
-  if (reconcileOnly && receipt && !["sending", "blocked"].includes(receipt.state)) return;
+  if (reconcileOnly && receipt && !["pending", "sending", "blocked"].includes(receipt.state)) return;
   if (
     !receipt ||
     ["sent", "skipped", "retired"].includes(receipt.state) ||
@@ -720,7 +720,11 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
     };
     if (legacyReconciled) {
       // Continue below by preparing the next message, without posting twice in this attempt.
-    } else if (message?.state === "sending" || (reconcileOnly && message?.attempted_at)) {
+    } else if (message?.state === "sending" || (message && message.attempted_at !== null)) {
+      if (message.attempted_at === null) {
+        await updateRoot("blocked", null, "post_unconfirmed");
+        return;
+      }
       const ts = await reconcileBotPost(
         env,
         installation,

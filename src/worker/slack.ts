@@ -2581,6 +2581,15 @@ async function retireSlackUnfurl(
   ]);
 }
 
+// Missing, disconnected and replaced installations all make this receipt obsolete.
+export async function retireObsoleteSlackUnfurl(env: Env, unfurlId: string) {
+  return env.DB.prepare(`UPDATE slack_unfurls SET retired_at=?,retirement_reason='obsolete_installation'
+    WHERE id=? AND delivered_at IS NULL AND retired_at IS NULL AND NOT EXISTS(SELECT 1 FROM slack_installations i
+      WHERE i.id=slack_unfurls.installation_id AND i.generation=slack_unfurls.installation_generation AND i.disconnected_at IS NULL)`)
+    .bind(Date.now(), unfurlId)
+    .run();
+}
+
 export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: string) {
   const row = await env.DB.prepare(
     `SELECT unfurl.id unfurl_id, unfurl.user_id, unfurl.channel_id, unfurl.message_ts, unfurl.unfurls_json, unfurl.created_at,
@@ -2605,7 +2614,10 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
         created_at: number;
       }
     >();
-  if (!row) return;
+  if (!row) {
+    await retireObsoleteSlackUnfurl(env, unfurlId);
+    return;
+  }
   if (!row.message_ts) {
     await retireSlackUnfurl(env, unfurlId, "missing_message_ts", outboxId);
     return;

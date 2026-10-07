@@ -75,7 +75,10 @@ export async function deliverThumbnail(env: Env, id: string) {
         .first()
     )
       return;
-    await retireObsoleteReceipt(env, "slack_file_artifacts", id, row.installation_id, row.installation_generation);
+    if (
+      !(await retireObsoleteReceipt(env, "slack_file_artifacts", id, row.installation_id, row.installation_generation))
+    )
+      throw new DeliveryInProgressError();
     await cleanupAllocation(env, row.installation_id, id, row.slack_file_id);
     return;
   }
@@ -107,8 +110,8 @@ export async function deliverThumbnail(env: Env, id: string) {
         .first<{ eligibility: "ready" | "paused" | "obsolete" }>();
       if (!status) throw new DeliveryInProgressError();
       if (status.eligibility === "ready") return true;
-      await env.DB.prepare(
-        `UPDATE slack_file_artifacts SET state=?,updated_at=?,attempt_count=MAX(0,attempt_count-?) WHERE id=? AND claim_token=?`,
+      const retained = await env.DB.prepare(
+        `UPDATE slack_file_artifacts AS r SET state=?,updated_at=?,attempt_count=MAX(0,attempt_count-?) WHERE id=? AND claim_token=? AND (${thumbnailEligibilitySql()})=?`,
       )
         .bind(
           status.eligibility === "paused" ? "pending" : "retired",
@@ -116,8 +119,10 @@ export async function deliverThumbnail(env: Env, id: string) {
           status.eligibility === "paused" ? 1 : 0,
           id,
           token,
+          status.eligibility,
         )
         .run();
+      if (!retained.meta.changes) throw new DeliveryInProgressError();
       if (status.eligibility === "obsolete") await cleanupAllocation(env, installation.id, id, row!.slack_file_id);
       return false;
     };

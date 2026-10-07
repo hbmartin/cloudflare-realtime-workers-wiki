@@ -82,14 +82,19 @@ export async function installationFor(env: Env, id: string, generation?: number)
   if (!row || (generation !== undefined && row.generation !== generation)) unavailable();
   return row;
 }
+export class SlackMirrorScopeError extends HttpError {
+  constructor(readonly credentialRevision: number) {
+    super(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
+  }
+}
 function requireMirrorScopes(installation: SlackInstallation) {
   if (!slackHasScopes(installation.scopes, SLACK_MIRROR_SCOPES))
-    throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
+    throw new SlackMirrorScopeError(installation.credential_revision);
   return installation;
 }
 function mirrorRouteError(error: unknown): never {
-  if (slackMissingScope(error))
-    throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
+  if (slackMissingScope(error) && error instanceof SlackApiError)
+    throw new SlackMirrorScopeError(error.credentialRevision);
   throw error;
 }
 async function memberFor(
@@ -751,13 +756,13 @@ export async function deliverSlackMutation(env: Env, receiptId: string, action: 
       throw error;
     }
     if (String(error).includes("CHECK constraint failed: authorized = 1")) {
-      const current = await env.DB.prepare(`SELECT scopes
+      const current = await env.DB.prepare(`SELECT scopes,credential_revision
         FROM slack_installations WHERE id=? AND disconnected_at IS NULL`)
         .bind(input.installationId)
-        .first<{ scopes: string }>();
+        .first<{ scopes: string; credential_revision: number }>();
       if (current) {
         if (!action && !slackHasScopes(current.scopes, SLACK_MIRROR_SCOPES))
-          throw new HttpError(403, "slack_mirror_missing_scope", "Reconnect Slack to enable thread mirroring.");
+          throw new SlackMirrorScopeError(current.credential_revision);
       }
     }
     const contentError =

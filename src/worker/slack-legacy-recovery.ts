@@ -219,12 +219,12 @@ export async function repairLegacySlackDelivery(env: Env) {
     {
       name: "orphans",
       run: async () => {
-        const roots = await env.DB.prepare(`SELECT DISTINCT root.id,root.claim_token,root.claimed_at
+        const roots = await env.DB.prepare(`SELECT root.id,root.claim_token,root.claimed_at
     FROM slack_digest_messages candidate INDEXED BY slack_digest_unsent_children
     CROSS JOIN slack_digest_receipts root ON root.id=candidate.receipt_id
     WHERE candidate.state='pending' AND candidate.attempted_at IS NULL
       AND root.state='retired' AND (root.claimed_at IS NULL OR root.claimed_at<=?)
-      AND ${digestRetirementGuardSql()} ORDER BY root.id LIMIT 50`)
+      AND ${digestRetirementGuardSql()} GROUP BY candidate.receipt_id ORDER BY candidate.receipt_id LIMIT 50`)
           .bind(now - 60_000)
           .all<{ id: string; claim_token: string | null; claimed_at: number | null }>();
         let orphanRepairs = 0;

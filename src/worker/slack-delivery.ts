@@ -144,7 +144,7 @@ export async function retireObsoleteReceipt(
   generation: number,
 ) {
   const token = crypto.randomUUID();
-  await env.DB.batch([
+  const results = await env.DB.batch([
     env.DB.prepare(`UPDATE ${table} SET claim_token=?,claimed_at=? WHERE id=? AND state IN ('pending'${table === "slack_file_artifacts" ? ",'uploading'" : ""})
       AND (claimed_at IS NULL OR claimed_at<?) AND NOT EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)
       ${table === "slack_digest_receipts" ? `AND ${digestRetirementGuardSql("slack_digest_receipts")}` : ""}`).bind(
@@ -160,6 +160,7 @@ export async function retireObsoleteReceipt(
       `UPDATE ${table} SET ${table === "slack_digest_receipts" ? "" : "state='retired',"}claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
     ).bind(id, token),
   ]);
+  return Boolean(results.at(-1)?.meta.changes);
 }
 
 // The dispatch hook has already classified unsent work as paused or retired.
