@@ -5,31 +5,14 @@ import {
   SlackRateLimitError,
   recordSlackInstallationError,
   slackInstallationError,
+  definiteSlackRejection,
   type SlackInstallation,
 } from "./slack";
 
-export type DeliveryOutcome = "completed" | "paused" | "competing" | "retryable" | "uncertain";
+export type { DeliveryOutcome } from "./slack-delivery-contracts";
+export { definiteSlackRejection } from "./slack";
 
 export { thumbnailDeliveryEnabled } from "./slack-delivery-contracts";
-
-// Only definite API rejections prove that no message was created. Transport and
-// malformed-response failures must retain the sending checkpoint for reconciliation.
-export function definiteSlackRejection(error: unknown): error is SlackApiError {
-  return (
-    error instanceof SlackApiError &&
-    error.status < 500 &&
-    ![
-      "http_error",
-      "invalid_response",
-      "internal_error",
-      "fatal_error",
-      "service_unavailable",
-      "request_timeout",
-      "org_login_required",
-      "team_added_to_org",
-    ].includes(error.code)
-  );
-}
 
 export function permanentSlackValidationError(error: string | null | undefined) {
   return PERMANENT_SLACK_VALIDATION_ERRORS.includes(error ?? "");
@@ -91,7 +74,7 @@ export function invalidSlackDestination(error: unknown): error is SlackApiError 
 export function digestRetirementGuardSql(root = "root") {
   const stale = Date.now() - 60_000;
   return `NOT EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=${root}.id
-    AND (child.state IN ('sending','blocked') OR (child.state='pending' AND child.attempted_at IS NOT NULL)
+    AND (child.state='sending'
       OR (child.claimed_at>${stale} AND child.claim_token IS NOT ${root}.claim_token)))
     AND NOT EXISTS(SELECT 1 FROM slack_digest_messages child JOIN json_each(child.event_ids_json) reservation
       JOIN slack_channel_events event ON event.id=reservation.value WHERE child.receipt_id=${root}.id
@@ -160,7 +143,7 @@ export async function retireObsoleteReceipt(
       `UPDATE ${table} SET ${table === "slack_digest_receipts" ? "" : "state='retired',"}claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
     ).bind(id, token),
   ]);
-  return Boolean(results.at(-1)?.meta.changes);
+  return Boolean(results.at(table === "slack_digest_receipts" ? -2 : -1)?.meta.changes);
 }
 
 // The dispatch hook has already classified unsent work as paused or retired.

@@ -49,8 +49,7 @@ function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string) {
       : "r.claimed_at";
   return `SELECT r.${contract.state} state,${claimed} claimed_at,${topic === "slack_file_upload" ? "NULL" : "r.attempted_at"} attempted_at,
     ${channel ? "r.delivered_at IS NOT NULL OR r.suppressed_at IS NOT NULL" : "0"} completed,
-    ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND (child.state IN ('sending','blocked') OR (child.state='pending' AND child.attempted_at IS NOT NULL)))" : "0"} uncertain_child,
-    ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND (child.state='blocked' OR (child.state='pending' AND child.attempted_at IS NOT NULL)))" : "0"} blocked_child,
+    ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state='sending')" : "0"} uncertain_child,
     ${topic === "slack_file_upload" ? destinationPause : `i.disconnected_at IS NULL AND i.generation=r.installation_generation AND (i.auth_error IS NOT NULL OR (${destinationPause}))`} paused
     FROM ${contract.table} r ${mapping ? "JOIN slack_channel_subscriptions m ON m.id=r.subscription_id" : ""}
     JOIN slack_installations i ON i.id=${installation} WHERE r.id=${idSql}`;
@@ -62,7 +61,7 @@ const outcomeSql = () => `CASE WHEN state IN ('sent','skipped','retired','upload
 export async function round2DeliveryStatus(env: Env, topic: keyof typeof round2Receipts, id: string) {
   return (
     (await env.DB.prepare(
-      `SELECT ${outcomeSql()} outcome,state,claimed_at,attempted_at,paused,blocked_child FROM (${receiptStatusSql(topic, "?")})`,
+      `SELECT ${outcomeSql()} outcome,state,claimed_at,attempted_at,paused FROM (${receiptStatusSql(topic, "?")})`,
     )
       .bind(id)
       .first<{
@@ -71,14 +70,12 @@ export async function round2DeliveryStatus(env: Env, topic: keyof typeof round2R
         claimed_at: number | null;
         attempted_at: number | null;
         paused: number;
-        blocked_child: number;
       }>()) ?? {
       outcome: "completed" as const,
       state: "retired",
       claimed_at: null,
       attempted_at: null,
       paused: 0,
-      blocked_child: 0,
     }
   );
 }
@@ -337,23 +334,9 @@ export async function redriveRound2Outbox(env: Env) {
         continue;
       }
       if (
-        row.topic === "slack_digest" &&
-        status.outcome === "uncertain" &&
-        status.blocked_child &&
-        ["pending", "sending"].includes(status.state)
-      ) {
-        const ownership = recoverySetGuard(row.topic, id, siblings.results);
-        await env.DB.prepare(`UPDATE slack_digest_receipts SET state='blocked',last_error='post_unconfirmed'
-          WHERE id=? AND state IN ('pending','sending') AND coalesce(claimed_at,0)<=? AND ${ownership.sql}
-            AND EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=slack_digest_receipts.id
-              AND child.state='pending' AND child.attempted_at IS NOT NULL)`)
-          .bind(id, now - 60_000, ...ownership.binds)
-          .run();
-      }
-      if (
         status.outcome === "paused" ||
         (status.outcome === "uncertain" &&
-          (status.state !== "sending" || status.attempted_at === null || status.paused || status.blocked_child))
+          (status.state !== "sending" || status.attempted_at === null || status.paused))
       ) {
         const due = now + 30 * 60_000;
         await env.DB.batch(
@@ -374,7 +357,7 @@ export async function redriveRound2Outbox(env: Env) {
       if (recoveries >= 50) continue;
       recoveries++;
       if (status.outcome === "retryable" && !coordinationRecheck && !enqueueRetry && budget >= 8) {
-        await exhaustRound2Receipt(env, row.topic, id, siblings.results);
+        await exhaustSlackReceipt(env, row.topic, id, siblings.results);
         continue;
       }
       const due = now + Math.min(6 * 60 * 60_000, 15 * 60_000 * 2 ** Math.min(budget, 5));
@@ -400,7 +383,7 @@ export async function redriveRound2Outbox(env: Env) {
   }
 }
 
-async function exhaustRound2Receipt(
+export async function exhaustSlackReceipt(
   env: Env,
   topic: keyof typeof round2Receipts,
   id: string,
@@ -482,7 +465,7 @@ async function exhaustRound2Receipt(
 // Owner recovery reconciles evidence only; it never resets an uncertain post for blind delivery.
 export async function reconcileRound2Mapping(env: Env, mappingId: string) {
   const digests = await env.DB.prepare(
-    `SELECT id FROM slack_digest_receipts WHERE subscription_id=? AND (state IN ('sending','blocked') OR EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=slack_digest_receipts.id AND child.attempted_at IS NOT NULL AND child.state IN ('pending','sending','blocked')))`,
+    `SELECT id FROM slack_digest_receipts WHERE subscription_id=? AND (state IN ('sending','blocked') OR EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=slack_digest_receipts.id AND child.state='sending'))`,
   )
     .bind(mappingId)
     .all<{ id: string }>();

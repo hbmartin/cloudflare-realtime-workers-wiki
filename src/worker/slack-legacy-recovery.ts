@@ -171,7 +171,7 @@ export async function repairLegacySlackDelivery(env: Env) {
       AND (root.claimed_at IS NULL OR root.claimed_at<=?)
       AND (event.claimed_at IS NULL OR event.claimed_at<=?)
       AND NOT EXISTS(SELECT 1 FROM slack_digest_message_events live JOIN slack_digest_messages uncertain ON uncertain.id=live.message_id
-        WHERE live.event_id=event.id AND uncertain.state IN ('pending','sending','blocked'))
+        WHERE live.event_id=event.id AND uncertain.state IN ('pending','sending'))
     ORDER BY event.id LIMIT 200`)
           .bind(now - 60_000, now - 60_000)
           .all<{
@@ -203,7 +203,7 @@ export async function repairLegacySlackDelivery(env: Env) {
           AND (child.last_error='redrive_exhausted' OR (root.state='retired' AND root.last_error='redrive_exhausted'))
           AND (root.claimed_at IS NULL OR root.claimed_at<=${now - 60_000}))
       AND NOT EXISTS(SELECT 1 FROM slack_digest_message_events live JOIN slack_digest_messages uncertain ON uncertain.id=live.message_id
-        WHERE live.event_id=slack_channel_events.id AND uncertain.state IN ('pending','sending','blocked'))`)
+        WHERE live.event_id=slack_channel_events.id AND uncertain.state IN ('pending','sending'))`)
                 .bind(
                   now,
                   JSON.stringify(stranded.results.map((row) => row.id)),
