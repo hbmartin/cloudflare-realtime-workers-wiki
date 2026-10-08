@@ -1,4 +1,8 @@
-import { mappingDeliveryPauseSql, PERMANENT_SLACK_VALIDATION_ERRORS } from "./slack-delivery-contracts";
+import {
+  mappingDeliveryPauseSql,
+  PERMANENT_SLACK_VALIDATION_ERRORS,
+  slackDeliveryFeatures,
+} from "./slack-delivery-contracts";
 import {
   SlackDispatchSkippedError,
   definiteSlackRejection,
@@ -14,7 +18,6 @@ import { digestWindow } from "./slack-schedule";
 import { CHANNEL_EVENT_TYPES, type ChannelEventType } from "../shared/activity";
 import { OPEN_THREAD_COUNT_SQL, TASK_STATUS_SQL } from "./activity";
 import type { Env } from "./env";
-import { HttpError } from "./http";
 import { digestBlocks, type DigestPage } from "./slack-blocks";
 import {
   round2Installation,
@@ -247,7 +250,7 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
       error,
     );
   }
-  if (env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true") return;
+  if (!slackDeliveryFeatures(env).slack_digest) return;
   await revalidateMappings(env);
   const mappings =
     await env.DB.prepare(`SELECT m.id,i.generation FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
@@ -494,6 +497,7 @@ export async function reconcileBotPost(
   threadTs?: string,
 ) {
   let cursor: string | undefined;
+  let confirmed: string | null = null;
   for (let page = 0; page < 20; page++) {
     const input = {
       channel,
@@ -511,10 +515,10 @@ export async function reconcileBotPost(
         m.metadata?.event_payload?.delivery_id === id &&
         (threadTs ? m.thread_ts === threadTs : !m.thread_ts || m.thread_ts === m.ts),
     );
-    if (found.length === 1) return found[0]!.ts;
-    if (found.length > 1) return null;
+    if (found.length > 1 || (found.length && confirmed)) return null;
+    if (found.length === 1) confirmed = found[0]!.ts;
     cursor = result.response_metadata?.next_cursor;
-    if (!cursor) return null;
+    if (!cursor) return confirmed;
   }
   return null;
 }
@@ -579,9 +583,7 @@ async function nextMessage(
 class EmptyDigestPageSkippedError extends SlackDispatchSkippedError {}
 
 export async function deliverDigest(env: Env, id: string, reconcileOnly = false) {
-  if (env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true") return;
-  if (env.SLACK_RICH_DIGESTS_ENABLED === "true" && env.WORKSPACE_ACTIVITY_ENABLED !== "true")
-    throw new HttpError(409, "activity_required", "Enable workspace activity before rich Slack digests.");
+  if (!slackDeliveryFeatures(env).slack_digest) return;
   let receipt = await env.DB.prepare(`SELECT * FROM slack_digest_receipts WHERE id=?`).bind(id).first<DigestReceipt>();
   if (reconcileOnly && receipt && !["pending", "sending", "blocked"].includes(receipt.state)) return;
   if (

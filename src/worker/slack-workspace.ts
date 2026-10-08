@@ -1842,56 +1842,53 @@ export async function deliverSlackShareResponse(
     if (error instanceof SlackApiError && error.code === "missing_scope") {
       // A definite rejection can rewind only this sending checkpoint. The batch
       // chooses between pausing its credentials and retrying newer credentials.
-      for (let rebase = 0; rebase < 3; rebase++) {
-        const current = await env.DB.prepare(`SELECT ${slackOutboxSnapshotFields.join(",")} FROM outbox WHERE id=?`)
-          .bind(durableId)
-          .first<SlackOutboxSnapshot>();
-        if (!current || !sameSlackOperation(durable, current)) throw new DeliveryInProgressError();
-        const fence = slackConsumerOutboxFence(current);
-        const target = `EXISTS(SELECT 1 FROM slack_installations i WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL)`;
-        const sending = `response_delivery_state='sending' AND response_delivery_attempted_at=?`;
-        const receiptGuard = `${RETRYABLE_SHARE_RECEIPT_SQL} AND EXISTS(SELECT 1 FROM slack_interaction_receipts receipt WHERE receipt.id=json_extract(outbox.payload_json,'$.receiptId') AND receipt.response_delivery_attempted_at IS ${claimed ? attemptedAt : "NULL"})`;
-        const rewound = env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='pending'
-          WHERE id=? AND outcome='accepted' AND denial_sent_at IS NULL AND ${claimed ? sending : "(response_delivery_state='pending' OR (response_delivery_state IS NULL AND response_delivery_attempted_at IS NULL))"}
-            AND ${target} AND EXISTS(SELECT 1 FROM outbox WHERE ${fence.sql})`).bind(
-          payload.receiptId,
-          ...(claimed ? [attemptedAt] : []),
+      const current = await env.DB.prepare(`SELECT ${slackOutboxSnapshotFields.join(",")} FROM outbox WHERE id=?`)
+        .bind(durableId)
+        .first<SlackOutboxSnapshot>();
+      if (!current || !sameSlackOperation(durable, current)) throw new DeliveryInProgressError();
+      const fence = slackConsumerOutboxFence(current);
+      const target = `EXISTS(SELECT 1 FROM slack_installations i WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL)`;
+      const sending = `response_delivery_state='sending' AND response_delivery_attempted_at=?`;
+      const receiptGuard = `${RETRYABLE_SHARE_RECEIPT_SQL} AND EXISTS(SELECT 1 FROM slack_interaction_receipts receipt WHERE receipt.id=json_extract(outbox.payload_json,'$.receiptId') AND receipt.response_delivery_attempted_at IS ${claimed ? attemptedAt : "NULL"})`;
+      const rewound = env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='pending'
+        WHERE id=? AND outcome='accepted' AND denial_sent_at IS NULL AND ${claimed ? sending : "(response_delivery_state='pending' OR (response_delivery_state IS NULL AND response_delivery_attempted_at IS NULL))"}
+          AND ${target} AND EXISTS(SELECT 1 FROM outbox WHERE ${fence.sql})`).bind(
+        payload.receiptId,
+        ...(claimed ? [attemptedAt] : []),
+        installationId,
+        generation,
+        ...fence.binds,
+      );
+      const results = await env.DB.batch([
+        rewound,
+        slackScopePauseStatement(
+          env,
+          fence,
+          slackScopeRequirements("slack_share_response", error.method, error.neededScopes),
+          error.credentialRevision,
+          receiptGuard,
+        ),
+        env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,
+          slack_claim_recheck_at=NULL WHERE ${fence.sql} AND ${receiptGuard}
+            AND EXISTS(SELECT 1 FROM slack_installations i WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL AND i.credential_revision<>?)`).bind(
+          Date.now(),
+          ...fence.binds,
           installationId,
           generation,
-          ...fence.binds,
-        );
-        const results = await env.DB.batch([
-          rewound,
-          slackScopePauseStatement(
-            env,
-            fence,
-            slackScopeRequirements("slack_share_response", error.method, error.neededScopes),
-            error.credentialRevision,
-            receiptGuard,
-          ),
-          env.DB.prepare(`UPDATE outbox SET attempts=attempts+1,enqueued_at=NULL,available_at=?,slack_redrive_due_at=NULL,
-            slack_claim_recheck_at=NULL WHERE ${fence.sql} AND ${receiptGuard}
-              AND EXISTS(SELECT 1 FROM slack_installations i WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL AND i.credential_revision<>?)`).bind(
-            Date.now(),
-            ...fence.binds,
-            installationId,
-            generation,
-            error.credentialRevision,
-          ),
-          env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_attempted_at=NULL
-            WHERE id=? AND response_delivery_state='pending' AND response_delivery_attempted_at IS ?
-              AND EXISTS(SELECT 1 FROM outbox WHERE id=? AND payload_json=? AND (slack_scope_paused_at IS NOT NULL OR (attempts=? AND enqueued_at IS NULL)))`).bind(
-            payload.receiptId,
-            claimed ? attemptedAt : null,
-            durableId,
-            current.payload_json,
-            current.attempts + 1,
-          ),
-        ]);
-        if (results[1]!.meta.changes) return "scope_paused";
-        if (results[2]!.meta.changes) return "retry_scheduled";
-        if (results[0]!.meta.changes) throw new DeliveryInProgressError();
-      }
+          error.credentialRevision,
+        ),
+        env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_attempted_at=NULL
+          WHERE id=? AND response_delivery_state='pending' AND response_delivery_attempted_at IS ?
+            AND EXISTS(SELECT 1 FROM outbox WHERE id=? AND payload_json=? AND (slack_scope_paused_at IS NOT NULL OR (attempts=? AND enqueued_at IS NULL)))`).bind(
+          payload.receiptId,
+          claimed ? attemptedAt : null,
+          durableId,
+          current.payload_json,
+          current.attempts + 1,
+        ),
+      ]);
+      if (results[1]!.meta.changes) return "scope_paused";
+      if (results[2]!.meta.changes) return "retry_scheduled";
       throw new DeliveryInProgressError();
     }
     if (

@@ -151,22 +151,46 @@ export function round2ChannelOwnershipSql(eventId: string) {
 export const ROUND2_OUTBOX_SQL = `(topic IN (${ROUND2_NON_CHANNEL_TOPICS_SQL})
  OR (topic='slack_channel' AND ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")}))`;
 
+export function slackDeliveryFeatures(env: Env) {
+  const validation = env.SLACK_CHANNEL_VALIDATION_ENABLED === "true";
+  const rich = env.SLACK_RICH_DIGESTS_ENABLED === "true";
+  const activity = env.WORKSPACE_ACTIVITY_ENABLED === "true";
+  return {
+    slack_channel: validation,
+    slack_bulk: validation,
+    slack_digest: validation && (!rich || activity),
+    slack_share_refresh: env.SLACK_SHARE_REFRESH_ENABLED === "true",
+    slack_file_upload: validation && rich && activity,
+  } satisfies Record<keyof typeof round2Receipts, boolean>;
+}
+
 export function thumbnailDeliveryEnabled(env: Env) {
-  return (
-    env.SLACK_RICH_DIGESTS_ENABLED === "true" &&
-    env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" &&
-    env.WORKSPACE_ACTIVITY_ENABLED === "true"
-  );
+  return slackDeliveryFeatures(env).slack_file_upload;
+}
+
+export function slackDeliveryRecheck(
+  status: { outcome: DeliveryOutcome; claimed_at?: number | null },
+  now = Date.now(),
+) {
+  return status.outcome === "completed"
+    ? null
+    : status.outcome === "competing"
+      ? Math.max(now + 1_000, (status.claimed_at ?? now) + 60_000)
+      : now + (status.outcome === "paused" || status.outcome === "uncertain" ? 30 * 60_000 : 60_000);
 }
 
 // Keep health and enqueue selection aligned during deliberate feature pauses.
 export function runnableOutboxSql(env: Env) {
+  const features = slackDeliveryFeatures(env);
   return `slack_scope_paused_at IS NULL
-    AND (topic<>'slack_file_upload' OR ${thumbnailDeliveryEnabled(env) ? 1 : 0}=1)
-    AND (topic<>'slack_share_refresh' OR ${env.SLACK_SHARE_REFRESH_ENABLED === "true" ? 1 : 0}=1)
-    AND (topic NOT IN ('slack_bulk','slack_digest') OR ${env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0}=1)
-    AND (${env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? 1 : 0}=1
-      OR NOT (topic='slack_channel' AND ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")}))`;
+    ${Object.entries(features)
+      .filter(([topic]) => topic !== "slack_channel")
+      .map(([topic, enabled]) => `AND (topic<>'${topic}' OR ${enabled ? 1 : 0}=1)`)
+      .join("\n")}
+    AND (${features.slack_channel ? 1 : 0}=1
+      OR NOT (topic='slack_channel' AND ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")}))
+    AND (topic<>'slack_channel' OR ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")} OR NOT EXISTS(
+      SELECT 1 FROM slack_channel_events blocked WHERE blocked.id=outbox.slack_round2_receipt_id AND blocked.round2_state='blocked'))`;
 }
 
 export function mappingDeliveryPauseSql(alias: string, now: string | number) {

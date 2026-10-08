@@ -1,4 +1,5 @@
-import { mappingDeliveryPauseSql } from "./slack-delivery-contracts";
+import { mappingDeliveryPauseSql, slackDeliveryFeatures, type DeliveryOutcome } from "./slack-delivery-contracts";
+import { logger } from "./observability";
 import {
   SlackDispatchSkippedError,
   definiteSlackRejection,
@@ -22,18 +23,122 @@ import {
   type SlackInstallation,
 } from "./slack";
 
+async function reconcileClaimedChannelPost(
+  env: Env,
+  installation: SlackInstallation,
+  eventId: string,
+  channelId: string,
+  attemptedAt: number | null,
+  token: string,
+): Promise<DeliveryOutcome> {
+  const ts =
+    attemptedAt === null
+      ? null
+      : await reconcileBotPost(env, installation, channelId, `channel:${eventId}`, attemptedAt);
+  const saved = await env.DB.prepare(`UPDATE slack_channel_events SET round2_state=?,message_ts=?,
+    delivered_at=CASE WHEN ? IS NOT NULL THEN ? ELSE delivered_at END
+    WHERE id=? AND claim_token=? AND delivered_at IS NULL AND installation_generation=?
+      AND delivery_channel_id=? AND attempted_at IS ?
+      AND (round2_state IN ('sending','blocked') OR (round2_state='pending' AND attempted_at IS NOT NULL))`)
+    .bind(ts ? "sent" : "blocked", ts, ts, Date.now(), eventId, token, installation.generation, channelId, attemptedAt)
+    .run();
+  if (!saved.meta.changes) throw new DeliveryInProgressError();
+  return ts ? "completed" : "uncertain";
+}
+
+// History verification is independent of delivery flags and current mapping pauses.
+export async function reconcileSlackChannelEvent(env: Env, eventId: string): Promise<DeliveryOutcome> {
+  const token = crypto.randomUUID();
+  const checkpoint = await env.DB.prepare(`UPDATE slack_channel_events SET claim_token=?,claimed_at=?
+    WHERE id=? AND delivered_at IS NULL AND (claimed_at IS NULL OR claimed_at<=?)
+      AND (round2_state IN ('sending','blocked') OR (round2_state='pending' AND attempted_at IS NOT NULL))
+    RETURNING attempted_at,installation_generation,delivery_channel_id,
+      (SELECT installation_id FROM slack_channel_subscriptions WHERE id=subscription_id) installation_id`)
+    .bind(token, Date.now(), eventId, Date.now() - 60_000)
+    .first<{
+      attempted_at: number | null;
+      installation_generation: number;
+      delivery_channel_id: string;
+      installation_id: string;
+    }>();
+  if (!checkpoint) {
+    const live =
+      await env.DB.prepare(`SELECT round2_state state FROM slack_channel_events WHERE id=? AND delivered_at IS NULL
+      AND (round2_state IN ('sending','blocked') OR (round2_state='pending' AND attempted_at IS NOT NULL))`)
+        .bind(eventId)
+        .first();
+    if (live) throw new DeliveryInProgressError();
+    return "completed";
+  }
+  try {
+    const installation = await round2Installation(env, checkpoint.installation_id, checkpoint.installation_generation);
+    if (!installation) {
+      const retired = await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='retired',delivered_at=?
+        WHERE id=? AND claim_token=? AND NOT EXISTS(SELECT 1 FROM slack_installations
+          WHERE id=? AND generation=? AND disconnected_at IS NULL)`)
+        .bind(Date.now(), eventId, token, checkpoint.installation_id, checkpoint.installation_generation)
+        .run();
+      return retired.meta.changes ? "completed" : "paused";
+    }
+    try {
+      return await reconcileClaimedChannelPost(
+        env,
+        installation,
+        eventId,
+        checkpoint.delivery_channel_id,
+        checkpoint.attempted_at,
+        token,
+      );
+    } catch (error) {
+      try {
+        await recordDeliveryError(env, installation, error);
+      } catch (secondary) {
+        logger.error(
+          "slack.channel.recovery_record_failed",
+          "slack",
+          "Could not record history verification error.",
+          { eventId },
+          secondary,
+        );
+      }
+      throw error;
+    }
+  } finally {
+    try {
+      await env.DB.prepare(
+        `UPDATE slack_channel_events SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
+      )
+        .bind(eventId, token)
+        .run();
+    } catch (error) {
+      logger.error(
+        "slack.channel.recovery_release_failed",
+        "slack",
+        "Could not release history verification claim.",
+        { eventId },
+        error,
+      );
+    }
+  }
+}
+
 export async function deliverRound2ChannelEvent(env: Env, eventId: string, reconcileOnly = false) {
+  if (reconcileOnly) {
+    await reconcileSlackChannelEvent(env, eventId);
+    return;
+  }
+  if (!slackDeliveryFeatures(env).slack_channel) return;
   const token = crypto.randomUUID();
   const claim =
     await env.DB.prepare(`UPDATE slack_channel_events SET claim_token=?,claimed_at=? WHERE id=? AND delivered_at IS NULL
-    AND (suppressed_at IS NULL OR round2_state IN ('sending'${reconcileOnly ? ",'blocked'" : ""}))
-    AND round2_state IN ('pending','sending'${reconcileOnly ? ",'blocked'" : ""}) AND (claimed_at IS NULL OR claimed_at<?)`)
+    AND (suppressed_at IS NULL OR round2_state IN ('sending'))
+    AND round2_state IN ('pending','sending') AND (claimed_at IS NULL OR claimed_at<?)`)
       .bind(token, Date.now(), eventId, Date.now() - 60_000)
       .run();
   if (!claim.meta.changes) {
     const live = await env.DB.prepare(
-      `SELECT 1 FROM slack_channel_events WHERE id=? AND round2_state IN ('pending','sending'${reconcileOnly ? ",'blocked'" : ""}) AND delivered_at IS NULL
-        AND (suppressed_at IS NULL OR round2_state IN ('sending'${reconcileOnly ? ",'blocked'" : ""}))`,
+      `SELECT 1 FROM slack_channel_events WHERE id=? AND round2_state IN ('pending','sending') AND delivered_at IS NULL
+        AND (suppressed_at IS NULL OR round2_state IN ('sending'))`,
     )
       .bind(eventId)
       .first();
@@ -96,7 +201,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
           notification_blocked_at: number | null;
         }>();
     let row = await load();
-    if (!row || (reconcileOnly && !["sending", "blocked"].includes(row.round2_state))) return;
+    if (!row) return;
     const installation = await round2Installation(env, row.installation_id, row.generation);
     if (!installation) {
       await env.DB.prepare(
@@ -119,13 +224,8 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
         .run();
       if (revision !== undefined && !result.meta.changes) throw new StaleSlackValidationError();
     };
-    if (row.round2_state === "sending" || reconcileOnly) {
-      const ts = await reconcileBotPost(env, installation, row.delivery_channel_id, id, row.attempted_at!);
-      if (ts) await finish(ts);
-      else
-        await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='blocked' WHERE id=? AND claim_token=?`)
-          .bind(eventId, token)
-          .run();
+    if (row.round2_state === "sending" || row.attempted_at !== null) {
+      await reconcileClaimedChannelPost(env, installation, eventId, row.delivery_channel_id, row.attempted_at, token);
       return;
     }
     if (row.delivery_channel_id !== row.channel_id || !row.owner_valid || row.import_job_id || row.is_template) {
