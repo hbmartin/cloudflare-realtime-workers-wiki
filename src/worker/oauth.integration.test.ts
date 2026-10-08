@@ -1710,6 +1710,237 @@ async function discoveryCall(token: string, method: string, params: Record<strin
   }>();
 }
 
+function markdownWriteBindings(flag: "false" | undefined): Env {
+  const bindings: Env = { ...env };
+  if (flag === undefined) delete bindings.NOTION_MARKDOWN_WRITES_ENABLED;
+  else bindings.NOTION_MARKDOWN_WRITES_ENABLED = flag;
+  return bindings;
+}
+
+describe("MCP Markdown write gate", () => {
+  it.each(["false", undefined] as const)("blocks new creates and updates when the write flag is %s", async (flag) => {
+    const connection = await connect(await bootstrap());
+    const bindings = markdownWriteBindings(flag);
+    const before = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+    );
+    const pageRows = () => env.DB.prepare("SELECT * FROM pages ORDER BY id").all();
+    const receipts = () => env.DB.prepare("SELECT * FROM oauth_operation_receipts ORDER BY operation_id").all();
+    const originalPages = (await pageRows()).results;
+    const originalReceipts = (await receipts()).results;
+    const disabled = {
+      isError: true,
+      structuredContent: { error: { code: "markdown_writes_disabled", retryable: true } },
+    };
+    expect(
+      (
+        await toolCall(
+          connection.token,
+          "create_page",
+          {
+            space_id: connection.page.spaceId,
+            title: "Disabled create",
+            markdown: "Never published",
+            operation_id: "disabled-create",
+          },
+          bindings,
+        )
+      ).result,
+    ).toMatchObject(disabled);
+    for (const guarded of [false, true]) {
+      expect(
+        (
+          await toolCall(
+            connection.token,
+            "update_page",
+            {
+              page_id: connection.page.id,
+              command: { type: "insert_content", insert_content: { content: "Never appended" } },
+              operation_id: `disabled-update-${guarded}`,
+              ...(guarded ? { expected_revision: before.revision, expected_content_epoch: before.contentEpoch } : {}),
+            },
+            bindings,
+          )
+        ).result,
+      ).toMatchObject(disabled);
+    }
+    expect((await pageRows()).results).toEqual(originalPages);
+    expect((await receipts()).results).toEqual(originalReceipts);
+    expect(
+      documentResultSchema.parse(
+        (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+      ),
+    ).toEqual(before);
+  });
+
+  it.each(["false", undefined] as const)(
+    "does not resume or publish staged creates when the write flag is %s",
+    async (flag) => {
+      const connection = await connect(await bootstrap());
+      const input = {
+        space_id: connection.page.spaceId,
+        title: "Staged create",
+        markdown: "Pending content",
+        operation_id: "staged-gate",
+      };
+      expect((await toolCall(connection.token, "create_page", input, failingMutations(503))).result.isError).toBe(true);
+      await env.DB.prepare("UPDATE pages SET updated_at=1 WHERE title=?").bind(input.title).run();
+      const stagedPage = () => env.DB.prepare("SELECT * FROM pages WHERE title=?").bind(input.title).first();
+      const stagedReceipt = () =>
+        env.DB.prepare("SELECT * FROM oauth_operation_receipts WHERE operation_id=?").bind(input.operation_id).first();
+      const beforePage = await stagedPage();
+      const beforeReceipt = await stagedReceipt();
+      expect(beforePage).toMatchObject({ import_job_id: expect.stringContaining("mcp:create:") });
+      expect(
+        (await toolCall(connection.token, "create_page", input, markdownWriteBindings(flag))).result,
+      ).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "markdown_writes_disabled", retryable: true } },
+      });
+      expect(await stagedPage()).toEqual(beforePage);
+      expect(await stagedReceipt()).toEqual(beforeReceipt);
+      expect((await toolCall(connection.token, "create_page", input)).result.isError).not.toBe(true);
+    },
+  );
+
+  it("returns completed OAuth create and update receipts while writes are disabled", async () => {
+    const connection = await connect(await bootstrap());
+    const create = {
+      space_id: connection.page.spaceId,
+      title: "Completed create",
+      markdown: "Original",
+      operation_id: "completed-create",
+    };
+    const created = await toolCall(connection.token, "create_page", create);
+    const pageId = (JSON.parse(created.result.content[0]!.text) as { id: string }).id;
+    const update = {
+      page_id: pageId,
+      command: { type: "insert_content", insert_content: { content: "One append" } },
+      operation_id: "completed-update",
+    };
+    const updated = await toolCall(connection.token, "update_page", update);
+    for (const flag of ["false", undefined] as const) {
+      const bindings = markdownWriteBindings(flag);
+      expect(await toolCall(connection.token, "create_page", create, bindings)).toEqual(created);
+      expect(await toolCall(connection.token, "update_page", update, bindings)).toEqual(updated);
+      for (const [tool, input] of [
+        ["create_page", { ...create, title: "Different" }],
+        ["update_page", { ...update, command: { type: "insert_content", insert_content: { content: "Different" } } }],
+      ] as const)
+        expect((await toolCall(connection.token, tool, input, bindings)).result).toMatchObject({
+          isError: true,
+          structuredContent: { error: { code: "operation_id_reused", retryable: false } },
+        });
+    }
+    const fetched = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: pageId })).result.structuredContent,
+    );
+    expect(fetched.markdown.match(/One append/g)).toHaveLength(1);
+  });
+
+  it("recovers a completed Durable Object update receipt without another content mutation while writes are disabled", async () => {
+    const connection = await connect(await bootstrap());
+    const input = {
+      page_id: connection.page.id,
+      command: { type: "insert_content", insert_content: { content: "Recovered once" } },
+      operation_id: "room-completed-update",
+    };
+    const updated = await toolCall(connection.token, "update_page", input);
+    expect(updated.result.isError).not.toBe(true);
+    for (const flag of ["false", undefined] as const) {
+      await env.DB.prepare("DELETE FROM oauth_operation_receipts WHERE grant_id=? AND operation_id=?")
+        .bind(connection.grantId, input.operation_id)
+        .run();
+      expect(await toolCall(connection.token, "update_page", input, markdownWriteBindings(flag))).toEqual(updated);
+    }
+    const fetched = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+    );
+    expect(fetched.markdown.match(/Recovered once/g)).toHaveLength(1);
+  });
+
+  it("keeps current authorization checks ahead of completed receipts and disabled-write errors", async () => {
+    const connection = await connect(await bootstrap());
+    const create = {
+      space_id: connection.page.spaceId,
+      title: "Permission test",
+      markdown: "Saved",
+      operation_id: "permission-create",
+    };
+    const created = await toolCall(connection.token, "create_page", create);
+    const pageId = (JSON.parse(created.result.content[0]!.text) as { id: string }).id;
+    const update = {
+      page_id: pageId,
+      command: { type: "insert_content", insert_content: { content: "Saved append" } },
+      operation_id: "permission-update",
+    };
+    expect((await toolCall(connection.token, "update_page", update)).result.isError).not.toBe(true);
+    const bindings = markdownWriteBindings("false");
+    await env.DB.prepare(
+      "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES ('other-gate-owner','Owner','other-gate-owner@example.test',1,1)",
+    ).run();
+    await env.DB.prepare(
+      "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES (?,'other-gate-owner','owner',1)",
+    )
+      .bind(connection.workspace.id)
+      .run();
+    await env.DB.prepare("UPDATE workspace_members SET role='viewer' WHERE workspace_id=? AND user_id=?")
+      .bind(connection.workspace.id, connection.user.id)
+      .run();
+    expect((await toolCall(connection.token, "create_page", create, bindings)).result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: "space_forbidden" } },
+    });
+    expect((await toolCall(connection.token, "update_page", update, bindings)).result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: "read_only" } },
+    });
+    const revokedBindings = {
+      ...afterDatabaseRead("SELECT access.grant_id", async () => {
+        await env.DB.prepare("UPDATE oauth_grants SET revoked_at=? WHERE id=?")
+          .bind(Date.now(), connection.grantId)
+          .run();
+      }),
+      NOTION_MARKDOWN_WRITES_ENABLED: "false",
+    } as Env;
+    expect((await toolCall(connection.token, "create_page", create, revokedBindings)).result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: "mcp_access_denied" } },
+    });
+  });
+
+  it("keeps reads, comments and scope-based tool discovery available while writes are disabled", async () => {
+    const connection = await connect(await bootstrap());
+    const bindings = markdownWriteBindings("false");
+    const listed = await discoveryCall(connection.token, "tools/list", {}, bindings);
+    expect(listed.result.tools?.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["create_page", "update_page", "create_comment", "fetch_page"]),
+    );
+    expect((await toolCall(connection.token, "list_spaces", {}, bindings)).result.isError).not.toBe(true);
+    expect(
+      (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId }, bindings)).result.isError,
+    ).not.toBe(true);
+    expect((await toolCall(connection.token, "search_pages", { query: "Welcome" }, bindings)).result.isError).not.toBe(
+      true,
+    );
+    const fetched = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id }, bindings)).result
+        .structuredContent,
+    );
+    expect(fetched.canEdit).toBe(false);
+    expect(
+      (
+        await toolCall(
+          connection.token,
+          "create_comment",
+          { page_id: connection.page.id, body: "Comments remain available", operation_id: "disabled-flag-comment" },
+          bindings,
+        )
+      ).result.isError,
+    ).not.toBe(true);
+  });
+});
+
 describe("ChatGPT plugin contracts", () => {
   it("opens authorized documents and links other page kinds to NoteFlare", async () => {
     const connection = await connect(await bootstrap());
@@ -1869,6 +2100,9 @@ describe("ChatGPT plugin contracts", () => {
 
   it("paginates roots without duplicates and rejects cursors or parents from another destination", async () => {
     const connection = await connect(await bootstrap());
+    await env.DB.prepare(
+      "INSERT INTO page_import_sources(page_id,source_path,source_role,created_at) VALUES (NULL,'missing-table-row','table_row_detail',1)",
+    ).run();
     const ids = Array.from({ length: 55 }, () => crypto.randomUUID());
     await env.DB.batch(
       ids.map((id, index) =>
@@ -1946,11 +2180,15 @@ describe("ChatGPT plugin contracts", () => {
       env.DB.prepare(
         "INSERT INTO page_import_sources(page_id,source_path,source_role,created_at) VALUES (?,'table-row','table_row_detail',1)",
       ).bind(detail),
+      env.DB.prepare(
+        "INSERT INTO page_import_sources(page_id,source_path,source_role,created_at) VALUES (NULL,'missing-table-row','table_row_detail',1)",
+      ),
     ]);
     const roots = pagesResultSchema.parse(
       (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId })).result.structuredContent,
     );
     expect(roots.pages.some((page) => page.id === detail || page.id === staged)).toBe(false);
+    expect(roots.pages.map((page) => page.id)).toContain(connection.page.id);
     const hiddenChildren = pagesResultSchema.parse(
       (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId, parent_id: detail })).result
         .structuredContent,

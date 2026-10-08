@@ -1796,31 +1796,34 @@ async function redriveNonReceiptSlackOutbox(env: Env) {
     AND outbox.slack_scope_paused_at IS NULL
     AND (delivery.id IS NULL OR delivery.state<>'pending' OR EXISTS
       (SELECT 1 FROM slack_thread_delivery_runnable runnable WHERE runnable.id=delivery.id))`;
-  const rows =
-    await env.DB.prepare(`SELECT ${slackOutboxSnapshotFields.map((field) => `outbox.${field}`).join(",")},outbox.workspace_id,outbox.topic,
+  const rows = await env.DB.prepare(`WITH candidates AS (
+      SELECT outbox.id FROM outbox ${deliveryJoin}
+      WHERE outbox.slack_redrive_due_at<=? AND ${runnable}
+      ORDER BY outbox.slack_redrive_due_at,outbox.id LIMIT 50)
+    SELECT ${slackOutboxSnapshotFields.map((field) => `outbox.${field}`).join(",")},outbox.workspace_id,outbox.topic,
       outbox.created_at,outbox.slack_auth_pause_baseline_ms,outbox.slack_eligible_started_at,outbox.slack_scope_paused_ms
-    FROM outbox ${deliveryJoin} WHERE outbox.slack_redrive_due_at<=? AND ${runnable}
+    FROM candidates JOIN outbox ON outbox.id=candidates.id ${deliveryJoin}
     ORDER BY CASE WHEN delivery.state='blocked' THEN 1 ELSE 0 END,
-      CASE WHEN delivery.operation='root' THEN 0 ELSE 1 END,outbox.slack_redrive_due_at,outbox.id LIMIT 50`)
-      .bind(now)
-      .all<
-        SlackOutboxSnapshot & {
-          id: string;
-          workspace_id: string;
-          topic: string;
-          payload_json: string;
-          attempts: number;
-          enqueued_at: number | null;
-          available_at: number;
-          slack_claim_recheck_at: number | null;
-          created_at: number;
-          slack_redrive_due_at: number;
-          slack_redrive_count: number;
-          slack_auth_pause_baseline_ms: number | null;
-          slack_eligible_started_at: number | null;
-          slack_scope_paused_ms: number;
-        }
-      >();
+      CASE WHEN delivery.operation='root' THEN 0 ELSE 1 END,outbox.slack_redrive_due_at,outbox.id`)
+    .bind(now)
+    .all<
+      SlackOutboxSnapshot & {
+        id: string;
+        workspace_id: string;
+        topic: string;
+        payload_json: string;
+        attempts: number;
+        enqueued_at: number | null;
+        available_at: number;
+        slack_claim_recheck_at: number | null;
+        created_at: number;
+        slack_redrive_due_at: number;
+        slack_redrive_count: number;
+        slack_auth_pause_baseline_ms: number | null;
+        slack_eligible_started_at: number | null;
+        slack_scope_paused_ms: number;
+      }
+    >();
   let redriven = 0;
   for (const row of rows.results) {
     try {

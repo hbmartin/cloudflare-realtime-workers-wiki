@@ -22,7 +22,12 @@ import {
 import type { VerificationBudget } from "./slack-history";
 import { logger } from "./observability";
 
-type Candidate = { id: string; topic: keyof typeof round2Receipts | "slack_thread_reply"; created_at: number };
+type Candidate = {
+  id: string;
+  topic: keyof typeof round2Receipts | "slack_thread_reply";
+  created_at: number;
+  installation_generation: number;
+};
 type Cursor = {
   mapping: string;
   generation: number;
@@ -55,15 +60,15 @@ function decode(value: string, mapping: string, generation: number): Cursor {
   }
 }
 // Each stream keeps its destination and generation; the channel stream uses the mapping recovery index.
-const candidatesSql = `SELECT id,'slack_channel' topic,created_at FROM slack_channel_events WHERE subscription_id=?1
+const candidatesSql = `SELECT id,'slack_channel' topic,created_at,installation_generation FROM slack_channel_events WHERE subscription_id=?1
   AND delivered_at IS NULL AND (round2_state IN ('sending','blocked') OR (round2_state='pending' AND attempted_at IS NOT NULL))
- UNION ALL SELECT id,'slack_digest',created_at FROM slack_digest_receipts WHERE subscription_id=?1
+ UNION ALL SELECT id,'slack_digest',created_at,installation_generation FROM slack_digest_receipts WHERE subscription_id=?1
   AND (state IN ('sending','blocked') OR EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=slack_digest_receipts.id AND child.state='sending'))
- UNION ALL SELECT r.id,'slack_bulk',r.created_at FROM slack_bulk_receipts r JOIN slack_channel_subscriptions m
+ UNION ALL SELECT r.id,'slack_bulk',r.created_at,r.installation_generation FROM slack_bulk_receipts r JOIN slack_channel_subscriptions m
   ON m.installation_id=r.installation_id AND m.channel_id=r.channel_id WHERE m.id=?1 AND r.state IN ('sending','blocked') AND r.attempted_at IS NOT NULL
- UNION ALL SELECT r.id,'slack_share_refresh',r.created_at FROM slack_share_refreshes r JOIN slack_channel_subscriptions m
+ UNION ALL SELECT r.id,'slack_share_refresh',r.created_at,r.installation_generation FROM slack_share_refreshes r JOIN slack_channel_subscriptions m
   ON m.installation_id=r.installation_id AND m.channel_id=r.channel_id WHERE m.id=?1 AND r.state IN ('sending','blocked') AND r.attempted_at IS NOT NULL
- UNION ALL SELECT d.id,'slack_thread_reply',d.created_at FROM slack_thread_deliveries d JOIN slack_thread_links l ON l.id=d.link_id
+ UNION ALL SELECT d.id,'slack_thread_reply',d.created_at,l.installation_generation FROM slack_thread_deliveries d JOIN slack_thread_links l ON l.id=d.link_id
   WHERE l.subscription_id=?1 AND d.operation<>'refresh' AND (d.state='sending' OR (d.state='blocked' AND d.failure_reason LIKE 'reconciliation_%'))`;
 
 async function verifyReceipt(env: Env, candidate: Candidate, budget: VerificationBudget) {
@@ -188,6 +193,11 @@ export async function verifySlackMapping(
     delete budget.lastResult;
     summary.checked++;
     lastChecked = tuple(c);
+    // Obsolete attempts remain historical evidence, but cannot be verified with current credentials.
+    if (c.installation_generation !== mapping.generation) {
+      summary.blocked++;
+      continue;
+    }
     try {
       const outcome = await verifyReceipt(env, c, budget);
       const historyResult = (budget as VerificationBudget).lastResult;
@@ -228,7 +238,8 @@ export async function verifySlackMapping(
       WHERE m.id=?1 AND i.auth_error IS NOT NULL)`;
   const unfinished = await env.DB.prepare(`SELECT count(*) count,coalesce(sum(paused),0) paused FROM (
     SELECT candidate.*,(${pausedSql}) paused FROM (${candidatesSql}) candidate
-    WHERE (created_at,topic,id)<=(?2,?3,?4) AND ((${pausedSql}) OR EXISTS(SELECT 1 FROM slack_history_verifications h
+    WHERE (created_at,topic,id)<=(?2,?3,?4) AND candidate.installation_generation=?5
+      AND ((${pausedSql}) OR EXISTS(SELECT 1 FROM slack_history_verifications h
       JOIN slack_channel_subscriptions m ON m.installation_id=h.installation_id WHERE m.id=?1
       AND h.installation_generation=?5 AND h.status='incomplete' AND
       (h.delivery_id=CASE WHEN candidate.topic='slack_channel' THEN 'channel:'||candidate.id ELSE candidate.id END

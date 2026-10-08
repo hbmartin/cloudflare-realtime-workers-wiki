@@ -12,6 +12,7 @@ import { logger } from "./observability";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import {
   slackApi,
+  definiteSlackRejection,
   recordSlackInstallationError,
   slackChannelError,
   slackInstallationError,
@@ -1014,10 +1015,7 @@ async function reconcileDelivery(
 }
 
 const transientSlackLookup = (error: SlackApiError) =>
-  error.status >= 500 ||
-  ["ratelimited", "internal_error", "service_unavailable", "fatal_error", "invalid_response", "http_error"].includes(
-    error.code,
-  );
+  !definiteSlackRejection(error) || ["ratelimited", "network_error", "timeout"].includes(error.code);
 
 async function installationPauseClock(env: Env, installationId: string) {
   const row = await env.DB.prepare(`SELECT auth_paused_ms,auth_error_at FROM slack_installations WHERE id=?`)

@@ -196,6 +196,11 @@ async function writableDestination(env: Env, access: McpAccess, spaceId: string,
     throw new HttpError(422, "cross_space_parent", "The parent page belongs to another space.");
 }
 
+function requireMarkdownWrites(env: Env) {
+  if (env.NOTION_MARKDOWN_WRITES_ENABLED !== "true")
+    throw new HttpError(503, "markdown_writes_disabled", "Markdown writes are temporarily disabled.");
+}
+
 type CreatePageInput = {
   space_id: string;
   parent_id?: string | null | undefined;
@@ -212,6 +217,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
   type Staged = { status: "staged"; pageId: string; children: ReturnType<typeof parseWritableMarkdown> };
   let receipt = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
   if (receipt && (receipt as { status?: unknown }).status !== "staged") return creationResult(receipt);
+  requireMarkdownWrites(env);
   if (!receipt) {
     const children = parseWritableMarkdown(input.markdown);
     if (children.length > 100)
@@ -462,6 +468,7 @@ async function updatePageTool(
   };
   const prior = await roomMutationReceipt(env, page, operationId);
   if (prior) return complete(prior.sequence);
+  requireMarkdownWrites(env);
   const envelope = await roomContent(env, access, page);
   if (
     input.expected_revision !== undefined &&
@@ -746,7 +753,7 @@ async function listPagesTool(
       AND (?='' OR p.position>? OR (p.position=? AND p.id>?))
       AND p.id NOT IN (
         WITH RECURSIVE hidden(id) AS (
-          SELECT page_id FROM page_import_sources WHERE source_role='table_row_detail'
+          SELECT page_id FROM page_import_sources WHERE source_role='table_row_detail' AND page_id IS NOT NULL
           UNION SELECT page_id FROM table_row_pages
           UNION ALL SELECT child.id FROM pages child JOIN hidden ON child.parent_id=hidden.id
         ) SELECT id FROM hidden

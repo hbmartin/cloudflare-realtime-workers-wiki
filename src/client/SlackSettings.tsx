@@ -10,7 +10,7 @@ import type {
   SlackVerificationSummary,
   Space,
 } from "../shared/types";
-import { api, apiErrorMessage, authClient, json } from "./api";
+import { api, ApiClientError, apiErrorMessage, authClient, json } from "./api";
 
 function initialSlackOAuthError() {
   const params = new URLSearchParams(window.location.search);
@@ -244,6 +244,13 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
       );
       await load();
     } catch (cause) {
+      if (cause instanceof ApiClientError && cause.code === "invalid_verification_cursor") {
+        setVerification((current) => {
+          const next = { ...current };
+          delete next[subscription.id];
+          return next;
+        });
+      }
       setError(apiErrorMessage(cause, "Slack verification could not be completed."));
     } finally {
       setBusy(false);

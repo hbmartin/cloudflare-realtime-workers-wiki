@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { PluginDocument, PluginPages, PluginSearch, PluginSpaces } from "../shared/plugin-contracts";
 import { PAGE_TITLE_MAX } from "../shared/validation";
 import { PluginToolError, requestFits, type CreateInput, type PluginApi, type SaveInput } from "./api";
 import { MarkdownPreview } from "./MarkdownPreview";
 
 type Destination = { id: string; title: string };
-type Navigation = { run: () => void | Promise<void> };
+type Navigation = { token: number; run: () => void | Promise<void> };
 
 export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageId?: string }) {
   const [spaces, setSpaces] = useState<PluginSpaces | null>(null);
@@ -29,6 +29,10 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
   const dialog = useRef<HTMLDialogElement>(null);
   const pending = useRef<{ key: string; id: string } | null>(null);
   const initialHandled = useRef<string | undefined>(undefined);
+  const initializing = useRef(true);
+  const loadedApi = useRef<PluginApi | null>(null);
+  const mounted = useRef(false);
+  const navigationToken = useRef(0);
   const dirty = creating ? !!draft || !!title : editing && draft !== page?.markdown;
   const writable = spaces?.spaces.find((space) => space.id === spaceId)?.canEdit === true;
   const parentId = parents.at(-1)?.id;
@@ -37,14 +41,21 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
     setError(cause instanceof Error ? cause.message : "NoteFlare is temporarily unavailable.");
     if (cause instanceof PluginToolError && cause.code === "page_changed" && editing) setConflict(true);
   }
-  async function share(next: PluginDocument | null, selection = "") {
-    try {
-      await api.context(next, selection);
-    } catch {
-      setNotice("Chat context could not be updated. You can still use the document tools.");
-    }
-  }
-  function acceptPage(next: PluginDocument) {
+  const current = useCallback((token: number) => mounted.current && token === navigationToken.current, []);
+  const nextToken = useCallback(() => ++navigationToken.current, []);
+  const share = useCallback(
+    async (next: PluginDocument | null, selection = "", token = navigationToken.current) => {
+      if (!current(token)) return;
+      try {
+        await api.context(next, selection);
+      } catch {
+        if (current(token)) setNotice("Chat context could not be updated. You can still use the document tools.");
+      }
+    },
+    [api, current],
+  );
+  function acceptPage(next: PluginDocument, token: number) {
+    if (!current(token)) return;
     setPage(next);
     setDraft(next.markdown);
     setCreating(false);
@@ -52,32 +63,54 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
     setConflict(false);
     setLatest(null);
     pending.current = null;
-    void share(next);
+    void share(next, "", token);
   }
-  async function task(action: () => Promise<void>) {
+  async function task(action: (token: number) => Promise<void>, token = navigationToken.current) {
+    if (!current(token)) return;
     setBusy(true);
     setError("");
     setNotice("");
     try {
-      await action();
+      await action(token);
     } catch (cause) {
-      report(cause);
+      if (current(token)) report(cause);
     } finally {
-      setBusy(false);
+      if (current(token)) setBusy(false);
     }
   }
-  function navigate(run: () => void | Promise<void>) {
-    if (dirty) setNavigation({ run });
-    else void run();
+  function navigate(run: (token: number) => void | Promise<void>) {
+    const token = nextToken();
+    if (dirty) {
+      setBusy(false);
+      setNavigation({ token, run: () => run(token) });
+    } else {
+      setNavigation(null);
+      void run(token);
+    }
   }
-  async function openPage(id: string) {
-    await task(async () => {
-      acceptPage(await api.document(id));
-    });
+  function keepEditing() {
+    nextToken();
+    setBusy(false);
+    setNavigation(null);
   }
-  async function browse(nextSpace: string, nextParents: Destination[] = []) {
+  async function openPage(id: string, token: number) {
     await task(async () => {
-      const next = await api.pages(nextSpace, nextParents.at(-1)?.id);
+      const next = await api.document(id);
+      if (!current(token)) return;
+      if (!listing) {
+        const nextPages = await api.pages(next.spaceId);
+        if (!current(token)) return;
+        setSpaceId(next.spaceId);
+        setParents([]);
+        setListing(nextPages);
+      }
+      acceptPage(next, token);
+    }, token);
+  }
+  async function browse(nextSpace: string, nextParents: Destination[], token: number) {
+    await task(async () => {
+      const next = nextSpace ? await api.pages(nextSpace, nextParents.at(-1)?.id) : null;
+      if (!current(token)) return;
       setSpaceId(nextSpace);
       setParents(nextParents);
       setListing(next);
@@ -90,66 +123,55 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
       setConflict(false);
       setLatest(null);
       pending.current = null;
-      void share(null);
-    });
+      void share(null, "", token);
+    }, token);
   }
 
   useEffect(() => {
-    let active = true;
+    mounted.current = true;
+    initializing.current = true;
+    loadedApi.current = null;
+    initialHandled.current = undefined;
+    const token = nextToken();
+    setSpaces(null);
+    setListing(null);
+    setBusy(true);
     async function initialize() {
       try {
         const nextSpaces = await api.spaces();
-        const nextPage = initialPageId ? await api.document(initialPageId) : null;
-        const nextSpace = nextPage?.spaceId ?? nextSpaces.spaces[0]?.id ?? "";
-        const nextPages = nextSpace ? await api.pages(nextSpace) : null;
-        if (!active) return;
+        if (!current(token)) return;
+        loadedApi.current = api;
         setSpaces(nextSpaces);
-        setSpaceId(nextSpace);
-        setListing(nextPages);
-        if (nextPage) {
-          setPage(nextPage);
-          setDraft(nextPage.markdown);
-          void api.context(nextPage).catch(() => {});
-        }
-        initialHandled.current = initialPageId;
       } catch (cause) {
-        if (active) setError(cause instanceof Error ? cause.message : "NoteFlare could not be loaded.");
-      } finally {
-        if (active) setBusy(false);
+        if (current(token)) {
+          setError(cause instanceof Error ? cause.message : "NoteFlare could not be loaded.");
+          setBusy(false);
+        }
       }
     }
     void initialize();
     return () => {
-      active = false;
+      mounted.current = false;
+      nextToken();
     };
-    // Initial setup is separate from later host navigation, which must guard a dirty draft.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api]);
+    // Load spaces once; the navigation effect uses the latest host page after bootstrap.
+  }, [api, current, nextToken]);
 
   useEffect(() => {
-    if (!spaces || !initialPageId || initialHandled.current === initialPageId) return;
+    if (!spaces || loadedApi.current !== api) return;
+    if (initializing.current) {
+      initializing.current = false;
+      initialHandled.current = initialPageId;
+      navigate((token) =>
+        initialPageId ? openPage(initialPageId, token) : browse(spaces.spaces[0]?.id ?? "", [], token),
+      );
+      return;
+    }
+    if (!initialPageId || initialHandled.current === initialPageId) return;
     initialHandled.current = initialPageId;
-    const run = async () => {
-      setBusy(true);
-      setError("");
-      try {
-        const next = await api.document(initialPageId);
-        setPage(next);
-        setDraft(next.markdown);
-        setCreating(false);
-        setEditing(false);
-        setConflict(false);
-        setLatest(null);
-        pending.current = null;
-        await api.context(next);
-      } catch (cause) {
-        setError(cause instanceof Error ? cause.message : "The document could not be opened.");
-      } finally {
-        setBusy(false);
-      }
-    };
-    if (dirty) setNavigation({ run });
-    else void run();
+    navigate((token) => openPage(initialPageId, token));
+    // Host intent and the draft guard trigger navigation; helpers use this render's state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, initialPageId, spaces, dirty]);
 
   useEffect(() => {
@@ -170,9 +192,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
         !preview.current.contains(selection.focusNode)
       )
         return;
-      void api.context(page, selection.toString()).catch(() => {
-        setNotice("Chat context could not be updated. You can still use the document tools.");
-      });
+      void share(page, selection.toString());
     }
     document.addEventListener("mouseup", selected);
     document.addEventListener("keyup", selected);
@@ -180,10 +200,13 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
       document.removeEventListener("mouseup", selected);
       document.removeEventListener("keyup", selected);
     };
-  }, [api, page]);
+  }, [share, page]);
 
   const openLink = (url: string) => {
-    void api.link(url).catch(report);
+    const token = navigationToken.current;
+    void api.link(url).catch((cause) => {
+      if (current(token)) report(cause);
+    });
   };
   const operationId = (key: string) => {
     if (pending.current?.key !== key) pending.current = { key, id: crypto.randomUUID() };
@@ -211,8 +234,8 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
     : saveInput("00000000-0000-0000-0000-000000000000");
   const fits = !previewInput || requestFits(creating ? "create_page" : "update_page", previewInput);
 
-  async function save(): Promise<boolean> {
-    if (conflict || !fits) return false;
+  async function save(token = navigationToken.current): Promise<boolean> {
+    if (!current(token) || conflict || !fits) return false;
     setBusy(true);
     setError("");
     setNotice("");
@@ -234,26 +257,29 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
         savedId = (await api.save(input)).id;
       } else return false;
       // Fetch failures retain the operation ID: retrying a committed write returns its receipt.
+      if (!current(token)) return false;
       const refreshed = await api.document(savedId);
-      acceptPage(refreshed);
+      if (!current(token)) return false;
+      acceptPage(refreshed, token);
       setNotice("Document saved.");
       if (spaceId) {
         try {
-          setListing(await api.pages(spaceId, parentId));
+          const next = await api.pages(spaceId, parentId);
+          if (current(token)) setListing(next);
         } catch {
-          setNotice("Document saved. Refresh navigation to see the updated list.");
+          if (current(token)) setNotice("Document saved. Refresh navigation to see the updated list.");
         }
       }
       return true;
     } catch (cause) {
-      report(cause);
+      if (current(token)) report(cause);
       return false;
     } finally {
-      setBusy(false);
+      if (current(token)) setBusy(false);
     }
   }
   function newDocument() {
-    navigate(() => {
+    navigate((token) => {
       setPage(null);
       setDraft("");
       setTitle("");
@@ -263,19 +289,19 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
       setLatest(null);
       setError("");
       pending.current = null;
-      void share(null);
+      void share(null, "", token);
     });
   }
   async function runNavigation(discard: boolean) {
     const next = navigation;
-    if (!next || (!discard && !(await save()))) return;
+    if (!next || !current(next.token) || (!discard && !(await save(next.token))) || !current(next.token)) return;
     setNavigation(null);
     await next.run();
   }
   async function find(more = false) {
-    await task(async () => {
+    await task(async (token) => {
       const result = await api.search(query.trim(), more ? (search?.nextCursor ?? undefined) : undefined);
-      setSearch(more && search ? { ...result, pages: [...search.pages, ...result.pages] } : result);
+      if (current(token)) setSearch(more && search ? { ...result, pages: [...search.pages, ...result.pages] } : result);
     });
   }
   const shareSelection = (selection: string) => {
@@ -310,7 +336,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
             disabled={busy || creating}
             onChange={(event) => {
               const destination = event.target.value;
-              navigate(() => browse(destination));
+              navigate((token) => browse(destination, [], token));
             }}
           >
             {spaces?.spaces.map((space) => (
@@ -346,7 +372,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
             </button>
           ) : (
             <nav aria-label="Page location">
-              <button type="button" disabled={busy} onClick={() => navigate(() => browse(spaceId))}>
+              <button type="button" disabled={busy} onClick={() => navigate((token) => browse(spaceId, [], token))}>
                 Space roots
               </button>
               {parents.map((parent, index) => (
@@ -354,7 +380,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                   key={parent.id}
                   type="button"
                   disabled={busy}
-                  onClick={() => navigate(() => browse(spaceId, parents.slice(0, index + 1)))}
+                  onClick={() => navigate((token) => browse(spaceId, parents.slice(0, index + 1), token))}
                 >
                   {parent.title}
                 </button>
@@ -368,7 +394,9 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                   type="button"
                   disabled={busy}
                   aria-current={page?.id === item.id ? "page" : undefined}
-                  onClick={() => (item.kind === "document" ? navigate(() => openPage(item.id)) : openLink(item.url))}
+                  onClick={() =>
+                    item.kind === "document" ? navigate((token) => openPage(item.id, token)) : openLink(item.url)
+                  }
                 >
                   {item.title || "Untitled"}
                   <small>{item.kind === "document" ? "" : `Open ${item.kind} in NoteFlare`}</small>
@@ -379,7 +407,9 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                     disabled={busy}
                     className="children"
                     aria-label={`Browse children of ${item.title}`}
-                    onClick={() => navigate(() => browse(spaceId, [...parents, { id: item.id, title: item.title }]))}
+                    onClick={() =>
+                      navigate((token) => browse(spaceId, [...parents, { id: item.id, title: item.title }], token))
+                    }
                   >
                     ›
                   </button>
@@ -397,9 +427,9 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
               type="button"
               disabled={busy}
               onClick={() =>
-                void task(async () => {
+                void task(async (token) => {
                   const more = await api.pages(spaceId, parentId, listing.nextCursor ?? undefined);
-                  setListing({ ...more, pages: [...listing.pages, ...more.pages] });
+                  if (current(token)) setListing({ ...more, pages: [...listing.pages, ...more.pages] });
                 })
               }
             >
@@ -477,7 +507,6 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                         navigate(() => {
                           setCreating(false);
                           setEditing(false);
-                          setDraft(page?.markdown ?? "");
                           setTitle("");
                           setConflict(false);
                           setLatest(null);
@@ -497,8 +526,11 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                         type="button"
                         disabled={busy}
                         onClick={() =>
-                          void task(async () => {
-                            if (page) setLatest(await api.document(page.id));
+                          void task(async (token) => {
+                            if (page) {
+                              const next = await api.document(page.id);
+                              if (current(token)) setLatest(next);
+                            }
                           })
                         }
                       >
@@ -508,7 +540,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                         type="button"
                         disabled={busy}
                         onClick={() => {
-                          if (page) navigate(() => openPage(page.id));
+                          if (page) navigate((token) => openPage(page.id, token));
                         }}
                       >
                         Reload document
@@ -543,7 +575,10 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                   <button
                     type="button"
                     disabled={busy || !page?.canEdit || page.truncated || !fits}
-                    onClick={() => setEditing(true)}
+                    onClick={() => {
+                      setDraft(page?.markdown ?? "");
+                      setEditing(true);
+                    }}
                   >
                     Edit Markdown
                   </button>
@@ -551,7 +586,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                     type="button"
                     disabled={busy}
                     onClick={() => {
-                      if (page) void openPage(page.id);
+                      if (page) navigate((token) => openPage(page.id, token));
                     }}
                   >
                     Refresh
@@ -572,12 +607,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
       </div>
       {navigation ? (
         <div className="dialog-backdrop">
-          <dialog
-            ref={dialog}
-            aria-labelledby="draft-dialog-title"
-            className="dialog"
-            onCancel={() => setNavigation(null)}
-          >
+          <dialog ref={dialog} aria-labelledby="draft-dialog-title" className="dialog" onCancel={keepEditing}>
             <h2 id="draft-dialog-title">Keep your draft?</h2>
             <p>You have unsaved changes.</p>
             <div className="actions">
@@ -591,7 +621,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
               <button type="button" disabled={busy} onClick={() => void runNavigation(true)}>
                 Discard and continue
               </button>
-              <button type="button" disabled={busy} onClick={() => setNavigation(null)}>
+              <button type="button" disabled={busy} onClick={keepEditing}>
                 Keep editing
               </button>
             </div>

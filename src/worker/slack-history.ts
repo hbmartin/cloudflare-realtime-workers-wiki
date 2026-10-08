@@ -1,7 +1,13 @@
 import { withSlackPrimaryError } from "./slack-delivery";
 import type { Env } from "./env";
 import { DeliveryInProgressError } from "./delivery-claim";
-import { slackApi, SlackApiError, SlackRateLimitError, slackInstallationError, type SlackInstallation } from "./slack";
+import {
+  slackApi,
+  SlackRateLimitError,
+  slackInstallationError,
+  definiteSlackRejection,
+  type SlackInstallation,
+} from "./slack";
 
 export type HistoryVerification =
   | { status: "confirmed"; ts: string }
@@ -28,6 +34,7 @@ type Progress = {
   revision: string;
 };
 const timestamp = /^\d+\.\d+$/;
+const POST_SETTLE_MS = 60_000;
 // Slack timestamps are decimal strings. Avoid float rounding at microsecond boundaries.
 function compare(a: string, b: string) {
   const [as, af = ""] = a.split(".");
@@ -56,10 +63,14 @@ async function searchHistoryPage(
     .first<Progress>();
   if (progress?.status === "confirmed" && progress.candidate_ts)
     return { status: "confirmed", ts: progress.candidate_ts };
-  if (!progress || progress.status !== "incomplete") {
+  const now = Date.now();
+  const settleAt = attemptedAt + POST_SETTLE_MS;
+  // A timed-out post can still arrive. Freeze the history window only after it settles.
+  if (now <= settleAt) return { status: "incomplete" };
+  if (!progress || progress.status !== "incomplete" || compare(progress.latest, (settleAt / 1000).toFixed(6)) <= 0) {
     progress = {
       oldest: ((attemptedAt - 5000) / 1000).toFixed(6),
-      latest: (Date.now() / 1000).toFixed(6),
+      latest: (now / 1000).toFixed(6),
       boundary: null,
       candidate_ts: null,
       status: "incomplete",
@@ -138,22 +149,12 @@ async function searchHistoryPage(
       budget.cooldowns[cooldownKey] = error.retryAt;
     }
     if (
-      error instanceof SlackApiError &&
+      definiteSlackRejection(error) &&
       !slackInstallationError(error) &&
       (error.code !== "missing_scope" ||
         (error.neededScopes.length > 0 &&
           !error.neededScopes.some((s) => ["channels:history", "groups:history"].includes(s)))) &&
-      error.status < 500 &&
-      ![
-        "ratelimited",
-        "internal_error",
-        "service_unavailable",
-        "fatal_error",
-        "invalid_response",
-        "http_error",
-        "network_error",
-        "timeout",
-      ].includes(error.code)
+      !["ratelimited", "network_error", "timeout"].includes(error.code)
     ) {
       await withSlackPrimaryError(error, "handle_error", { deliveryId }, () =>
         save("missing", progress.boundary, progress.candidate_ts, error.code),

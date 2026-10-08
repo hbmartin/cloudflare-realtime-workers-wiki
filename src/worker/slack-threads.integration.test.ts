@@ -3897,6 +3897,10 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+function settlePosts() {
+  vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_001);
+}
+
 describe("canonical Slack mirrors", () => {
   it("keeps a scope-paused root beyond a day and posts it once after reauthorization", async () => {
     await setSlackMirror(runtime(), owner, "space", true);
@@ -4294,6 +4298,7 @@ describe("canonical Slack mirrors", () => {
     await env.DB.prepare("UPDATE slack_method_cooldowns SET retry_at=0").run();
     postFailure = "lost";
     await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("response lost");
+    settlePosts();
     await deliverSlackThread(runtime(), root.id);
     expect(posts).toHaveLength(1);
     expect((await deliveries(created.id))[0]!.state).toBe("sent");
@@ -4310,6 +4315,7 @@ describe("canonical Slack mirrors", () => {
       const [root, successor] = await deliveries(created.id);
       postFailure = "lost";
       await expect(deliverSlackThread(runtime(), root!.id)).rejects.toThrow("response lost");
+      settlePosts();
       if (change === "archived page")
         await env.DB.prepare(`UPDATE pages SET archived_at=? WHERE id='page'`).bind(Date.now()).run();
       else if (change === "disabled mirror")
@@ -4425,7 +4431,7 @@ describe("canonical Slack mirrors", () => {
         .first(),
     ).toEqual({ scheduled: null });
   });
-  it("selects a root before limiting a backlog of fifty-two blocked replies", async () => {
+  it("advances the oldest blocked replies before redriving a later root", async () => {
     await setSlackMirror(runtime(), owner, "space", true);
     const created = await thread();
     const root = (await deliveries(created.id))[0]!;
@@ -4442,6 +4448,16 @@ describe("canonical Slack mirrors", () => {
     await env.DB.prepare("UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=2 WHERE id=?")
       .bind(`outbox:${root.id}`)
       .run();
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      (await env.DB.prepare("SELECT enqueued_at FROM outbox WHERE id=?").bind(`outbox:${root.id}`).first())
+        ?.enqueued_at,
+    ).toBe(1);
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM outbox WHERE id LIKE 'outbox:blocked-%' AND slack_redrive_due_at IS NULL",
+      ).first(),
+    ).toEqual({ count: 50 });
     await redriveStaleSlackOutbox(runtime());
     expect(
       (await env.DB.prepare("SELECT enqueued_at FROM outbox WHERE id=?").bind(`outbox:${root.id}`).first())
@@ -4895,6 +4911,7 @@ describe("canonical Slack mirrors", () => {
     const [root, waiting] = await deliveries(created.id);
     postFailure = "unrecorded";
     await expect(deliverSlackThread(runtime(), root!.id)).rejects.toThrow("connection lost");
+    settlePosts();
     postFailure = "none";
     await deliverSlackThread(runtime(), root!.id);
     expect(
@@ -4999,6 +5016,7 @@ describe("canonical Slack mirrors", () => {
     const root = (await deliveries(created.id))[0]!;
     postFailure = "unrecorded";
     await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("connection lost");
+    settlePosts();
     postFailure = "none";
     beforeResponse = async (method) => {
       if (method === "conversations.history") throw new Error("lookup unavailable");
@@ -5033,6 +5051,7 @@ describe("canonical Slack mirrors", () => {
       const root = (await deliveries(created.id))[0]!;
       postFailure = "unrecorded";
       await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("connection lost");
+      settlePosts();
       postFailure = "none";
       historyFailure = code;
       await expect(deliverSlackThread(runtime(), root.id)).rejects.toMatchObject({ code });
@@ -5054,6 +5073,7 @@ describe("canonical Slack mirrors", () => {
     const root = (await deliveries(created.id))[0]!;
     postFailure = "unrecorded";
     await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("connection lost");
+    settlePosts();
     postFailure = "none";
     beforeResponse = async (method) => {
       if (method === "conversations.history") throw new SlackApiError(method, "no_permission", 200);
@@ -5070,6 +5090,7 @@ describe("canonical Slack mirrors", () => {
     const root = (await deliveries(created.id))[0]!;
     postFailure = "unrecorded";
     await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("connection lost");
+    settlePosts();
     channelExtra = { is_member: false };
     await deliverSlackThread(runtime(), root.id);
     expect(
@@ -5086,6 +5107,7 @@ describe("canonical Slack mirrors", () => {
     const root = (await deliveries(created.id))[0]!;
     postFailure = "lost";
     await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("response lost");
+    settlePosts();
     expect(posts).toHaveLength(1);
     await env.DB.prepare(`DELETE FROM workspace_members WHERE user_id='viewer'`).run();
     await deliverSlackThread(runtime(), root.id);
@@ -5121,6 +5143,7 @@ describe("canonical Slack mirrors", () => {
     const root = (await deliveries(created.id))[0]!;
     postFailure = "unrecorded";
     await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("connection lost");
+    settlePosts();
     postFailure = "none";
     await deliverSlackThread(runtime(), root.id);
     await deliverSlackThread(runtime(), root.id);
@@ -5137,6 +5160,7 @@ describe("canonical Slack mirrors", () => {
     const next = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
     postFailure = "lost";
     await expect(deliverSlackThread(runtime(), next.id)).rejects.toThrow("response lost");
+    settlePosts();
     await env.DB.prepare(`UPDATE slack_thread_links SET claim_token = 'dead-worker', claimed_at = 1`).run();
     await deliverSlackThread(runtime(), next.id);
     expect(posts).toHaveLength(2);
@@ -5148,6 +5172,7 @@ describe("canonical Slack mirrors", () => {
     const recovered = (await deliveries(created.id)).find((d) => d.operation === "reply")!;
     postFailure = "lost";
     await expect(deliverSlackThread(runtime(), recovered.id)).rejects.toThrow("response lost");
+    settlePosts();
     await env.DB.prepare(`DELETE FROM workspace_members WHERE user_id='viewer'`).run();
     await addCommentReply(runtime(), owner, commentPage, created.id, body("Still here"));
     const next = (await deliveries(created.id)).find((d) => d.operation === "reply" && d.id !== recovered.id)!;
@@ -5952,6 +5977,7 @@ describe("Slack delayed-work boundaries", () => {
     const root = (await deliveries(created.id))[0]!;
     postFailure = "malformed";
     await expect(deliverSlackThread(runtime(), root.id)).rejects.toThrow("Slack message result is incomplete");
+    settlePosts();
     posts[0]!.user = "UOWNER";
     await deliverSlackThread(runtime(), root.id);
     expect((await deliveries(created.id))[0]!.state).toBe("blocked");
