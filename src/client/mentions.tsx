@@ -148,12 +148,12 @@ const codeBlock = {
   implementation: {
     ...codeBlockBase.implementation,
     render: function (
-      this: unknown,
+      this: ThisParameterType<typeof codeBlockBase.implementation.render>,
       block: Parameters<typeof codeBlockBase.implementation.render>[0],
       editor: Parameters<typeof codeBlockBase.implementation.render>[1],
-    ) {
-      return codeBlockBase.implementation.render.call(
-        this as never,
+    ): ReturnType<typeof codeBlockBase.implementation.render> {
+      const rendered = codeBlockBase.implementation.render.call(
+        this,
         {
           ...block,
           props: {
@@ -163,6 +163,52 @@ const codeBlock = {
         },
         editor,
       );
+      if (this.renderType !== "nodeView" || !rendered.contentDOM) return rendered;
+
+      const code = rendered.contentDOM;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "code-copy-button";
+      button.textContent = "Copy code";
+      button.contentEditable = "false";
+      button.setAttribute("aria-label", "Copy code");
+      rendered.dom.appendChild(button);
+
+      let destroyed = false;
+      let resetTimer: number | undefined;
+      const copy = async () => {
+        try {
+          await navigator.clipboard.writeText(code.textContent ?? "");
+          if (destroyed) return;
+          window.clearTimeout(resetTimer);
+          button.textContent = "Copied";
+          resetTimer = window.setTimeout(() => {
+            button.textContent = "Copy code";
+          }, 2_000);
+        } catch {
+          if (destroyed) return;
+          window.clearTimeout(resetTimer);
+          button.textContent = "Copy failed";
+        }
+      };
+      const onClick = () => void copy();
+      button.addEventListener("click", onClick);
+
+      return {
+        ...rendered,
+        ignoreMutation: (mutation) => {
+          // Only the copy control belongs to us. Native edits beside contentDOM
+          // must still reach ProseMirror, including mobile paragraph splits.
+          if (mutation.type !== "selection" && button.contains(mutation.target)) return true;
+          return rendered.ignoreMutation?.(mutation) ?? false;
+        },
+        destroy: () => {
+          destroyed = true;
+          window.clearTimeout(resetTimer);
+          button.removeEventListener("click", onClick);
+          rendered.destroy?.();
+        },
+      };
     },
   },
 };

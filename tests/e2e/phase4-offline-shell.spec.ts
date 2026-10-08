@@ -208,7 +208,6 @@ test("opens two visited documents offline and keeps local edits through refresh"
     });
   });
   await context.setOffline(false);
-  await page.getByRole("button", { name: "Reconnect" }).click();
   await expect(
     page.getByText("This document's version changed. The local copy is preserved for export."),
   ).toBeVisible();
@@ -424,7 +423,6 @@ test("recovers a saved draft when the catalog pending write fails", async ({ pag
   await page.getByRole("button", { name: "Cancel" }).click();
   await expect(page.getByRole("heading", { name: "Available offline" })).toBeVisible();
   await context.setOffline(false);
-  await page.getByRole("button", { name: "Reconnect" }).click();
   await expect(page.getByRole("heading", { name: "Available offline" })).toHaveCount(0);
   await expect(page.locator(".bn-editor")).toContainText("Online seedZ");
 });
@@ -540,7 +538,6 @@ test("opens the online workspace from a quarantined offline draft", async ({ pag
     await route.fulfill({ response: upstream, json: body });
   });
   await context.setOffline(false);
-  await page.getByRole("button", { name: "Reconnect" }).click();
   await expect(
     page.getByText("This document's version changed. The local copy is preserved for export."),
   ).toBeVisible();
@@ -941,7 +938,6 @@ test("removes a clean cached copy when live page access is revoked", async ({ pa
     }),
   );
   await context.setOffline(false);
-  await page.getByRole("button", { name: "Reconnect" }).click();
   await expect(page.getByText("Access to that document was removed. Its local copy is being deleted.")).toBeVisible();
   await expect(page.getByRole("button", { name: /Revoked offline copy/ })).toHaveCount(0);
   await expect

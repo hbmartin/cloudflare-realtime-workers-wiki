@@ -656,6 +656,50 @@ describe("NoteFlare embedded editor", () => {
     expect(api.create.mock.calls[1]![0]).toMatchObject({ title: "Corrected title", markdown: "Corrected draft" });
   });
 
+  it.each(["create", "update"] as const)(
+    "allows correcting a rejected %s after a document limit failure",
+    async (kind) => {
+      const { api, page } = fixture();
+      const rejected = new PluginToolError("The mutation exceeds document limits.", "document_limit", false);
+      if (kind === "create") {
+        api.create.mockRejectedValueOnce(rejected);
+        render(<PluginApp api={api} />);
+        await beginCreate();
+        fireEvent.change(screen.getByLabelText("Title"), { target: { value: "First title" } });
+      } else {
+        api.save.mockRejectedValueOnce(rejected);
+        await edit(api);
+      }
+      fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Rejected draft" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("The mutation exceeds document limits.");
+      expect(screen.getByLabelText("Markdown draft")).toHaveValue("Rejected draft");
+      expect(screen.getByLabelText("Markdown draft")).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+      expect(screen.getByLabelText(kind === "create" ? "Title" : "Markdown draft")).toBeEnabled();
+      if (kind === "create") {
+        fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Corrected title" } });
+      }
+      fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Corrected draft" } });
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await screen.findByText("Document saved.");
+      const calls = kind === "create" ? api.create.mock.calls : api.save.mock.calls;
+      expect(calls).toHaveLength(2);
+      expect(calls[1]![0].operation_id).not.toBe(calls[0]![0].operation_id);
+      expect(calls[1]![0]).toMatchObject(
+        kind === "create"
+          ? { space_id: "space", title: "Corrected title", markdown: "Corrected draft" }
+          : {
+              page_id: page.id,
+              expected_revision: page.revision,
+              expected_content_epoch: page.contentEpoch,
+              command: { type: "replace_content", replace_content: { new_str: "Corrected draft" } },
+            },
+      );
+      expect(kind === "create" ? api.save : api.create).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     { kind: "create", protectedPage: {} },
     { kind: "update", protectedPage: {} },

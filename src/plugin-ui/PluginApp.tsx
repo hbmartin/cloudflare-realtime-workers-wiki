@@ -374,7 +374,9 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
         if (
           !mutation.acknowledgement &&
           cause instanceof PluginToolError &&
-          ["page_changed", "invalid_markdown", "request_too_large", "too_many_blocks"].includes(cause.code)
+          ["page_changed", "invalid_markdown", "request_too_large", "too_many_blocks", "document_limit"].includes(
+            cause.code,
+          )
         ) {
           pending.current = null;
           setRecovery(null);
