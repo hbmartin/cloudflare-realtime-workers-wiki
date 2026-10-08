@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Page, Space } from "../shared/types";
-import { api, authClient } from "./api";
+import { api, ApiClientError, authClient } from "./api";
 import { SlackSettings } from "./SlackSettings";
 import { CHANNEL_EVENT_TYPES } from "../shared/activity";
 
@@ -438,8 +438,12 @@ describe("Slack thread mirror controls", () => {
 });
 
 describe("bounded verification progress", () => {
-  function setup(summary: object) {
-    vi.mocked(api).mockImplementation(async (path) => {
+  function setup(
+    summary: object,
+    verify?: (path: string, init?: RequestInit) => Promise<object>,
+    mappingIds = ["mapping"],
+  ) {
+    vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/slack/status")
         return {
           available: true,
@@ -448,21 +452,20 @@ describe("bounded verification progress", () => {
         };
       if (path === "/api/slack/channels")
         return {
-          subscriptions: [
-            {
-              id: "mapping",
-              channelId: "C123",
-              channelName: "product",
-              spaceId: space.id,
-              pageId: null,
-              eventTypes: [],
-              cadence: "immediate",
-              blockedDeliveries: 6,
-              notificationBlockedAt: 1,
-            },
-          ],
+          subscriptions: mappingIds.map((id) => ({
+            id,
+            channelId: "C123",
+            channelName: id === "mapping" ? "product" : id,
+            spaceId: space.id,
+            pageId: null,
+            eventTypes: [],
+            cadence: "immediate",
+            blockedDeliveries: 6,
+            notificationBlockedAt: 1,
+          })),
         };
-      if (path.endsWith("verify-recovery") || path.endsWith("repair-notifications")) return summary;
+      if (path.endsWith("verify-recovery") || path.endsWith("repair-notifications"))
+        return verify ? verify(path, init) : summary;
       return {};
     });
     render(<SlackSettings owner spaces={[space]} pages={[page]} />);
@@ -519,5 +522,90 @@ describe("bounded verification progress", () => {
     expect(await screen.findByRole("button", { name: "Continue verification" })).toBeDisabled();
     expect(await screen.findByText(/Slack requests can resume after/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Verify and resume notifications" })).toBeDisabled();
+  });
+
+  it("restarts a rejected cursor after another session reconnects Slack and keeps other mappings' progress", async () => {
+    let reconnectedElsewhere = false;
+    const summary = {
+      status: "partial",
+      checked: 5,
+      confirmed: 1,
+      blocked: 2,
+      pending: 3,
+      paused: 0,
+      retryAt: null,
+    };
+    setup(
+      summary,
+      async (path, init) => {
+        const id = path.includes("/mapping/") ? "mapping" : "other";
+        const input = JSON.parse(String(init?.body));
+        if (reconnectedElsewhere && id === "mapping" && input.cursor)
+          throw new ApiClientError(422, "invalid_verification_cursor", "Restart verification for this mapping.");
+        return { ...summary, nextCursor: `${id}-cursor` };
+      },
+      ["mapping", "other"],
+    );
+    const first = within((await screen.findByText("#product")).closest("article")!);
+    const other = within(screen.getByText("#other").closest("article")!);
+    fireEvent.click(first.getByRole("button", { name: "Verify and resume delivery" }));
+    await waitFor(() => expect(first.getByRole("button", { name: "Continue verification" })).toBeEnabled());
+    fireEvent.click(other.getByRole("button", { name: "Verify and resume delivery" }));
+    await waitFor(() => expect(other.getByRole("button", { name: "Continue verification" })).toBeEnabled());
+    // This Settings instance stays mounted while another session changes installation generation.
+    reconnectedElsewhere = true;
+    fireEvent.click(first.getByRole("button", { name: "Continue verification" }));
+    await screen.findByText("Restart verification for this mapping.");
+    expect(first.queryByRole("button", { name: "Continue verification" })).not.toBeInTheDocument();
+    expect(other.getByRole("button", { name: "Continue verification" })).toBeEnabled();
+    fireEvent.click(first.getByRole("button", { name: "Verify and resume delivery" }));
+    await waitFor(() => expect(first.getByRole("button", { name: "Continue verification" })).toBeEnabled());
+    const requests = vi
+      .mocked(api)
+      .mock.calls.filter(([path]) => path === "/api/slack/channels/mapping/verify-recovery");
+    expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([{}, { cursor: "mapping-cursor" }, {}]);
+    fireEvent.click(other.getByRole("button", { name: "Continue verification" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith("/api/slack/channels/other/verify-recovery", {
+        method: "POST",
+        body: JSON.stringify({ cursor: "other-cursor" }),
+      }),
+    );
+  });
+
+  it("retains the continuation after a transient verification failure", async () => {
+    let failNext = false;
+    const summary = {
+      status: "partial",
+      checked: 5,
+      confirmed: 1,
+      blocked: 2,
+      pending: 3,
+      paused: 0,
+      nextCursor: "retry-cursor",
+      retryAt: null,
+    };
+    setup(summary, async () => {
+      if (failNext) {
+        failNext = false;
+        throw new ApiClientError(503, "slack_unavailable", "Slack is temporarily unavailable.");
+      }
+      return summary;
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Verify and resume delivery" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Continue verification" })).toBeEnabled());
+    failNext = true;
+    fireEvent.click(screen.getByRole("button", { name: "Continue verification" }));
+    await screen.findByText("Slack is temporarily unavailable.");
+    fireEvent.click(screen.getByRole("button", { name: "Continue verification" }));
+    await waitFor(() => expect(screen.queryByText("Slack is temporarily unavailable.")).not.toBeInTheDocument());
+    const requests = vi
+      .mocked(api)
+      .mock.calls.filter(([path]) => path === "/api/slack/channels/mapping/verify-recovery");
+    expect(requests.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+      {},
+      { cursor: "retry-cursor" },
+      { cursor: "retry-cursor" },
+    ]);
   });
 });

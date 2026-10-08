@@ -7240,22 +7240,28 @@ describe("bounded verified Slack recovery", () => {
       expect(calls).toHaveLength(1);
     },
   );
-  it.each(["invalid_auth", "missing_scope", "internal_error"])(
-    "keeps recovery after history error %s",
-    async (code) => {
-      const m = await uncertain();
-      responses["conversations.history"] = { ok: false, error: code, needed: "channels:history" };
-      const summary = await verifySlackMapping(runtime(), m.id);
-      expect(summary.confirmed).toBe(0);
-      expect(summary.paused + summary.pending).toBeGreaterThan(0);
-      expect((await env.DB.prepare("SELECT round2_state FROM slack_channel_events").first())?.round2_state).toBe(
-        "sending",
-      );
-      expect(
-        (await env.DB.prepare("SELECT slack_redrive_due_at FROM outbox").first())?.slack_redrive_due_at,
-      ).not.toBeNull();
-    },
-  );
+  it.each([
+    "invalid_auth",
+    "missing_scope",
+    "internal_error",
+    "request_timeout",
+    "org_login_required",
+    "team_added_to_org",
+  ])("keeps recovery after history error %s", async (code) => {
+    const m = await uncertain();
+    responses["conversations.history"] = { ok: false, error: code, needed: "channels:history" };
+    const summary = await verifySlackMapping(runtime(), m.id);
+    expect(summary.confirmed).toBe(0);
+    expect(summary.paused + summary.pending).toBeGreaterThan(0);
+    expect(summary.nextCursor).not.toBeNull();
+    expect((await env.DB.prepare("SELECT status FROM slack_history_verifications").first())?.status).toBe("incomplete");
+    expect((await env.DB.prepare("SELECT round2_state FROM slack_channel_events").first())?.round2_state).toBe(
+      "sending",
+    );
+    expect(
+      (await env.DB.prepare("SELECT slack_redrive_due_at FROM outbox").first())?.slack_redrive_due_at,
+    ).not.toBeNull();
+  });
   it("persists rate limits across clicks and skips remaining calls for the same method", async () => {
     const m = await uncertain(5);
     responses["conversations.history"] = Response.json(
@@ -7472,5 +7478,163 @@ describe("bounded verified Slack recovery", () => {
     ).toBe(0);
     await consumeDeliveryMessage(runtime(), message);
     expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(1);
+  });
+
+  async function uncertainStreams() {
+    const m = await uncertain();
+    await env.DB.prepare("UPDATE slack_installations SET scopes=scopes||',users:read'").run();
+    await receipt(m.id);
+    await thread();
+    await reference();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE slack_digest_receipts SET state='sending',attempted_at=1,created_at=2"),
+      env.DB
+        .prepare(`INSERT INTO slack_digest_messages(id,receipt_id,sequence,state,page_ids_json,event_ids_json,attempted_at)
+        VALUES('stream-digest-child','digest-test',0,'sending','[]','[]',1)`),
+      env.DB
+        .prepare(`INSERT INTO slack_bulk_receipts(id,installation_id,installation_generation,channel_id,operation_id,event_type,state,attempted_at,created_at)
+        VALUES('stream-bulk','installation',1,'C123','stream-op','page_moved','sending',1,3)`),
+      env.DB
+        .prepare(`INSERT INTO slack_share_refreshes(id,reference_id,revision,installation_id,installation_generation,workspace_id,page_id,channel_id,message_ts,url,reference_kind,state,attempted_at,created_at)
+        VALUES('stream-refresh','reference',1,'installation',1,'workspace','page','C123','123.456','http://example.test/?page=page','page','sending',1,4)`),
+      env.DB.prepare(`INSERT INTO slack_thread_links(id,installation_id,installation_generation,subscription_id,workspace_id,page_id,thread_id,channel_id,state,created_at,updated_at)
+        VALUES('stream-link','installation',1,?,'workspace','page','thread','C123','pending',1,1)`).bind(m.id),
+      env.DB
+        .prepare(`INSERT INTO slack_thread_deliveries(id,link_id,operation,source_id,actor_id,state,attempted_at,created_at,updated_at)
+        VALUES('stream-thread','stream-link','root','source','owner','sending',1,5,1)`),
+      ...(
+        [
+          ["slack_digest", "digestId", "digest-test"],
+          ["slack_bulk", "summaryId", "stream-bulk"],
+          ["slack_share_refresh", "refreshId", "stream-refresh"],
+          ["slack_thread_reply", "deliveryId", "stream-thread"],
+        ] as const
+      ).map(([topic, key, id]) =>
+        env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,created_at,available_at,enqueued_at,slack_redrive_due_at)
+        VALUES(?,'workspace',?,json_object(?,?),1,1,1,1)`).bind(`outbox:${id}`, topic, key, id),
+      ),
+    ]);
+    calls = [];
+    return m;
+  }
+  it.each(["request_timeout", "org_login_required", "team_added_to_org"])(
+    "retains every recovery stream and history progress after temporary %s errors",
+    async (code) => {
+      const m = await uncertainStreams();
+      responses["conversations.history"] = { ok: false, error: code };
+      responses["conversations.replies"] = { ok: false, error: code };
+      const summary = await verifySlackMapping(runtime(), m.id);
+      expect(summary).toMatchObject({
+        checked: 5,
+        confirmed: 0,
+        blocked: 0,
+        pending: 5,
+        nextCursor: expect.any(String),
+      });
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) count FROM slack_history_verifications WHERE status='incomplete'",
+        ).first(),
+      ).toEqual({ count: 5 });
+      expect(
+        await env.DB.prepare("SELECT count(*) count FROM outbox WHERE slack_redrive_due_at IS NOT NULL").first(),
+      ).toEqual({ count: 5 });
+      expect(
+        await env.DB.prepare("SELECT state FROM slack_thread_deliveries WHERE id='stream-thread'").first(),
+      ).toEqual({ state: "sending" });
+      expect(
+        calls.filter((c) => c.method === "conversations.history" || c.method === "conversations.replies"),
+      ).toHaveLength(5);
+      expect(calls.some((c) => c.method.startsWith("chat."))).toBe(false);
+    },
+  );
+  it.each([false, true])(
+    "reports obsolete attempts across every stream without changing evidence (paused=%s)",
+    async (paused) => {
+      const m = await uncertainStreams();
+      await env.DB.prepare("UPDATE slack_installations SET generation=2,auth_error=?")
+        .bind(paused ? "invalid_auth" : null)
+        .run();
+      if (paused) await env.DB.prepare("UPDATE outbox SET slack_scope_paused_at=1").run();
+      await env.DB.prepare(`INSERT INTO slack_history_verifications(installation_id,installation_generation,delivery_id,channel_id,attempted_at,oldest,latest,status,revision,updated_at)
+      VALUES('installation',1,'stream-bulk','C123',1,'0.001','500.001','incomplete','original',1)`).run();
+      const tables = [
+        "slack_channel_events",
+        "slack_digest_receipts",
+        "slack_digest_messages",
+        "slack_bulk_receipts",
+        "slack_share_refreshes",
+        "slack_thread_links",
+        "slack_thread_deliveries",
+        "outbox",
+      ];
+      const snapshot = () =>
+        Promise.all(
+          tables.map(async (table) => (await env.DB.prepare(`SELECT * FROM ${table} ORDER BY id`).all()).results),
+        );
+      const before = await snapshot();
+      const history = (await env.DB.prepare("SELECT * FROM slack_history_verifications").all()).results;
+      expect(await verifySlackMapping(runtime(), m.id)).toEqual({
+        status: "complete",
+        checked: 5,
+        confirmed: 0,
+        blocked: 5,
+        pending: 0,
+        paused: 0,
+        nextCursor: null,
+        retryAt: null,
+      });
+      expect(await snapshot()).toEqual(before);
+      expect((await env.DB.prepare("SELECT * FROM slack_history_verifications").all()).results).toEqual(history);
+      expect(calls).toEqual([]);
+    },
+  );
+  it("advances past obsolete attempts to current work in the same fixed pass", async () => {
+    const m = await uncertain(6);
+    await env.DB.prepare("UPDATE slack_installations SET generation=2").run();
+    await env.DB.prepare("UPDATE slack_channel_events SET installation_generation=2 WHERE id='bounded:5'").run();
+    const snapshot = async () =>
+      (await env.DB.prepare("SELECT * FROM slack_channel_events WHERE id<>'bounded:5' ORDER BY id").all()).results;
+    const before = await snapshot();
+    responses["conversations.history"] = { ok: true, messages: [post("bounded:5")] };
+    const first = await verifySlackMapping(runtime(), m.id);
+    expect(first).toMatchObject({ checked: 5, blocked: 5, confirmed: 0, nextCursor: expect.any(String) });
+    expect(calls).toEqual([]);
+    const last = await verifySlackMapping(runtime(), m.id, first.nextCursor!);
+    expect(last).toEqual({
+      status: "complete",
+      checked: 1,
+      confirmed: 1,
+      blocked: 0,
+      pending: 0,
+      paused: 0,
+      nextCursor: null,
+      retryAt: null,
+    });
+    expect(await snapshot()).toEqual(before);
+    expect(calls.filter((c) => c.method === "conversations.history")).toHaveLength(1);
+    expect(calls.some((c) => c.method === "chat.postMessage")).toBe(false);
+  });
+  it("finishes a pass containing more than five obsolete attempts without rewinding", async () => {
+    const m = await uncertain(11);
+    await env.DB.prepare("UPDATE slack_installations SET generation=2").run();
+    const before = (await env.DB.prepare("SELECT * FROM slack_channel_events ORDER BY id").all()).results;
+    let cursor: string | undefined;
+    let checked = 0;
+    for (const count of [5, 5, 1]) {
+      const summary = await verifySlackMapping(runtime(), m.id, cursor);
+      expect(summary.checked).toBe(count);
+      expect(summary.blocked).toBe(count);
+      expect(summary.confirmed).toBe(0);
+      checked += summary.checked;
+      cursor = summary.nextCursor ?? undefined;
+      expect(summary.pending).toBe(11 - checked);
+      expect(summary.paused).toBe(0);
+      expect(summary.status).toBe(count === 1 ? "complete" : "partial");
+      expect(summary.nextCursor === null).toBe(count === 1);
+    }
+    expect(checked).toBe(11);
+    expect((await env.DB.prepare("SELECT * FROM slack_channel_events ORDER BY id").all()).results).toEqual(before);
+    expect(calls).toEqual([]);
   });
 });

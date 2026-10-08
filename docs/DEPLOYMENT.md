@@ -441,6 +441,11 @@ and a partial recovery index beginning with `subscription_id`. It requires verif
 the obsolete token table. It does not backfill, convert, or replay historical records. Historical migrations and
 compatibility columns remain; the runtime no longer reads initialization or migration-state columns.
 
+Slack recovery after these migrations is forward-only. Keep the queue paused and channel validation disabled
+if migration or deployment fails, and repair the forward migration/deployment sequence before resuming delivery.
+Do not deploy legacy Slack code that relies on the removed token table or permits linking without fresh
+identity verification. The general code rollback procedure does not make that legacy code compatible.
+
 Slack has not been deployed. Apply the full forward migration chain before its first deployment, keeping production
 flags off until deployment is separately verified. Validation disabled holds all channel delivery; enabling it
 resumes the saved backlog without spending another retry. Mapping revalidation runs independently when enabled.

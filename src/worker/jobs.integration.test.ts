@@ -22,6 +22,7 @@ import {
   expireJobArtifacts,
   finishPendingJobCleanup,
   recoverQueuedJobs,
+  redriveStaleSlackOutbox,
   resolveJobWorkflowAttempt,
   runCommentMigration,
   startJobExecution,
@@ -5447,5 +5448,82 @@ describe("delivery outbox", () => {
           .first<{ count: number }>()
       )?.count,
     ).toBe(1);
+  });
+});
+
+describe("Slack recovery scheduling", () => {
+  it("does not let fifty paused roots starve older work in a healthy workspace", async () => {
+    const start = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+    onTestFinished(() => {
+      vi.restoreAllMocks();
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('recovery-user','Recovery','recovery@example.test',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO workspaces(id,name,created_at) VALUES('paused-ws','Paused',1),('healthy-ws','Healthy',1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('paused-ws','recovery-user','owner',1),('healthy-ws','recovery-user','owner',1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at) VALUES('recovery-page','paused-ws','paused-ws-general','document','a0','Recovery','recovery-user',1,1)",
+      ),
+      env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,auth_error,auth_error_at,created_at,updated_at)
+        VALUES('paused-install','paused-ws','TPAUSED','Paused','BPAUSED','unused','','recovery-user','invalid_auth',?,1,1),
+        ('healthy-install','healthy-ws','THEALTHY','Healthy','BHEALTHY','unused','','recovery-user',NULL,NULL,1,1)`).bind(
+        start,
+      ),
+    ]);
+    await env.DB.batch(
+      Array.from({ length: 50 }, (_, n) => [
+        env.DB.prepare(
+          "INSERT INTO comment_threads(id,workspace_id,space_id,page_id,created_by,created_at,updated_at) VALUES(?,'paused-ws','paused-ws-general','recovery-page','recovery-user',?,?)",
+        ).bind(`thread-${n}`, start, start),
+        env.DB.prepare(
+          "INSERT INTO slack_thread_links(id,installation_id,workspace_id,page_id,thread_id,channel_id,state,created_at,updated_at) VALUES(?,'paused-install','paused-ws','recovery-page',?,'CPAUSED','pending',?,?)",
+        ).bind(`link-${n}`, `thread-${n}`, start, start),
+        env.DB.prepare(
+          "INSERT INTO slack_thread_deliveries(id,link_id,operation,source_id,actor_id,state,attempted_at,created_at,updated_at) VALUES(?,?,'root',?,'recovery-user','sending',?,?,?)",
+        ).bind(`root-${n}`, `link-${n}`, `source-${n}`, start, start, start),
+        env.DB.prepare(
+          "INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_redrive_due_at) VALUES(?,'paused-ws','slack_thread_reply',?,1,?,1,2)",
+        ).bind(`paused-outbox-${n}`, JSON.stringify({ deliveryId: `root-${n}` }), start),
+      ]).flat(),
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO slack_interaction_receipts(id,installation_id,interaction_id,callback_id,received_at) VALUES('healthy-receipt','healthy-install','healthy-interaction','response',?)",
+      ).bind(start),
+      env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_redrive_due_at)
+        VALUES('healthy-outbox','healthy-ws','slack_interaction_response',json_object('receiptId','healthy-receipt'),1,?,1,1)`).bind(
+        start,
+      ),
+    ]);
+    for (let pass = 0; pass < 3; pass++) {
+      clock.mockReturnValue(start + pass * 15 * 60_000);
+      if (pass)
+        await env.DB.prepare("UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=1 WHERE id='healthy-outbox'").run();
+      expect(await redriveStaleSlackOutbox(env as unknown as Env)).toBe(1);
+      expect(
+        await env.DB.prepare(
+          "SELECT slack_redrive_count,enqueued_at,slack_redrive_due_at FROM outbox WHERE id='healthy-outbox'",
+        ).first(),
+      ).toEqual({ slack_redrive_count: pass + 1, enqueued_at: null, slack_redrive_due_at: null });
+    }
+    expect(
+      await env.DB.prepare(
+        "SELECT sum(slack_redrive_count) retries FROM outbox WHERE workspace_id='paused-ws'",
+      ).first(),
+    ).toEqual({ retries: 0 });
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM slack_thread_deliveries WHERE state='sending' AND attempted_at=?",
+      )
+        .bind(start)
+        .first(),
+    ).toEqual({ count: 50 });
   });
 });

@@ -4425,7 +4425,7 @@ describe("canonical Slack mirrors", () => {
         .first(),
     ).toEqual({ scheduled: null });
   });
-  it("selects a root before limiting a backlog of fifty-two blocked replies", async () => {
+  it("advances the oldest blocked replies before redriving a later root", async () => {
     await setSlackMirror(runtime(), owner, "space", true);
     const created = await thread();
     const root = (await deliveries(created.id))[0]!;
@@ -4442,6 +4442,16 @@ describe("canonical Slack mirrors", () => {
     await env.DB.prepare("UPDATE outbox SET enqueued_at=1,slack_redrive_due_at=2 WHERE id=?")
       .bind(`outbox:${root.id}`)
       .run();
+    await redriveStaleSlackOutbox(runtime());
+    expect(
+      (await env.DB.prepare("SELECT enqueued_at FROM outbox WHERE id=?").bind(`outbox:${root.id}`).first())
+        ?.enqueued_at,
+    ).toBe(1);
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) count FROM outbox WHERE id LIKE 'outbox:blocked-%' AND slack_redrive_due_at IS NULL",
+      ).first(),
+    ).toEqual({ count: 50 });
     await redriveStaleSlackOutbox(runtime());
     expect(
       (await env.DB.prepare("SELECT enqueued_at FROM outbox WHERE id=?").bind(`outbox:${root.id}`).first())

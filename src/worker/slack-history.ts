@@ -1,7 +1,13 @@
 import { withSlackPrimaryError } from "./slack-delivery";
 import type { Env } from "./env";
 import { DeliveryInProgressError } from "./delivery-claim";
-import { slackApi, SlackApiError, SlackRateLimitError, slackInstallationError, type SlackInstallation } from "./slack";
+import {
+  slackApi,
+  SlackRateLimitError,
+  slackInstallationError,
+  definiteSlackRejection,
+  type SlackInstallation,
+} from "./slack";
 
 export type HistoryVerification =
   | { status: "confirmed"; ts: string }
@@ -138,22 +144,12 @@ async function searchHistoryPage(
       budget.cooldowns[cooldownKey] = error.retryAt;
     }
     if (
-      error instanceof SlackApiError &&
+      definiteSlackRejection(error) &&
       !slackInstallationError(error) &&
       (error.code !== "missing_scope" ||
         (error.neededScopes.length > 0 &&
           !error.neededScopes.some((s) => ["channels:history", "groups:history"].includes(s)))) &&
-      error.status < 500 &&
-      ![
-        "ratelimited",
-        "internal_error",
-        "service_unavailable",
-        "fatal_error",
-        "invalid_response",
-        "http_error",
-        "network_error",
-        "timeout",
-      ].includes(error.code)
+      !["ratelimited", "network_error", "timeout"].includes(error.code)
     ) {
       await withSlackPrimaryError(error, "handle_error", { deliveryId }, () =>
         save("missing", progress.boundary, progress.candidate_ts, error.code),
