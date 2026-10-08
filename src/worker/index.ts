@@ -5,7 +5,7 @@ import { activityMutationStart, activityMutationEnd, activePageSelectionSql } fr
 import { DOCX_MIME } from "../shared/docx-metadata";
 import { EXPORT_CAPABILITIES } from "../shared/export-format";
 import { dueRound2Digests } from "./slack-digests";
-import { reconcileRound2Mapping } from "./slack-recovery";
+import { reconcileRound2Mapping, reconcileSlackChannelMapping } from "./slack-recovery";
 import { listActivity } from "./activity";
 import { CHANNEL_EVENT_TYPES, type ChannelEventType } from "../shared/activity";
 import { channelDirectory, syncRound2Configuration, revalidateMappings } from "./slack-channels";
@@ -3102,6 +3102,7 @@ app.post("/api/slack/channels/:id/verify-recovery", async (c) => {
   if (!mapping) throw new HttpError(404, "mapping_unavailable", "This mapping is unavailable.");
   if (mapping.mirrorEnabled) await verifySlackMirrorRecovery(c.env, member, mapping.id);
   if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await reconcileRound2Mapping(c.env, mapping.id);
+  else await reconcileSlackChannelMapping(c.env, mapping.id);
   c.executionCtx.waitUntil(sweepOutbox(c.env));
   return c.json({ ok: true });
 });
@@ -3204,6 +3205,7 @@ app.post("/api/slack/channels/:id/repair-notifications", async (c) => {
     (async () => {
       try {
         if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await reconcileRound2Mapping(c.env, c.req.param("id"));
+        else await reconcileSlackChannelMapping(c.env, c.req.param("id"));
       } catch (error) {
         logger.warn(
           "slack.repair.reconciliation_pending",

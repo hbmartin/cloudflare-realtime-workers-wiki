@@ -1,4 +1,5 @@
 import { slackAccessAuthorization } from "./slack-identity";
+import { slackDeliveryFeatures } from "./slack-delivery-contracts";
 import { definiteSlackRejection, recordDeliveryError, retireObsoleteReceipt } from "./slack-delivery";
 import type { Env } from "./env";
 import { sha256Hex } from "../shared/import-integrity";
@@ -105,7 +106,7 @@ async function shareRefreshBlocks(env: Env, row: Refresh) {
   };
 }
 export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = false) {
-  if (env.SLACK_SHARE_REFRESH_ENABLED !== "true") return;
+  if (!slackDeliveryFeatures(env).slack_share_refresh) return;
   let row = await env.DB.prepare(`SELECT * FROM slack_share_refreshes WHERE id=?`).bind(id).first<Refresh>();
   if (!row || ["sent", "retired"].includes(row.state) || (!reconcileOnly && row.state === "blocked")) return;
   if (reconcileOnly && !["sending", "blocked"].includes(row.state)) return;

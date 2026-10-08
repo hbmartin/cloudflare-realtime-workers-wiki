@@ -6161,7 +6161,25 @@ describe("Slack inbound replies and actions", () => {
     beforeResponse = async (method) => {
       if (method === "chat.postMessage") throw new SlackApiError(method, "missing_scope", 403);
     };
-    await deliverSlackChannelEvent(runtime(), "scope-event");
+    await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_redrive_due_at)
+      VALUES('scope-event-outbox','workspace','slack_channel','{"eventId":"scope-event"}',1,1,1,1)`).run();
+    const ack = vi.fn();
+    await consumeDeliveryMessage(runtime(), {
+      body: { outboxId: "scope-event-outbox" },
+      ack,
+      retry: vi.fn(),
+    } as unknown as Message<import("./jobs").DeliveryQueueMessage>);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(
+      await env.DB.prepare(
+        "SELECT round2_state,attempted_at,suppressed_at FROM slack_channel_events WHERE id='scope-event'",
+      ).first(),
+    ).toEqual({ round2_state: "pending", attempted_at: null, suppressed_at: null });
+    expect(
+      await env.DB.prepare(
+        "SELECT slack_scope_paused_at IS NOT NULL paused,slack_redrive_count FROM outbox WHERE id='scope-event-outbox'",
+      ).first(),
+    ).toEqual({ paused: 1, slack_redrive_count: 0 });
     expect(
       await env.DB.prepare(`SELECT notification_error FROM slack_channel_subscriptions WHERE id='space'`).first(),
     ).toEqual({ notification_error: "missing_scope" });
@@ -6194,7 +6212,7 @@ describe("Slack inbound replies and actions", () => {
       WHERE event.subscription_id='shared'`).first<{ id: string }>();
     expect(first).not.toBeNull();
     postFailure = "permission";
-    await deliverSlackChannelEvent(runtime(), first!.id);
+    expect(await deliverSlackChannelEvent(runtime(), first!.id)).toBe("paused");
     expect(
       await env.DB.prepare(`SELECT notification_error FROM slack_channel_subscriptions WHERE id='shared'`).first(),
     ).toEqual({ notification_error: "no_permission" });
@@ -6202,7 +6220,7 @@ describe("Slack inbound replies and actions", () => {
       await env.DB.prepare(`SELECT suppressed_at IS NOT NULL suppressed FROM slack_channel_events WHERE id=?`)
         .bind(first!.id)
         .first(),
-    ).toEqual({ suppressed: 1 });
+    ).toEqual({ suppressed: 0 });
     channelExtra = { is_shared: true, is_ext_shared: true };
     postFailure = "none";
     await repairSlackChannelNotifications(runtime(), owner, "shared");

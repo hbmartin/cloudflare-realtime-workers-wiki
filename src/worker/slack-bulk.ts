@@ -1,5 +1,5 @@
 import { logger } from "./observability";
-import { mappingDeliveryPauseSql } from "./slack-delivery-contracts";
+import { mappingDeliveryPauseSql, slackDeliveryFeatures } from "./slack-delivery-contracts";
 import type { Env } from "./env";
 import { sha256Hex } from "../shared/import-integrity";
 import { DeliveryInProgressError } from "./notifications";
@@ -85,6 +85,7 @@ export async function cleanupPendingBulkEvents(env: Env) {
 }
 
 export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = false) {
+  if (!slackDeliveryFeatures(env).slack_bulk) return;
   let row = await env.DB.prepare("SELECT * FROM slack_bulk_receipts WHERE id=?").bind(id).first<Summary>();
   if (!row || ["sent", "retired"].includes(row.state) || (row.state === "blocked" && !reconcileOnly)) return;
   if (reconcileOnly && !["sending", "blocked"].includes(row.state)) return;

@@ -583,7 +583,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       onClick={() =>
                         void deliveryHealthAction(
                           `/api/slack/channels/${encodeURIComponent(subscription.id)}/verify-recovery`,
-                          "Slack channel access verified.",
+                          "Verification finished. Unconfirmed messages remain blocked.",
                         )
                       }
                     >

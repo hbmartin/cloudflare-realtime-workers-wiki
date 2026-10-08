@@ -219,6 +219,74 @@ describe("legacy channel event settlement", () => {
     expect(posts).not.toHaveBeenCalled();
   });
 
+  it.each(
+    ["verify-recovery", "repair-notifications"].flatMap((route) =>
+      [0, 1].flatMap((initialized) => [false, true].map((canonical) => ({ route, initialized, canonical }))),
+    ),
+  )(
+    "confirms uncertainty through $route with validation disabled (initialized=$initialized canonical=$canonical)",
+    async ({ route, initialized, canonical }) => {
+      const fixture = await legacyChannelFixture("immediate");
+      const installation = (await env.DB.prepare("SELECT * FROM slack_installations").first<SlackInstallation>())!;
+      const id = canonical ? "activity:owner-recovery" : "actor-event";
+      await env.DB.prepare("UPDATE slack_channel_events SET id=? WHERE id='actor-event'").bind(id).run();
+      await env.DB.prepare("UPDATE slack_channel_subscriptions SET round2_initialized=? WHERE id=?")
+        .bind(initialized, fixture.mapping.id)
+        .run();
+      await env.DB.prepare(
+        "UPDATE slack_channel_events SET round2_state='sending',attempted_at=1,suppressed_at=1 WHERE id=?",
+      )
+        .bind(id)
+        .run();
+      if (route === "repair-notifications")
+        await env.DB.prepare(
+          "UPDATE slack_channel_subscriptions SET notification_blocked_at=1,notification_error='not_in_channel'",
+        ).run();
+      const posts = vi.fn(),
+        history = vi.fn();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL) => {
+          if (String(input).includes("conversations.history")) {
+            history();
+            return Response.json({
+              ok: true,
+              messages: [
+                {
+                  user: installation.bot_user_id,
+                  ts: "123.001",
+                  metadata: { event_payload: { delivery_id: `channel:${id}` } },
+                },
+              ],
+            });
+          }
+          if (String(input).includes("chat.postMessage")) posts();
+          return Response.json({
+            ok: true,
+            channel: { id: fixture.mapping.channelId, is_channel: true, is_member: true, is_archived: false },
+          });
+        }),
+      );
+      const context = createExecutionContext();
+      const result = await worker.fetch(
+        request(fixture.cookie, `/api/slack/channels/${fixture.mapping.id}/${route}`, { method: "POST" }),
+        fixture.bindings,
+        context,
+      );
+      expect(result.status).toBe(200);
+      await waitOnExecutionContext(context);
+      expect(history).toHaveBeenCalledOnce();
+      expect(posts).not.toHaveBeenCalled();
+      expect(
+        await env.DB.prepare(
+          "SELECT round2_state,message_ts,delivered_at IS NOT NULL delivered FROM slack_channel_events WHERE id=?",
+        )
+          .bind(id)
+          .first(),
+      ).toEqual({ round2_state: "sent", message_ts: "123.001", delivered: 1 });
+    },
+  );
+
   it("excludes templates from fanout and suppresses an already queued template event", async () => {
     const fixture = await legacyChannelFixture("immediate");
     await env.DB.prepare("UPDATE pages SET is_template=1 WHERE id=?").bind(fixture.page.id).run();
@@ -282,10 +350,10 @@ describe("legacy channel event settlement", () => {
     const checks = queries.filter(
       (query) =>
         query.sql.startsWith("SELECT event.id FROM slack_channel_events event") ||
-        query.sql.startsWith("UPDATE slack_channel_events SET suppressed_at=") ||
+        query.sql.startsWith("UPDATE slack_channel_events SET round2_state='retired',suppressed_at=") ||
         query.sql.includes("SELECT event.id event_id"),
     );
-    expect(checks).toHaveLength(5);
+    expect(checks).toHaveLength(4);
     for (const query of checks) {
       const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${query.sql}`)
         .bind(...query.binds)
