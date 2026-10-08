@@ -1,4 +1,3 @@
-import { shareRecoveryPreflightSql } from "../src/shared/slack-share-recovery.ts";
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { parsePendingMigrations } from "./check-page-move-migration.mjs";
@@ -132,15 +131,6 @@ export function main(argv, execute, { slackReviewMigrationSafe = false } = {}) {
       ) {
         throw new Error("Legacy digest schema is incomplete; refusing to apply migrations.");
       }
-    }
-    if (pending.includes("0074_slack_enqueue_recovery.sql") && !pending.includes("0066_slack_round2.sql")) {
-      checkResult(
-        execute(["d1", "execute", "DB", ...args, "--command", shareRecoveryPreflightSql(pending)], {
-          timeout: preflightTimeoutMs,
-          stdio: "pipe",
-        }),
-        "indexed legacy share recovery",
-      );
     }
     const applied = execute(["d1", "migrations", "apply", "DB", ...args], { stdio: "inherit" });
     if (applied.stdout) console.log(applied.stdout);

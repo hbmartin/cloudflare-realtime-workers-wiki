@@ -18,6 +18,7 @@ describe("Slack review migration deployment gate", () => {
     "0076_slack_delivery_recovery_followup.sql",
     "0077_slack_recovery_query_indexes.sql",
     "0078_slack_delivery_recovery_repairs.sql",
+    "0079_slack_verified_recovery.sql",
   ])("requires confirmation while %s is pending", (migration) => {
     const pending = listing([migration]);
     expect(() => checkSlackReviewMigration(pending)).toThrow("manually confirmed safe upgrade");

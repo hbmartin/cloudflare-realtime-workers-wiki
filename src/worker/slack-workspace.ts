@@ -7,7 +7,6 @@ import {
   RETRYABLE_SHARE_RECEIPT_SQL,
   type SlackOutboxSnapshot,
 } from "./slack-delivery-contracts";
-import { legacyShareRecoverySelectSql } from "../shared/slack-share-recovery";
 import { slackAccessAuthorization } from "./slack-identity";
 import { round2WakeStatement } from "./slack-delivery-contracts";
 import { listTasks } from "./tasks";
@@ -996,7 +995,7 @@ function rootGuard(env: Env, receiptId: string, input: ActionInput, linkId: stri
         AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
         AND (wm.role = 'owner' OR space.visibility = 'workspace' OR sm.user_id IS NOT NULL)
         AND (? = 0 OR wm.role = 'owner')
-        AND link.slack_user_id = ? AND link.migration_state = 'verified'
+        AND link.slack_user_id = ?
         AND link.verification_method = 'slack_openid' AND link.verified_at = ?
         AND link.user_id = ? AND account.id = ? AND account.providerId = 'slack'
         AND account.accountId = i.team_id || ':' || link.slack_user_id
@@ -1029,7 +1028,7 @@ function homeGuard(env: Env, receiptId: string, input: ActionInput, sessionId: s
       WHERE receipt.id = ? AND receipt.processed_at IS NULL
         AND receipt.received_at > unixepoch('subsec') * 1000 - 600000 AND i.id = ? AND i.generation = ?
         AND session.id = ? AND session.kind = 'home' AND session.slack_user_id = ?
-        AND link.slack_user_id = ? AND link.migration_state = 'verified'
+        AND link.slack_user_id = ?
         AND link.verification_method = 'slack_openid' AND link.verified_at = ?
         AND link.user_id = ? AND account.id = ? AND account.providerId = 'slack'
         AND account.accountId = i.team_id || ':' || link.slack_user_id
@@ -1333,7 +1332,7 @@ function unfurlGuard(env: Env, receiptId: string, input: ActionInput, referenceI
         AND receipt.received_at > unixepoch('subsec') * 1000 - 600000 AND i.id = ? AND i.generation = ?
         AND ref.id = ? AND ref.channel_id = ? AND ref.message_ts = ? AND ref.state <> 'retired'
         AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template = 0
-        AND link.slack_user_id = ? AND link.migration_state = 'verified'
+        AND link.slack_user_id = ?
         AND link.verification_method = 'slack_openid' AND link.verified_at = ?
         AND link.user_id = ? AND account.id = ? AND account.providerId = 'slack'
         AND account.accountId = i.team_id || ':' || link.slack_user_id
@@ -1643,14 +1642,7 @@ export async function deliverSlackShareResponse(
   if (captured && !sameSlackOperation(captured, { ...durable, payload_json: captured.payload_json }))
     throw new DeliveryInProgressError();
   const source = JSON.parse(durable.payload_json) as Record<string, unknown>;
-  if (
-    captured &&
-    JSON.stringify(source) !== JSON.stringify(payload) &&
-    (Object.hasOwn(payload, "identity") ||
-      !Object.hasOwn(source, "identity") ||
-      JSON.stringify({ ...source, identity: undefined }) !== JSON.stringify({ ...payload, identity: undefined }))
-  )
-    throw new DeliveryInProgressError();
+  if (captured && JSON.stringify(source) !== JSON.stringify(payload)) throw new DeliveryInProgressError();
   if (
     ["receiptId", "installationId", "generation", "userId", "channelId", "messageTs", "pageId", "shareId"].some(
       (key) => source[key] !== payload[key],
@@ -1668,17 +1660,6 @@ export async function deliverSlackShareResponse(
       .bind(payload.installationId, payload.generation)
       .first());
   if (await authPaused()) return "deferred";
-  if (storedReceipt.response_delivery_state === "pending" && storedReceipt.response_delivery_attempted_at !== null) {
-    // Older consumers retained this timestamp after a definite rejection or a
-    // failure before dispatch. Pending is the evidence that this send can retry.
-    const normalized = await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_attempted_at=NULL
-      WHERE id=? AND outcome='accepted' AND denial_sent_at IS NULL AND response_delivery_state='pending'
-        AND response_delivery_attempted_at=? AND EXISTS(SELECT 1 FROM outbox WHERE ${durableFence.sql})`)
-      .bind(payload.receiptId, storedReceipt.response_delivery_attempted_at, ...durableFence.binds)
-      .run();
-    if (!normalized.meta.changes) throw new DeliveryInProgressError();
-    storedReceipt.response_delivery_attempted_at = null;
-  }
   if (storedReceipt.response_delivery_attempted_at !== null) {
     const blocked =
       await env.DB.prepare(`UPDATE slack_interaction_receipts SET response_delivery_state='blocked',response_delivery_error='send_unconfirmed'
@@ -1693,27 +1674,6 @@ export async function deliverSlackShareResponse(
         .run();
     if (!blocked.meta.changes) throw new DeliveryInProgressError();
     return;
-  }
-  if (!Object.hasOwn(payload, "identity")) {
-    const proof = await env.DB.prepare(
-      // Unary + also keeps SQLite from substituting the payload parameter into the indexed JSON expression.
-      `SELECT * FROM (${legacyShareRecoverySelectSql}) WHERE id=? AND attempts=? AND +payload_json=?`,
-    )
-      .bind(durableId, durable.attempts, durable.payload_json)
-      .first<{ identity_json: string }>();
-    if (proof) {
-      const persisted = await env.DB.prepare(`UPDATE outbox SET payload_json=json_set(payload_json,'$.identity',json(?))
-        WHERE ${durableFence.sql}
-        AND EXISTS(SELECT 1 FROM (${legacyShareRecoverySelectSql}) proof WHERE proof.id=outbox.id AND proof.identity_json=? AND proof.response_delivery_state IS ?)`)
-        .bind(proof.identity_json, ...durableFence.binds, proof.identity_json, storedReceipt.response_delivery_state)
-        .run();
-      if (!persisted.meta.changes) throw new DeliveryInProgressError();
-      return deliverSlackShareResponse(env, { ...source, identity: JSON.parse(proof.identity_json) }, durableId, {
-        ...durable,
-        payload_json: JSON.stringify({ ...source, identity: JSON.parse(proof.identity_json) }),
-      });
-    }
-    if (await authPaused()) return "deferred";
   }
   const expected = payload.identity as Partial<NonNullable<ActionInput["identity"]>> | null;
   if (
@@ -1761,7 +1721,7 @@ export async function deliverSlackShareResponse(
         JOIN workspace_members member ON member.workspace_id=page.workspace_id AND member.user_id=link.user_id
         WHERE installation.id=? AND installation.generation=? AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
           AND link.installation_generation=? AND link.user_id=? AND link.slack_user_id=?
-          AND link.better_auth_account_id=? AND link.verified_at=? AND link.migration_state='verified'
+          AND link.better_auth_account_id=? AND link.verified_at=?
           AND link.verification_method='slack_openid' AND link.authorization_started_at<=?
           AND member.role='owner' AND page.id=? AND page.archived_at IS NULL AND page.import_job_id IS NULL AND page.is_template=0
           AND share.id=? AND share.revoked_at IS NULL

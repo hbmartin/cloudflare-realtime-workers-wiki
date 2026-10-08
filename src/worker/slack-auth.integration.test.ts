@@ -5,8 +5,8 @@ import { bytesToBase64Url } from "../shared/security";
 import worker from "./index";
 import * as authApi from "better-auth/api";
 import { HttpError } from "./http";
-import type { Env, MemberContext } from "./env";
-import { consumeSlackLink, encryptSlackToken } from "./slack";
+import type { Env } from "./env";
+import { encryptSlackToken } from "./slack";
 import { disconnectSlackIdentity, slackAccessAuthorization } from "./slack-identity";
 
 const configured = () =>
@@ -184,58 +184,6 @@ function beforeAuthWrite(pattern: string, before: () => Promise<void>) {
 }
 
 describe("Slack OAuth authorization boundaries", () => {
-  it.each(["verified", "legacy"])(
-    "repairs a NULL grant start through %s relinking without admitting historical work",
-    async (mode) => {
-      const { cookie, user } = await account();
-      await callback(await start(cookie));
-      await env.DB.prepare("UPDATE slack_user_links SET authorization_started_at=NULL").run();
-      let location: string | null = null;
-      if (mode === "verified") {
-        const response = await callback(await start(cookie));
-        location = response.headers.get("location");
-      } else {
-        const raw = "repair-null-link-token";
-        const hash = Array.from(
-          new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw))),
-          (byte) => byte.toString(16).padStart(2, "0"),
-        ).join("");
-        await env.DB.prepare(
-          "INSERT INTO slack_link_tokens(token_hash,installation_id,slack_user_id,expires_at,created_at) VALUES(?,'installation','UOWNER',?,1)",
-        )
-          .bind(hash, Date.now() + 60000)
-          .run();
-        const member = await (await securityRequest(cookie, "/api/me")).json<MemberContext>();
-        const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?")
-          .bind(user)
-          .first<{ id: string }>())!;
-        await consumeSlackLink(
-          configured(),
-          { ...member, session: { id: session.id, expiresAt: new Date(Date.now() + 60000) } },
-          raw,
-        );
-      }
-      expect(location?.includes("slack=verified") ?? false).toBe(mode === "verified");
-      const link = (await env.DB.prepare("SELECT authorization_started_at,linked_at FROM slack_user_links").first<{
-        authorization_started_at: number;
-        linked_at: number;
-      }>())!;
-      expect(link.authorization_started_at).toBe(link.linked_at);
-      expect(link.authorization_started_at).toBeGreaterThan(2);
-      await expect(
-        slackAccessAuthorization(configured(), { id: "installation", generation: 0 }, { userId: user }, 2)(),
-      ).rejects.toMatchObject({ code: "slack_identity_required" });
-      await expect(
-        slackAccessAuthorization(
-          configured(),
-          { id: "installation", generation: 0 },
-          { userId: user },
-          link.authorization_started_at,
-        )(),
-      ).resolves.toBeUndefined();
-    },
-  );
-
   it.each(["old", "malformed"])("rejects a %s populated OAuth permit before changing its grant", async (mode) => {
     const { cookie, user } = await account();
     await callback(await start(cookie));
@@ -458,72 +406,6 @@ describe("Slack OAuth authorization boundaries", () => {
     expect(destination.searchParams.has("view")).toBe(false);
   });
 
-  it.each([
-    "legacy relink",
-    "legacy verification",
-    "verified relink",
-    "identity replacement",
-    "installation reconnect",
-    "security reset",
-  ])("preserves only a continuous authorization start through %s", async (mode) => {
-    const { cookie, user } = await account();
-    await env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,security_generation,installation_generation,authorization_started_at)
-        VALUES('installation',?,'UOWNER',1,0,0,1)`)
-      .bind(user)
-      .run();
-    if (["verified relink", "identity replacement", "installation reconnect", "security reset"].includes(mode))
-      await callback(await start(cookie));
-    if (mode === "identity replacement") slackUser = "UREPLACEMENT";
-    if (mode === "installation reconnect")
-      await env.DB.prepare("UPDATE slack_installations SET generation=generation+1").run();
-    if (mode === "security reset") {
-      await env.DB.prepare("UPDATE account_security SET generation=generation+1").run();
-      await env.DB.prepare("UPDATE session_security SET generation=1,verified_at=?").bind(Date.now()).run();
-    }
-    let completion: Response | null = null;
-    if (mode === "legacy relink") {
-      const raw = "continuity-link-token";
-      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw));
-      const hash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-      await env.DB.prepare(
-        "INSERT INTO slack_link_tokens(token_hash,installation_id,slack_user_id,expires_at,created_at) VALUES(?,'installation','UOWNER',?,1)",
-      )
-        .bind(hash, Date.now() + 60000)
-        .run();
-      const member = await (await securityRequest(cookie, "/api/me")).json<MemberContext>();
-      const session = (await env.DB.prepare("SELECT id FROM session WHERE userId=?")
-        .bind(user)
-        .first<{ id: string }>())!;
-      await consumeSlackLink(
-        configured(),
-        { ...member, session: { id: session.id, expiresAt: new Date(Date.now() + 60000) } },
-        raw,
-      );
-    } else {
-      completion = await callback(await start(cookie));
-    }
-    expect(completion?.status ?? 200).toBe(mode === "legacy relink" ? 200 : 302);
-    expect(completion?.headers.get("location")?.includes("slack=verified") ?? false).toBe(mode !== "legacy relink");
-    const link = (await env.DB.prepare(
-      "SELECT authorization_started_at,linked_at,verified_at FROM slack_user_links",
-    ).first<{ authorization_started_at: number; linked_at: number; verified_at: number | null }>())!;
-    const continuous = ["legacy relink", "legacy verification", "verified relink"].includes(mode);
-    expect(link.authorization_started_at).toBe(continuous ? 1 : link.linked_at);
-    expect(link.linked_at).toBeGreaterThan(1);
-    expect(link.verified_at === null).toBe(mode === "legacy relink");
-    const authorize = slackAccessAuthorization(
-      configured(),
-      { id: "installation", generation: mode === "installation reconnect" ? 1 : 0 },
-      { userId: user },
-      2,
-    );
-    const denial = await authorize().then(
-      () => null,
-      (error: { code: string }) => error.code,
-    );
-    expect(denial).toBe(continuous ? null : "slack_identity_required");
-  });
-
   it("backfills known grant starts when upgrading from 0071", async () => {
     await reset();
     const migrations = env.TEST_MIGRATIONS!;
@@ -659,8 +541,8 @@ describe("Slack OAuth authorization boundaries", () => {
       expect(new URL(losing.headers.get("location")!, "http://example.test").searchParams.get("error")).toBe(
         "slack_link_changed",
       );
-      expect(await env.DB.prepare("SELECT user_id,migration_state FROM slack_user_links").first()).toEqual(
-        adoption === "verified link" ? { user_id: user, migration_state: "verified" } : null,
+      expect(await env.DB.prepare("SELECT user_id,verification_method FROM slack_user_links").first()).toEqual(
+        adoption === "verified link" ? { user_id: user, verification_method: "slack_openid" } : null,
       );
       expect(await env.DB.prepare("SELECT userId FROM account WHERE providerId='slack'").first()).toEqual({
         userId: user,

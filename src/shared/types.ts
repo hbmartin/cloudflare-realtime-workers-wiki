@@ -279,12 +279,10 @@ export type SlackStatus = {
     };
     capabilities?: Record<SlackCapability, SlackCapabilityHealth>;
   } | null;
-  /** @deprecated Use identity.state during the rolling deployment. */
-  linked: boolean;
-  identity?: {
+  identity: {
     accessAuthorized?: boolean;
     reauthorizationRequired?: boolean;
-    state: "unlinked" | "legacy" | "verified";
+    state: "unlinked" | "verified";
     slackUserId: string | null;
     verifiedAt: number | null;
   };
@@ -502,3 +500,14 @@ export type TableData = {
 export type TableLeaseTiming = { leaseDurationMs: number };
 
 export type TableLeaseResponse = TableLeaseTiming & { leaseToken: string };
+
+export type SlackVerificationSummary = {
+  status: "complete" | "partial" | "paused";
+  checked: number;
+  confirmed: number;
+  blocked: number;
+  pending: number;
+  paused: number;
+  nextCursor: string | null;
+  retryAt: number | null;
+};

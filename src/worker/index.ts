@@ -5,14 +5,14 @@ import { activityMutationStart, activityMutationEnd, activePageSelectionSql } fr
 import { DOCX_MIME } from "../shared/docx-metadata";
 import { EXPORT_CAPABILITIES } from "../shared/export-format";
 import { dueRound2Digests } from "./slack-digests";
-import { reconcileRound2Mapping, reconcileSlackChannelMapping } from "./slack-recovery";
+import { verifySlackMapping } from "./slack-verification";
 import { listActivity } from "./activity";
 import { CHANNEL_EVENT_TYPES, type ChannelEventType } from "../shared/activity";
 import { channelDirectory, syncRound2Configuration, revalidateMappings } from "./slack-channels";
 import { acceptSlackProductInteraction, openSlackProduct } from "./slack-product";
 import { authorizeSlackCaptureJobRetry } from "./slack-capture";
 import { taskListStatements, listTasks, mutateTask, taskAssignees } from "./tasks";
-import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror, verifySlackMirrorRecovery } from "./slack-threads";
+import { acceptSlackReply, acceptSlackThreadAction, setSlackMirror } from "./slack-threads";
 import { acceptSlackWorkspaceInteraction, openSlackSearch, purgeExpiredSlackSearchSessions } from "./slack-workspace";
 import {
   pageForMember,
@@ -226,7 +226,6 @@ import {
   updateShare,
 } from "./shares";
 import {
-  consumeSlackLink,
   createSlackOAuthUrl,
   deleteSlackChannelSubscription,
   disconnectSlack,
@@ -238,7 +237,6 @@ import {
   acknowledgeSlackDeliveryFailures,
   pruneSlackSecurityRecords,
   repairSlackChannelNotifications,
-  sendDueSlackChannelDigests,
   setSlackChannelPause,
   SlackRateLimitError,
   slackConfigurationStatus,
@@ -2863,13 +2861,6 @@ app.post("/api/slack/disconnect", async (c) => {
   return c.json({ ok: true });
 });
 
-app.post("/api/slack/link", async (c) => {
-  const member = await requireMember(c.req.raw, c.env);
-  const body = await jsonBody(c.req.raw);
-  await consumeSlackLink(c.env, member, text(body.token, "token", 200));
-  return c.json({ ok: true });
-});
-
 app.delete("/api/slack/identity", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   await disconnectSlackIdentity(c.env, member.user.id, member.session.id, member.workspace.id);
@@ -3089,15 +3080,15 @@ app.post("/api/slack/delivery-health/:id/acknowledge", async (c) => {
 });
 
 app.post("/api/slack/channels/:id/verify-recovery", async (c) => {
+  const deadline = Date.now() + 20_000;
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   const mapping = (await listSlackChannelSubscriptions(c.env, member)).find((m) => m.id === c.req.param("id"));
   if (!mapping) throw new HttpError(404, "mapping_unavailable", "This mapping is unavailable.");
-  if (mapping.mirrorEnabled) await verifySlackMirrorRecovery(c.env, member, mapping.id);
-  if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await reconcileRound2Mapping(c.env, mapping.id);
-  else await reconcileSlackChannelMapping(c.env, mapping.id);
+  const body = await c.req.json<{ cursor?: string }>().catch(() => ({ cursor: undefined }));
+  const summary = await verifySlackMapping(c.env, mapping.id, body.cursor, deadline);
   c.executionCtx.waitUntil(sweepOutbox(c.env));
-  return c.json({ ok: true });
+  return c.json(summary);
 });
 
 app.post("/api/slack/channels", async (c) => {
@@ -3107,7 +3098,7 @@ app.post("/api/slack/channels", async (c) => {
   const spaceId = text(body.spaceId, "spaceId", 100);
   const pageId = body.pageId === null || body.pageId === undefined ? null : text(body.pageId, "pageId", 100);
   const channelId = text(body.channelId, "channelId", 30).toUpperCase();
-  if (!/^[CDG][A-Z0-9]{1,29}$/.test(channelId)) {
+  if (!/^[CG][A-Z0-9]{1,29}$/.test(channelId)) {
     throw new HttpError(422, "invalid_slack_channel", "Enter a valid Slack channel ID.");
   }
   const channelName = text(body.channelName ?? channelId, "channelName", 100).replace(/^#/, "");
@@ -3115,8 +3106,7 @@ app.post("/api/slack/channels", async (c) => {
   if (cadence !== "immediate" && cadence !== "digest") {
     throw new HttpError(422, "invalid_slack_cadence", "Slack cadence must be immediate or digest.");
   }
-  if (body.eventTypes === undefined && c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true")
-    body.eventTypes = [...CHANNEL_EVENT_TYPES];
+  if (body.eventTypes === undefined) body.eventTypes = [...CHANNEL_EVENT_TYPES];
   if (body.digestOpenWork !== undefined && typeof body.digestOpenWork !== "boolean")
     throw new HttpError(422, "invalid_digest_open_work", "Choose whether to include open work.");
   if (!Array.isArray(body.eventTypes) || !body.eventTypes.length) {
@@ -3125,14 +3115,7 @@ app.post("/api/slack/channels", async (c) => {
   const eventTypes = body.eventTypes.map(
     (value) => text(value, "eventType", 40) as ChannelEventType | NotificationEventType,
   );
-  if (
-    eventTypes.some(
-      (value) =>
-        !(c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true" ? CHANNEL_EVENT_TYPES : NOTIFICATION_EVENT_TYPES).includes(
-          value as never,
-        ),
-    )
-  ) {
+  if (eventTypes.some((value) => !CHANNEL_EVENT_TYPES.includes(value as ChannelEventType))) {
     throw new HttpError(422, "invalid_slack_events", "A Slack event type is invalid.");
   }
   if (new Set(eventTypes).size !== eventTypes.length) {
@@ -3190,31 +3173,14 @@ app.patch("/api/slack/channels/:id/pause", async (c) => {
 });
 
 app.post("/api/slack/channels/:id/repair-notifications", async (c) => {
+  const deadline = Date.now() + 20_000;
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
   await repairSlackChannelNotifications(c.env, member, c.req.param("id"));
   if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await wakeRound2Mapping(c.env, c.req.param("id"));
-  c.executionCtx.waitUntil(
-    (async () => {
-      try {
-        if (c.env.SLACK_CHANNEL_VALIDATION_ENABLED === "true") await reconcileRound2Mapping(c.env, c.req.param("id"));
-        else await reconcileSlackChannelMapping(c.env, c.req.param("id"));
-      } catch (error) {
-        logger.warn(
-          "slack.repair.reconciliation_pending",
-          "slack",
-          "Repair saved; older deliveries still need verification.",
-          { mappingId: c.req.param("id") },
-          error,
-        );
-      } finally {
-        await sweepOutbox(c.env);
-      }
-    })(),
-  );
-  return c.json({
-    subscription: (await listSlackChannelSubscriptions(c.env, member)).find((s) => s.id === c.req.param("id")),
-  });
+  const summary = await verifySlackMapping(c.env, c.req.param("id"), undefined, deadline);
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json(summary);
 });
 
 app.delete("/api/slack/channels/:id", async (c) => {
@@ -7113,8 +7079,12 @@ export async function backfillTableSearchValues(env: Env) {
 }
 
 export async function runSlackMaintenance(env: Env) {
-  const operations = ["redrive", "file_cleanup"] as const;
-  const results = await Promise.allSettled([redriveStaleSlackOutbox(env), processDueSlackFileCleanup(env)]);
+  const operations = ["redrive", "file_cleanup", "mapping_validation"] as const;
+  const results = await Promise.allSettled([
+    redriveStaleSlackOutbox(env),
+    processDueSlackFileCleanup(env),
+    revalidateMappings(env),
+  ]);
   const failures: unknown[] = [];
   const summaries: string[] = [];
   for (const [index, result] of results.entries()) {
@@ -7227,7 +7197,6 @@ export default {
         date_reminders: () => processDueDateReminders(env),
         slack_digests: async () => {
           await dueRound2Digests(env);
-          await sendDueSlackChannelDigests(env);
         },
         slack_security_records: async () => {
           await env.DB.prepare("DELETE FROM workspace_activity WHERE created_at<?")

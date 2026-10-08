@@ -21,12 +21,12 @@ export type SlackLinkAuthorization = FreshSecurityAuthorization & {
   }[];
 };
 
-export function slackGrantStartSql(verified: boolean) {
+function slackGrantStartSql() {
   return `CASE WHEN slack_user_links.authorization_started_at IS NOT NULL
     AND slack_user_links.slack_user_id=excluded.slack_user_id
     AND slack_user_links.installation_generation=excluded.installation_generation
     AND slack_user_links.security_generation=excluded.security_generation
-    ${verified ? "AND (slack_user_links.migration_state='legacy' OR slack_user_links.better_auth_account_id=excluded.better_auth_account_id)" : ""}
+    AND slack_user_links.better_auth_account_id=excluded.better_auth_account_id
     AND EXISTS(SELECT 1 FROM slack_authorized_user_links authorized
       WHERE authorized.installation_id=slack_user_links.installation_id AND authorized.user_id=slack_user_links.user_id)
     THEN slack_user_links.authorization_started_at ELSE excluded.authorization_started_at END`;
@@ -34,7 +34,7 @@ export function slackGrantStartSql(verified: boolean) {
 
 export const SLACK_PRODUCT_SESSION_ACCESS_SQL = `EXISTS(SELECT 1 FROM slack_authorized_user_links link
   WHERE link.installation_id=product_session.installation_id AND link.installation_generation=product_session.generation
-    AND link.slack_user_id=product_session.slack_user_id AND link.migration_state='verified'
+    AND link.slack_user_id=product_session.slack_user_id
     AND link.verification_method='slack_openid'
     AND link.user_id=json_extract(product_session.identity_json,'$.userId')
     AND link.better_auth_account_id=json_extract(product_session.identity_json,'$.accountId')
@@ -138,8 +138,8 @@ export async function recordVerifiedSlackIdentity(
   const prior = permit.bindings.find((binding) => binding.installation_id === identity.installationId);
   const timestamp = Date.now();
   const result = await env.DB.prepare(`INSERT INTO slack_user_links
-    (installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,verified_at,migration_state,installation_generation,security_generation,authorization_started_at)
-    SELECT ?,?,?,?,?, 'slack_openid',?,'verified',generation,?,? FROM slack_installations
+    (installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,verified_at,installation_generation,security_generation,authorization_started_at)
+    SELECT ?,?,?,?,?, 'slack_openid',?,generation,?,? FROM slack_installations
     WHERE id=? AND generation=? AND disconnected_at IS NULL AND ${guard.sql}
       AND EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id=slack_installations.workspace_id AND user_id=?)
       AND EXISTS(SELECT 1 FROM account WHERE id=? AND userId=? AND providerId='slack' AND accountId=?)
@@ -149,13 +149,13 @@ export async function recordVerifiedSlackIdentity(
           AND installation_generation=? AND authorization_started_at IS ?))
     ON CONFLICT(installation_id,user_id) DO UPDATE SET
       slack_user_id=excluded.slack_user_id,better_auth_account_id=excluded.better_auth_account_id,
-      verification_method='slack_openid',migration_state='verified',linked_at=excluded.linked_at,
-      authorization_started_at=${slackGrantStartSql(true)},
+      verification_method='slack_openid',linked_at=excluded.linked_at,
+      authorization_started_at=${slackGrantStartSql()},
       verified_at=CASE WHEN slack_user_links.slack_user_id=excluded.slack_user_id
         AND slack_user_links.better_auth_account_id=excluded.better_auth_account_id
         AND slack_user_links.installation_generation=excluded.installation_generation
         AND slack_user_links.security_generation=excluded.security_generation
-        AND slack_user_links.migration_state='verified' THEN slack_user_links.verified_at ELSE excluded.verified_at END,
+        THEN slack_user_links.verified_at ELSE excluded.verified_at END,
       installation_generation=excluded.installation_generation,security_generation=excluded.security_generation`)
     .bind(
       identity.installationId,

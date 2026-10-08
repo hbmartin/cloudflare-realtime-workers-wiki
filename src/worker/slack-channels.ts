@@ -166,36 +166,10 @@ export async function syncRound2Configuration(env: Env) {
     env.SLACK_DIGEST_DEFAULT_TIMEZONE && validTimezone(env.SLACK_DIGEST_DEFAULT_TIMEZONE)
       ? env.SLACK_DIGEST_DEFAULT_TIMEZONE
       : null;
-  try {
-    await env.DB.prepare(`UPDATE round2_runtime SET activity_enabled=?,share_enabled=?,validation_enabled=?,rich_enabled=?,timezone=?,
+  await env.DB.prepare(`UPDATE round2_runtime SET activity_enabled=?,share_enabled=?,validation_enabled=?,rich_enabled=?,timezone=?,
     activity_started_at=CASE WHEN ?=1 THEN coalesce(activity_started_at,?) ELSE activity_started_at END
     WHERE id=1 AND (activity_enabled<>? OR share_enabled<>? OR validation_enabled<>? OR rich_enabled<>? OR timezone IS NOT ?)`)
-      .bind(activity, share, validation, rich, zone, activity, Date.now(), activity, share, validation, rich, zone)
-      .run();
-  } catch (error) {
-    // Disabled controls must not break health/auth diagnostics on an older database.
-    if (
-      !activity &&
-      !share &&
-      !validation &&
-      !rich &&
-      error instanceof Error &&
-      error.message.includes("no such table: round2_runtime")
-    )
-      return { activationError: null };
-    throw error;
-  }
-  if (!validation) return { activationError: null };
-  if (!zone)
-    return {
-      activationError:
-        "Set a valid SLACK_DIGEST_DEFAULT_TIMEZONE before initializing Slack channel mappings. Existing saved schedules remain active.",
-    };
-  await env.DB.prepare(`UPDATE slack_channel_subscriptions SET digest_timezone=coalesce(digest_timezone,?),
-    digest_not_before=?,round2_initialized=1,event_types_json=(SELECT json_group_array(value) FROM
-      (SELECT value FROM json_each(event_types_json) UNION SELECT 'page_created' UNION SELECT 'page_moved' UNION SELECT 'page_archived' UNION SELECT 'task_status_changed'))
-    WHERE round2_initialized=0`)
-    .bind(zone, Date.now())
+    .bind(activity, share, validation, rich, zone, activity, Date.now(), activity, share, validation, rich, zone)
     .run();
   return { activationError: null };
 }

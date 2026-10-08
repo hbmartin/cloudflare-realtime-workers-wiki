@@ -1,3 +1,5 @@
+import { withSlackPrimaryError } from "./slack-delivery";
+import { verifyHistoryPage as reconcileBotPost, type HistoryVerificationOptions } from "./slack-history";
 import {
   mappingDeliveryPauseSql,
   PERMANENT_SLACK_VALIDATION_ERRORS,
@@ -8,6 +10,7 @@ import {
   definiteSlackRejection,
   invalidSlackDestination,
   recordDeliveryError,
+  recordSecondarySlackError,
   recordPermanentDeliveryFailure,
   retireObsoleteReceipt,
   retireDigestReceiptStatements,
@@ -19,12 +22,7 @@ import { CHANNEL_EVENT_TYPES, type ChannelEventType } from "../shared/activity";
 import { OPEN_THREAD_COUNT_SQL, TASK_STATUS_SQL } from "./activity";
 import type { Env } from "./env";
 import { digestBlocks, type DigestPage } from "./slack-blocks";
-import {
-  round2Installation,
-  validateMappingEvidence,
-  revalidateMappings,
-  StaleSlackValidationError,
-} from "./slack-channels";
+import { round2Installation, validateMappingEvidence, StaleSlackValidationError } from "./slack-channels";
 import {
   slackApi,
   SlackApiError,
@@ -134,7 +132,7 @@ async function retireDeniedDigestEvents(
     WHERE id IN (SELECT event.id FROM json_each(?) candidate CROSS JOIN slack_channel_events event ON event.id=candidate.value
       JOIN pages page ON page.id=event.page_id
       JOIN slack_channel_subscriptions m ON m.id=event.subscription_id JOIN slack_installations i ON i.id=m.installation_id
-      WHERE m.round2_initialized=1
+      WHERE 1
         AND event.summary_id IS NULL AND event.round2_state='pending' AND event.delivered_at IS NULL AND event.suppressed_at IS NULL
         AND (event.claimed_at IS NULL OR event.claimed_at<=?)
         AND (page.is_template=1 OR NOT ${channelActivityActorAuthoritySql}
@@ -251,10 +249,9 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
     );
   }
   if (!slackDeliveryFeatures(env).slack_digest) return;
-  await revalidateMappings(env);
   const mappings =
     await env.DB.prepare(`SELECT m.id,i.generation FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
-    WHERE m.round2_initialized=1 AND m.cadence='digest' AND m.digest_timezone IS NOT NULL AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=?
+    WHERE m.cadence='digest' AND m.digest_timezone IS NOT NULL AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=?
     AND m.notification_blocked_at IS NULL AND i.disconnected_at IS NULL AND i.auth_error IS NULL
     ORDER BY m.digest_not_before,m.id`)
       .bind(timestamp)
@@ -488,40 +485,7 @@ async function attachThumbnail(env: Env, item: DigestPage, installation: SlackIn
     .first<{ slack_file_id: string }>();
   if (cached) item.fileId = cached.slack_file_id;
 }
-export async function reconcileBotPost(
-  env: Env,
-  installation: SlackInstallation,
-  channel: string,
-  id: string,
-  attemptedAt: number,
-  threadTs?: string,
-) {
-  let cursor: string | undefined;
-  let confirmed: string | null = null;
-  for (let page = 0; page < 20; page++) {
-    const input = {
-      channel,
-      oldest: String((attemptedAt - 5000) / 1000),
-      limit: 100,
-      include_all_metadata: true,
-      ...(cursor ? { cursor } : {}),
-    };
-    const result = threadTs
-      ? await slackApi(env, installation, "conversations.replies", { ...input, ts: threadTs })
-      : await slackApi(env, installation, "conversations.history", input);
-    const found = result.messages.filter(
-      (m) =>
-        m.user === installation.bot_user_id &&
-        m.metadata?.event_payload?.delivery_id === id &&
-        (threadTs ? m.thread_ts === threadTs : !m.thread_ts || m.thread_ts === m.ts),
-    );
-    if (found.length > 1 || (found.length && confirmed)) return null;
-    if (found.length === 1) confirmed = found[0]!.ts;
-    cursor = result.response_metadata?.next_cursor;
-    if (!cursor) return confirmed;
-  }
-  return null;
-}
+export { verifyHistoryPage as reconcileBotPost } from "./slack-history";
 type DigestMessage = {
   id: string;
   receipt_id: string;
@@ -582,8 +546,13 @@ async function nextMessage(
 
 class EmptyDigestPageSkippedError extends SlackDispatchSkippedError {}
 
-export async function deliverDigest(env: Env, id: string, reconcileOnly = false) {
-  if (!slackDeliveryFeatures(env).slack_digest) return;
+export async function deliverDigest(
+  env: Env,
+  id: string,
+  reconcileOnly = false,
+  options: HistoryVerificationOptions = {},
+) {
+  if (!reconcileOnly && !slackDeliveryFeatures(env).slack_digest) return;
   let receipt = await env.DB.prepare(`SELECT * FROM slack_digest_receipts WHERE id=?`).bind(id).first<DigestReceipt>();
   if (reconcileOnly && receipt && !["pending", "sending", "blocked"].includes(receipt.state)) return;
   if (
@@ -628,60 +597,7 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
     )
       .bind(id)
       .first<DigestMessage>();
-    // A pre-migration uncertain post retains its original delivery ID. Its old
-    // event list was not trustworthy evidence of which pages were rendered.
-    const hasChildren = await env.DB.prepare("SELECT 1 FROM slack_digest_messages WHERE receipt_id=? LIMIT 1")
-      .bind(id)
-      .first();
-    let legacyReconciled = false;
-    if ((receipt.state === "sending" || reconcileOnly) && !message && !hasChildren) {
-      if (!receipt.attempted_at) return;
-      const ts = await reconcileBotPost(env, installation, receipt.channel_id, id, receipt.attempted_at);
-      if (!ts) {
-        await updateRoot("blocked", null, "post_unconfirmed");
-        return;
-      }
-      // The legacy checkpoint includes every event considered for its first ten
-      // pages. Reconstruct that immutable prefix after confirming its original ID.
-      const prefix = await env.DB.prepare(`SELECT e.page_id,json_group_array(e.id) event_ids FROM slack_channel_events e
-        WHERE e.id IN (SELECT value FROM json_each(?)) GROUP BY e.page_id ORDER BY max(e.created_at) DESC,e.page_id LIMIT 10`)
-        .bind(receipt.event_ids_json)
-        .all<{ page_id: string; event_ids: string }>();
-      const memberIds = JSON.stringify(prefix.results.flatMap((p) => JSON.parse(p.event_ids) as string[]));
-      const messageId = `${id}:message:0`;
-      await env.DB.batch([
-        env.DB.prepare(`INSERT INTO slack_digest_messages(id,receipt_id,sequence,state,page_ids_json,event_ids_json,message_ts,attempted_at)
-          SELECT ?,?,0,'sent',?,?,?,? WHERE EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
-          messageId,
-          id,
-          JSON.stringify(prefix.results.map((p) => p.page_id)),
-          memberIds,
-          ts,
-          receipt.attempted_at,
-          id,
-          token,
-        ),
-        env.DB.prepare(`INSERT INTO slack_digest_message_events(event_id,message_id) SELECT value,? FROM json_each(?)
-          WHERE EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
-          messageId,
-          memberIds,
-          id,
-          token,
-        ),
-        env.DB.prepare(`UPDATE slack_channel_events SET delivered_at=? WHERE id IN (SELECT value FROM json_each(?))
-          AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
-          Date.now(),
-          memberIds,
-          id,
-          token,
-        ),
-        env.DB.prepare(`UPDATE outbox SET slack_redrive_count=0,slack_enqueue_redrive_pending=0 WHERE topic='slack_digest' AND slack_round2_receipt_id=?
-          AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(id, id, token),
-      ]);
-      await updateRoot("pending", ts);
-      legacyReconciled = true;
-    }
-    if (reconcileOnly && !legacyReconciled && !message?.attempted_at) return;
+    if (reconcileOnly && !message?.attempted_at) return;
     let mapping = await digestMapping(env, receipt.subscription_id);
     const finishMessage = async (state: string, ts: string | null) => {
       if (!message) return;
@@ -720,26 +636,46 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
         ),
       ]);
     };
-    if (legacyReconciled) {
-      // Continue below by preparing the next message, without posting twice in this attempt.
-    } else if (message?.state === "sending") {
+    if (message?.state === "sending") {
       if (message.attempted_at === null) {
         await updateRoot("blocked", null, "post_unconfirmed");
         return;
       }
-      const ts = await reconcileBotPost(
+      const result = await reconcileBotPost(
         env,
         installation,
         receipt.channel_id,
         message.sequence === 0 ? id : message.id,
         message.attempted_at!,
+        undefined,
+        {
+          ...options,
+          fence: {
+            sql: "EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)",
+            binds: [id, token],
+          },
+        },
       );
-      if (!ts) {
-        await updateRoot("blocked", null, "post_unconfirmed");
+      if (result.status === "incomplete") return;
+      if (result.status !== "confirmed") {
+        await updateRoot(
+          "blocked",
+          null,
+          result.reason ?? (result.status === "ambiguous" ? "post_ambiguous" : "post_unconfirmed"),
+        );
         return;
       }
-      await finishMessage("sent", ts);
-      await updateRoot("pending", ts);
+      await finishMessage("sent", result.ts);
+      await updateRoot("pending", result.ts);
+      if (reconcileOnly) {
+        const unfinished = await env.DB.prepare(
+          "SELECT 1 FROM slack_digest_messages WHERE receipt_id=? AND state IN ('pending','sending') LIMIT 1",
+        )
+          .bind(id)
+          .first();
+        if (!unfinished) await updateRoot("sent", result.ts);
+        return;
+      }
     } else {
       if (!mapping || mapping.channel_id !== receipt.channel_id || !eligible(mapping, Date.now())) {
         if (mapping && mapping.delivery_paused) return;
@@ -944,45 +880,53 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
           await updateRoot("pending", posted.ts);
         } catch (error) {
           if (!dispatched)
-            await env.DB.batch([
-              env.DB.prepare(`UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,claim_token=NULL,claimed_at=NULL
+            await withSlackPrimaryError(error, "handle_error", { id }, () =>
+              env.DB.batch([
+                env.DB.prepare(`UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,claim_token=NULL,claimed_at=NULL
               WHERE id=? AND state='sending' AND claim_token=? AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
-                message!.id,
-                token,
-                id,
-                token,
-              ),
-              env.DB.prepare(
-                `UPDATE slack_digest_receipts SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=? AND state='sending'`,
-              ).bind(id, token),
-            ]);
+                  message!.id,
+                  token,
+                  id,
+                  token,
+                ),
+                env.DB.prepare(
+                  `UPDATE slack_digest_receipts SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=? AND state='sending'`,
+                ).bind(id, token),
+              ]),
+            );
           if (error instanceof SlackDispatchSkippedError && !(error instanceof EmptyDigestPageSkippedError)) return;
           if (!(error instanceof EmptyDigestPageSkippedError)) {
-            await recordDeliveryError(env, installation, error, mapping.id, mapping.channel_id);
+            await withSlackPrimaryError(error, "handle_error", { id }, () =>
+              recordDeliveryError(env, installation, error, mapping!.id, mapping!.channel_id),
+            );
             if (error instanceof SlackApiError && error.code === "msg_too_long") {
-              await recordPermanentDeliveryFailure(
-                env,
-                installation,
-                message.sequence === 0 ? id : message.id,
-                mapping.id,
-                mapping.channel_id,
-                error.code,
+              await withSlackPrimaryError(error, "handle_error", { id }, () =>
+                recordPermanentDeliveryFailure(
+                  env,
+                  installation,
+                  message!.sequence === 0 ? id : message!.id,
+                  mapping!.id,
+                  mapping!.channel_id,
+                  error.code,
+                ),
               );
-              await finishMessage("retired", null);
-              await updateRoot("pending", null, error.code);
+              await withSlackPrimaryError(error, "handle_error", { id }, () => finishMessage("retired", null));
+              await withSlackPrimaryError(error, "handle_error", { id }, () => updateRoot("pending", null, error.code));
             } else {
               if (invalidSlackDestination(error)) {
-                await finishMessage("retired", null);
-                await retireRoot("terminal", error.code);
+                await withSlackPrimaryError(error, "handle_error", { id }, () => finishMessage("retired", null));
+                await withSlackPrimaryError(error, "handle_error", { id }, () => retireRoot("terminal", error.code));
                 return;
               }
               if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
-                await env.DB.prepare(
-                  `UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,last_error=? WHERE id=? AND claim_token=?`,
-                )
-                  .bind(error instanceof SlackApiError ? error.code : "rate_limited", message.id, token)
-                  .run();
-                await updateRoot("pending");
+                await withSlackPrimaryError(error, "handle_error", { id }, () =>
+                  env.DB.prepare(
+                    `UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,last_error=? WHERE id=? AND claim_token=?`,
+                  )
+                    .bind(error instanceof SlackApiError ? error.code : "rate_limited", message!.id, token)
+                    .run(),
+                );
+                await withSlackPrimaryError(error, "handle_error", { id }, () => updateRoot("pending"));
               }
               throw error;
             }
@@ -1009,18 +953,20 @@ export async function deliverDigest(env: Env, id: string, reconcileOnly = false)
       .bind(`outbox:${next.id}`, installation.workspace_id, id, Date.now(), Date.now(), id, token)
       .run();
   } catch (error) {
-    await recordDeliveryError(env, installation, error);
+    await recordSecondarySlackError("record", { id }, () => recordDeliveryError(env, installation, error));
     throw error;
   } finally {
-    await env.DB.prepare(
-      `UPDATE slack_digest_receipts SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
-    )
-      .bind(id, token)
-      .run();
-    await env.DB.prepare(
-      `UPDATE slack_digest_messages SET claim_token=NULL,claimed_at=NULL WHERE receipt_id=? AND claim_token=?`,
-    )
-      .bind(id, token)
-      .run();
+    await recordSecondarySlackError("release", { id }, () =>
+      env.DB.prepare(`UPDATE slack_digest_receipts SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`)
+        .bind(id, token)
+        .run(),
+    );
+    await recordSecondarySlackError("release", { id }, () =>
+      env.DB.prepare(
+        `UPDATE slack_digest_messages SET claim_token=NULL,claimed_at=NULL WHERE receipt_id=? AND claim_token=?`,
+      )
+        .bind(id, token)
+        .run(),
+    );
   }
 }

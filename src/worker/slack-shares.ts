@@ -1,3 +1,6 @@
+import { withSlackPrimaryError } from "./slack-delivery";
+import { recordSecondarySlackError } from "./slack-delivery";
+import { type HistoryVerificationOptions } from "./slack-history";
 import { slackAccessAuthorization } from "./slack-identity";
 import { slackDeliveryFeatures } from "./slack-delivery-contracts";
 import { definiteSlackRejection, recordDeliveryError, retireObsoleteReceipt } from "./slack-delivery";
@@ -105,8 +108,13 @@ async function shareRefreshBlocks(env: Env, row: Refresh) {
         : "This NoteFlare page has no active public share.",
   };
 }
-export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = false) {
-  if (!slackDeliveryFeatures(env).slack_share_refresh) return;
+export async function deliverShareRefresh(
+  env: Env,
+  id: string,
+  reconcileOnly = false,
+  options: HistoryVerificationOptions = {},
+) {
+  if (!reconcileOnly && !slackDeliveryFeatures(env).slack_share_refresh) return;
   let row = await env.DB.prepare(`SELECT * FROM slack_share_refreshes WHERE id=?`).bind(id).first<Refresh>();
   if (!row || ["sent", "retired"].includes(row.state) || (!reconcileOnly && row.state === "blocked")) return;
   if (reconcileOnly && !["sending", "blocked"].includes(row.state)) return;
@@ -151,24 +159,36 @@ export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = 
       ]);
     };
     if (row.state === "sending" || reconcileOnly) {
-      const ts = await reconcileBotPost(
+      const result = await reconcileBotPost(
         env,
         installation,
         row.channel_id,
         row.id,
         row.attempted_at!,
         row.fallback_thread_ts ?? row.message_ts,
+        {
+          ...options,
+          fence: {
+            sql: "EXISTS(SELECT 1 FROM slack_share_refreshes WHERE id=? AND claim_token=?)",
+            binds: [id, token],
+          },
+        },
       );
-      if (ts) {
+      if (result.status === "incomplete") return;
+      if (result.status === "confirmed") {
         await env.DB.prepare(`UPDATE slack_share_refreshes SET fallback_ts=? WHERE id=? AND claim_token=?`)
-          .bind(ts, id, token)
+          .bind(result.ts, id, token)
           .run();
         await finish(row.rendered_hash!);
       } else
         await env.DB.prepare(
-          `UPDATE slack_share_refreshes SET state='blocked',last_error='fallback_unconfirmed' WHERE id=? AND claim_token=?`,
+          `UPDATE slack_share_refreshes SET state='blocked',last_error=? WHERE id=? AND claim_token=?`,
         )
-          .bind(id, token)
+          .bind(
+            result.reason ?? (result.status === "ambiguous" ? "fallback_ambiguous" : "fallback_unconfirmed"),
+            id,
+            token,
+          )
           .run();
       return;
     }
@@ -223,7 +243,7 @@ export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = 
       );
       await finish(hash, rendered.state === "unavailable" ? "retired" : "sent");
     } catch (error) {
-      await recordDeliveryError(env, installation, error);
+      await recordSecondarySlackError("record", { id }, () => recordDeliveryError(env, installation, error));
       if (
         !(error instanceof SlackApiError) ||
         ["invalid_auth", "token_revoked", "account_inactive", "missing_scope"].includes(error.code)
@@ -239,13 +259,13 @@ export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = 
           "no_permission",
         ].includes(error.code)
       ) {
-        await finish(hash, "retired");
+        await withSlackPrimaryError(error, "handle_error", { id }, () => finish(hash, "retired"));
         return;
       }
       // Ordinary authorized unfurls do not require bot membership. A fallback
       // reply does, so retire a rejected preview without attempting a post.
       if (!channel.is_member) {
-        await finish(hash, "retired");
+        await withSlackPrimaryError(error, "handle_error", { id }, () => finish(hash, "retired"));
         return;
       }
       // Retry temporary service failures. Other permanent attachment rejections may
@@ -293,11 +313,13 @@ export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = 
         });
       } catch (postError) {
         if (postError instanceof SlackRateLimitError || definiteSlackRejection(postError))
-          await env.DB.prepare(
-            `UPDATE slack_share_refreshes SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,
-          )
-            .bind(id, token)
-            .run();
+          await withSlackPrimaryError(postError, "handle_error", { id }, () =>
+            env.DB.prepare(
+              `UPDATE slack_share_refreshes SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,
+            )
+              .bind(id, token)
+              .run(),
+          );
         throw postError;
       }
       await env.DB.prepare(`UPDATE slack_share_refreshes SET fallback_ts=? WHERE id=? AND claim_token=?`)
@@ -306,27 +328,31 @@ export async function deliverShareRefresh(env: Env, id: string, reconcileOnly = 
       await finish(hash, rendered.state === "unavailable" ? "retired" : "sent");
     }
   } catch (error) {
-    await recordDeliveryError(env, installation, error);
+    await recordSecondarySlackError("record", { id }, () => recordDeliveryError(env, installation, error));
     if (
       definiteSlackRejection(error) &&
       ["channel_not_found", "not_in_channel", "is_archived", "message_not_found", "cannot_find_message"].includes(
         error.code,
       )
     ) {
-      await env.DB.prepare("UPDATE slack_share_refreshes SET state=?,last_error=? WHERE id=? AND claim_token=?")
-        .bind(row?.state === "sending" || reconcileOnly ? "blocked" : "retired", error.code, id, token)
-        .run();
+      await withSlackPrimaryError(error, "handle_error", { id }, () =>
+        env.DB.prepare("UPDATE slack_share_refreshes SET state=?,last_error=? WHERE id=? AND claim_token=?")
+          .bind(row?.state === "sending" || reconcileOnly ? "blocked" : "retired", error.code, id, token)
+          .run(),
+      );
       return;
     }
-    await env.DB.prepare("UPDATE slack_share_refreshes SET last_error=? WHERE id=? AND claim_token=?")
-      .bind(error instanceof SlackApiError ? error.code : "lookup_or_delivery_failed", id, token)
-      .run();
+    await withSlackPrimaryError(error, "handle_error", { id }, () =>
+      env.DB.prepare("UPDATE slack_share_refreshes SET last_error=? WHERE id=? AND claim_token=?")
+        .bind(error instanceof SlackApiError ? error.code : "lookup_or_delivery_failed", id, token)
+        .run(),
+    );
     throw error;
   } finally {
-    await env.DB.prepare(
-      `UPDATE slack_share_refreshes SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
-    )
-      .bind(id, token)
-      .run();
+    await recordSecondarySlackError("release", { id }, () =>
+      env.DB.prepare(`UPDATE slack_share_refreshes SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`)
+        .bind(id, token)
+        .run(),
+    );
   }
 }

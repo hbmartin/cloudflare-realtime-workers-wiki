@@ -3,32 +3,14 @@ import { SlackChannelPicker } from "./SlackChannelPicker";
 import { ACTIVITY_LABELS, CHANNEL_EVENT_TYPES } from "../shared/activity";
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import type {
-  NotificationEventType,
   Page,
   SlackChannelSubscription as ChannelSubscription,
   SlackStatus,
   SlackCleanupHealth,
+  SlackVerificationSummary,
   Space,
 } from "../shared/types";
 import { api, apiErrorMessage, authClient, json } from "./api";
-
-const EVENT_OPTIONS: Array<{ value: NotificationEventType; label: string }> = [
-  { value: "mention", label: "Mentions" },
-  { value: "reply", label: "Comment replies" },
-  { value: "thread_resolved", label: "Resolved threads" },
-  { value: "thread_reopened", label: "Reopened threads" },
-  { value: "page_edit", label: "Page edits" },
-];
-
-function removeLinkToken() {
-  const url = new URL(window.location.href);
-  url.searchParams.delete("slackLink");
-  url.searchParams.delete("slack");
-  url.searchParams.delete("error");
-  url.searchParams.delete("error_description");
-  url.searchParams.delete("slackAuth");
-  history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
-}
 
 function initialSlackOAuthError() {
   const params = new URLSearchParams(window.location.search);
@@ -46,7 +28,9 @@ function initialSlackOAuthError() {
     (oauthError.toLowerCase().includes("link")
       ? "Slack could not be connected to this account. Sign in normally and try again."
       : "Slack authorization could not be completed.");
-  removeLinkToken();
+  const url = new URL(window.location.href);
+  for (const key of ["error", "error_description", "slackAuth"]) url.searchParams.delete(key);
+  history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
   return message;
 }
 
@@ -63,15 +47,16 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
   >([]);
   const [error, setError] = useState(initialSlackOAuthError);
   const [notice, setNotice] = useState("");
+  const [verification, setVerification] = useState<Record<string, SlackVerificationSummary>>({});
   const [pickerVersion, setPickerVersion] = useState(0);
-  const [busy, setBusy] = useState(() => new URLSearchParams(window.location.search).has("slackLink"));
+  const [busy, setBusy] = useState(false);
   const [currentTime, setCurrentTime] = useState(() => Date.now());
   const [snoozeHours, setSnoozeHours] = useState<Record<string, "" | "1" | "8" | "24">>({});
   const [spaceId, setSpaceId] = useState(spaces[0]?.id ?? "");
   const resolvedSpaceId = spaces.some((space) => space.id === spaceId) ? spaceId : (spaces[0]?.id ?? "");
 
   useEffect(() => {
-    const timer = window.setInterval(() => setCurrentTime(Date.now()), 60_000);
+    const timer = window.setInterval(() => setCurrentTime(Date.now()), 1_000);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -105,20 +90,8 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
   }, [owner]);
 
   useEffect(() => {
-    const token = new URLSearchParams(window.location.search).get("slackLink");
-    if (!token) {
-      const timer = window.setTimeout(() => void load(), 0);
-      return () => window.clearTimeout(timer);
-    }
-    void api("/api/slack/link", { method: "POST", body: json({ token }) })
-      .then(() => {
-        setNotice("Your NoteFlare and Slack accounts are linked.");
-        removeLinkToken();
-        return load();
-      })
-      .catch((cause) => setError(apiErrorMessage(cause, "The Slack account link could not be completed.")))
-      .finally(() => setBusy(false));
-    return undefined;
+    const timer = window.setTimeout(() => void load(), 0);
+    return () => window.clearTimeout(timer);
   }, [load]);
 
   const eligiblePages = useMemo(
@@ -208,9 +181,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
     event.preventDefault();
     const form = event.currentTarget;
     const values = new FormData(form);
-    const eventTypes = (status?.round2?.channels ? CHANNEL_EVENT_TYPES.map((value) => ({ value })) : EVENT_OPTIONS)
-      .filter(({ value }) => values.has(`event:${value}`))
-      .map(({ value }) => value);
+    const eventTypes = CHANNEL_EVENT_TYPES.filter((value) => values.has(`event:${value}`));
     setBusy(true);
     setError("");
     try {
@@ -220,16 +191,11 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
           spaceId: resolvedSpaceId,
           pageId: String(values.get("pageId") ?? "") || null,
           channelId: String(values.get("channelId") ?? ""),
-          ...(status?.round2?.channels ? {} : { channelName: String(values.get("channelName") ?? "") }),
           cadence: String(values.get("cadence") ?? "immediate"),
           eventTypes,
-          ...(status?.round2?.channels
-            ? {
-                digestTime: String(values.get("digestTime") ?? "09:00"),
-                ...(values.get("digestTimezone") ? { digestTimezone: String(values.get("digestTimezone")) } : {}),
-                digestOpenWork: values.has("digestOpenWork"),
-              }
-            : {}),
+          digestTime: String(values.get("digestTime") ?? "09:00"),
+          ...(values.get("digestTimezone") ? { digestTimezone: String(values.get("digestTimezone")) } : {}),
+          digestOpenWork: values.has("digestOpenWork"),
         }),
       });
       form.reset();
@@ -262,15 +228,23 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
     }
   }
 
-  async function repairNotifications(subscription: ChannelSubscription) {
+  async function verifyNotifications(subscription: ChannelSubscription, repair = false) {
     setBusy(true);
     setError("");
     try {
-      await api(`/api/slack/channels/${encodeURIComponent(subscription.id)}/repair-notifications`, { method: "POST" });
-      setNotice("Repair saved. New notifications can resume; older deliveries may still need verification.");
+      const previous = verification[subscription.id];
+      const summary = await api<SlackVerificationSummary>(
+        `/api/slack/channels/${encodeURIComponent(subscription.id)}/${repair ? "repair-notifications" : "verify-recovery"}`,
+        { method: "POST", body: json(!repair && previous?.nextCursor ? { cursor: previous.nextCursor } : {}) },
+      );
+      setVerification((current) => ({ ...current, [subscription.id]: summary }));
+      const progress = `Checked ${summary.checked}: ${summary.confirmed} confirmed, ${summary.blocked} blocked, ${summary.pending} pending, ${summary.paused} paused.`;
+      setNotice(
+        `${repair ? "Channel access repaired. " : ""}${progress}${summary.nextCursor ? " Continue verification to check remaining deliveries." : ""}${summary.retryAt ? ` Slack requests can resume after ${new Date(summary.retryAt).toLocaleTimeString()}.` : ""}`,
+      );
       await load();
     } catch (cause) {
-      setError(apiErrorMessage(cause, "Channel access could not be verified."));
+      setError(apiErrorMessage(cause, "Slack verification could not be completed."));
     } finally {
       setBusy(false);
     }
@@ -319,7 +293,7 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
   }
 
   const connected = status?.installation?.connected === true;
-  const identityState = status?.identity?.state ?? (status?.linked ? "legacy" : "unlinked");
+  const identityState = status?.identity.state ?? "unlinked";
   return (
     <section className="slack-settings" aria-labelledby="slack-settings-title">
       <div className="slack-settings-heading">
@@ -367,14 +341,8 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
             <strong>{status.installation!.teamName}</strong>
             {identityState === "verified" ? (
               <p>Your Slack identity is verified.</p>
-            ) : identityState === "legacy" ? (
-              <p>
-                {status?.identity?.accessAuthorized
-                  ? "Your legacy Slack delivery link is active. Verify it to enable Slack sign-in."
-                  : "Your legacy Slack delivery is paused. Verify account protection and relink Slack to resume delivery."}
-              </p>
             ) : (
-              <p>Connect your Slack identity, or run /notes link for legacy personal delivery.</p>
+              <p>Connect your Slack identity to enable personal notifications.</p>
             )}
           </div>
         </div>
@@ -383,11 +351,11 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
         status?.installation?.capabilities?.identity.available &&
         (identityState !== "verified" || status.identity?.reauthorizationRequired) && (
           <button className="primary-small" disabled={busy} onClick={() => void linkIdentity()}>
-            {identityState === "legacy" ? "Verify Slack identity" : "Connect Slack identity"}
+            Connect Slack identity
           </button>
         )}
       {status?.identity?.reauthorizationRequired && <p>Verify your account protection and reconnect Slack access.</p>}
-      {connected && status?.linked && (
+      {connected && identityState === "verified" && (
         <button disabled={busy} onClick={() => void disconnectIdentity()}>
           Disconnect Slack access
         </button>
@@ -424,96 +392,80 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
 
       {owner && connected && (
         <>
-          <form className="slack-channel-form" onSubmit={addSubscription}>
-            <h3>Channel updates</h3>
-            <p className="muted">
-              Map a channel to a whole space or one page. Private page previews require a mapping.
-            </p>
-            <div className="slack-field-grid">
-              <label>
-                Space
-                <select value={resolvedSpaceId} onChange={(event) => setSpaceId(event.target.value)} required>
-                  {spaces.map((space) => (
-                    <option key={space.id} value={space.id}>
-                      {space.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Page scope
-                <select key={resolvedSpaceId} name="pageId" defaultValue="">
-                  <option value="">Every page in this space</option>
-                  {eligiblePages.map((page) => (
-                    <option key={page.id} value={page.id}>
-                      {page.title}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {status?.round2?.channels ? (
-                <SlackChannelPicker key={pickerVersion} />
-              ) : (
-                <>
-                  <label>
-                    Channel ID
-                    <input name="channelId" placeholder="C0123456789" maxLength={30} required />
-                  </label>
-                  <label>
-                    Channel name
-                    <input name="channelName" placeholder="product-notes" maxLength={100} required />
-                  </label>
-                </>
-              )}
-              <label>
-                Cadence
-                <select name="cadence" defaultValue="immediate">
-                  <option value="immediate">Immediate</option>
-                  <option value="digest">
-                    {status?.round2?.channels ? "Daily digest" : "Daily digest at 09:00 UTC"}
-                  </option>
-                </select>
-              </label>
-            </div>
-            {status?.round2?.channels && (
+          {status?.round2?.channels && (
+            <form className="slack-channel-form" onSubmit={addSubscription}>
+              <h3>Channel updates</h3>
+              <p className="muted">
+                Map a channel to a whole space or one page. Private page previews require a mapping.
+              </p>
               <div className="slack-field-grid">
                 <label>
-                  Daily send time
-                  <input type="time" name="digestTime" defaultValue="09:00" required />
+                  Space
+                  <select value={resolvedSpaceId} onChange={(event) => setSpaceId(event.target.value)} required>
+                    {spaces.map((space) => (
+                      <option key={space.id} value={space.id}>
+                        {space.name}
+                      </option>
+                    ))}
+                  </select>
                 </label>
                 <label>
-                  Digest timezone
-                  <input
-                    name="digestTimezone"
-                    defaultValue={status.round2.defaultTimezone ?? ""}
-                    placeholder="Operator default timezone"
-                    maxLength={100}
-                  />
+                  Page scope
+                  <select key={resolvedSpaceId} name="pageId" defaultValue="">
+                    <option value="">Every page in this space</option>
+                    {eligiblePages.map((page) => (
+                      <option key={page.id} value={page.id}>
+                        {page.title}
+                      </option>
+                    ))}
+                  </select>
                 </label>
+                <SlackChannelPicker key={pickerVersion} />
                 <label>
-                  <input type="checkbox" name="digestOpenWork" defaultChecked /> Include unresolved comments and
-                  unfinished tasks
+                  Cadence
+                  <select name="cadence" defaultValue="immediate">
+                    <option value="immediate">Immediate</option>
+                    <option value="digest">Daily digest</option>
+                  </select>
                 </label>
-                {!status.round2.defaultTimezone && (
-                  <p>The operator must configure a default timezone before enabling digests.</p>
-                )}
               </div>
-            )}
-            <fieldset className="slack-event-options">
-              <legend>Events</legend>
-              {(status?.round2?.channels
-                ? CHANNEL_EVENT_TYPES.map((value) => ({ value, label: ACTIVITY_LABELS[value] }))
-                : EVENT_OPTIONS
-              ).map((option) => (
-                <label key={option.value}>
-                  <input name={`event:${option.value}`} type="checkbox" defaultChecked /> {option.label}
-                </label>
-              ))}
-            </fieldset>
-            <button className="primary-small" disabled={busy || !resolvedSpaceId}>
-              {busy ? "Saving…" : "Save channel mapping"}
-            </button>
-          </form>
+              {status?.round2?.channels && (
+                <div className="slack-field-grid">
+                  <label>
+                    Daily send time
+                    <input type="time" name="digestTime" defaultValue="09:00" required />
+                  </label>
+                  <label>
+                    Digest timezone
+                    <input
+                      name="digestTimezone"
+                      defaultValue={status.round2.defaultTimezone ?? ""}
+                      placeholder="Operator default timezone"
+                      maxLength={100}
+                    />
+                  </label>
+                  <label>
+                    <input type="checkbox" name="digestOpenWork" defaultChecked /> Include unresolved comments and
+                    unfinished tasks
+                  </label>
+                  {!status.round2.defaultTimezone && (
+                    <p>The operator must configure a default timezone before enabling digests.</p>
+                  )}
+                </div>
+              )}
+              <fieldset className="slack-event-options">
+                <legend>Events</legend>
+                {CHANNEL_EVENT_TYPES.map((value) => ({ value, label: ACTIVITY_LABELS[value] })).map((option) => (
+                  <label key={option.value}>
+                    <input name={`event:${option.value}`} type="checkbox" defaultChecked /> {option.label}
+                  </label>
+                ))}
+              </fieldset>
+              <button className="primary-small" disabled={busy || !resolvedSpaceId || !status?.round2?.channels}>
+                {busy ? "Saving…" : "Save channel mapping"}
+              </button>
+            </form>
+          )}
 
           <div className="slack-channel-list">
             {subscriptions.map((subscription) => {
@@ -577,17 +529,14 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                       <output>{subscription.failedDeliveries} deliveries failed.</output>
                     )}
                   </div>
-                  {Boolean(subscription.blockedDeliveries) && (
+                  {(Boolean(subscription.blockedDeliveries) || verification[subscription.id]?.nextCursor) && (
                     <button
-                      disabled={busy}
-                      onClick={() =>
-                        void deliveryHealthAction(
-                          `/api/slack/channels/${encodeURIComponent(subscription.id)}/verify-recovery`,
-                          "Verification finished. Unconfirmed messages remain blocked.",
-                        )
-                      }
+                      disabled={busy || (verification[subscription.id]?.retryAt ?? 0) > currentTime}
+                      onClick={() => void verifyNotifications(subscription)}
                     >
-                      Verify and resume delivery
+                      {verification[subscription.id]?.nextCursor
+                        ? "Continue verification"
+                        : "Verify and resume delivery"}
                     </button>
                   )}
                   {Boolean(subscription.failedDeliveries) && (
@@ -611,7 +560,10 @@ export function SlackSettings({ owner, spaces, pages }: { owner: boolean; spaces
                     {subscription.mirrorEnabled ? "Disable mirror" : "Validate and enable mirror"}
                   </button>
                   {subscription.notificationBlockedAt && (
-                    <button disabled={busy} onClick={() => void repairNotifications(subscription)}>
+                    <button
+                      disabled={busy || (verification[subscription.id]?.retryAt ?? 0) > currentTime}
+                      onClick={() => void verifyNotifications(subscription, true)}
+                    >
                       Verify and resume notifications
                     </button>
                   )}

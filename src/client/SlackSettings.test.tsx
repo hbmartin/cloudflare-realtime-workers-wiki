@@ -55,7 +55,7 @@ describe("SlackSettings", () => {
     vi.mocked(api).mockResolvedValue({
       available: true,
       installation: { connected: true, teamName: "Product Slack", capabilities: { identity: { available: true } } },
-      linked: false,
+      identity: { state: "unlinked", slackUserId: null, verifiedAt: null },
     });
     vi.mocked(authClient.linkSocial).mockRejectedValueOnce(new Error("Network failure"));
     render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
@@ -74,7 +74,7 @@ describe("SlackSettings", () => {
     vi.mocked(api).mockResolvedValue({
       available: true,
       installation: { connected: true, capabilities: { identity: { available: true } } },
-      linked: false,
+      identity: { state: "unlinked", slackUserId: null, verifiedAt: null },
     });
     vi.mocked(authClient.linkSocial).mockResolvedValueOnce({
       data: null,
@@ -105,26 +105,13 @@ describe("SlackSettings", () => {
     ],
   ])("shows an actionable callback error: %s", async (code, message) => {
     history.replaceState(null, "", `/?slackAuth=callback&error=${code}`);
-    vi.mocked(api).mockResolvedValue({ available: true, installation: null, linked: false });
-    render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
-    expect(await screen.findByText(message)).toBeInTheDocument();
-  });
-
-  it.each([false, true])("describes legacy delivery with authorization %s", async (accessAuthorized) => {
     vi.mocked(api).mockResolvedValue({
       available: true,
-      installation: { connected: true, teamName: "Slack" },
-      identity: { state: "legacy", accessAuthorized, reauthorizationRequired: !accessAuthorized },
-      linked: true,
+      installation: null,
+      identity: { state: "unlinked", slackUserId: null, verifiedAt: null },
     });
     render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
-    expect(
-      await screen.findByText(
-        accessAuthorized
-          ? "Your legacy Slack delivery link is active. Verify it to enable Slack sign-in."
-          : "Your legacy Slack delivery is paused. Verify account protection and relink Slack to resume delivery.",
-      ),
-    ).toBeInTheDocument();
+    expect(await screen.findByText(message)).toBeInTheDocument();
   });
 
   it("shows paused cleanup remediation and disconnects access separately from sign-in", async () => {
@@ -134,7 +121,6 @@ describe("SlackSettings", () => {
           available: true,
           installation: { connected: true },
           identity: { state: "verified", accessAuthorized: true, slackUserId: "U123" },
-          linked: true,
         };
       if (path === "/api/slack/delivery-health")
         return {
@@ -155,7 +141,13 @@ describe("SlackSettings", () => {
 
   it("acknowledges a failure for an orphaned link using its encoded identifier", async () => {
     vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/slack/status") return { available: true, missing: [], installation: null, linked: false };
+      if (path === "/api/slack/status")
+        return {
+          available: true,
+          missing: [],
+          installation: null,
+          identity: { state: "unlinked", slackUserId: null, verifiedAt: null },
+        };
       if (path === "/api/slack/delivery-health")
         return { orphanedFailures: [{ id: "orphan:link-1", channelName: "notes", failedDeliveries: 1 }] };
       if (path === "/api/slack/delivery-health/orphan%3Alink-1/acknowledge") return { ok: true };
@@ -172,7 +164,13 @@ describe("SlackSettings", () => {
 
   it("reports thumbnail cleanup as manual attention and only acknowledges the health notice", async () => {
     vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/slack/status") return { available: true, missing: [], installation: null, linked: false };
+      if (path === "/api/slack/status")
+        return {
+          available: true,
+          missing: [],
+          installation: null,
+          identity: { state: "unlinked", slackUserId: null, verifiedAt: null },
+        };
       if (path === "/api/slack/delivery-health")
         return {
           orphanedFailures: [
@@ -197,7 +195,7 @@ describe("SlackSettings", () => {
       available: false,
       missing: ["SLACK_CLIENT_ID"],
       installation: null,
-      linked: false,
+      identity: { state: "unlinked", slackUserId: null, verifiedAt: null },
     });
     render(<SlackSettings owner spaces={[space]} pages={[page]} />);
     expect(await screen.findByText(/Slack is unavailable until an operator configures/)).toHaveTextContent(
@@ -206,79 +204,14 @@ describe("SlackSettings", () => {
     expect(screen.queryByRole("button", { name: "Add to Slack" })).not.toBeInTheDocument();
   });
 
-  it("lets an owner map a channel to a page and choose delivery cadence", async () => {
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path === "/api/slack/status") {
-        return {
-          available: true,
-          missing: [],
-          installation: {
-            teamId: "T123",
-            teamName: "Product Slack",
-            botUserId: "B123",
-            scopes: [],
-            connected: true,
-            createdAt: 1,
-            updatedAt: 1,
-          },
-          linked: true,
-        };
-      }
-      if (path === "/api/slack/channels" && !init?.method) return { subscriptions: [] };
-      if (path === "/api/slack/channels" && init?.method === "POST") return { subscription: { id: "mapping" } };
-      throw new Error(`Unexpected request: ${path}`);
-    });
-    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
-    expect(await screen.findByText("Product Slack")).toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText("Page scope"), { target: { value: page.id } });
-    fireEvent.change(screen.getByLabelText("Channel ID"), { target: { value: "C0123456789" } });
-    fireEvent.change(screen.getByLabelText("Channel name"), { target: { value: "launch" } });
-    fireEvent.change(screen.getByLabelText("Cadence"), { target: { value: "digest" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save channel mapping" }));
-
-    await waitFor(() =>
-      expect(api).toHaveBeenCalledWith("/api/slack/channels", expect.objectContaining({ method: "POST" })),
-    );
-    const saved = vi
-      .mocked(api)
-      .mock.calls.find(([path, init]) => path === "/api/slack/channels" && init?.method === "POST");
-    expect(JSON.parse(String(saved?.[1]?.body))).toMatchObject({
-      channelId: "C0123456789",
-      pageId: page.id,
-      cadence: "digest",
-    });
-    expect(await screen.findByText("Slack channel mapping saved.")).toBeInTheDocument();
-  });
-
-  it("consumes a Slack account link once and removes it from browser history", async () => {
-    history.replaceState(null, "", "/?view=settings&slackLink=single-use-token");
-    vi.mocked(api).mockImplementation(async (path, init) => {
-      if (path === "/api/slack/link" && init?.method === "POST") return { ok: true };
-      if (path === "/api/slack/status") {
-        return { available: true, missing: [], installation: null, linked: true };
-      }
-      throw new Error(`Unexpected request: ${path}`);
-    });
-    render(<SlackSettings owner={false} spaces={[space]} pages={[page]} />);
-    expect(await screen.findByText("Your NoteFlare and Slack accounts are linked.")).toBeInTheDocument();
-    // The token is single use, so a second POST would burn it and 4xx the retry.
-    const linkCalls = vi
-      .mocked(api)
-      .mock.calls.filter(([path, init]) => path === "/api/slack/link" && init?.method === "POST");
-    expect(linkCalls).toHaveLength(1);
-    expect(linkCalls[0]?.[1]).toEqual(
-      expect.objectContaining({ method: "POST", body: '{"token":"single-use-token"}' }),
-    );
-    expect(window.location.search).toBe("?view=settings");
-  });
-
   it("creates a daily mapping with the operator timezone, lifecycle events, and open work", async () => {
     vi.mocked(api).mockImplementation(async (path, init) => {
       if (path === "/api/slack/status")
         return {
+          identity: { state: "unlinked", slackUserId: null, verifiedAt: null },
           available: true,
           missing: [],
-          linked: true,
+
           installation: {
             connected: true,
             teamId: "T123",
@@ -318,45 +251,6 @@ describe("SlackSettings", () => {
     });
   });
 
-  it("distinguishes legacy identity migration and bot reauthorization health", async () => {
-    vi.mocked(api).mockImplementation(async (path) => {
-      if (path === "/api/slack/status") {
-        return {
-          available: true,
-          missing: [],
-          installation: {
-            teamId: "T123",
-            teamName: "Product Slack",
-            botUserId: "B123",
-            scopes: ["commands", "users:read"],
-            connected: true,
-            createdAt: 1,
-            updatedAt: 1,
-            scopeHealth: {
-              required: ["commands", "chat:write"],
-              granted: ["commands", "users:read"],
-              missing: ["chat:write"],
-              reauthorizationRequired: true,
-            },
-            capabilities: {
-              identity: { available: true, requiredScopes: ["users:read"], missingScopes: [] },
-            },
-          },
-          linked: true,
-          identity: { state: "legacy", slackUserId: "U123", verifiedAt: null, accessAuthorized: true },
-          reauthorization: { required: true, available: true },
-        };
-      }
-      if (path === "/api/slack/channels") return { subscriptions: [] };
-      throw new Error(`Unexpected request: ${path}`);
-    });
-    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
-    expect(await screen.findByText(/legacy Slack delivery link is active/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Verify Slack identity" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reauthorize Slack" })).toBeInTheDocument();
-    expect(screen.getByText("Missing: chat:write")).toBeInTheDocument();
-  });
-
   it("offers owners reauthorization for bot authentication failure with complete scopes", async () => {
     vi.mocked(api).mockImplementation(async (path) => {
       if (path === "/api/slack/status")
@@ -382,7 +276,7 @@ describe("SlackSettings", () => {
               identity: { available: true, requiredScopes: ["users:read"], missingScopes: [] },
             },
           },
-          linked: false,
+          identity: { state: "unlinked", slackUserId: null, verifiedAt: null },
           reauthorization: { required: true, available: true },
         };
       if (path === "/api/slack/channels") return { subscriptions: [] };
@@ -416,7 +310,7 @@ describe("SlackSettings", () => {
               identity: { available: true, requiredScopes: ["users:read"], missingScopes: [] },
             },
           },
-          linked: true,
+
           identity: { state: "verified", slackUserId: "U123", verifiedAt: 1 },
           reauthorization: { required: false, available: true },
         };
@@ -439,7 +333,7 @@ describe("Slack thread mirror controls", () => {
         return {
           available: true,
           missing: [],
-          linked: true,
+
           identity: { state: identity, slackUserId: "UOWNER", verifiedAt: 1 },
           installation: {
             teamId: "T123",
@@ -501,8 +395,8 @@ describe("Slack thread mirror controls", () => {
       ),
     );
   });
-  it("keeps enabling disabled for legacy identities", async () => {
-    setupMirror("legacy");
+  it("keeps enabling disabled for unlinked identities", async () => {
+    setupMirror("unlinked");
     render(<SlackSettings owner spaces={[space]} pages={[page]} />);
     expect(await screen.findByRole("button", { name: "Enable thread mirror for #product" })).toBeDisabled();
   });
@@ -540,5 +434,90 @@ describe("Slack thread mirror controls", () => {
     await screen.findByText("Your Slack identity is verified.");
     expect(screen.queryByRole("button", { name: /thread mirror/ })).not.toBeInTheDocument();
     expect(api).not.toHaveBeenCalledWith("/api/slack/channels");
+  });
+});
+
+describe("bounded verification progress", () => {
+  function setup(summary: object) {
+    vi.mocked(api).mockImplementation(async (path) => {
+      if (path === "/api/slack/status")
+        return {
+          available: true,
+          identity: { state: "verified", slackUserId: "U123", verifiedAt: 1 },
+          installation: { connected: true, teamName: "Slack" },
+        };
+      if (path === "/api/slack/channels")
+        return {
+          subscriptions: [
+            {
+              id: "mapping",
+              channelId: "C123",
+              channelName: "product",
+              spaceId: space.id,
+              pageId: null,
+              eventTypes: [],
+              cadence: "immediate",
+              blockedDeliveries: 6,
+              notificationBlockedAt: 1,
+            },
+          ],
+        };
+      if (path.endsWith("verify-recovery") || path.endsWith("repair-notifications")) return summary;
+      return {};
+    });
+    render(<SlackSettings owner spaces={[space]} pages={[page]} />);
+  }
+  it("reports partial counts and sends the continuation on the next click", async () => {
+    setup({
+      status: "partial",
+      checked: 5,
+      confirmed: 1,
+      blocked: 2,
+      pending: 3,
+      paused: 0,
+      nextCursor: "next-pass",
+      retryAt: null,
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Verify and resume delivery" }));
+    expect(await screen.findByText(/Checked 5: 1 confirmed, 2 blocked, 3 pending, 0 paused/)).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "Continue verification" }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith("/api/slack/channels/mapping/verify-recovery", {
+        method: "POST",
+        body: JSON.stringify({ cursor: "next-pass" }),
+      }),
+    );
+  });
+  it("repairs one batch and exposes continuation from the shared summary", async () => {
+    setup({
+      status: "partial",
+      checked: 5,
+      confirmed: 2,
+      blocked: 1,
+      pending: 4,
+      paused: 0,
+      nextCursor: "repair-next",
+      retryAt: null,
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Verify and resume notifications" }));
+    expect(await screen.findByText(/Channel access repaired. Checked 5: 2 confirmed/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue verification" })).toBeEnabled();
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith("repair-notifications"))).toHaveLength(1);
+  });
+  it("disables continuation until the persisted cooldown expires", async () => {
+    setup({
+      status: "paused",
+      checked: 1,
+      confirmed: 0,
+      blocked: 0,
+      pending: 0,
+      paused: 1,
+      nextCursor: "continue",
+      retryAt: Date.now() + 60_000,
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Verify and resume delivery" }));
+    expect(await screen.findByRole("button", { name: "Continue verification" })).toBeDisabled();
+    expect(await screen.findByText(/Slack requests can resume after/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Verify and resume notifications" })).toBeDisabled();
   });
 });
