@@ -15,6 +15,7 @@ import { sourceRateLimitKey } from "./source-rate-limit";
 import type { Env } from "./env";
 import { protectedCommentBlockIds } from "./comments";
 import type { DocumentContentEnvelope, ProseMirrorJson } from "../shared/types";
+import { documentResultSchema, pagesResultSchema, spacesResultSchema, PLUGIN_UI_URI } from "../shared/plugin-contracts";
 
 const ORIGIN = "http://example.test";
 const RESOURCE = `${ORIGIN}/mcp`;
@@ -208,6 +209,7 @@ async function toolCall(token: string, name: string, args: Record<string, unknow
       isError?: boolean;
       content: Array<{ text: string }>;
       structuredContent?: { error: { code: string; retryable: boolean } };
+      _meta?: Record<string, unknown>;
     };
   }>();
 }
@@ -1287,7 +1289,11 @@ describe("OAuth MCP foundation", () => {
       name: "fetch_page",
       arguments: { page_id: createdPageId },
     });
-    const content = JSON.stringify(await fetched.json());
+    const fetchedResult = await fetched.json<{
+      result: { content: Array<{ text: string }>; structuredContent: unknown };
+    }>();
+    expect(fetchedResult.result.structuredContent).toEqual(JSON.parse(fetchedResult.result.content[0]!.text));
+    const content = fetchedResult.result.content[0]!.text;
     expect(content).toContain("created");
     expect(content).toContain("Another line");
     expect(content.match(/Another line/g)).toHaveLength(1);
@@ -1329,6 +1335,7 @@ describe("OAuth MCP foundation", () => {
       issuer: ORIGIN,
       code_challenge_methods_supported: ["S256"],
       token_endpoint_auth_methods_supported: ["none"],
+      client_id_metadata_document_supported: true,
     });
   });
 
@@ -1655,5 +1662,394 @@ describe("OAuth MCP foundation", () => {
       });
       expect(response.status).toBe(400);
     }
+  });
+});
+
+async function discoveryCall(token: string, method: string, params: Record<string, unknown> = {}, bindings: Env = env) {
+  const context = createExecutionContext();
+  const response = await mcpRequest(
+    new Request(RESOURCE, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        accept: "application/json",
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": method,
+        ...(method === "resources/read" ? { "mcp-name": String(params.uri) } : {}),
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method,
+        params: {
+          ...params,
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+          },
+        },
+      }),
+    }),
+    bindings,
+    context,
+  );
+  await waitOnExecutionContext(context);
+  expect(response.status).toBe(200);
+  return response.json<{
+    result: {
+      tools?: Array<{
+        name: string;
+        inputSchema: unknown;
+        outputSchema: unknown;
+        annotations: Record<string, boolean>;
+        _meta: Record<string, unknown>;
+      }>;
+      contents?: Array<{ text: string; mimeType: string; _meta: unknown }>;
+    };
+  }>();
+}
+
+describe("ChatGPT plugin contracts", () => {
+  it("opens authorized documents and links other page kinds to NoteFlare", async () => {
+    const connection = await connect(await bootstrap());
+    const opened = await toolCall(connection.token, "open_noteflare", { page_id: connection.page.id });
+    expect(JSON.parse(opened.result.content[0]!.text)).toMatchObject({
+      initialPageId: connection.page.id,
+      linkedPage: null,
+    });
+    await env.DB.prepare("UPDATE pages SET kind='diagram' WHERE id=?").bind(connection.page.id).run();
+    const linked = await toolCall(connection.token, "open_noteflare", { page_id: connection.page.id });
+    expect(JSON.parse(linked.result.content[0]!.text)).toMatchObject({
+      initialPageId: null,
+      linkedPage: { id: connection.page.id, kind: "diagram", url: `${ORIGIN}/?page=${connection.page.id}` },
+    });
+    expect((await toolCall(connection.token, "open_noteflare", { page_id: crypto.randomUUID() })).result.isError).toBe(
+      true,
+    );
+  });
+
+  it("returns a tool-level OAuth challenge when the connection is revoked during a request", async () => {
+    const connection = await connect(await bootstrap());
+    const bindings = afterDatabaseRead("SELECT access.grant_id", async () => {
+      await env.DB.prepare("UPDATE oauth_grants SET revoked_at=? WHERE id=?")
+        .bind(Date.now(), connection.grantId)
+        .run();
+    });
+    const response = await toolCall(connection.token, "list_spaces", {}, bindings);
+    expect(response.result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: "mcp_access_denied" } },
+    });
+    expect(response.result["_meta"]?.["mcp/www_authenticate"]).toEqual([
+      expect.stringContaining('error="invalid_token"'),
+    ]);
+  });
+
+  it("declares output schemas, OAuth scopes, supported commands, and global and thread UI entrypoints", async () => {
+    const connection = await connect(await bootstrap());
+    const { result } = await discoveryCall(connection.token, "tools/list");
+    expect(result.tools?.map((tool) => tool.name).sort()).toEqual([
+      "create_comment",
+      "create_page",
+      "fetch_page",
+      "list_pages",
+      "list_spaces",
+      "open_noteflare",
+      "search_pages",
+      "update_page",
+    ]);
+    for (const tool of result.tools!) {
+      expect(tool.outputSchema).toMatchObject({ type: "object" });
+      expect(tool["_meta"].securitySchemes).toEqual([
+        {
+          type: "oauth2",
+          scopes:
+            tool.name === "create_comment"
+              ? ["pages:read", "comments:write"]
+              : [tool.name === "create_page" || tool.name === "update_page" ? "pages:write" : "pages:read"],
+        },
+      ]);
+      expect(tool.annotations.idempotentHint).toBe(true);
+    }
+    const open = result.tools!.find((tool) => tool.name === "open_noteflare")!;
+    expect(open["_meta"].ui).toMatchObject({ resourceUri: PLUGIN_UI_URI });
+    expect(open["_meta"]["openai/ui"]).toEqual({ entrypoints: [{ type: "global" }, { type: "thread" }] });
+    const update = result.tools!.find((tool) => tool.name === "update_page")!;
+    expect(update.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    for (const type of ["replace_content", "insert_content", "update_content", "replace_content_range"])
+      expect(JSON.stringify(update.inputSchema)).toContain(type);
+    const spaces = await toolCall(connection.token, "list_spaces", {});
+    expect(spaces.result.structuredContent).toEqual(JSON.parse(spaces.result.content[0]!.text));
+    expect(spacesResultSchema.parse(spaces.result.structuredContent)).toMatchObject({
+      workspace: { id: connection.workspace.id },
+      spaces: [{ id: connection.page.spaceId, canEdit: true }],
+    });
+  });
+
+  it("serves a self-contained UI resource through assets with an empty external resource policy", async () => {
+    const connection = await connect(await bootstrap());
+    const bindings = {
+      ...env,
+      ASSETS: {
+        fetch: vi.fn().mockResolvedValue(
+          new Response('<html><meta name="noteflare-plugin-ui" content="0.1.0"></html>', {
+            headers: { "content-type": "text/html" },
+          }),
+        ),
+      },
+    } as unknown as Env;
+    const resource = await discoveryCall(connection.token, "resources/read", { uri: PLUGIN_UI_URI }, bindings);
+    expect(resource.result.contents![0]).toMatchObject({
+      mimeType: "text/html;profile=mcp-app",
+      _meta: {
+        ui: { csp: { connectDomains: [], resourceDomains: [], frameDomains: [] } },
+        "openai/ui": { availableDisplayModes: ["inline", "fullscreen"] },
+      },
+    });
+    expect(resource.result.contents![0]!.text).toContain('name="noteflare-plugin-ui"');
+  });
+
+  it("filters private spaces and hidden navigation pages and applies effective write permissions", async () => {
+    const connection = await connect(await bootstrap());
+    const privateId = crypto.randomUUID();
+    const hiddenId = crypto.randomUUID();
+    const replacementOwner = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES (?,'Other owner','navigation-owner@example.test',1,1)",
+      ).bind(replacementOwner),
+      env.DB.prepare("INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES (?,?,'owner',1)").bind(
+        connection.workspace.id,
+        replacementOwner,
+      ),
+      env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE workspace_id=? AND user_id=?").bind(
+        connection.workspace.id,
+        connection.user.id,
+      ),
+      env.DB.prepare(
+        "INSERT INTO spaces(id,workspace_id,name,slug,visibility,position,created_at,updated_at) VALUES (?,?,'Secret','secret','private','b0',1,1)",
+      ).bind(privateId, connection.workspace.id),
+      env.DB.prepare("UPDATE pages SET is_template=1 WHERE id=?").bind(connection.page.id),
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,updated_by,created_at,updated_at,archived_at) VALUES (?,?,?,'document','a1','Archived',?,?,1,1,2)",
+      ).bind(hiddenId, connection.workspace.id, connection.page.spaceId, connection.user.id, connection.user.id),
+    ]);
+    const spaces = spacesResultSchema.parse(
+      (await toolCall(connection.token, "list_spaces", {})).result.structuredContent,
+    );
+    expect(spaces.spaces.map((space) => space.id)).not.toContain(privateId);
+    expect((await toolCall(connection.token, "list_pages", { space_id: privateId })).result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: "space_not_found" } },
+    });
+    const listed = pagesResultSchema.parse(
+      (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId })).result.structuredContent,
+    );
+    expect(listed.pages.map((page) => page.id)).not.toContain(connection.page.id);
+    expect(listed.pages.map((page) => page.id)).not.toContain(hiddenId);
+    await env.DB.prepare("INSERT INTO space_members(space_id,user_id,role,created_at) VALUES (?,?,'viewer',1)")
+      .bind(privateId, connection.user.id)
+      .run();
+    const granted = spacesResultSchema.parse(
+      (await toolCall(connection.token, "list_spaces", {})).result.structuredContent,
+    );
+    expect(granted.spaces.find((space) => space.id === privateId)?.canEdit).toBe(false);
+    expect(
+      (
+        await toolCall(connection.token, "create_page", {
+          space_id: privateId,
+          title: "Denied",
+          markdown: "",
+          operation_id: "viewer-create",
+        })
+      ).result.isError,
+    ).toBe(true);
+  });
+
+  it("paginates roots without duplicates and rejects cursors or parents from another destination", async () => {
+    const connection = await connect(await bootstrap());
+    const ids = Array.from({ length: 55 }, () => crypto.randomUUID());
+    await env.DB.batch(
+      ids.map((id, index) =>
+        env.DB.prepare(
+          "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,updated_by,created_at,updated_at) VALUES (?,?,?,'document',?,'Navigation',?,?,1,1)",
+        ).bind(
+          id,
+          connection.workspace.id,
+          connection.page.spaceId,
+          `b${String(index).padStart(3, "0")}`,
+          connection.user.id,
+          connection.user.id,
+        ),
+      ),
+    );
+    const first = pagesResultSchema.parse(
+      (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId })).result.structuredContent,
+    );
+    expect(first.pages).toHaveLength(50);
+    expect(first.nextCursor).toBeTruthy();
+    const second = pagesResultSchema.parse(
+      (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId, cursor: first.nextCursor }))
+        .result.structuredContent,
+    );
+    expect(second.nextCursor).toBeNull();
+    const all = [...first.pages, ...second.pages].map((page) => page.id);
+    expect(new Set(all).size).toBe(all.length);
+    expect(ids.every((id) => all.includes(id))).toBe(true);
+    expect(
+      (
+        await toolCall(connection.token, "list_pages", {
+          space_id: connection.page.spaceId,
+          parent_id: connection.page.id,
+          cursor: first.nextCursor,
+        })
+      ).result,
+    ).toMatchObject({ isError: true, structuredContent: { error: { code: "invalid_cursor" } } });
+    const otherSpace = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO spaces(id,workspace_id,name,slug,position,created_at,updated_at) VALUES (?,?,'Other','other','c0',1,1)",
+    )
+      .bind(otherSpace, connection.workspace.id)
+      .run();
+    expect(
+      (await toolCall(connection.token, "list_pages", { space_id: otherSpace, parent_id: connection.page.id })).result
+        .isError,
+    ).toBe(true);
+  });
+
+  it("hides staged pages, table detail pages, and their descendants while returning ordinary children", async () => {
+    const connection = await connect(await bootstrap());
+    const detail = crypto.randomUUID();
+    const descendant = crypto.randomUUID();
+    const staged = crypto.randomUUID();
+    const child = crypto.randomUUID();
+    await env.DB.batch([
+      ...[
+        { id: detail, parent: null, stage: null },
+        { id: descendant, parent: detail, stage: null },
+        { id: staged, parent: null, stage: `mcp:create:${staged}` },
+        { id: child, parent: connection.page.id, stage: null },
+      ].map((row) =>
+        env.DB.prepare(
+          "INSERT INTO pages(id,workspace_id,space_id,parent_id,kind,position,title,import_job_id,created_by,updated_by,created_at,updated_at) VALUES (?,?,?,?,'document','b0','Child',?,?,?,1,1)",
+        ).bind(
+          row.id,
+          connection.workspace.id,
+          connection.page.spaceId,
+          row.parent,
+          row.stage,
+          connection.user.id,
+          connection.user.id,
+        ),
+      ),
+      env.DB.prepare(
+        "INSERT INTO page_import_sources(page_id,source_path,source_role,created_at) VALUES (?,'table-row','table_row_detail',1)",
+      ).bind(detail),
+    ]);
+    const roots = pagesResultSchema.parse(
+      (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId })).result.structuredContent,
+    );
+    expect(roots.pages.some((page) => page.id === detail || page.id === staged)).toBe(false);
+    const hiddenChildren = pagesResultSchema.parse(
+      (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId, parent_id: detail })).result
+        .structuredContent,
+    );
+    expect(hiddenChildren.pages).toEqual([]);
+    const children = pagesResultSchema.parse(
+      (
+        await toolCall(connection.token, "list_pages", {
+          space_id: connection.page.spaceId,
+          parent_id: connection.page.id,
+        })
+      ).result.structuredContent,
+    );
+    expect(children.pages.map((page) => page.id)).toContain(child);
+  });
+
+  it("rejects stale revisions and epochs before mutation and replays successful writes before version checks", async () => {
+    const connection = await connect(await bootstrap());
+    const created = await toolCall(connection.token, "create_page", {
+      space_id: connection.page.spaceId,
+      title: "Conflict test",
+      markdown: "Base",
+      operation_id: "conflict-create",
+    });
+    const id = JSON.parse(created.result.content[0]!.text).id as string;
+    const before = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: id })).result.structuredContent,
+    );
+    const input = {
+      page_id: id,
+      expected_revision: before.revision,
+      expected_content_epoch: before.contentEpoch,
+      operation_id: "guarded-save",
+      command: { type: "replace_content", replace_content: { new_str: "Saved" } },
+    };
+    const saved = await toolCall(connection.token, "update_page", input);
+    expect(saved.result.isError).not.toBe(true);
+    expect(saved.result.structuredContent).toEqual(JSON.parse(saved.result.content[0]!.text));
+    expect(await toolCall(connection.token, "update_page", input)).toEqual(saved);
+    const stale = await toolCall(connection.token, "update_page", { ...input, operation_id: "stale-save" });
+    expect(stale.result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: "page_changed", retryable: false } },
+    });
+    const current = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: id })).result.structuredContent,
+    );
+    expect(current.markdown).toContain("Saved");
+    await env.DB.prepare("UPDATE pages SET content_epoch=content_epoch+1 WHERE id=?").bind(id).run();
+    const restored = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: id })).result.structuredContent,
+    );
+    const wrongEpoch = await toolCall(connection.token, "update_page", {
+      ...input,
+      operation_id: "old-epoch",
+      expected_revision: restored.revision,
+    });
+    expect(wrongEpoch.result).toMatchObject({ isError: true, structuredContent: { error: { code: "page_changed" } } });
+    // A successful receipt remains authoritative even when a restore has changed the epoch.
+    expect(await toolCall(connection.token, "update_page", input)).toEqual(saved);
+    expect(
+      await env.DB.prepare(
+        "SELECT operation_id FROM oauth_operation_receipts WHERE operation_id IN ('stale-save','old-epoch')",
+      ).all(),
+    ).toMatchObject({ results: [] });
+  });
+
+  it("requires paired version guards and explicit command shapes, and reports read-only capabilities", async () => {
+    const connection = await connect(await bootstrap());
+    expect(
+      (
+        await toolCall(connection.token, "update_page", {
+          page_id: connection.page.id,
+          operation_id: "missing-epoch",
+          expected_revision: 0,
+          command: { type: "replace_content", replace_content: { new_str: "test" } },
+        })
+      ).result.isError,
+    ).toBe(true);
+    expect(
+      (
+        await toolCall(connection.token, "update_page", {
+          page_id: connection.page.id,
+          operation_id: "invalid-command",
+          command: { type: "anything" },
+        })
+      ).result.isError,
+    ).toBe(true);
+    await env.DB.prepare("UPDATE oauth_grants SET scopes='pages:read' WHERE id=?").bind(connection.grantId).run();
+    const doc = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+    );
+    expect(doc.canEdit).toBe(false);
+    expect(
+      spacesResultSchema
+        .parse((await toolCall(connection.token, "list_spaces", {})).result.structuredContent)
+        .spaces.every((space) => !space.canEdit),
+    ).toBe(true);
+    const listed = await discoveryCall(connection.token, "tools/list");
+    expect(listed.result.tools?.some((tool) => tool.name === "update_page")).toBe(false);
   });
 });

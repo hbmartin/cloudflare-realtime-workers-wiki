@@ -1,13 +1,11 @@
-import { slackBulkCandidateSql, legacyChannelEligibilitySql, legacyChannelPauseSql, SlackApiError } from "./slack";
-import { deliverBulkSummary } from "./slack-bulk";
-import { deliverDigest } from "./slack-digests";
-import { deliverShareRefresh } from "./slack-shares";
+import { type HistoryVerificationOptions } from "./slack-history";
+import { slackBulkCandidateSql, SlackApiError } from "./slack";
 import { reconcileSlackChannelEvent } from "./slack-channel-events";
 import {
-  wakeRound2Mapping,
   retireDigestReceiptStatements,
   digestRetirementGuardSql,
   type DeliveryOutcome,
+  recordSecondarySlackError,
 } from "./slack-delivery";
 import type { Env } from "./env";
 import { outboxEnqueueRetryAt, reportPersistentEnqueueFailure } from "./outbox-retry";
@@ -24,20 +22,12 @@ import {
   thumbnailEligibilitySql,
   slackDeliveryFeatures,
   slackDeliveryRecheck,
-  round2ChannelOwnershipSql,
-  slackScopePauseStatement,
-  slackScopeRequirements,
-  SLACK_OUTBOX_CHANNEL_TYPE_SQL,
+  prepareSlackScopePause,
 } from "./slack-delivery-contracts";
 export { round2Receipts } from "./slack-delivery-contracts";
 
-const legacyChannelEvidenceSql = (sql: string) => `EXISTS(SELECT 1 FROM slack_channel_events event
-    JOIN slack_channel_subscriptions subscription ON subscription.id=event.subscription_id
-    JOIN pages page ON page.id=event.page_id JOIN slack_installations installation ON installation.id=subscription.installation_id
-    WHERE event.id=r.id AND (${sql}))`;
-
 // Both consumers and redrive use the same receipt and destination evidence.
-function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string, legacy = false) {
+function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string) {
   const contract = round2Receipts[topic];
   const channel = topic === "slack_channel";
   const mapping = channel || topic === "slack_digest";
@@ -52,19 +42,13 @@ function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string, leg
       JOIN pages page ON page.id=e.page_id JOIN slack_installations installation ON installation.id=m.installation_id
       WHERE e.summary_id=r.id AND ${slackBulkCandidateSql} AND NOT ${mappingDeliveryPauseSql("m", Date.now())})`;
   else if (topic === "slack_file_upload") destinationPause = `(${thumbnailEligibilitySql()})='paused'`;
-  const legacyPending =
-    channel && legacy
-      ? `NOT ${round2ChannelOwnershipSql("r.id")} AND r.round2_state='pending' AND r.attempted_at IS NULL`
-      : "0";
-  if (channel && legacy)
-    destinationPause = `CASE WHEN ${legacyPending} THEN ${legacyChannelEvidenceSql(legacyChannelPauseSql)} ELSE (${destinationPause}) END`;
   const childClaim = `(SELECT max(child.claimed_at) FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state='pending')`;
   const claimed =
     topic === "slack_digest"
       ? `CASE WHEN ${childClaim}>coalesce(r.claimed_at,0) THEN ${childClaim} ELSE r.claimed_at END`
       : "r.claimed_at";
   return `SELECT r.${contract.state} state,${claimed} claimed_at,${topic === "slack_file_upload" ? "NULL" : "r.attempted_at"} attempted_at,
-    ${channel ? `r.delivered_at IS NOT NULL OR r.suppressed_at IS NOT NULL OR (${legacyPending} AND NOT ${legacyChannelEvidenceSql(legacyChannelEligibilitySql)})` : "0"} completed,
+    ${channel ? `r.delivered_at IS NOT NULL OR r.suppressed_at IS NOT NULL` : "0"} completed,
     ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state='sending')" : channel ? "r.attempted_at IS NOT NULL AND r.round2_state='pending'" : "0"} uncertain_child,
     ${topic === "slack_file_upload" ? destinationPause : `i.disconnected_at IS NULL AND i.generation=r.installation_generation AND (i.auth_error IS NOT NULL OR (${destinationPause}))`} paused
     FROM ${contract.table} r ${mapping ? "JOIN slack_channel_subscriptions m ON m.id=r.subscription_id" : ""}
@@ -77,7 +61,7 @@ const outcomeSql = () => `CASE WHEN state IN ('sent','skipped','retired','upload
 export async function round2DeliveryStatus(env: Env, topic: keyof typeof round2Receipts, id: string) {
   return (
     (await env.DB.prepare(
-      `SELECT ${outcomeSql()} outcome,state,claimed_at,attempted_at,paused FROM (${receiptStatusSql(topic, "?", !slackDeliveryFeatures(env).slack_channel)})`,
+      `SELECT ${outcomeSql()} outcome,state,claimed_at,attempted_at,paused FROM (${receiptStatusSql(topic, "?")})`,
     )
       .bind(id)
       .first<{
@@ -325,6 +309,15 @@ export async function redriveRound2Outbox(env: Env) {
         );
         continue;
       }
+      if (status.state === "blocked") {
+        await env.DB.batch(
+          siblings.results.map((s) =>
+            env.DB.prepare(`UPDATE outbox SET slack_redrive_due_at=NULL,slack_claim_recheck_at=NULL
+          WHERE ${recoverySnapshotSql}`).bind(...recoverySnapshotBinds(s)),
+          ),
+        );
+        continue;
+      }
       if (siblings.results.some((sibling) => sibling.slack_scope_paused_at !== null)) {
         await deferRecoverySnapshots(env, siblings.results, now + 30 * 60_000, true);
         continue;
@@ -394,7 +387,7 @@ export async function redriveRound2Outbox(env: Env) {
   }
 }
 
-export async function exhaustSlackReceipt(
+async function exhaustSlackReceipt(
   env: Env,
   topic: keyof typeof round2Receipts,
   id: string,
@@ -405,8 +398,7 @@ export async function exhaustSlackReceipt(
   const token = crypto.randomUUID();
   const guard = recoverySetGuard(topic, id, snapshots);
   const claim = env.DB.prepare(`UPDATE ${contract.table} SET claim_token=?,claimed_at=? WHERE id=?
-    AND (SELECT ${outcomeSql()} FROM (${receiptStatusSql(topic, "?", !slackDeliveryFeatures(env).slack_channel)}))='retryable' AND ${guard.sql}
-    ${topic === "slack_channel" && !slackDeliveryFeatures(env).slack_channel ? `AND NOT ${round2ChannelOwnershipSql(`${contract.table}.id`)}` : ""}
+    AND (SELECT ${outcomeSql()} FROM (${receiptStatusSql(topic, "?")}))='retryable' AND ${guard.sql}
     ${topic === "slack_digest" ? `AND ${digestRetirementGuardSql(contract.table)}` : ""}`).bind(
     token,
     Date.now(),
@@ -475,7 +467,11 @@ export async function exhaustSlackReceipt(
 }
 
 // Verification changes no delivery budget and never publishes an uncertain post.
-export async function reconcileSlackChannelOutbox(env: Env, eventId: string): Promise<DeliveryOutcome> {
+export async function reconcileSlackChannelOutbox(
+  env: Env,
+  eventId: string,
+  options: HistoryVerificationOptions = {},
+): Promise<DeliveryOutcome> {
   const siblings = (
     await env.DB.prepare(`SELECT ${recoverySnapshotFields.join(",")}
     FROM outbox WHERE topic='slack_channel' AND slack_round2_receipt_id=?`)
@@ -483,95 +479,51 @@ export async function reconcileSlackChannelOutbox(env: Env, eventId: string): Pr
       .all<SlackOutboxSnapshot>()
   ).results;
   if (siblings.some((s) => s.slack_scope_paused_at !== null)) return "paused";
-  let status: { outcome: DeliveryOutcome; claimed_at?: number | null };
+  let primary: unknown;
   try {
-    status = { outcome: await reconcileSlackChannelEvent(env, eventId) };
+    await reconcileSlackChannelEvent(env, eventId, options);
   } catch (error) {
-    status = await round2DeliveryStatus(env, "slack_channel", eventId);
-    if (error instanceof SlackApiError && error.code === "missing_scope" && error.credentialRevision !== null) {
-      const destination = await env.DB.prepare(`SELECT ${SLACK_OUTBOX_CHANNEL_TYPE_SQL} channel_type FROM outbox
-        WHERE topic='slack_channel' AND slack_round2_receipt_id=? LIMIT 1`)
-        .bind(eventId)
-        .first<{ channel_type: string | null }>();
-      const scopes = slackScopeRequirements(
-        "slack_channel",
-        error.method,
-        error.neededScopes,
-        destination?.channel_type,
-      );
-      if (siblings.length)
-        await env.DB.batch(
-          siblings.map((s) =>
-            slackScopePauseStatement(
-              env,
-              { sql: recoverySnapshotSql, binds: recoverySnapshotBinds(s) },
-              scopes,
-              error.credentialRevision!,
-            ),
-          ),
-        );
-      return "paused";
-    }
-    logger.warn(
-      "slack.channel.history_pending",
-      "slack",
-      "Channel history verification remains pending.",
-      { eventId },
-      error,
-    );
+    primary = error;
+    if (error instanceof SlackApiError && error.code === "missing_scope")
+      await recordSecondarySlackError("scope_pause", { eventId }, async () => {
+        for (const sibling of siblings)
+          await prepareSlackScopePause(env, sibling.id, "slack_channel", error, {
+            sql: recoverySnapshotSql,
+            binds: recoverySnapshotBinds(sibling),
+          });
+      });
   }
-  // A completed search leaves durable blocked work for explicit owner verification.
-  const current = await round2DeliveryStatus(env, "slack_channel", eventId);
-  const stop = current.outcome === "completed" || current.state === "blocked";
-  const due = stop ? null : slackDeliveryRecheck(status);
-  if (siblings.length)
-    await env.DB.batch(
-      siblings.map((s) =>
-        env.DB.prepare(`UPDATE outbox
-    SET slack_redrive_due_at=CASE WHEN ? IS NULL THEN NULL ELSE max(coalesce(slack_redrive_due_at,0),?) END,
-      slack_claim_recheck_at=CASE WHEN ?='competing' THEN ? ELSE NULL END
-    WHERE ${recoverySnapshotSql}`).bind(due, due, status.outcome, due, ...recoverySnapshotBinds(s)),
-      ),
-    );
-  return current.outcome;
-}
-
-export async function reconcileSlackChannelMapping(env: Env, mappingId: string) {
-  const events = await env.DB.prepare(`SELECT id FROM slack_channel_events event WHERE subscription_id=?
-    AND delivered_at IS NULL
-    AND (round2_state IN ('sending','blocked') OR (round2_state='pending' AND attempted_at IS NOT NULL))
-    ORDER BY created_at,id`)
-    .bind(mappingId)
-    .all<{ id: string }>();
-  for (const event of events.results) await reconcileSlackChannelOutbox(env, event.id);
-}
-
-// Owner recovery reconciles evidence only; it never resets an uncertain post for blind delivery.
-export async function reconcileRound2Mapping(env: Env, mappingId: string) {
-  const digests = await env.DB.prepare(
-    `SELECT id FROM slack_digest_receipts WHERE subscription_id=? AND (state IN ('sending','blocked') OR EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=slack_digest_receipts.id AND child.state='sending'))`,
-  )
-    .bind(mappingId)
-    .all<{ id: string }>();
-  for (const row of digests.results)
-    if ((await round2DeliveryOutcome(env, "slack_digest", row.id)) === "uncertain")
-      await deliverDigest(env, row.id, true);
-  await reconcileSlackChannelMapping(env, mappingId);
-  const summaries = await env.DB.prepare(
-    `SELECT DISTINCT r.id FROM slack_bulk_receipts r JOIN slack_channel_subscriptions m ON m.installation_id=r.installation_id AND m.channel_id=r.channel_id WHERE m.id=? AND r.state IN ('sending','blocked') AND r.attempted_at IS NOT NULL`,
-  )
-    .bind(mappingId)
-    .all<{ id: string }>();
-  for (const row of summaries.results)
-    if ((await round2DeliveryOutcome(env, "slack_bulk", row.id)) === "uncertain")
-      await deliverBulkSummary(env, row.id, true);
-  const shares =
-    await env.DB.prepare(`SELECT r.id FROM slack_share_refreshes r JOIN slack_channel_subscriptions m ON m.installation_id=r.installation_id AND m.channel_id=r.channel_id
-    WHERE m.id=? AND r.state IN ('sending','blocked') AND r.attempted_at IS NOT NULL`)
-      .bind(mappingId)
-      .all<{ id: string }>();
-  for (const row of shares.results)
-    if ((await round2DeliveryOutcome(env, "slack_share_refresh", row.id)) === "uncertain")
-      await deliverShareRefresh(env, row.id, true);
-  await wakeRound2Mapping(env, mappingId);
+  try {
+    // The receipt can change during verification. Its reread is the only scheduling evidence.
+    const current = await round2DeliveryStatus(env, "slack_channel", eventId);
+    const due = current.outcome === "completed" || current.state === "blocked" ? null : slackDeliveryRecheck(current);
+    if (siblings.length)
+      await env.DB.batch(
+        siblings.map((s) =>
+          env.DB.prepare(`UPDATE outbox
+      SET slack_redrive_due_at=CASE WHEN ? IS NULL THEN NULL ELSE max(coalesce(slack_redrive_due_at,0),?) END,
+        slack_claim_recheck_at=CASE WHEN ?='competing' THEN ? ELSE NULL END WHERE ${recoverySnapshotSql}`).bind(
+            due,
+            due,
+            current.outcome,
+            due,
+            ...recoverySnapshotBinds(s),
+          ),
+        ),
+      );
+    if (primary) throw primary;
+    return current.paused && !options.budget?.lastResult ? "paused" : current.outcome;
+  } catch (error) {
+    if (primary && error !== primary) {
+      logger.error(
+        "slack.recovery.secondary_failed",
+        "slack",
+        "Could not refresh recovery scheduling.",
+        { eventId },
+        error,
+      );
+      throw primary;
+    }
+    throw error;
+  }
 }

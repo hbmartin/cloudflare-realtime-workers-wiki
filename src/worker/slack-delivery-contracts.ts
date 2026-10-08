@@ -142,14 +142,7 @@ export const ROUND2_NON_CHANNEL_TOPICS_SQL = Object.keys(round2Receipts)
   .filter((topic) => topic !== "slack_channel")
   .map((topic) => `'${topic}'`)
   .join(",");
-export function round2ChannelOwnershipSql(eventId: string) {
-  return `(coalesce(${eventId} LIKE 'activity:%',0) OR EXISTS(
-    SELECT 1 FROM slack_channel_events owned JOIN slack_channel_subscriptions mapping ON mapping.id=owned.subscription_id
-    WHERE owned.id=${eventId} AND mapping.round2_initialized=1))`;
-}
-
-export const ROUND2_OUTBOX_SQL = `(topic IN (${ROUND2_NON_CHANNEL_TOPICS_SQL})
- OR (topic='slack_channel' AND ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")}))`;
+export const ROUND2_OUTBOX_SQL = `topic IN (${ROUND2_TOPICS_SQL})`;
 
 export function slackDeliveryFeatures(env: Env) {
   const validation = env.SLACK_CHANNEL_VALIDATION_ENABLED === "true";
@@ -184,12 +177,9 @@ export function runnableOutboxSql(env: Env) {
   const features = slackDeliveryFeatures(env);
   return `slack_scope_paused_at IS NULL
     ${Object.entries(features)
-      .filter(([topic]) => topic !== "slack_channel")
       .map(([topic, enabled]) => `AND (topic<>'${topic}' OR ${enabled ? 1 : 0}=1)`)
       .join("\n")}
-    AND (${features.slack_channel ? 1 : 0}=1
-      OR NOT (topic='slack_channel' AND ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")}))
-    AND (topic<>'slack_channel' OR ${round2ChannelOwnershipSql("outbox.slack_round2_receipt_id")} OR NOT EXISTS(
+    AND (topic<>'slack_channel' OR NOT EXISTS(
       SELECT 1 FROM slack_channel_events blocked WHERE blocked.id=outbox.slack_round2_receipt_id AND blocked.round2_state='blocked'))`;
 }
 
@@ -271,7 +261,7 @@ export function slackScopeRequirements(
   return clauses;
 }
 
-// Validate the entire stored format before falling back for older/corrupt rows.
+// Validate the nested scope clauses before using the current topic requirements.
 const validStored = `CASE WHEN json_valid(slack_scope_required_json) THEN slack_scope_required_json ELSE '[]' END`;
 const fallbackSql = `CASE topic ${[
   "slack_thread_reply",
@@ -283,38 +273,20 @@ const fallbackSql = `CASE topic ${[
   "slack_bulk",
   "slack_share_refresh",
 ]
-  .map((topic) => `WHEN '${topic}' THEN '${JSON.stringify(slackDeliveryScopes(topic))}'`)
+  .map((topic) => `WHEN '${topic}' THEN '${JSON.stringify(slackScopeRequirements(topic))}'`)
   .join(" ")}
  ELSE '[["chat:write"]]' END`;
 const storedScopesSql = `CASE WHEN json_type(${validStored})='array' AND json_array_length(${validStored})>0
- AND (SELECT count(DISTINCT type) FROM json_each(${validStored}))=1
- AND NOT EXISTS(SELECT 1 FROM json_each(${validStored}) item WHERE
-   item.type NOT IN ('text','array') OR (item.type='text' AND length(item.value)=0) OR
-   (item.type='array' AND (json_array_length(item.value)=0 OR EXISTS(SELECT 1 FROM json_each(item.value) child WHERE child.type<>'text' OR length(child.value)=0))))
+ AND NOT EXISTS(SELECT 1 FROM json_each(${validStored}) item WHERE item.type<>'array'
+   OR json_array_length(item.value)=0 OR EXISTS(SELECT 1 FROM json_each(item.value) child WHERE child.type<>'text' OR length(child.value)=0))
  THEN ${validStored} ELSE ${fallbackSql} END`;
-
-// Convert legacy flat conversation families to clauses without broadening a
-// single explicitly reported channel scope. New nested clauses pass through.
-function clauseSql(value: string, type: string, requirements: string) {
-  return `CASE WHEN ${type}='array' THEN ${value} ${scopeFamilies
-    .map((family) => {
-      const all = family.map((scope) => `'${scope}'`).join(",");
-      const supported = family
-        .slice(0, 2)
-        .map((scope) => `'${scope}'`)
-        .join(",");
-      return `WHEN ${value} IN (${all}) AND EXISTS(SELECT 1 FROM json_each(${requirements}) member WHERE member.type='text' AND member.value IN (${supported}))
-      THEN (SELECT json_group_array(value) FROM (SELECT DISTINCT value FROM json_each(${requirements}) WHERE type='text' AND value IN (${supported}) ORDER BY value))`;
-    })
-    .join(" ")} ELSE json_array(${value}) END`;
-}
-export const SLACK_OUTBOX_CHANNEL_TYPE_SQL = `CASE outbox.topic
+const SLACK_OUTBOX_CHANNEL_TYPE_SQL = `CASE outbox.topic
  WHEN 'slack_channel' THEN (SELECT m.channel_type FROM slack_channel_events r JOIN slack_channel_subscriptions m ON m.id=r.subscription_id WHERE r.id=outbox.slack_round2_receipt_id)
  WHEN 'slack_digest' THEN (SELECT m.channel_type FROM slack_digest_receipts r JOIN slack_channel_subscriptions m ON m.id=r.subscription_id WHERE r.id=outbox.slack_round2_receipt_id)
  WHEN 'slack_bulk' THEN (SELECT m.channel_type FROM slack_bulk_receipts r JOIN slack_channel_subscriptions m ON m.installation_id=r.installation_id AND m.channel_id=r.channel_id WHERE r.id=outbox.slack_round2_receipt_id LIMIT 1)
  WHEN 'slack_share_refresh' THEN (SELECT m.channel_type FROM slack_share_refreshes r JOIN slack_channel_subscriptions m ON m.installation_id=r.installation_id AND m.channel_id=r.channel_id WHERE r.id=outbox.slack_round2_receipt_id LIMIT 1)
  END`;
-const pausedClausesSql = `SELECT ${clauseSql("required.value", "required.type", storedScopesSql)} clause FROM json_each(${storedScopesSql}) required
+const pausedClausesSql = `SELECT required.value clause FROM json_each(${storedScopesSql}) required
  UNION SELECT json_array(value) FROM json_each(CASE
    WHEN topic IN ('slack_thread_reply','slack_inbound_reply','slack_thread_action') THEN '${JSON.stringify(SLACK_MIRROR_SCOPES)}'
    WHEN topic='slack_unfurl' THEN '["links:write"]' ELSE '[]' END)`;
@@ -394,4 +366,27 @@ export function startSlackShareEligibleClockStatement(
     slack_auth_pause_baseline_ms=(SELECT i.auth_paused_ms FROM slack_installations i WHERE i.workspace_id=outbox.workspace_id AND i.disconnected_at IS NULL)
     WHERE id=? AND topic='slack_share_response' AND json_valid(payload_json) AND slack_eligible_started_at IS NULL AND slack_scope_paused_at IS NULL
       AND ${PENDING_SHARE_RESPONSE_SQL} AND (${fence.sql})`).bind(now, id, ...fence.binds);
+}
+
+export async function prepareSlackScopePause(
+  env: Env,
+  outboxId: string,
+  topic: string,
+  error: { method?: string; neededScopes?: readonly string[]; credentialRevision: number | null },
+  fence: { sql: string; binds: unknown[] },
+  extraGuard = "1",
+) {
+  if (error.credentialRevision === null) return undefined;
+  const destination = await env.DB.prepare(
+    `SELECT ${SLACK_OUTBOX_CHANNEL_TYPE_SQL} channel_type FROM outbox WHERE id=?`,
+  )
+    .bind(outboxId)
+    .first<{ channel_type: string | null }>();
+  return slackScopePauseStatement(
+    env,
+    fence,
+    slackScopeRequirements(topic, error.method, error.neededScopes ?? [], destination?.channel_type),
+    error.credentialRevision,
+    extraGuard,
+  ).run();
 }

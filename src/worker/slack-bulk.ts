@@ -1,3 +1,6 @@
+import { withSlackPrimaryError } from "./slack-delivery";
+import { recordSecondarySlackError } from "./slack-delivery";
+import { type HistoryVerificationOptions } from "./slack-history";
 import { logger } from "./observability";
 import { mappingDeliveryPauseSql, slackDeliveryFeatures } from "./slack-delivery-contracts";
 import type { Env } from "./env";
@@ -84,8 +87,13 @@ export async function cleanupPendingBulkEvents(env: Env) {
   });
 }
 
-export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = false) {
-  if (!slackDeliveryFeatures(env).slack_bulk) return;
+export async function deliverBulkSummary(
+  env: Env,
+  id: string,
+  reconcileOnly = false,
+  options: HistoryVerificationOptions = {},
+) {
+  if (!reconcileOnly && !slackDeliveryFeatures(env).slack_bulk) return;
   let row = await env.DB.prepare("SELECT * FROM slack_bulk_receipts WHERE id=?").bind(id).first<Summary>();
   if (!row || ["sent", "retired"].includes(row.state) || (row.state === "blocked" && !reconcileOnly)) return;
   if (reconcileOnly && !["sending", "blocked"].includes(row.state)) return;
@@ -124,13 +132,15 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
     if (!row) throw new DeliveryInProgressError();
     if (row.state === "sending" || reconcileOnly) {
       if (!row.attempted_at) return;
-      const ts = await reconcileBotPost(env, installation, row.channel_id, id, row.attempted_at);
-      if (ts) await finish("sent", ts);
+      const result = await reconcileBotPost(env, installation, row.channel_id, id, row.attempted_at, undefined, {
+        ...options,
+        fence: { sql: "EXISTS(SELECT 1 FROM slack_bulk_receipts WHERE id=? AND claim_token=?)", binds: [id, token] },
+      });
+      if (result.status === "incomplete") return;
+      if (result.status === "confirmed") await finish("sent", result.ts);
       else
-        await env.DB.prepare(
-          "UPDATE slack_bulk_receipts SET state='blocked',last_error='post_unconfirmed' WHERE id=? AND claim_token=?",
-        )
-          .bind(id, token)
+        await env.DB.prepare("UPDATE slack_bulk_receipts SET state='blocked',last_error=? WHERE id=? AND claim_token=?")
+          .bind(result.reason ?? (result.status === "ambiguous" ? "post_ambiguous" : "post_unconfirmed"), id, token)
           .run();
       return;
     }
@@ -310,43 +320,53 @@ export async function deliverBulkSummary(env: Env, id: string, reconcileOnly = f
       await finish("sent", posted.ts);
     } catch (error) {
       if (!dispatched)
-        await env.DB.prepare(`UPDATE slack_bulk_receipts SET state='pending',attempted_at=NULL
+        await withSlackPrimaryError(error, "handle_error", { id }, () =>
+          env.DB.prepare(`UPDATE slack_bulk_receipts SET state='pending',attempted_at=NULL
         WHERE id=? AND claim_token=? AND state='sending'`)
-          .bind(id, token)
-          .run();
-      if (error instanceof SlackDispatchSkippedError) return;
-      await recordDeliveryError(env, installation, error, events.results[0]?.mapping_id, row.channel_id);
-      if (error instanceof SlackApiError && error.code === "msg_too_long") {
-        await recordPermanentDeliveryFailure(
-          env,
-          installation,
-          id,
-          events.results[0]!.mapping_id,
-          row.channel_id,
-          error.code,
+            .bind(id, token)
+            .run(),
         );
-        await finish("retired");
+      if (error instanceof SlackDispatchSkippedError) return;
+      await withSlackPrimaryError(error, "handle_error", { id }, () =>
+        recordDeliveryError(env, installation, error, events.results[0]?.mapping_id, row!.channel_id),
+      );
+      if (error instanceof SlackApiError && error.code === "msg_too_long") {
+        await withSlackPrimaryError(error, "handle_error", { id }, () =>
+          recordPermanentDeliveryFailure(
+            env,
+            installation,
+            id,
+            events.results[0]!.mapping_id,
+            row!.channel_id,
+            error.code,
+          ),
+        );
+        await withSlackPrimaryError(error, "handle_error", { id }, () => finish("retired"));
         return;
       }
       if (invalidSlackDestination(error)) {
-        await finish("retired");
+        await withSlackPrimaryError(error, "handle_error", { id }, () => finish("retired"));
         return;
       }
       if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
-        await env.DB.prepare(
-          `UPDATE slack_bulk_receipts SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,
-        )
-          .bind(id, token)
-          .run();
+        await withSlackPrimaryError(error, "handle_error", { id }, () =>
+          env.DB.prepare(
+            `UPDATE slack_bulk_receipts SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,
+          )
+            .bind(id, token)
+            .run(),
+        );
       }
       throw error;
     }
   } catch (error) {
-    await recordDeliveryError(env, installation, error);
+    await recordSecondarySlackError("record", { id }, () => recordDeliveryError(env, installation, error));
     throw error;
   } finally {
-    await env.DB.prepare("UPDATE slack_bulk_receipts SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?")
-      .bind(id, token)
-      .run();
+    await recordSecondarySlackError("release", { id }, () =>
+      env.DB.prepare("UPDATE slack_bulk_receipts SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?")
+        .bind(id, token)
+        .run(),
+    );
   }
 }

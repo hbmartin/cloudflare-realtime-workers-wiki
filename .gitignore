@@ -16,3 +16,6 @@ wrangler.jsonc
 notion-export*/
 notion-sidebar.png
 NoteFlare Parity Report.htm
+
+public/plugin-ui/
+plugins/noteflare/.app.json

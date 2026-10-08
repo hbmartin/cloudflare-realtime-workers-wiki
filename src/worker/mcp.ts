@@ -8,12 +8,19 @@ import { MarkdownWriteError, parseWritableMarkdown } from "../shared/notion-mark
 import { markdownMutations } from "../shared/notion-markdown-mutations";
 import { parseMarkdownCommand } from "../shared/notion-markdown-commands";
 import type { DocumentContentEnvelope } from "../shared/types";
-import { ID_PATTERN, PAGE_TITLE_MAX } from "../shared/validation";
 import type { Env } from "./env";
 import { HttpError, locationHint, sha256 } from "./http";
 import { mcpAccess, mcpBearerChallenge, type McpAccess, type McpScope } from "./oauth";
 import { correlationHeaders, logger } from "./observability";
-import { editableSpaceForMember, pageForMember, requirePageEditor, type PageRow } from "./page-access";
+import {
+  editableSpaceForMember,
+  effectiveSpaceRole,
+  pageForMember,
+  requirePageEditor,
+  spaceForMember,
+  spacesForMember,
+  type PageRow,
+} from "./page-access";
 import { pageJson } from "./page-row";
 import { parseSearchRequest, searchPages } from "./search";
 import { broadcastWorkspaceEvent } from "./workspace-events";
@@ -23,9 +30,9 @@ import { consumeFixedWindow } from "./rate-limit";
 import { sourceRateLimitKey } from "./source-rate-limit";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { webhookEventStatements } from "./webhooks";
+import { MCP_MAX_REQUEST_BYTES, PLUGIN_UI_URI, pluginToolContracts } from "../shared/plugin-contracts";
 
-const MAX_MCP_BODY = 64 * 1024;
-const OPERATION_ID = /^[A-Za-z0-9:_-]{1,128}$/;
+const MAX_MCP_BODY = MCP_MAX_REQUEST_BYTES;
 const RECEIPT_TTL_MS = 30 * 24 * 60 * 60_000;
 const STAGED_PAGE_TTL_MS = 24 * 60 * 60_000;
 const STAGED_CLEANUP_RETRY_MS = 60_000;
@@ -36,10 +43,16 @@ const TOOL_SCOPES: Record<string, readonly McpScope[]> = {
   create_page: ["pages:write"],
   update_page: ["pages:write"],
   create_comment: ["pages:read", "comments:write"],
+  list_spaces: ["pages:read"],
+  list_pages: ["pages:read"],
+  open_noteflare: ["pages:read"],
 };
 
 function result(value: unknown) {
-  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(value) }],
+    structuredContent: value as Record<string, unknown>,
+  };
 }
 
 export async function pruneStagedMcpPages(env: Env) {
@@ -105,13 +118,22 @@ export async function pruneStagedMcpPages(env: Env) {
   }
 }
 
-function toolError(error: unknown) {
+function toolError(error: unknown, bindings?: Env) {
   const message =
     error instanceof HttpError || error instanceof MarkdownWriteError
       ? error.message
       : "The tool could not complete this request.";
   return {
     isError: true,
+    ...(bindings && error instanceof HttpError && error.code === "mcp_access_denied"
+      ? {
+          _meta: {
+            "mcp/www_authenticate": [
+              `${mcpBearerChallenge(bindings)}, error="invalid_token", error_description="Reconnect NoteFlare to continue."`,
+            ],
+          },
+        }
+      : {}),
     content: [{ type: "text" as const, text: message }],
     structuredContent: {
       error: {
@@ -402,7 +424,13 @@ async function roomMutationReceipt(env: Env, page: PageRow, operationId: string)
 async function updatePageTool(
   request: Request,
   env: Env,
-  input: { page_id: string; command: Record<string, unknown>; operation_id: string },
+  input: {
+    page_id: string;
+    command: Record<string, unknown>;
+    operation_id: string;
+    expected_revision?: number | undefined;
+    expected_content_epoch?: number | undefined;
+  },
 ) {
   let access = await currentAccess(request, env, ["pages:write"]);
   let page = await pageForMember(env, access.member, input.page_id);
@@ -435,6 +463,15 @@ async function updatePageTool(
   const prior = await roomMutationReceipt(env, page, operationId);
   if (prior) return complete(prior.sequence);
   const envelope = await roomContent(env, access, page);
+  if (
+    input.expected_revision !== undefined &&
+    (input.expected_revision !== envelope.sequence || input.expected_content_epoch !== envelope.contentEpoch)
+  )
+    throw new HttpError(
+      409,
+      "page_changed",
+      "The document changed. Your draft was not saved. Read the current document and reconcile your edits.",
+    );
   const projection = projectNotionMarkdown(envelope.document, new Map(), {
     pageHref: (id) => new URL(`/?page=${encodeURIComponent(id)}`, env.BETTER_AUTH_URL).href,
   });
@@ -647,109 +684,239 @@ async function fetchPageTool(request: Request, env: Env, pageId: string) {
     title: page.title,
     url: new URL(`/?page=${encodeURIComponent(page.id)}`, env.BETTER_AUTH_URL).href,
     revision: envelope.sequence,
+    contentEpoch: envelope.contentEpoch,
+    spaceId: page.space_id ?? `${access.member.workspace.id}-general`,
+    parentId: page.parent_id,
+    canEdit:
+      access.scopes.has("pages:write") &&
+      page.effective_role !== "viewer" &&
+      env.NOTION_MARKDOWN_WRITES_ENABLED === "true",
     markdown: projected.markdown,
     truncated: projected.truncated,
     unknownBlockIds: projected.unknownBlockIds,
   };
 }
 
+async function listSpacesTool(request: Request, env: Env) {
+  const access = await currentAccess(request, env, ["pages:read"]);
+  const spaces = await spacesForMember(env, access.member);
+  return {
+    workspace: { id: access.member.workspace.id, name: access.member.workspace.name },
+    scopes: [...access.scopes],
+    spaces: spaces.map((space) => ({
+      id: space.id,
+      name: space.name,
+      canEdit:
+        access.scopes.has("pages:write") &&
+        env.NOTION_MARKDOWN_WRITES_ENABLED === "true" &&
+        effectiveSpaceRole(access.member.role, space.visibility, space.space_role) !== "viewer",
+    })),
+  };
+}
+
+async function listPagesTool(
+  request: Request,
+  env: Env,
+  input: { space_id: string; parent_id?: string | undefined; cursor?: string | undefined },
+) {
+  const access = await currentAccess(request, env, ["pages:read"]);
+  const space = await spaceForMember(env, access.member, input.space_id);
+  const parentId = input.parent_id ?? null;
+  if (parentId) {
+    const parent = await pageForMember(env, access.member, parentId);
+    if (parent.space_id !== space.id) throw new HttpError(404, "page_not_found", "Page not found.");
+  }
+  let position = "";
+  let afterId = "";
+  if (input.cursor) {
+    try {
+      const cursor = z
+        .object({ spaceId: z.string(), parentId: z.string().nullable(), position: z.string(), id: z.string() })
+        .parse(JSON.parse(atob(input.cursor)));
+      if (cursor.spaceId !== space.id || cursor.parentId !== parentId) throw new Error("Wrong destination");
+      position = cursor.position;
+      afterId = cursor.id;
+    } catch {
+      throw new HttpError(400, "invalid_cursor", "The navigation cursor is invalid.");
+    }
+  }
+  const rows = await env.DB.prepare(
+    `SELECT p.* FROM pages p WHERE p.workspace_id=? AND p.space_id=? AND p.parent_id IS ?
+      AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0
+      AND (?='' OR p.position>? OR (p.position=? AND p.id>?))
+      AND p.id NOT IN (
+        WITH RECURSIVE hidden(id) AS (
+          SELECT page_id FROM page_import_sources WHERE source_role='table_row_detail'
+          UNION SELECT page_id FROM table_row_pages
+          UNION ALL SELECT child.id FROM pages child JOIN hidden ON child.parent_id=hidden.id
+        ) SELECT id FROM hidden
+      ) ORDER BY p.position,p.id LIMIT 51`,
+  )
+    .bind(access.member.workspace.id, space.id, parentId, afterId, position, position, afterId)
+    .all<PageRow>();
+  const visible = rows.results.slice(0, 50);
+  const last = visible.at(-1);
+  const canEdit =
+    access.scopes.has("pages:write") &&
+    env.NOTION_MARKDOWN_WRITES_ENABLED === "true" &&
+    effectiveSpaceRole(access.member.role, space.visibility, space.space_role) !== "viewer";
+  return {
+    pages: visible.map((page) => ({
+      id: page.id,
+      title: page.title,
+      kind: page.kind,
+      parentId: page.parent_id,
+      spaceId: space.id,
+      url: new URL(`/?page=${encodeURIComponent(page.id)}`, env.BETTER_AUTH_URL).href,
+      canEdit: canEdit && page.kind === "document",
+    })),
+    nextCursor:
+      rows.results.length > 50 && last
+        ? btoa(JSON.stringify({ spaceId: space.id, parentId, position: last.position, id: last.id }))
+        : null,
+  };
+}
+
+function toolMetadata(name: string, readOnly: boolean, destructive = false) {
+  return {
+    annotations: { readOnlyHint: readOnly, destructiveHint: destructive, idempotentHint: true, openWorldHint: false },
+    _meta: { securitySchemes: [{ type: "oauth2", scopes: TOOL_SCOPES[name] }], ui: { visibility: ["model", "app"] } },
+  };
+}
+
 function serverFor(request: Request, env: Env, context: BackgroundContext, access: McpAccess) {
-  const server = new McpServer({ name: "noteflare", version: "1.0.0" });
-  if (access.scopes.has("pages:read"))
+  const server = new McpServer({ name: "noteflare", version: "1.1.0" });
+  const wrap = async (action: () => Promise<unknown>) => {
+    try {
+      return result(await action());
+    } catch (error) {
+      return toolError(error, env);
+    }
+  };
+  if (access.scopes.has("pages:read")) {
     server.registerTool(
       "search_pages",
       {
         title: "Search pages",
-        description: "Search pages currently accessible to the connected member.",
-        inputSchema: z.object({ query: z.string().trim().min(1).max(200), cursor: z.string().max(512).optional() }),
+        ...pluginToolContracts.search_pages,
+        ...toolMetadata("search_pages", true),
       },
-      async ({ query, cursor }) => {
-        try {
-          return result(await searchPageTool(request, env, query, cursor));
-        } catch (error) {
-          return toolError(error);
-        }
-      },
+      ({ query, cursor }) => wrap(() => searchPageTool(request, env, query, cursor)),
     );
+    server.registerTool(
+      "fetch_page",
+      {
+        title: "Read document",
+        ...pluginToolContracts.fetch_page,
+        ...toolMetadata("fetch_page", true),
+      },
+      ({ page_id }) => wrap(() => fetchPageTool(request, env, page_id)),
+    );
+    server.registerTool(
+      "list_spaces",
+      {
+        title: "List spaces",
+        ...pluginToolContracts.list_spaces,
+        ...toolMetadata("list_spaces", true),
+      },
+      () => wrap(() => listSpacesTool(request, env)),
+    );
+    server.registerTool(
+      "list_pages",
+      {
+        title: "Browse pages",
+        ...pluginToolContracts.list_pages,
+        ...toolMetadata("list_pages", true),
+      },
+      (input) => wrap(() => listPagesTool(request, env, input)),
+    );
+    const metadata = toolMetadata("open_noteflare", true);
+    server.registerTool(
+      "open_noteflare",
+      {
+        title: "Open NoteFlare",
+        ...pluginToolContracts.open_noteflare,
+        ...metadata,
+        _meta: {
+          ...metadata["_meta"],
+          ui: { resourceUri: PLUGIN_UI_URI, visibility: ["model", "app"] },
+          "openai/ui": { entrypoints: [{ type: "global" }, { type: "thread" }] },
+        },
+      },
+      ({ page_id }) =>
+        wrap(async () => {
+          const current = await currentAccess(request, env, ["pages:read"]);
+          const page = page_id ? await pageForMember(env, current.member, page_id) : null;
+          return {
+            workspace: { id: current.member.workspace.id, name: current.member.workspace.name },
+            initialPageId: page?.kind === "document" ? page.id : null,
+            linkedPage:
+              page && page.kind !== "document"
+                ? {
+                    id: page.id,
+                    title: page.title,
+                    kind: page.kind,
+                    url: new URL(`/?page=${encodeURIComponent(page.id)}`, env.BETTER_AUTH_URL).href,
+                  }
+                : null,
+          };
+        }),
+    );
+    server.registerResource("noteflare-editor", PLUGIN_UI_URI, { mimeType: "text/html;profile=mcp-app" }, async () => {
+      await currentAccess(request, env, ["pages:read"]);
+      const response = await env.ASSETS.fetch(new Request(new URL("/plugin-ui/noteflare.html", env.BETTER_AUTH_URL)));
+      if (!response.ok || !response.headers.get("content-type")?.includes("text/html"))
+        throw new HttpError(503, "ui_unavailable", "The NoteFlare editor is unavailable.");
+      const html = await response.text();
+      if (!html.includes('name="noteflare-plugin-ui"'))
+        throw new HttpError(503, "ui_unavailable", "Build the NoteFlare editor bundle first.");
+      return {
+        contents: [
+          {
+            uri: PLUGIN_UI_URI,
+            mimeType: "text/html;profile=mcp-app",
+            text: html,
+            _meta: {
+              ui: { prefersBorder: true, csp: { connectDomains: [], resourceDomains: [], frameDomains: [] } },
+              "openai/ui": { availableDisplayModes: ["inline", "fullscreen"] },
+              "openai/widgetDescription":
+                "Browse NoteFlare documents and save Markdown drafts with conflict detection.",
+            },
+          },
+        ],
+      };
+    });
+  }
   if (TOOL_SCOPES.create_comment!.every((scope) => access.scopes.has(scope)))
     server.registerTool(
       "create_comment",
       {
-        title: "Create comment",
-        description: "Post a comment as the connected member. Reuse operation_id when retrying.",
-        inputSchema: z.object({
-          page_id: z.string().regex(ID_PATTERN),
-          body: z.string().trim().min(1).max(16_000),
-          block_id: z.string().regex(ID_PATTERN).optional(),
-          operation_id: z.string().regex(OPERATION_ID),
-        }),
+        title: "Post comment",
+        ...pluginToolContracts.create_comment,
+        ...toolMetadata("create_comment", false),
       },
-      async (input) => {
-        try {
-          return result(await commentTool(request, env, context, input));
-        } catch (error) {
-          return toolError(error);
-        }
-      },
+      (input) => wrap(() => commentTool(request, env, context, input)),
     );
-  if (access.scopes.has("pages:write"))
+  if (access.scopes.has("pages:write")) {
     server.registerTool(
       "create_page",
       {
-        title: "Create page",
-        description: "Create a document in a writable space. Reuse operation_id when retrying.",
-        inputSchema: z.object({
-          space_id: z.string().regex(ID_PATTERN),
-          parent_id: z.string().regex(ID_PATTERN).nullable().optional(),
-          title: z.string().trim().min(1).max(PAGE_TITLE_MAX),
-          markdown: z.string().max(64_000),
-          operation_id: z.string().regex(OPERATION_ID),
-        }),
+        title: "Create document",
+        ...pluginToolContracts.create_page,
+        ...toolMetadata("create_page", false),
       },
-      async (input) => {
-        try {
-          return result(await createPageTool(request, env, context, input));
-        } catch (error) {
-          return toolError(error);
-        }
-      },
+      (input) => wrap(() => createPageTool(request, env, context, input)),
     );
-  if (access.scopes.has("pages:write"))
     server.registerTool(
       "update_page",
       {
-        title: "Update page",
-        description: "Apply a Phase 5 Markdown command to a writable document. Reuse operation_id when retrying.",
-        inputSchema: z.object({
-          page_id: z.string().regex(ID_PATTERN),
-          command: z.record(z.string(), z.unknown()),
-          operation_id: z.string().regex(OPERATION_ID),
-        }),
+        title: "Update document",
+        ...pluginToolContracts.update_page,
+        ...toolMetadata("update_page", false, true),
       },
-      async (input) => {
-        try {
-          return result(await updatePageTool(request, env, input));
-        } catch (error) {
-          return toolError(error);
-        }
-      },
+      (input) => wrap(() => updatePageTool(request, env, input)),
     );
-  if (access.scopes.has("pages:read"))
-    server.registerTool(
-      "fetch_page",
-      {
-        title: "Fetch page",
-        description: "Read a document as Markdown using current member permissions.",
-        inputSchema: z.object({ page_id: z.string().regex(ID_PATTERN) }),
-      },
-      async ({ page_id }) => {
-        try {
-          return result(await fetchPageTool(request, env, page_id));
-        } catch (error) {
-          return toolError(error);
-        }
-      },
-    );
+  }
   return server;
 }
 

@@ -26,6 +26,24 @@ function slackEnv(): Env {
   return { ...env, ...SLACK_SECRETS } as unknown as Env;
 }
 
+async function verifySlackDigestRecipients(ids: string[]) {
+  await protectSlackFixtureUsers(ids);
+  for (const id of ids) {
+    const accountId = `digest-slack-account:${id}`;
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO account(id,userId,providerId,accountId,createdAt,updatedAt)
+        SELECT ?,link.user_id,'slack',installation.team_id||':'||link.slack_user_id,link.linked_at,link.linked_at
+        FROM slack_user_links link JOIN slack_installations installation ON installation.id=link.installation_id
+        WHERE link.user_id=?`).bind(accountId, id),
+      env.DB.prepare(`UPDATE slack_user_links SET verification_method='slack_openid',verified_at=linked_at,
+        better_auth_account_id=?,authorization_started_at=linked_at,
+        security_generation=(SELECT generation FROM slack_protected_accounts WHERE user_id=slack_user_links.user_id),
+        installation_generation=(SELECT generation FROM slack_installations WHERE id=slack_user_links.installation_id)
+        WHERE user_id=?`).bind(accountId, id),
+    ]);
+  }
+}
+
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
   headers.set("cookie", cookie);
@@ -1191,7 +1209,7 @@ describe("notification feed and subscriptions", () => {
                  '{"notificationId":"linked-digest-notification"}', ?, ?)`,
       ).bind(installed.workspaceId, timestamp, timestamp),
     ]);
-    await protectSlackFixtureUsers(["linked-digest-user"]);
+    await verifySlackDigestRecipients(["linked-digest-user"]);
     const fetchMock = vi.fn(async () => Response.json({ ok: true }));
     vi.stubGlobal("fetch", fetchMock);
 
@@ -1264,7 +1282,7 @@ describe("notification feed and subscriptions", () => {
            FROM notifications WHERE id LIKE 'budget-notification-%'`,
       ).bind(timestamp, timestamp),
     ]);
-    await protectSlackFixtureUsers(
+    await verifySlackDigestRecipients(
       Array.from({ length: 10 }, (_, n) => `budget-user-${String(n + 1).padStart(2, "0")}`),
     );
     let statementCount = 0;
@@ -1407,7 +1425,7 @@ describe("notification feed and subscriptions", () => {
            FROM notifications WHERE id LIKE 'rate-notification-%'`,
       ).bind(timestamp, timestamp),
     ]);
-    await protectSlackFixtureUsers(["rate-user-a", "rate-user-b", "rate-user-c"]);
+    await verifySlackDigestRecipients(["rate-user-a", "rate-user-b", "rate-user-c"]);
     const channels: string[] = [];
     let remainingRateLimits = 1;
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -1419,6 +1437,7 @@ describe("notification feed and subscriptions", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const now = vi.spyOn(Date, "now").mockReturnValue(timestamp);
 
     await sendDueNotificationDigests(configured, timestamp);
 
@@ -1436,6 +1455,11 @@ describe("notification feed and subscriptions", () => {
       ],
     });
 
+    now.mockReturnValue(timestamp + 15_000);
+    await sendDueNotificationDigests(configured, timestamp + 15_000);
+    expect(channels).toEqual(["URATEA", "URATEC"]);
+
+    now.mockReturnValue(timestamp + 15 * 60_000);
     await sendDueNotificationDigests(configured, timestamp + 15 * 60_000);
 
     expect(channels).toEqual(["URATEA", "URATEC", "URATEA", "URATEB"]);

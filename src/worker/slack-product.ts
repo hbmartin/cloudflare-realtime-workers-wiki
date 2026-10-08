@@ -369,7 +369,7 @@ function authorization(session: Session) {
   const identity = JSON.parse(session.identity_json) as NonNullable<Identity>;
   return {
     sql: `EXISTS(SELECT 1 FROM slack_installations i JOIN slack_authorized_user_links l ON l.installation_id=i.id AND l.installation_generation=i.generation JOIN account a ON a.id=l.better_auth_account_id AND a.userId=l.user_id
-    WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL AND l.slack_user_id=? AND l.user_id=? AND l.better_auth_account_id=? AND l.verified_at=? AND l.migration_state='verified' AND l.verification_method='slack_openid' AND a.providerId='slack' AND a.accountId=i.team_id||':'||l.slack_user_id)`,
+    WHERE i.id=? AND i.generation=? AND i.disconnected_at IS NULL AND l.slack_user_id=? AND l.user_id=? AND l.better_auth_account_id=? AND l.verified_at=? AND l.verification_method='slack_openid' AND a.providerId='slack' AND a.accountId=i.team_id||':'||l.slack_user_id)`,
     binds: [
       session.installation_id,
       session.generation,

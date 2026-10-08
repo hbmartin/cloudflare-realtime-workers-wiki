@@ -12,7 +12,7 @@ the repository.
 | ------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `BETTER_AUTH_URL`               | `http://localhost:5173`              | The exact origin the installation is served from. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **The production environment must use its deployed HTTPS origin.**                                          |
 | `EXPANDED_EMBEDS_ENABLED`       | local/E2E `true`, production `false` | Set to `true` to enable Loom, Google, Miro, Spotify, and CodePen frames and the link-preview action. The Worker exposes the flag in `/api/me`. Disabling it preserves stored links and the original YouTube, Vimeo, and Figma frames; `/v1` can round-trip expanded URLs as content while the client renders them as links. Regenerate binding types with `pnpm cf-typegen` after changing the committed value. |
-| `SLACK_DIGEST_DEFAULT_TIMEZONE` | `America/Los_Angeles`                | IANA timezone used to initialize Round 2 mappings at 09:00. Later deployment-default changes affect new mappings only. Missing/invalid values prevent initialization; initialized mappings retain their saved zones and uninitialized mappings retain legacy 09:00 UTC delivery.                                                                                                                                |
+| `SLACK_DIGEST_DEFAULT_TIMEZONE` | `America/Los_Angeles`                | IANA timezone used for new digest mappings at 09:00. Later deployment-default changes affect new mappings only. Existing mappings retain their saved schedules.                                                                                                                                                                                                                                                 |
 
 Release flags (`OFFLINE_EDITING_ENABLED`, `NOTION_MARKDOWN_WRITES_ENABLED`, `WORKFLOW_INLINE`) and owner settings are
 listed in [Flags and release controls](FLAGS.md).
@@ -298,7 +298,7 @@ Unapplied buttons expire after ten minutes.
 show ten currently accessible results at a time. The Slack App Home Mentions tab shows ten mentions per page,
 with unread state and a **Mark inbox read** action. Opening Home starts a fresh inbox snapshot; Next and Previous
 continue within that snapshot. Configure the manifest's interactivity **Options Load URL** alongside its Request URL
-to load Space and Tags options. Legacy `/notes link` users must verify their Slack identity from NoteFlare Settings
+to load Space and Tags options. Members must verify their Slack identity from NoteFlare Settings
 before searching. New mentions use the actor of the update that introduced them; historical or automated mentions
 without proven provenance display “A collaborator.”
 
@@ -318,7 +318,11 @@ ephemeral to the acting user while they are active in Slack; an uncertain send i
 recheck current identity, membership, mapping, and page permissions when delayed work runs; old buttons and
 saved modal state do not grant access. Owners may create a replacement share privately from a revoked pinned reference; its old public URL stays revoked.
 
-For Round 2 activation, follow the [Slack rollout sequence](DEPLOYMENT.md#slack-review-follow-up-migration) before applying pending production migrations: pause the delivery queue, disable scheduled channel validation, and wait the documented 16-minute drain interval. Apply all required forward migrations, including `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, `0075_slack_delivery_recovery.sql`, `0076_slack_delivery_recovery_followup.sql`, `0077_slack_recovery_query_indexes.sql`, and `0078_slack_delivery_recovery_repairs.sql`, and keep delivery paused and validation disabled through deployment. After deployment verification, restore the intended flags, configure `SLACK_DIGEST_DEFAULT_TIMEZONE`, run the channel-validation dry run, and call owner-only `POST /api/slack/configuration/sync` before resuming delivery. The cron also synchronizes release configuration; authentication and Slack acknowledgment paths do not. The sync endpoint reports missing/invalid activation defaults. Channel revalidation preserves delivery permission blocks until explicit recovery establishes permission. Production release flags remain off until deployment and the live exit matrix are separately verified.
+Before first Slack deployment, apply all forward migrations through `0079_slack_verified_recovery.sql` and
+configure `SLACK_DIGEST_DEFAULT_TIMEZONE` for new mappings. The migration adds persisted history progress,
+method cooldowns, mapping recovery indexes, and verified-only authorization; it drops link tokens without converting
+or replaying historical Slack records. Deployment and production activation are separate from code preparation.
+Channel revalidation runs independently when validation is enabled. Saved schedules and delivery fences remain intact.
 
 Queue transport failures retry with sanitized error text and exponential backoff from ten seconds to one hour.
 They spend no delivery redrive budget. An ordinary recovery enqueue keeps its intent through transport failures
@@ -328,7 +332,7 @@ minutes without consuming a recovery attempt. Stale checkpoints receive a fenced
 newer consumer schedules and scope pauses remain intact. Activity outbox rows retain Round 2 ownership
 while validation is disabled and resume when it is enabled.
 
-Legacy digests filter actor access, templates, and mapping ownership before selection limits, with at most 200
+Digests filter actor access, templates, and mapping ownership before selection limits, with at most 200
 denied events retired per pass. Bulk summaries validate each unpaused contributing mapping before selection.
 Temporary validation failures preserve pending events and undo sending checkpoints before dispatch. Only
 `channel_not_found`, `not_in_channel`, `is_archived`, `shared_channel`, and `unsupported_channel_type` permanently
@@ -336,10 +340,9 @@ invalidate a channel during validation. Pending digest events lose replay eligib
 membership, account protection, or applicable integration authority, including events never assigned to a
 message. Uncertain sends retain their evidence. Page departures can still use sanitized messages.
 
-Missing legacy share identities recover only for accepted receipts under the same installation generation and
-Slack user, using a currently authorized verified binding whose verification and continuous authorization predate
-the request. Recovery persists the identity before dispatch. Malformed identities or incomplete evidence remain
-blocked, and all current owner, page, share, channel membership, and final authorization checks still apply.
+Share responses require the verified identity captured when the request was accepted. Missing or malformed identity
+evidence remains blocked; runtime recovery never reconstructs a historical grant. Current owner, page, share,
+channel membership, and final authorization checks still apply.
 
 Reauthorization resumes each scope-paused operation only when its required permissions are present.
 Text notifications can resume without `files:write`; mirroring retains all mirror permissions and unfurls
@@ -418,4 +421,8 @@ its realtime load check, but no configuration in this repository deploys such an
 be created and maintained separately if wanted. See
 [Operations](OPERATIONS.md#known-gaps).
 
-Disabling channel validation intentionally pauses initialized mappings, including channel events with legacy IDs. Initialization remains saved; held work and recovery markers are retained and excluded from runnable health counts. Re-enable validation and synchronize configuration to resume the backlog without resetting its retry budget. Uninitialized mappings retain legacy delivery; attempted channel checkpoints wait for Round 2 reconciliation.
+Disabling channel validation holds all channel and digest delivery. Backlog and recovery markers are retained and
+excluded from runnable health counts. Enabling validation resumes the backlog without spending another retry.
+Verify and Repair process one bounded batch: at most five receipts, five history calls, and twenty seconds.
+Responses report checked, confirmed, blocked, pending, and paused work, with `nextCursor` and `retryAt` for
+continued verification. Incomplete searches retain timestamp progress and their fixed search window.

@@ -1,8 +1,3 @@
-import {
-  legacyShareRecoverySelectSql,
-  blockedShareRecoverySelectSql,
-  shareRecoveryPreflightSql,
-} from "../shared/slack-share-recovery";
 import { applyD1Migrations, env, reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Env } from "./env";
@@ -12,7 +7,7 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
-  it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076", "0077", "0078"])(
+  it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076", "0077", "0078", "0079"])(
     "upgrades a database before %s through the additive follow-up",
     async (foundation) => {
       await applyD1Migrations(
@@ -34,6 +29,61 @@ describe("D1 migrations", () => {
       });
     },
   );
+  it("0079 adds verification persistence without converting or replaying legacy records", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((m) => m.name < "0079"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@example.test',1,1)",
+      ),
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Notes',1)"),
+      env.DB.prepare(
+        "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace','owner','owner',1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO twoFactor(id,userId,secret,backupCodes,verified) VALUES('factor','owner','secret','[]',1)",
+      ),
+      env.DB.prepare("UPDATE account_security SET codes_saved=1 WHERE user_id='owner'"),
+      env.DB.prepare(
+        "INSERT INTO account(id,userId,providerId,accountId,createdAt,updatedAt) VALUES('oauth','owner','slack','T123:UOWNER',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,generation,created_at,updated_at) VALUES('installation','workspace','T123','Slack','B123','unused','chat:write','owner',1,1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation,authorization_started_at) VALUES('installation','owner','UOWNER',1,1,0,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at) VALUES('page','workspace','workspace-general','document','a0','Page','owner',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_channel_subscriptions(id,installation_id,space_id,channel_id,channel_name,event_types_json,cadence,created_by,created_at,updated_at) VALUES('mapping','installation','workspace-general','C123','notes','[]','digest','owner',1,1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at,round2_state,attempted_at) VALUES('legacy-event','mapping','workspace','page_edit','owner','page','digest',1,'blocked',1)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO outbox(id,workspace_id,topic,payload_json,created_at,available_at,enqueued_at,slack_redrive_due_at,slack_redrive_count) VALUES('legacy-outbox','workspace','slack_channel','{\"eventId\":\"legacy-event\"}',1,1,1,123456,8)",
+      ),
+    ]);
+    const tables = ["slack_user_links", "slack_channel_subscriptions", "slack_channel_events", "outbox"] as const;
+    const before = await Promise.all(tables.map((table) => env.DB.prepare(`SELECT * FROM ${table}`).all()));
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    for (const [index, table] of tables.entries())
+      expect((await env.DB.prepare(`SELECT * FROM ${table}`).all()).results).toEqual(before[index]!.results);
+    expect(await env.DB.prepare("SELECT * FROM slack_authorized_user_links").first()).toBeNull();
+    expect(await env.DB.prepare("SELECT count(*) n FROM slack_history_verifications").first()).toEqual({ n: 0 });
+    expect(await env.DB.prepare("SELECT count(*) n FROM slack_method_cooldowns").first()).toEqual({ n: 0 });
+    expect(await env.DB.prepare("SELECT name FROM sqlite_master WHERE name='slack_link_tokens'").first()).toBeNull();
+    await env.DB.prepare(
+      "UPDATE slack_user_links SET better_auth_account_id='oauth',verification_method='slack_openid',verified_at=1",
+    ).run();
+    expect(await env.DB.prepare("SELECT migration_state FROM slack_authorized_user_links").first()).toEqual({
+      migration_state: "legacy",
+    });
+  });
   it("0078 repairs only missing owned channel deadlines and preserves protected schedules", async () => {
     await applyD1Migrations(
       env.DB,
@@ -117,233 +167,6 @@ describe("D1 migrations", () => {
       expect(repaired && Number(row.slack_redrive_due_at) <= 1).toBe(false);
     }
   });
-  it.each([
-    { preflight: false, foundation: "0074" },
-    { preflight: true, foundation: "0074" },
-    { preflight: true, foundation: "0072" },
-    { preflight: true, foundation: "0071" },
-    { preflight: true, foundation: "0073" },
-    { preflight: true, foundation: "0067" },
-    { preflight: true, foundation: "0068" },
-    { preflight: true, foundation: "0069" },
-  ])(
-    "repairs only proven work through 0078 with $foundation foundation and preflight=$preflight",
-    async ({ preflight, foundation }) => {
-      await applyD1Migrations(
-        env.DB,
-        env.TEST_MIGRATIONS!.filter((migration) => migration.name < foundation),
-      );
-      await env.DB.batch([
-        env.DB.prepare(
-          "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('owner','Owner','owner@example.test',1,1)",
-        ),
-        env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('workspace','Notes',1)"),
-        env.DB.prepare(
-          "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('workspace','owner','owner',1)",
-        ),
-        env.DB.prepare(
-          "INSERT INTO twoFactor(id,userId,secret,backupCodes,verified) VALUES('factor','owner','secret','[]',1)",
-        ),
-        env.DB.prepare("UPDATE account_security SET codes_saved=1 WHERE user_id='owner'"),
-        env.DB.prepare(
-          "INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at,generation) VALUES('installation','workspace','T123','Slack','B123','unused','chat:write','owner',1,1,1)",
-        ),
-        env.DB.prepare(
-          "INSERT INTO account(id,userId,providerId,accountId,createdAt,updatedAt) VALUES('oauth','owner','slack','T123:UOWNER',1,1)",
-        ),
-        env.DB.prepare(
-          `INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,better_auth_account_id,verification_method,migration_state,verified_at,installation_generation
-          ${foundation > "0071" ? ",security_generation" : ""}${foundation > "0072" ? ",authorization_started_at" : ""})
-          VALUES('installation','owner','UOWNER',1,'oauth','slack_openid','verified',1,1${foundation > "0071" ? ",0" : ""}${foundation > "0072" ? ",1" : ""})`,
-        ),
-        env.DB.prepare(
-          "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at) VALUES('page','workspace','workspace-general','document','a0','Page','owner',1,1)",
-        ),
-        env.DB.prepare(
-          "INSERT INTO slack_channel_subscriptions(id,installation_id,space_id,channel_id,channel_name,event_types_json,cadence,created_by,created_at,updated_at) VALUES('mapping','installation','workspace-general','C123','notes','[]','immediate','owner',1,1)",
-        ),
-      ]);
-      const activityModes = ["pending", "sending", "blocked", "retired", "scope", "claimed", "newer"];
-      for (const mode of activityModes) {
-        const id = `activity:${mode}`;
-        await env.DB.prepare(`INSERT INTO slack_channel_events(id,subscription_id,workspace_id,event_type,actor_id,page_id,cadence,created_at,round2_state,claimed_at)
-        VALUES(?,'mapping','workspace','page_created','owner','page','immediate',1,?,?)`)
-          .bind(
-            id,
-            ["sending", "blocked", "retired"].includes(mode) ? mode : "pending",
-            mode === "claimed" ? Date.now() : null,
-          )
-          .run();
-        await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,last_error,slack_scope_paused_at)
-        VALUES(?,'workspace','slack_channel',?,1,1,1,?,?)`)
-          .bind(
-            id,
-            JSON.stringify({ eventId: id }),
-            mode === "newer" ? "newer_schedule" : "Invalid Slack redrive payload",
-            mode === "scope" ? 1 : null,
-          )
-          .run();
-      }
-      const modes = [
-        "pending",
-        "blocked_identity",
-        "scope",
-        "sending",
-        "sent",
-        "uncertain",
-        "future",
-        "generation",
-        "user",
-        "malformed",
-        "denied",
-      ];
-      for (const mode of modes) {
-        const state =
-          mode === "pending" || ["scope", "future", "generation", "user", "malformed", "denied"].includes(mode)
-            ? "pending"
-            : mode === "blocked_identity" || mode === "uncertain"
-              ? "blocked"
-              : mode;
-        await env.DB.prepare(`INSERT INTO slack_interaction_receipts(id,installation_id,interaction_id,callback_id,received_at,processed_at,outcome,response_delivery_state,response_delivery_error)
-        VALUES(?,'installation',?,'share',?,1,?,?,?)`)
-          .bind(
-            mode,
-            mode,
-            mode === "future" ? 0 : 10,
-            mode === "denied" ? "denied" : "accepted",
-            state,
-            mode === "blocked_identity"
-              ? "request_identity_unavailable"
-              : mode === "uncertain"
-                ? "send_unconfirmed"
-                : null,
-          )
-          .run();
-        const payload = {
-          receiptId: mode,
-          installationId: "installation",
-          generation: mode === "generation" ? 2 : 1,
-          userId: mode === "user" ? "OTHER" : "UOWNER",
-          ...(mode === "malformed" ? { identity: null } : {}),
-        };
-        await env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_scope_paused_at)
-        VALUES(?,'workspace','slack_share_response',?,1,1,1,?)`)
-          .bind(`share:${mode}`, JSON.stringify(payload), mode === "scope" ? 1 : null)
-          .run();
-      }
-      if (preflight && foundation === "0074")
-        await env.DB.prepare(`WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<5000)
-        INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
-        SELECT 'unrelated:'||n,'workspace','slack_unfurl','{}',1,1 FROM numbers`).run();
-      if (preflight)
-        await env.DB.prepare(
-          "UPDATE outbox SET slack_redrive_count=7,slack_eligible_started_at=1 WHERE id='share:blocked_identity'",
-        ).run();
-      let preflightPlan: string[] = [];
-      if (preflight) {
-        const statements = shareRecoveryPreflightSql(
-          env.TEST_MIGRATIONS!.filter((migration) => migration.name >= foundation).map((migration) => migration.name),
-        )
-          .split(";")
-          .map((sql) => sql.trim())
-          .filter(Boolean);
-        const update = statements.findIndex((sql) => sql.startsWith("UPDATE outbox"));
-        await env.DB.batch(statements.slice(0, update).map((sql) => env.DB.prepare(sql)));
-        const plan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${statements[update]}`).all<{ detail: string }>();
-        preflightPlan = plan.results.map((row) => row.detail);
-        await env.DB.batch(statements.slice(update).map((sql) => env.DB.prepare(sql)));
-        await env.DB.batch(statements.map((sql) => env.DB.prepare(sql)));
-      }
-      expect(
-        preflightPlan.some((detail) => detail.includes("SEARCH outbox USING INDEX sqlite_autoindex_outbox_1")),
-      ).toBe(preflight);
-      expect(preflightPlan.some((detail) => detail.includes("sqlite_autoindex_slack_share_recovery_preflight_1"))).toBe(
-        preflight,
-      );
-      expect(preflightPlan.some((detail) => detail.includes("SCAN repair"))).toBe(false);
-      await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
-      expect(await env.DB.prepare("SELECT max(slack_enqueue_failure_count) failures FROM outbox").first()).toEqual({
-        failures: 0,
-      });
-      const indexes = (
-        await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='index'").all<{ name: string }>()
-      ).results.map((row) => row.name);
-      expect(indexes).toEqual(
-        expect.arrayContaining([
-          "slack_digest_receipts_subscription_window",
-          "slack_digest_pending_cleanup",
-          "slack_activity_legacy_repair",
-          "slack_share_response_receipt",
-          "slack_digest_pending_subscription",
-          "slack_digest_reservations_message",
-          "slack_share_recoverable_receipts",
-        ]),
-      );
-      const sharePlan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${legacyShareRecoverySelectSql}`).all<{
-        detail: string;
-      }>();
-      expect(sharePlan.results.some((row) => row.detail.includes("slack_share_response_receipt (<expr>=?)"))).toBe(
-        true,
-      );
-      const blockedPlan = await env.DB.prepare(`EXPLAIN QUERY PLAN ${blockedShareRecoverySelectSql}`).all<{
-        detail: string;
-      }>();
-      expect(blockedPlan.results.some((row) => row.detail.includes("slack_share_recoverable_receipts"))).toBe(true);
-      const receiptPlan = await env.DB.prepare(
-        "EXPLAIN QUERY PLAN SELECT id FROM slack_digest_receipts WHERE subscription_id=? AND window_start<=? AND window_end>?",
-      )
-        .bind("mapping", 1, 1)
-        .all<{ detail: string }>();
-      expect(receiptPlan.results.some((row) => row.detail.includes("slack_digest_receipts_subscription_window"))).toBe(
-        true,
-      );
-      for (const mode of activityModes) {
-        const row = await env.DB.prepare(
-          "SELECT enqueued_at,last_error,slack_enqueue_redrive_pending,attempts FROM outbox WHERE id=?",
-        )
-          .bind(`activity:${mode}`)
-          .first();
-        expect(row).toMatchObject({
-          enqueued_at: mode === "pending" ? null : 1,
-          last_error: mode === "pending" ? null : mode === "newer" ? "newer_schedule" : "Invalid Slack redrive payload",
-          slack_enqueue_redrive_pending: 0,
-          attempts: mode === "pending" ? 1 : 0,
-        });
-      }
-      for (const mode of modes) {
-        const repaired = ["pending", "blocked_identity"].includes(mode);
-        const row = await env.DB.prepare(
-          "SELECT enqueued_at,attempts,json_extract(payload_json,'$.identity') identity FROM outbox WHERE id=?",
-        )
-          .bind(`share:${mode}`)
-          .first<{ identity: string | null }>();
-        expect(row).toMatchObject({ enqueued_at: repaired ? null : 1, attempts: repaired ? 1 : 0 });
-        expect(row!.identity === null).toBe(!repaired);
-        expect(row!.identity ? JSON.parse(row!.identity) : null).toEqual(
-          repaired
-            ? {
-                userId: "owner",
-                accountId: "oauth",
-                verifiedAt: 1,
-                slackUserId: "UOWNER",
-              }
-            : null,
-        );
-      }
-      const clock = await env.DB.prepare(
-        "SELECT slack_redrive_count,slack_eligible_started_at FROM outbox WHERE id='share:blocked_identity'",
-      ).first();
-      expect(clock).toEqual({ slack_redrive_count: 0, slack_eligible_started_at: null });
-      expect(
-        await env.DB.prepare(
-          "SELECT response_delivery_state,response_delivery_error FROM slack_interaction_receipts WHERE id='blocked_identity'",
-        ).first(),
-      ).toEqual({ response_delivery_state: "pending", response_delivery_error: null });
-      expect(
-        await env.DB.prepare("SELECT name FROM sqlite_master WHERE name='slack_share_recovery_0074'").first(),
-      ).toBeNull();
-    },
-  );
 
   it("applies 0075 after an already deployed 0074 without changing scheduling versions", async () => {
     await applyD1Migrations(
@@ -403,7 +226,7 @@ describe("D1 migrations", () => {
       expect(
         (await env.DB.prepare("SELECT installation_id FROM slack_authorized_user_links WHERE user_id='member'").all())
           .results,
-      ).toHaveLength(2);
+      ).toHaveLength(kind === "verified" ? 2 : 0);
       await env.DB.prepare("DELETE FROM workspace_members WHERE workspace_id='first' AND user_id='member'").run();
       expect(
         (await env.DB.prepare("SELECT installation_id FROM slack_user_links WHERE user_id='member'").all()).results,
@@ -434,7 +257,7 @@ describe("D1 migrations", () => {
     },
   );
 
-  it("grandfathers protected bindings, rejects older writes and revokes access on reset or unlink", async () => {
+  it("requires verified grants after migration and revokes access on reset or unlink", async () => {
     await applyD1Migrations(
       env.DB,
       env.TEST_MIGRATIONS!.filter((m) => m.name < "0071"),
@@ -468,9 +291,7 @@ describe("D1 migrations", () => {
       ),
     ]);
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
-    expect((await env.DB.prepare("SELECT user_id FROM slack_authorized_user_links").all()).results).toEqual([
-      { user_id: "protected" },
-    ]);
+    expect((await env.DB.prepare("SELECT user_id FROM slack_authorized_user_links").all()).results).toEqual([]);
     expect(await env.DB.prepare("SELECT 1 FROM slack_primary_factor_proofs").first()).toBeNull();
     await env.DB.prepare("DELETE FROM slack_user_links WHERE user_id='protected'").run();
     await env.DB.prepare(

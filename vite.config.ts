@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { cloudflare } from "@cloudflare/vite-plugin";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
@@ -20,6 +21,14 @@ export default defineConfig(({ command }) => {
     },
     plugins: [
       react(),
+      {
+        name: "noteflare-plugin-ui-development",
+        apply: "serve",
+        configureServer(server) {
+          const bundler = spawn(process.execPath, ["scripts/build-plugin-ui.mjs", "--watch"], { stdio: "inherit" });
+          server.httpServer?.once("close", () => bundler.kill());
+        },
+      },
       cloudflare({
         persistState: process.env.NOTES_E2E_STATE
           ? { path: process.env.NOTES_E2E_STATE }

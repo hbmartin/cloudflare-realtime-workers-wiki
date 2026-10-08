@@ -32,7 +32,7 @@ Audited on 1 October 2026 against `main` at `2ef1450`. Milestones are listed in 
 
 | Milestone                               | Status                     | Evidence and remaining work                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | --------------------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0 — Secure foundation                   | Shipped                    | Better Auth Slack OIDC with implicit linking and signup disabled (`src/worker/auth.ts`). Invite-gated signup, team matching, and the MFA handoff are in place. The schema foundations are in migration `0035_slack_secure_foundation.sql`. Typed `SlackApiContracts` and scope health live in `src/worker/slack.ts`. The manifest already requests every scope below. **Remaining:** deprecate `/notes link`, which still issues legacy links.                                                                                                                                                            |
+| 0 — Secure foundation                   | Shipped                    | Better Auth Slack OIDC with implicit linking and signup disabled (`src/worker/auth.ts`). Invite-gated signup, team matching, and the MFA handoff are in place. The schema foundations are in migration `0035_slack_secure_foundation.sql`. Typed `SlackApiContracts` and scope health live in `src/worker/slack.ts`. The manifest already requests every scope below. Token linking has been removed; Settings establishes verified identities.                                                                                                                                                           |
 | 1 — Bidirectional threads               | Shipped                    | Owner mirror opt-in (`PATCH /api/slack/channels/:id/mirror`). `slack_thread_links` and `slack_thread_deliveries` handle outbound delivery. Inbound replies go through `slack_inbound_receipts`, mrkdwn conversion, mention translation, and source suppression (`src/worker/slack-threads.ts`, `slack-thread-fanout.ts`). Migrations `0036`–`0046` add delivery ordering, recovery, and redrive.                                                                                                                                                                                                          |
 | 2 — Interactive workspace               | Shipped                    | `POST /api/slack/interactions` acknowledges within a 2.7-second deadline. It handles Resolve/Reopen, Watch, Mute, Snooze (1, 8, or 24 hours), and owner share actions; the search modal (ten-result paging); and the App Home Mentions inbox (`src/worker/slack-workspace.ts`, `slack-blocks.ts`). Interaction receipts are in `slack_interaction_receipts` and `slack_action_commits`.                                                                                                                                                                                                                   |
 | 3 — Atomic capture                      | Shipped (#202)             | Both shortcuts claim `slack_captures` and publish a hidden staged import only after verification (`src/worker/slack-capture.ts`, `slack-capture-content.ts`; migrations `0053`–`0056`). Live signed-capture verification is tracked in [roadmap Phase 2](roadmap/02-phase2-evidence.md). The shipped modal can also create a **task**; this roadmap describes documents only.                                                                                                                                                                                                                             |
@@ -124,17 +124,16 @@ the affected capability without breaking existing notification delivery.
   assurance requirements remain unchanged.
 - The OpenID team ID must match the workspace's active Slack installation. A member cannot attach an identity from a
   different Slack workspace.
-- Continue honoring authorized legacy `slack_user_links` for existing outbound personal notifications during migration. Installation disconnect/reconnect, protection changes, or lost membership revoke access and require explicit relinking; Member removal deletes that workspace’s stored Slack access link; rejoining requires explicit relinking with a new authorization start. Settings shows delivery as paused until authorization is restored.
-  Require an OpenID-verified link for interactions, inbound comments, capture, and Slack login.
-- Deprecate `/notes link` once members have had a migration window. Do not silently upgrade legacy links to verified
-  OpenID links.
-- Slack Settings shows whether the current member is unlinked, legacy-linked, or OpenID-verified and provides the
-  appropriate connect or migration action.
+- Require verified Slack identities for personal notifications, interactions, inbound comments, capture, and Slack login.
+  Installation disconnect deletes identity grants while preserving OAuth login. Protection changes or lost membership
+  revoke access and require explicit relinking. Rejoining starts a new authorization grant.
+- Slack Settings exposes the required `unlinked` or `verified` identity state and the appropriate connection action.
+  Command-generated tokens and `/api/slack/link` are removed.
 
 Channel activity checks the actor's current membership, account protection, and page access; it does not require
 an actor Slack identity link. Historical channel events retire when their actor loses membership or account
 protection. Restoring authority does not replay retired events. Temporary destination, credential, and scope pauses keep
-work pending. Legacy digest cleanup examines at most 50 subscriptions and 40 candidate events per subscription.
+work pending. Digest cleanup processes bounded batches independently of delivery eligibility.
 
 Stale channel-validation retries retain `slack_validation_stale` as a durable coordination exemption from the eight
 ordinary redrives. Enqueue acceptance, queue loss, wakeups, competing claims, pauses, and unresolved uncertain sends
@@ -143,7 +142,7 @@ validation failure establishes a new exemption.
 
 #### Failure behavior
 
-- Unlinked and legacy-only users receive an ephemeral authentication prompt for interactive actions.
+- Unlinked users receive an ephemeral authentication prompt for interactive actions.
 - Wrong-team, disabled, guest/external, or no-longer-member identities fail closed.
 - Responses must not reveal the title or location of an inaccessible page, space, or thread.
 
@@ -401,9 +400,9 @@ Add dispatch and recovery support for:
 
 ### Identity and installation records
 
-Extend `slack_user_links` with the Better Auth account identity, OpenID verification method/time, and migration state.
-The installation/team remains part of every uniqueness boundary. Existing unverified rows remain usable only for
-legacy outbound personal delivery.
+Bind `slack_user_links` to the Better Auth account, OpenID verification method/time, protection generation, and
+installation generation. The installation/team remains part of every uniqueness boundary. Unverified rows never
+authorize delivery; migration state is an inert compatibility column.
 
 Update the shared `SlackStatus` and client settings types to expose:
 
@@ -609,7 +608,7 @@ loop; and an owner can disable inbound mirroring without uninstalling Slack.
 ### Authentication and authorization
 
 - Cover invited Slack signup, explicit existing-account linking, same-email refusal, wrong-team refusal, OAuth
-  state/replay expiry, legacy-link restrictions, and mandatory MFA.
+  state/replay expiry, verified-only authorization, and mandatory MFA.
 - Revoke workspace, space, page, thread, owner, and mapping access after ingestion but before execution; every delayed
   operation must fail closed.
 - Verify errors do not reveal inaccessible titles, spaces, channel mappings, or member identities.
@@ -668,7 +667,7 @@ Measure without logging content:
 - Authorization rejection counts by safe reason code.
 - Inbound receipt duplicates and comment creation outcomes.
 - Outbox delivery latency, retries, rate limits, and terminal failures by Slack topic.
-- Active verified identities and remaining legacy links.
+- Active verified identities and revoked grants.
 - Active mirror mappings and thread-link creation failures.
 - Capture workflow duration and terminal state.
 - Digest size/truncation and thumbnail upload/fallback counts.

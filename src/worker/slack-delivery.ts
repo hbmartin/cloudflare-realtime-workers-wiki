@@ -1,3 +1,4 @@
+import { logger } from "./observability";
 import { round2WakeStatement, PERMANENT_SLACK_VALIDATION_ERRORS } from "./slack-delivery-contracts";
 import type { Env } from "./env";
 import {
@@ -143,8 +144,55 @@ export async function retireObsoleteReceipt(
       `UPDATE ${table} SET ${table === "slack_digest_receipts" ? "" : "state='retired',"}claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
     ).bind(id, token),
   ]);
-  return Boolean(results.at(table === "slack_digest_receipts" ? -2 : -1)?.meta.changes);
+  const retired = Boolean(results.at(table === "slack_digest_receipts" ? -2 : -1)?.meta.changes);
+  if (retired)
+    logger.info("slack.delivery.retired", "slack", "Retired obsolete installation work.", {
+      id,
+      installationId,
+      generation,
+    });
+  return retired;
 }
 
 // The dispatch hook has already classified unsent work as paused or retired.
 export class SlackDispatchSkippedError extends Error {}
+
+// Cleanup and diagnostics must never replace the delivery error being handled.
+export async function recordSecondarySlackError<T>(
+  operation: string,
+  context: Record<string, string>,
+  work: () => Promise<T>,
+): Promise<T | undefined> {
+  try {
+    return await work();
+  } catch (error) {
+    logger.error(
+      "slack.delivery.secondary_failed",
+      "slack",
+      "Slack error cleanup failed.",
+      { ...context, operation },
+      error,
+    );
+    return undefined;
+  }
+}
+
+export async function withSlackPrimaryError<T>(
+  primary: unknown,
+  operation: string,
+  context: Record<string, string>,
+  work: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await work();
+  } catch (secondary) {
+    logger.error(
+      "slack.delivery.secondary_failed",
+      "slack",
+      "Slack error cleanup failed.",
+      { ...context, operation },
+      secondary,
+    );
+    throw primary;
+  }
+}

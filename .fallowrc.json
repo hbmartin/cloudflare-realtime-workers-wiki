@@ -8,7 +8,8 @@
     "vitest.worker.config.ts",
     "playwright.config.ts",
     "scripts/*.mjs",
-    "scripts/**/*.test.mjs"
+    "scripts/**/*.test.mjs",
+    "src/plugin-ui/main.tsx"
   ],
   "ignorePatterns": ["worker-configuration.d.ts", "reviews_triage/**"],
   "typeAware": {

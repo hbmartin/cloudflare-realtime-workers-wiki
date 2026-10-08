@@ -15,7 +15,7 @@ flag; any other value or an unset variable disables it.
 | `NOTION_MARKDOWN_WRITES_ENABLED`   | `true`       | `false`    | `PATCH /v1/pages/:id/markdown` returns 404 `object_not_found`, and queued async Markdown tasks are neither run nor recovered. `GET /v1/pages/:id/markdown` is unaffected.                                                                   |
 | `WORKFLOW_INLINE`                  | E2E only     | unset      | Import and export jobs run on the `NOTES_WORKFLOW` Workflow. When it is `true`, jobs run inline instead, so the E2E environment needs no Workflows. **Never set it in production.**                                                         |
 | `WORKSPACE_ACTIVITY_ENABLED`       | off / E2E on | `false`    | Hides Activity/Open work and disables canonical event recording. Recorded metadata still expires after 30 days.                                                                                                                             |
-| `SLACK_CHANNEL_VALIDATION_ENABLED` | `false`      | `false`    | Uninitialized mappings retain legacy delivery. Disabling pauses initialized mappings and their legacy-ID events; backlog resumes when enabled. Configure the operator timezone before activation.                                           |
+| `SLACK_CHANNEL_VALIDATION_ENABLED` | `false`      | `false`    | Holds all channel delivery and its recovery scheduling. Enabling resumes the existing backlog without spending another retry.                                                                                                               |
 | `SLACK_SHARE_REFRESH_ENABLED`      | `false`      | `false`    | Stops queued attachment refresh effects and new lifecycle hooks; preserves recovery markers for paused queued work.                                                                                                                         |
 | `SLACK_RICH_DIGESTS_ENABLED`       | `false`      | `false`    | Sends grouped text without images; saved scheduling, validation and receipts continue when strict validation is enabled.                                                                                                                    |
 
@@ -51,7 +51,7 @@ These capabilities have no switch of their own. Each one turns on when its prere
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Slack integration           | All four of `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`, and `SLACK_TOKEN_ENCRYPTION_KEY` are set                                                                     |
 | Each Slack capability       | The installation has been granted that capability's scopes (`SLACK_CAPABILITY_SCOPES` in `src/worker/slack.ts`). Slack Settings lists the missing scopes and offers **Reauthorize Slack**. |
-| Slack interactions, capture | The acting member has an OpenID-verified Slack link. A legacy `/notes link` covers outbound personal notifications only.                                                                   |
+| Slack interactions, capture | The acting member has an OpenID-verified Slack identity. Personal notifications require the same verified authorization.                                                                   |
 | Integration webhooks        | `WEBHOOK_ENCRYPTION_KEY` is set and valid                                                                                                                                                  |
 | Offline app shell           | It is a production client build (`import.meta.env.PROD`). The service worker is not registered in the Vite dev server.                                                                     |
 
@@ -73,20 +73,23 @@ Add every new flag to this file in the PR that introduces it.
 
 ## Slack Round 2 activation
 
-Before setting strict validation to true, an owner calls `POST /api/slack/channels/validate` for a read-only report of
-all mappings in their workspace. Resolve shared/unsupported/unjoined channels and missing scopes. Set the deployment
-variable `SLACK_DIGEST_DEFAULT_TIMEZONE` to a valid IANA timezone before migration/activation. The initial migration
-persists 09:00 in that zone; subsequent operator-default changes affect new mappings only. Apply forward migration
-`0067_review_delivery.sql`, then call owner-only `POST /api/slack/configuration/sync` to initialize eligible mappings.
-Scheduled maintenance also synchronizes configuration. Authentication and Slack acknowledgment requests do not.
-A missing or invalid default produces a clear activation error; existing saved schedules remain intact and
-uninitialized mappings continue legacy digest delivery.
+Channel mappings always require a validated public or private channel. Configure `SLACK_DIGEST_DEFAULT_TIMEZONE`
+for new digest schedules and apply all forward migrations, including `0079_slack_verified_recovery.sql`, before
+first deployment. Configuration sync and maintenance synchronize flags without converting historical records.
+Channel revalidation runs independently whenever validation is enabled.
 
-Enable and validate increments in order: strict channel settings, Activity/feed, share refresh, rich digests/images.
-Workspace activity and strict validation must both be enabled before rich digests. Each increment requires the
-[deployed Phase 9 matrix](roadmap/09-slack-digests-shares.md#exit-matrix). These controls remain off in production until
-that verification is recorded. Operations alerts remain Phase 10.
+Enable increments in order: strict channel settings, Activity/feed, share refresh, rich digests/images. Workspace
+activity and validation must both be enabled before rich digests. Production activation is a separate deployment step.
 
-Slack mapping initialization persists across validation rollback. Once initialized, a mapping and all its channel events use Round 2 ownership even when event IDs use the legacy format. Setting `SLACK_CHANNEL_VALIDATION_ENABLED=false` holds their backlog and recovery deadlines. Consumers release the queued scheduling version and any uncommitted redrive intent while preserving committed retry counts. Round 2 digests require validation and, when rich digests are enabled, workspace activity. Feature-held channel, digest, bulk, share-refresh, and thumbnail work is excluded from runnable selection and health counts. Re-enable the relevant flags to make held work eligible for the normal outbox sweep immediately, including work at the eight-redrive limit; resuming a hold does not spend another delivery retry.
+Setting `SLACK_CHANNEL_VALIDATION_ENABLED=false` holds every channel event regardless of its ID or inert
+compatibility columns. It also holds digest delivery. Held work retains its backlog and committed retry count;
+resuming flags makes it runnable without spending another retry. Other receipt kinds retain their own flags.
 
-Uninitialized mappings continue legacy delivery. Immediate legacy posts checkpoint `sending` and the first eligible dispatch time before calling Slack, and include the delivery ID in message metadata. Confirmed success records the message timestamp and delivery time; definite rejections restore `pending`. Accepted-but-unconfirmed sends retain their checkpoint and recovery deadline. After the 60-second claim expires, maintenance verifies the saved installation generation, original channel, bot identity, and delivery metadata against Slack history. Confirmed messages finish, including messages suppressed during the request. Missing or ambiguous evidence leaves the event blocked, visible in the recovery banner, and excluded from automatic publication and overdue health counts. Owners can repeat verification or repair with validation disabled, including after mapping initialization; unconfirmed messages remain blocked. Authentication and missing history scopes preserve the checkpoint through existing pause handling, while transport failures and rate limits defer verification without spending delivery retries. Neither immediate delivery nor digest selection blindly replays uncertain messages. The 24-hour exhaustion clock begins at the first eligible legacy dispatch and deducts authentication and scope pauses. Queue publication is staged before send, and clock or queue failures receive enqueue backoff starting at ten seconds without spending a delivery retry.
+Accepted but unconfirmed sends retain their attempt, installation generation, and original destination. Maintenance
+queues reconciliation; each queue invocation scans at most one history page. Owner Verify and Repair requests
+process at most five receipts and five history calls within twenty seconds, returning a mapping continuation token
+and cooldown deadline. Searches persist a fixed window and exclusive timestamp progress instead of Slack cursors.
+Only a completed unique match confirms delivery; incomplete searches remain uncertain. Missing, ambiguous, or
+permanently unavailable evidence blocks automatic polling until explicit owner verification. Authentication and
+supported scope failures pause recovery; transient failures retain progress and retry deadlines. Installation,
+generation, and method cooldowns survive subsequent requests. Uncertain messages are never blindly resent.

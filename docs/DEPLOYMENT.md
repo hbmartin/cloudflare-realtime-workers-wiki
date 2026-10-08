@@ -140,8 +140,7 @@ importing the updated manifest. Then have the
 workspace owner use **Reauthorize Slack** once and confirm that Settings reports no missing bot scopes.
 The bot install callback and Better Auth OpenID callback are intentionally separate. Reauthorization
 must use the Slack team already bound to the NoteFlare workspace; changing teams requires a future
-explicit reset flow. Existing slash search, unfurls, notifications, and legacy `/notes link` delivery
-continue to use only their original scopes during the rollout.
+explicit reset flow. Slash search, unfurls, and personal notifications require verified Slack identities and their capability scopes.
 
 ## 4. Configure rate limiting
 
@@ -398,7 +397,7 @@ before making changes. Quiesce page moves or verify that the live Worker already
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
 until that manually dispatched run has deployed the new Worker.
 
-Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, `0075_slack_delivery_recovery.sql`, `0076_slack_delivery_recovery_followup.sql`, `0077_slack_recovery_query_indexes.sql`, or `0078_slack_delivery_recovery_repairs.sql` also stop automatic deployment.
+Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, `0075_slack_delivery_recovery.sql`, `0076_slack_delivery_recovery_followup.sql`, `0077_slack_recovery_query_indexes.sql`, `0078_slack_delivery_recovery_repairs.sql`, or `0079_slack_verified_recovery.sql` also stop automatic deployment.
 Follow the [Slack rollout pause](#slack-review-follow-up-migration), then manually dispatch with
 `confirm_slack_review_migration_safe` checked. The workflow passes this confirmation to the guarded
 remote migration command. Once these migrations are applied, later automatic releases need no Slack
@@ -429,32 +428,34 @@ since before the accepted request. It requeues responses blocked solely by `requ
 Scope-paused, completed, sending, uncertain, and actively claimed work is preserved. Apply this migration before
 the updated Worker, using the same queue pause and validation drain below.
 
-`0075_slack_delivery_recovery.sql` adds the independent enqueue-failure counter, bounded digest cleanup
-cursor, and recovery indexes. Migration 0074 stays unchanged. When 0074 is pending on an existing
-Round 2 schema, the guarded runner first captures proven share repairs in an indexed ledger,
-persists identities by captured outbox ID and version, and resets blocked receipts only after that
-write succeeds. For pending 0071/0072, it uses their equivalent protection and grant-start predicates.
-Fresh migration chains build the required schema normally.
-
-`0076_slack_delivery_recovery_followup.sql` adds indexes for recoverable share receipts, targeted subscription/window cleanup, and child reservations, plus a cursor and index for bounded bulk cleanup. Applied migrations remain unchanged. The preflight also supports upgrades before 0068 and creates its expression lookup index before repairing shares.
+`0075_slack_delivery_recovery.sql` and `0076_slack_delivery_recovery_followup.sql` remain historical migrations for
+enqueue counters, cleanup cursors, and recovery indexes. The migration runner no longer reconstructs legacy share
+identities or performs compatibility repairs outside migrations.
 
 `0077_slack_recovery_query_indexes.sql` adds a partial index on pending, never-attempted digest children for orphan reservation discovery. It is an index-only forward migration; it does not backfill or revive work. Apply it under the same pause, disabled-validation, backup, 16-minute drain, deployment, and verification sequence below.
 
 `0078_slack_delivery_recovery_repairs.sql` establishes missing recovery deadlines for already-enqueued Round 2-owned channel receipts, including legacy IDs on initialized mappings. It preserves completed/suppressed receipts, scope pauses, fresh claims, existing schedules, retry budgets, and explicit repair signatures. Apply it before deploying the Worker using the queue pause, validation disable, backup, and 16-minute drain sequence below. Verify the repaired rows before restoring flags and delivery.
 
-Validation rollback intentionally holds initialized mappings and all their channel events. Initialization persists, backlog and recovery markers remain, and held work is excluded from runnable health counts. Uninitialized mappings retain legacy delivery. Re-enabling validation and synchronizing configuration resumes held work without resetting budgets; uncertain sends require reconciliation. During release verification, monitor recovery, scope-pause, enqueue-failure, and exhaustion telemetry. Confirm obsolete unfurls stop redriving and resumed delivery produces no duplicate sends.
+`0079_slack_verified_recovery.sql` adds fixed-window history progress, installation/generation/method cooldowns,
+and a partial recovery index beginning with `subscription_id`. It requires verified identity authorization and drops
+the obsolete token table. It does not backfill, convert, or replay historical records. Historical migrations and
+compatibility columns remain; the runtime no longer reads initialization or migration-state columns.
 
-The updated maintenance pass repairs up to 50 channel outbox rows and 50 proven identity candidates,
-even while delivery flags are disabled. Pending Activity work becomes enqueueable; sending work
-receives a reconciliation deadline with its send evidence intact. Authentication failures defer
-identity recovery. Explicit malformed identities, uncertain ephemeral responses, active claims,
-scope pauses, changed identities, and notifications without an explicit repair signature stay intact.
-Digest cleanup examines at most 200 events per call and advances a durable global cursor that wraps. Authorization cleanup continues while channel validation is disabled. It expires events older than the latest closed digest window, preserving active claims and uncertain sends. Schedule edits preserve eligible overlapping events for replacement receipts.
+Slack has not been deployed. Apply the full forward migration chain before its first deployment, keeping production
+flags off until deployment is separately verified. Validation disabled holds all channel delivery; enabling it
+resumes the saved backlog without spending another retry. Mapping revalidation runs independently when enabled.
 
-Repair categories and recovery stages run independently; failures retain deadlines for subsequent maintenance passes. Retired roots with unattempted pending children are repaired only without uncertain sends or fresh competing claims. Historical suppressed events are not automatically revived. Share budgets start at the first eligible enqueue or recovery pass, exclude authentication and scope pauses, and preserve the eight-redrive limit across credential recovery. Bulk status reads do not acquire delivery claims or clean up events. During normal processing, accepted pending share receipts with old attempt timestamps are normalized under the receipt and outbox version fences; their clocks and retry counts are preserved. NULL-state attempt evidence and existing blocked uncertain sends remain protected. Obsolete digest roots release safe child reservations without suppressing their events; permanent denial and exhaustion retain terminal suppression.
+Maintenance queues uncertain delivery, with at most one history page per invocation. Owner Verify and Repair each
+process one batch of at most five receipts and five history calls within twenty seconds. Continue verification uses
+a mapping token and fixed pass boundary. Incomplete searches retain their fixed window, timestamp progress, and
+candidate match. Permanent or ambiguous results block automatic polling; authentication and supported scope errors
+pause recovery. Transient errors retain retry deadlines. Honor `retryAt` and persisted method cooldowns before
+continuing. Never resend uncertain messages.
 
-Inspect `slack.legacy.repair` for bounded repair counts, remaining explicit candidates, and rows with
-nonzero enqueue-failure counts. Inspect `slack.digest.cleanup` and `slack.bulk.cleanup` for examined and retired event counts. Monitor `slack.legacy.repair_failed`, recovery-stage failures, stranded counts, enqueue failures, and queue errors over subsequent passes.
+Inspect digest/bulk cleanup, recovery-stage failures, stranded counts, enqueue failures, and queue errors. Obsolete
+installation-generation retirement uses `slack.delivery.retired` structured logging rather than a delivery failure
+for every retired receipt.
+
 `outbox.slack_enqueue_failure_count` drives enqueue backoff and persistent failure alerts;
 `outbox.attempts` remains the scheduling version. A cached destination error preserves work until
 revalidation; a fresh permanent destination failure retires unsent work in all three delivery modes.

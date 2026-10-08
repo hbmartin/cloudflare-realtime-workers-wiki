@@ -1,3 +1,4 @@
+import { type HistoryVerificationOptions } from "./slack-history";
 import { mappingDeliveryPauseSql, slackDeliveryFeatures, type DeliveryOutcome } from "./slack-delivery-contracts";
 import { logger } from "./observability";
 import {
@@ -5,6 +6,8 @@ import {
   definiteSlackRejection,
   invalidSlackDestination,
   recordDeliveryError,
+  recordSecondarySlackError,
+  withSlackPrimaryError,
   recordPermanentDeliveryFailure,
 } from "./slack-delivery";
 import { DeliveryInProgressError } from "./notifications";
@@ -30,11 +33,21 @@ async function reconcileClaimedChannelPost(
   channelId: string,
   attemptedAt: number | null,
   token: string,
+  options: HistoryVerificationOptions = {},
 ): Promise<DeliveryOutcome> {
-  const ts =
+  const result =
     attemptedAt === null
-      ? null
-      : await reconcileBotPost(env, installation, channelId, `channel:${eventId}`, attemptedAt);
+      ? { status: "missing" as const }
+      : await reconcileBotPost(env, installation, channelId, `channel:${eventId}`, attemptedAt, undefined, {
+          ...options,
+          fence: {
+            sql: `EXISTS(SELECT 1 FROM slack_channel_events WHERE id=? AND claim_token=?
+      AND installation_generation=? AND delivery_channel_id=? AND attempted_at IS ?)`,
+            binds: [eventId, token, installation.generation, channelId, attemptedAt],
+          },
+        });
+  if (result.status === "incomplete") return "uncertain";
+  const ts = result.status === "confirmed" ? result.ts : null;
   const saved = await env.DB.prepare(`UPDATE slack_channel_events SET round2_state=?,message_ts=?,
     delivered_at=CASE WHEN ? IS NOT NULL THEN ? ELSE delivered_at END
     WHERE id=? AND claim_token=? AND delivered_at IS NULL AND installation_generation=?
@@ -47,7 +60,11 @@ async function reconcileClaimedChannelPost(
 }
 
 // History verification is independent of delivery flags and current mapping pauses.
-export async function reconcileSlackChannelEvent(env: Env, eventId: string): Promise<DeliveryOutcome> {
+export async function reconcileSlackChannelEvent(
+  env: Env,
+  eventId: string,
+  options: HistoryVerificationOptions = {},
+): Promise<DeliveryOutcome> {
   const token = crypto.randomUUID();
   const checkpoint = await env.DB.prepare(`UPDATE slack_channel_events SET claim_token=?,claimed_at=?
     WHERE id=? AND delivered_at IS NULL AND (claimed_at IS NULL OR claimed_at<=?)
@@ -78,6 +95,12 @@ export async function reconcileSlackChannelEvent(env: Env, eventId: string): Pro
           WHERE id=? AND generation=? AND disconnected_at IS NULL)`)
         .bind(Date.now(), eventId, token, checkpoint.installation_id, checkpoint.installation_generation)
         .run();
+      if (retired.meta.changes)
+        logger.info("slack.delivery.retired", "slack", "Retired obsolete installation work.", {
+          eventId,
+          installationId: checkpoint.installation_id,
+          generation: checkpoint.installation_generation,
+        });
       return retired.meta.changes ? "completed" : "paused";
     }
     try {
@@ -88,6 +111,7 @@ export async function reconcileSlackChannelEvent(env: Env, eventId: string): Pro
         checkpoint.delivery_channel_id,
         checkpoint.attempted_at,
         token,
+        options,
       );
     } catch (error) {
       try {
@@ -204,11 +228,17 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
     if (!row) return;
     const installation = await round2Installation(env, row.installation_id, row.generation);
     if (!installation) {
-      await env.DB.prepare(
+      const retired = await env.DB.prepare(
         `UPDATE slack_channel_events SET round2_state='retired',delivered_at=? WHERE id=? AND claim_token=? AND NOT EXISTS(SELECT 1 FROM slack_installations WHERE id=? AND generation=? AND disconnected_at IS NULL)`,
       )
         .bind(Date.now(), eventId, token, row.installation_id, row.generation)
         .run();
+      if (retired.meta.changes)
+        logger.info("slack.delivery.retired", "slack", "Retired obsolete installation work.", {
+          eventId,
+          installationId: row.installation_id,
+          generation: row.generation,
+        });
       return;
     }
     const id = `channel:${eventId}`;
@@ -373,12 +403,16 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       await finish(posted.ts);
     } catch (error) {
       if (!dispatched)
-        await env.DB.prepare(`UPDATE slack_channel_events SET round2_state='pending',attempted_at=NULL
+        await withSlackPrimaryError(error, "rewind", { eventId }, () =>
+          env.DB.prepare(`UPDATE slack_channel_events SET round2_state='pending',attempted_at=NULL
         WHERE id=? AND claim_token=? AND round2_state='sending'`)
-          .bind(eventId, token)
-          .run();
+            .bind(eventId, token)
+            .run(),
+        );
       if (error instanceof SlackDispatchSkippedError) return;
-      await recordDeliveryError(env, installation, error, destination.subscriptionId, destination.channelId);
+      await withSlackPrimaryError(error, "record", { eventId }, () =>
+        recordDeliveryError(env, installation, error, destination.subscriptionId, destination.channelId),
+      );
       if (error instanceof SlackApiError && error.code === "msg_too_long") {
         await recordPermanentDeliveryFailure(
           env,
@@ -396,27 +430,31 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
         return;
       }
       if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
-        await env.DB.prepare(
-          `UPDATE slack_channel_events SET round2_state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,
-        )
-          .bind(eventId, token)
-          .run();
+        await withSlackPrimaryError(error, "rewind", { eventId }, () =>
+          env.DB.prepare(
+            `UPDATE slack_channel_events SET round2_state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,
+          )
+            .bind(eventId, token)
+            .run(),
+        );
       }
       throw error;
     }
   } catch (error) {
-    const installation = await env.DB.prepare(
-      "SELECT i.* FROM slack_installations i JOIN slack_channel_subscriptions m ON m.installation_id=i.id JOIN slack_channel_events e ON e.subscription_id=m.id WHERE e.id=? AND e.claim_token=? AND i.generation=e.installation_generation",
-    )
-      .bind(eventId, token)
-      .first<SlackInstallation>();
-    if (installation) await recordDeliveryError(env, installation, error);
+    await recordSecondarySlackError("lookup", { eventId }, async () => {
+      const installation = await env.DB.prepare(
+        "SELECT i.* FROM slack_installations i JOIN slack_channel_subscriptions m ON m.installation_id=i.id JOIN slack_channel_events e ON e.subscription_id=m.id WHERE e.id=? AND e.claim_token=? AND i.generation=e.installation_generation",
+      )
+        .bind(eventId, token)
+        .first<SlackInstallation>();
+      if (installation) await recordDeliveryError(env, installation, error);
+    });
     throw error;
   } finally {
-    await env.DB.prepare(
-      `UPDATE slack_channel_events SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`,
-    )
-      .bind(eventId, token)
-      .run();
+    await recordSecondarySlackError("release", { eventId }, () =>
+      env.DB.prepare(`UPDATE slack_channel_events SET claim_token=NULL,claimed_at=NULL WHERE id=? AND claim_token=?`)
+        .bind(eventId, token)
+        .run(),
+    );
   }
 }
