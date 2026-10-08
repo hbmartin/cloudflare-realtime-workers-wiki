@@ -1,5 +1,6 @@
 import { build, context } from "esbuild";
 import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
@@ -20,8 +21,8 @@ async function writeBundle(result) {
   const style = result.outputFiles.find((file) => file.path.endsWith(".css"));
   if (!script || !style) throw new Error("The plugin UI script or stylesheet is missing.");
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="noteflare-plugin-ui" content="0.1.0"><title>NoteFlare</title><style>${style.text}</style></head><body><div id="root"></div><script type="module">${script.text.replaceAll("</script", "<\\/script")}</script></body></html>`;
-  await mkdir(new URL("../public/plugin-ui/", import.meta.url), { recursive: true });
-  await writeFile(new URL("../public/plugin-ui/noteflare.html", import.meta.url), html);
+  await mkdir(join(root, "public/plugin-ui"), { recursive: true });
+  await writeFile(join(root, "public/plugin-ui/noteflare.html"), html);
   process.stdout.write(`NoteFlare plugin UI: ${Buffer.byteLength(html)} bytes, scripts and styles bundled.\n`);
 }
 if (process.argv.includes("--watch")) {
