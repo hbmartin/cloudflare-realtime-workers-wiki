@@ -5,7 +5,6 @@ import { localStorageColorSchemeManager, MantineProvider } from "@mantine/core";
 import { App } from "./App";
 import "./styles.css";
 
-/** @expected-unused -- Loaded through the feature-gated dynamic import in startup.tsx. */
 export default function SupportedApp() {
   return (
     <MantineProvider
