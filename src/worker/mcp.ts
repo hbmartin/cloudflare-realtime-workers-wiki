@@ -753,7 +753,7 @@ async function listPagesTool(
       AND (?='' OR p.position>? OR (p.position=? AND p.id>?))
       AND p.id NOT IN (
         WITH RECURSIVE hidden(id) AS (
-          SELECT page_id FROM page_import_sources WHERE source_role='table_row_detail'
+          SELECT page_id FROM page_import_sources WHERE source_role='table_row_detail' AND page_id IS NOT NULL
           UNION SELECT page_id FROM table_row_pages
           UNION ALL SELECT child.id FROM pages child JOIN hidden ON child.parent_id=hidden.id
         ) SELECT id FROM hidden

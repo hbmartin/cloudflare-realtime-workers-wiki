@@ -276,8 +276,11 @@ against an ordinary message event by its reply timestamp. Conversion accepts at 
 nodes before the existing 32 KiB comment validation. Unknown mentions remain plain text. Delivery rechecks current
 authority; disconnect invalidates queued work and requires identity verification and mirror opt-in after reconnect.
 
-Outbound posts carry an opaque delivery marker. A lost response or abandoned send is reconciled against at most 20
-history pages of 100 messages. Replies waiting for an earlier delivery stay pending; Settings shows waiting and
+Outbound posts carry an opaque delivery marker. A lost response or abandoned send stays pending through a
+60-second settle window from the send attempt. History verification starts after that window, processing one page
+of up to 100 messages per invocation and persisting progress in `slack_history_verifications` without a fixed total
+page cap. The search window is then fixed and timestamp pagination resumes across invocations. Replies waiting
+for an earlier delivery stay pending; Settings shows waiting and
 unresolved reconciliation separately. An uncertain send is never blindly reposted. Do not reset a `sending` record
 to `pending`: Slack may already have accepted it. Installation authentication outages and failed history lookups pause
 the reconciliation clock. After 24 eligible hours without confirmation, an uncertain reply is skipped and later
@@ -319,7 +322,10 @@ recheck current identity, membership, mapping, and page permissions when delayed
 saved modal state do not grant access. Owners may create a replacement share privately from a revoked pinned reference; its old public URL stays revoked.
 
 Before first Slack deployment, apply all forward migrations through `0079_slack_verified_recovery.sql` and
-configure `SLACK_DIGEST_DEFAULT_TIMEZONE` for new mappings. The migration adds persisted history progress,
+configure `SLACK_DIGEST_DEFAULT_TIMEZONE` for new mappings. Follow the
+[Slack review follow-up migration procedure](DEPLOYMENT.md#slack-review-follow-up-migration): pause queue delivery,
+disable validation, wait 16 minutes for existing invocations to drain, export D1, then apply migrations and deploy
+while delivery remains paused through verification. The migration adds persisted history progress,
 method cooldowns, mapping recovery indexes, and verified-only authorization; it drops link tokens without converting
 or replaying historical Slack records. Deployment and production activation are separate from code preparation.
 Channel revalidation runs independently when validation is enabled. Saved schedules and delivery fences remain intact.
@@ -425,4 +431,5 @@ Disabling channel validation holds all channel and digest delivery. Backlog and 
 excluded from runnable health counts. Enabling validation resumes the backlog without spending another retry.
 Verify and Repair process one bounded batch: at most five receipts, five history calls, and twenty seconds.
 Responses report checked, confirmed, blocked, pending, and paused work, with `nextCursor` and `retryAt` for
-continued verification. Incomplete searches retain timestamp progress and their fixed search window.
+continued verification. Recent uncertain sends remain incomplete through the 60-second settle window without
+making history calls. After settling, incomplete searches retain timestamp progress and their fixed search window.

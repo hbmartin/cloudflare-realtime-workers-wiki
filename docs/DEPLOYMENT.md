@@ -452,8 +452,11 @@ resumes the saved backlog without spending another retry. Mapping revalidation r
 
 Maintenance queues uncertain delivery, with at most one history page per invocation. Owner Verify and Repair each
 process one batch of at most five receipts and five history calls within twenty seconds. Continue verification uses
-a mapping token and fixed pass boundary. Incomplete searches retain their fixed window, timestamp progress, and
-candidate match. Permanent or ambiguous results block automatic polling; authentication and supported scope errors
+a mapping token and fixed pass boundary. Uncertain sends remain incomplete through a 60-second settle window
+from the send attempt without making history calls. After settling, the first scan fixes the search window;
+incomplete searches retain that window, timestamp progress, and candidate match without a fixed total page cap.
+Earlier incomplete searches whose upper bound does not extend beyond the settle window restart before scanning.
+Permanent or ambiguous results block automatic polling; authentication and supported scope errors
 pause recovery. Transient errors retain retry deadlines. Honor `retryAt` and persisted method cooldowns before
 continuing. Never resend uncertain messages.
 

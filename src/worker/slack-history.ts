@@ -34,6 +34,7 @@ type Progress = {
   revision: string;
 };
 const timestamp = /^\d+\.\d+$/;
+const POST_SETTLE_MS = 60_000;
 // Slack timestamps are decimal strings. Avoid float rounding at microsecond boundaries.
 function compare(a: string, b: string) {
   const [as, af = ""] = a.split(".");
@@ -62,10 +63,14 @@ async function searchHistoryPage(
     .first<Progress>();
   if (progress?.status === "confirmed" && progress.candidate_ts)
     return { status: "confirmed", ts: progress.candidate_ts };
-  if (!progress || progress.status !== "incomplete") {
+  const now = Date.now();
+  const settleAt = attemptedAt + POST_SETTLE_MS;
+  // A timed-out post can still arrive. Freeze the history window only after it settles.
+  if (now <= settleAt) return { status: "incomplete" };
+  if (!progress || progress.status !== "incomplete" || compare(progress.latest, (settleAt / 1000).toFixed(6)) <= 0) {
     progress = {
       oldest: ((attemptedAt - 5000) / 1000).toFixed(6),
-      latest: (Date.now() / 1000).toFixed(6),
+      latest: (now / 1000).toFixed(6),
       boundary: null,
       candidate_ts: null,
       status: "incomplete",

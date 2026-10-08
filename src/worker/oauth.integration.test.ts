@@ -2100,6 +2100,9 @@ describe("ChatGPT plugin contracts", () => {
 
   it("paginates roots without duplicates and rejects cursors or parents from another destination", async () => {
     const connection = await connect(await bootstrap());
+    await env.DB.prepare(
+      "INSERT INTO page_import_sources(page_id,source_path,source_role,created_at) VALUES (NULL,'missing-table-row','table_row_detail',1)",
+    ).run();
     const ids = Array.from({ length: 55 }, () => crypto.randomUUID());
     await env.DB.batch(
       ids.map((id, index) =>
@@ -2177,11 +2180,15 @@ describe("ChatGPT plugin contracts", () => {
       env.DB.prepare(
         "INSERT INTO page_import_sources(page_id,source_path,source_role,created_at) VALUES (?,'table-row','table_row_detail',1)",
       ).bind(detail),
+      env.DB.prepare(
+        "INSERT INTO page_import_sources(page_id,source_path,source_role,created_at) VALUES (NULL,'missing-table-row','table_row_detail',1)",
+      ),
     ]);
     const roots = pagesResultSchema.parse(
       (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId })).result.structuredContent,
     );
     expect(roots.pages.some((page) => page.id === detail || page.id === staged)).toBe(false);
+    expect(roots.pages.map((page) => page.id)).toContain(connection.page.id);
     const hiddenChildren = pagesResultSchema.parse(
       (await toolCall(connection.token, "list_pages", { space_id: connection.page.spaceId, parent_id: detail })).result
         .structuredContent,
