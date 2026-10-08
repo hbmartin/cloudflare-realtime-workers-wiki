@@ -1,6 +1,11 @@
 allowBuilds:
   esbuild: true
   workerd: true
+overrides:
+  # BlockNote, Tiptap, and Yjs must share ProseMirror class identities.
+  prosemirror-model: 1.25.12
+  prosemirror-transform: 1.12.2
+  prosemirror-view: 1.42.6
 minimumReleaseAgeExclude:
   - "@better-auth/core@1.6.28"
   - "@better-auth/drizzle-adapter@1.6.28"
