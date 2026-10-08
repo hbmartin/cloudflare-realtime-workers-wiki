@@ -56,6 +56,41 @@ function installDocumentBlocks(document: Y.Doc, ...containers: Y.XmlElement[]) {
   fragment.insert(0, [group]);
 }
 
+const protectedOperationId = "mcp:v2:response-grant:protected-operation";
+const protectedInputHash = "a".repeat(64);
+
+function protectedMutation(userId: string, overrides: Record<string, unknown> = {}) {
+  return new Request("https://document.internal/api-mutate", {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+    body: JSON.stringify({
+      actorId: userId,
+      operationId: protectedOperationId,
+      mcpInputHash: protectedInputHash,
+      operations: [
+        {
+          type: "append_children",
+          children: [
+            {
+              type: "blockContainer",
+              attrs: { id: "protected-block" },
+              content: [{ type: "paragraph", content: [{ type: "text", text: "Protected append" }] }],
+            },
+          ],
+        },
+      ],
+      ...overrides,
+    }),
+  });
+}
+
+function protectedLookup(hash?: unknown, operationId = protectedOperationId) {
+  const url = new URL("https://document.internal/api-mutate-receipt");
+  url.searchParams.set("operationId", operationId);
+  if (hash !== undefined && hash !== null) url.searchParams.set("mcpInputHash", String(hash));
+  return new Request(url, { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } });
+}
+
 beforeEach(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
   await env.DB.batch([env.DB.prepare("DELETE FROM workspaces"), env.DB.prepare("DELETE FROM user")]);
@@ -366,4 +401,208 @@ describe("document mutation response barriers", () => {
       }
     });
   });
+});
+
+describe("protected MCP operation identity", () => {
+  it.each([undefined, null, 123, "A".repeat(64), "a".repeat(63)])(
+    "requires a lowercase SHA-256 input identity: %s",
+    async (hash) => {
+      const installed = await fixture();
+      const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+      await stub.fetch(internalWarmupRequest());
+      await runInDurableObject(stub, async (instance, state) => {
+        const room = instance as unknown as TestDocument;
+        for (const request of [protectedMutation(installed.userId, { mcpInputHash: hash }), protectedLookup(hash)]) {
+          const rejected = await room.onRequest(request);
+          expect(rejected.status).toBe(409);
+          expect(await rejected.json()).toEqual({ error: "operation_id_reused" });
+        }
+        expect(room.document.getMap("api-operation-receipts").size).toBe(0);
+        expect(state.storage.sql.exec("SELECT * FROM api_operation_inputs").toArray()).toEqual([]);
+      });
+    },
+  );
+
+  it("returns the original revision after later edits, compaction and restart", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    let sequence = 0;
+    await runInDurableObject(stub, async (instance, state) => {
+      const room = instance as unknown as TestDocument;
+      const written = await room.onRequest(protectedMutation(installed.userId));
+      expect(written.status).toBe(200);
+      sequence = (await written.json<{ sequence: number }>()).sequence;
+      expect(state.storage.sql.exec("SELECT * FROM api_operation_inputs").toArray()).toEqual([
+        { operation_id: protectedOperationId, input_hash: protectedInputHash, sequence },
+      ]);
+      const group = room.document.getXmlFragment("document-store").get(0) as Y.XmlElement;
+      group.insert(group.length, [documentBlock("later-edit", "Later edit").container]);
+      await room.compact();
+      expect(
+        state.storage.sql.exec<{ snapshot_seq: number }>("SELECT snapshot_seq FROM document_meta").one().snapshot_seq,
+      ).toBeGreaterThan(sequence);
+      expect(state.storage.sql.exec("SELECT * FROM update_events").toArray()).toEqual([]);
+      for (const request of [protectedLookup(protectedInputHash), protectedMutation(installed.userId)]) {
+        const replay = await room.onRequest(request);
+        expect(replay.status).toBe(200);
+        expect((await replay.json<{ sequence: number }>()).sequence).toBe(sequence);
+      }
+      expect(group.length).toBe(2);
+    });
+    await abortAllDurableObjects();
+    const restarted = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    const replay = await restarted.fetch(protectedLookup(protectedInputHash));
+    expect(replay.status).toBe(200);
+    expect((await replay.json<{ sequence: number }>()).sequence).toBe(sequence);
+  });
+
+  it("rejects missing or changed identities for a committed receipt", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    expect((await stub.fetch(protectedMutation(installed.userId))).status).toBe(200);
+    for (const hash of [undefined, "b".repeat(64)]) {
+      for (const request of [protectedLookup(hash), protectedMutation(installed.userId, { mcpInputHash: hash })]) {
+        const rejected = await stub.fetch(request);
+        expect(rejected.status).toBe(409);
+        expect(await rejected.json()).toEqual({ error: "operation_id_reused" });
+      }
+    }
+    const changedOperations = await stub.fetch(
+      protectedMutation(installed.userId, { operations: [{ type: "delete_block", internalId: "protected-block" }] }),
+    );
+    expect(changedOperations.status).toBe(409);
+    expect(await changedOperations.json()).toEqual({ error: "idempotency_key_reused" });
+  });
+
+  it.each(["identity", "receipt"])("rejects one-sided %s loss instead of treating it as absent", async (lost) => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    expect((await stub.fetch(protectedMutation(installed.userId))).status).toBe(200);
+    await runInDurableObject(stub, async (instance, state) => {
+      const room = instance as unknown as TestDocument;
+      if (lost === "identity") state.storage.sql.exec("DELETE FROM api_operation_inputs");
+      else room.document.getMap("api-operation-receipts").delete(protectedOperationId);
+      for (const request of [protectedLookup(protectedInputHash), protectedMutation(installed.userId)]) {
+        const rejected = await room.onRequest(request);
+        expect(rejected.status).toBe(409);
+        expect(await rejected.json()).toEqual({ error: "operation_receipt_unverifiable" });
+      }
+      expect((room.document.getXmlFragment("document-store").get(0) as Y.XmlElement).length).toBe(1);
+      expect((await room.onRequest(protectedLookup(protectedInputHash, "mcp:v2:response-grant:absent"))).status).toBe(
+        404,
+      );
+    });
+  });
+
+  it("does not downgrade a protected receipt inherited by version restore", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    expect((await stub.fetch(protectedMutation(installed.userId))).status).toBe(200);
+    const version = await env.DB.prepare("SELECT id FROM page_versions WHERE page_id=? ORDER BY created_at DESC")
+      .bind(installed.pageId)
+      .first<{ id: string }>();
+    expect(version).not.toBeNull();
+    const restored = await stub.fetch(
+      new Request("https://document.internal/restore-version", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+        body: JSON.stringify({ versionId: version!.id, userId: installed.userId }),
+      }),
+    );
+    expect(restored.status).toBe(200);
+    const current = env.DOCUMENT.getByName(`${installed.pageId}~2`);
+    for (const request of [protectedLookup(protectedInputHash), protectedMutation(installed.userId)]) {
+      const rejected = await current.fetch(request);
+      expect(rejected.status).toBe(409);
+      expect(await rejected.json()).toEqual({ error: "operation_receipt_unverifiable" });
+    }
+  });
+
+  it("rolls back identity and update logging together, then flushes retained work on lookup", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance, state) => {
+      const room = instance as unknown as TestDocument;
+      state.storage.sql.exec(`CREATE TRIGGER reject_operation_input BEFORE INSERT ON api_operation_inputs
+        BEGIN SELECT RAISE(ABORT, 'identity storage unavailable'); END`);
+      await expect(room.onRequest(protectedMutation(installed.userId))).rejects.toThrow("identity storage unavailable");
+      expect(state.storage.sql.exec("SELECT * FROM update_events").toArray()).toEqual([]);
+      expect(state.storage.sql.exec("SELECT * FROM update_chunks").toArray()).toEqual([]);
+      expect(state.storage.sql.exec("SELECT * FROM api_operation_inputs").toArray()).toEqual([]);
+      state.storage.sql.exec("DROP TRIGGER reject_operation_input");
+      const recovered = await room.onRequest(protectedLookup(protectedInputHash));
+      expect(recovered.status).toBe(200);
+      const { sequence } = await recovered.json<{ sequence: number }>();
+      expect(state.storage.sql.exec("SELECT sequence FROM api_operation_inputs").one()).toEqual({ sequence });
+      expect((await room.onRequest(protectedMutation(installed.userId))).status).toBe(200);
+      expect((room.document.getXmlFragment("document-store").get(0) as Y.XmlElement).length).toBe(1);
+    });
+  });
+
+  it("retries once after restart discards an uncommitted flush", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance, state) => {
+      const room = instance as unknown as TestDocument;
+      state.storage.sql.exec(`CREATE TRIGGER reject_operation_input BEFORE INSERT ON api_operation_inputs
+        BEGIN SELECT RAISE(ABORT, 'identity storage unavailable'); END`);
+      await expect(room.onRequest(protectedMutation(installed.userId))).rejects.toThrow("identity storage unavailable");
+    });
+    await abortAllDurableObjects();
+    const restarted = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    expect((await restarted.fetch(protectedLookup(protectedInputHash))).status).toBe(404);
+    await runInDurableObject(restarted, async (_instance, state) => {
+      state.storage.sql.exec("DROP TRIGGER reject_operation_input");
+    });
+    expect((await restarted.fetch(protectedMutation(installed.userId))).status).toBe(200);
+    await runInDurableObject(restarted, async (instance, state) => {
+      const room = instance as unknown as TestDocument;
+      expect((room.document.getXmlFragment("document-store").get(0) as Y.XmlElement).length).toBe(1);
+      expect(state.storage.sql.exec("SELECT * FROM api_operation_inputs").toArray()).toHaveLength(1);
+    });
+  });
+
+  it("recovers a durable identity after response compaction fails and the room restarts", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    let sequence = 0;
+    await runInDurableObject(stub, async (instance, state) => {
+      const room = instance as unknown as TestDocument;
+      const compact = vi.spyOn(room, "compact").mockRejectedValueOnce(new Error("Snapshot unavailable"));
+      try {
+        await expect(room.onRequest(protectedMutation(installed.userId))).rejects.toThrow("Snapshot unavailable");
+        sequence = state.storage.sql
+          .exec<{ sequence: number }>("SELECT sequence FROM api_operation_inputs")
+          .one().sequence;
+        expect(state.storage.sql.exec("SELECT * FROM update_events").toArray()).toHaveLength(1);
+      } finally {
+        compact.mockRestore();
+      }
+    });
+    await abortAllDurableObjects();
+    const restarted = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    const recovered = await restarted.fetch(protectedLookup(protectedInputHash));
+    expect(recovered.status).toBe(200);
+    expect((await recovered.json<{ sequence: number }>()).sequence).toBe(sequence);
+    expect((await restarted.fetch(protectedMutation(installed.userId))).status).toBe(200);
+  });
+
+  it.each([{ expectedSequence: 1 }, { operations: [{ type: "delete_block", internalId: "missing-block" }] }])(
+    "leaves no receipt identity for a rejected mutation: %j",
+    async (overrides) => {
+      const installed = await fixture();
+      const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+      const rejected = await stub.fetch(protectedMutation(installed.userId, overrides));
+      expect([404, 409]).toContain(rejected.status);
+      await runInDurableObject(stub, async (instance, state) => {
+        const room = instance as unknown as TestDocument;
+        expect(room.document.getMap("api-operation-receipts").has(protectedOperationId)).toBe(false);
+        expect(state.storage.sql.exec("SELECT * FROM api_operation_inputs").toArray()).toEqual([]);
+      });
+    },
+  );
 });

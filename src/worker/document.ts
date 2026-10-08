@@ -511,6 +511,7 @@ export class Document extends YServer {
   private readonly bindings: Env;
   private metadata!: MetaRow;
   private pendingUpdates: Uint8Array[] = [];
+  private pendingOperationInputs = new Map<string, string>();
   private pendingAuthorId: string | null = null;
   private pendingMentionActors = new Map<string, string | null>();
   private mentionTracker: MentionTargetTracker | null = null;
@@ -614,6 +615,11 @@ export class Document extends YServer {
       target_user_id TEXT PRIMARY KEY,
       seq INTEGER NOT NULL,
       actor_id TEXT
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS api_operation_inputs (
+      operation_id TEXT PRIMARY KEY,
+      input_hash TEXT NOT NULL,
+      sequence INTEGER NOT NULL
     )`);
     sql.exec(`CREATE TABLE IF NOT EXISTS restore_recovery (
       id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -952,9 +958,17 @@ export class Document extends YServer {
       const responseMode = url.searchParams.get("responseMode") ?? "content";
       if (responseMode !== "content" && responseMode !== "receipt")
         return Response.json({ error: "Invalid response mode." }, { status: 400 });
+      this.flushPendingUpdates();
+      const input = this.apiOperationInput(operationId, url.searchParams.get("mcpInputHash"));
+      if (input instanceof Response) return input;
       if (!this.document.getMap<string>("api-operation-receipts").has(operationId))
         return Response.json({ found: false }, { status: 404 });
-      return this.apiMutationResponse({ operationId, receiptOnly: responseMode === "receipt", found: true });
+      return this.apiMutationResponse({
+        operationId,
+        receiptOnly: responseMode === "receipt",
+        found: true,
+        committedSequence: input?.sequence,
+      });
     }
     if (request.method === "POST" && url.pathname.endsWith("/api-mutate")) {
       if (this.metadata.content_kind !== "document") {
@@ -968,6 +982,7 @@ export class Document extends YServer {
         expectedSequence?: unknown;
         slackProductSessionId?: unknown;
         responseMode?: unknown;
+        mcpInputHash?: unknown;
       };
       try {
         body = await request.json();
@@ -1042,6 +1057,8 @@ export class Document extends YServer {
       )
         return Response.json({ error: "revision_changed" }, { status: 409 });
       const receipts = operationId ? this.document.getMap<string>("api-operation-receipts") : null;
+      const input = operationId ? this.apiOperationInput(operationId, body.mcpInputHash) : null;
+      if (input instanceof Response) return input;
       if (operationId && receipts?.has(operationId)) {
         if (receipts.get(operationId) !== requestHash)
           return Response.json({ error: "idempotency_key_reused" }, { status: 409 });
@@ -1051,6 +1068,7 @@ export class Document extends YServer {
           authorized,
           forceVersion: true,
           suppressExternalEffects: body.suppressExternalEffects === true,
+          committedSequence: input?.sequence,
         });
       }
       if (
@@ -1104,12 +1122,20 @@ export class Document extends YServer {
         for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(this.document, operation);
         if (operationId && requestHash) receipts!.set(operationId, requestHash);
       }, "api-mutation");
+      if (operationId?.startsWith("mcp:v2:")) this.pendingOperationInputs.set(operationId, body.mcpInputHash as string);
+      this.flushPendingUpdates();
+      const committedSequence = operationId?.startsWith("mcp:v2:")
+        ? this.state.storage.sql
+            .exec<{ sequence: number }>("SELECT sequence FROM api_operation_inputs WHERE operation_id = ?", operationId)
+            .one().sequence
+        : undefined;
       return this.apiMutationResponse({
         operationId,
         receiptOnly: body.responseMode === "receipt",
         authorized,
         forceVersion: true,
         suppressExternalEffects: body.suppressExternalEffects === true,
+        committedSequence,
       });
     }
     if (request.method === "GET" && url.pathname.endsWith("/legacy-comments")) {
@@ -1310,6 +1336,7 @@ export class Document extends YServer {
       this.purged = true;
       this.metadata.retired = 1;
       this.pendingUpdates = [];
+      this.pendingOperationInputs.clear();
       this.pendingAuthorId = null;
       this.pendingMentionActors.clear();
       this.pendingNotifyEdit = false;
@@ -1327,6 +1354,24 @@ export class Document extends YServer {
     return Response.json({ error: "This document version has been retired." }, { status: 410 });
   }
 
+  private apiOperationInput(operationId: string, expectedHash: unknown) {
+    // v2 proves identity outside client-writable Yjs; missing proofs never become legacy replay.
+    if (!operationId.startsWith("mcp:v2:")) return null;
+    if (typeof expectedHash !== "string" || !/^[a-f0-9]{64}$/.test(expectedHash))
+      return Response.json({ error: "operation_id_reused" }, { status: 409 });
+    const input = this.state.storage.sql
+      .exec<{ input_hash: string; sequence: number }>(
+        "SELECT input_hash, sequence FROM api_operation_inputs WHERE operation_id = ?",
+        operationId,
+      )
+      .toArray()[0];
+    const receipt = this.document.getMap<string>("api-operation-receipts").has(operationId);
+    if (receipt !== Boolean(input)) return Response.json({ error: "operation_receipt_unverifiable" }, { status: 409 });
+    if (input && input.input_hash !== expectedHash)
+      return Response.json({ error: "operation_id_reused" }, { status: 409 });
+    return input ?? null;
+  }
+
   private async apiMutationResponse(options: {
     operationId: string | null;
     receiptOnly: boolean;
@@ -1334,6 +1379,7 @@ export class Document extends YServer {
     authorized?: () => Promise<unknown>;
     forceVersion?: boolean;
     suppressExternalEffects?: boolean;
+    committedSequence?: number | undefined;
   }) {
     if (this.purged || this.metadata.retired) return this.retiredApiResponse();
     const content = this.captureApiContent(options.receiptOnly);
@@ -1358,7 +1404,13 @@ export class Document extends YServer {
     }
     return Response.json({
       ...(options.found ? { found: true } : {}),
-      ...(options.receiptOnly ? { committed: true, operationId: options.operationId } : content),
+      ...(options.receiptOnly
+        ? {
+            committed: true,
+            operationId: options.operationId,
+            ...(options.committedSequence === undefined ? {} : { sequence: options.committedSequence }),
+          }
+        : { ...content, sequence: options.committedSequence ?? content.sequence }),
     });
   }
 
@@ -1437,6 +1489,14 @@ export class Document extends YServer {
           actorId,
         );
       }
+      for (const [operationId, inputHash] of this.pendingOperationInputs) {
+        this.state.storage.sql.exec(
+          "INSERT INTO api_operation_inputs (operation_id, input_hash, sequence) VALUES (?, ?, ?)",
+          operationId,
+          inputHash,
+          row.seq,
+        );
+      }
       this.state.storage.sql.exec(
         `UPDATE document_meta SET dirty = 1, last_editor_id = COALESCE(?, last_editor_id),
           notify_edit = CASE WHEN ? THEN 1 ELSE notify_edit END WHERE id = 1`,
@@ -1445,6 +1505,7 @@ export class Document extends YServer {
       );
     });
     this.pendingUpdates = [];
+    this.pendingOperationInputs.clear();
     this.pendingAuthorId = null;
     this.pendingMentionActors.clear();
     this.pendingNotifyEdit = false;
