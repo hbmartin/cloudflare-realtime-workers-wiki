@@ -21,6 +21,7 @@ import {
   requirePageEditor,
   spaceForMember,
   editableSpaceForMember,
+  spacesForMember,
   type PageRow,
   type SpaceRow,
 } from "./page-access";
@@ -1686,16 +1687,8 @@ app.delete("/api/members/:id", async (c) => {
 
 app.get("/api/spaces", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  const rows = await c.env.DB.prepare(
-    `SELECT s.*, sm.role space_role FROM spaces s
-      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
-     WHERE s.workspace_id = ?
-       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
-     ORDER BY s.position, s.id`,
-  )
-    .bind(member.user.id, member.workspace.id, member.role)
-    .all<SpaceRow>();
-  return c.json({ spaces: rows.results.map((row) => spaceJson(row, member)) });
+  const rows = await spacesForMember(c.env, member);
+  return c.json({ spaces: rows.map((row) => spaceJson(row, member)) });
 });
 
 app.post("/api/spaces", async (c) => {

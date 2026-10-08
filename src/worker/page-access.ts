@@ -50,6 +50,19 @@ export async function editableSpaceForMember(env: Env, member: MemberContext, sp
   return space;
 }
 
+export async function spacesForMember(env: Env, member: MemberContext) {
+  const rows = await env.DB.prepare(
+    `SELECT s.*, sm.role space_role FROM spaces s
+      LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
+     WHERE s.workspace_id = ?
+       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+     ORDER BY s.position, s.id`,
+  )
+    .bind(member.user.id, member.workspace.id, member.role)
+    .all<SpaceRow>();
+  return rows.results;
+}
+
 export async function pageForMember(env: Env, member: MemberContext, pageId: string, includeArchived = false) {
   const row = await env.DB.prepare(
     `SELECT p.*, s.visibility, sm.role space_role

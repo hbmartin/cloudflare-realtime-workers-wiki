@@ -1,0 +1,74 @@
+{
+  "recordedAt": "2026-10-08T17:52:20.427Z",
+  "model": "gpt-5.4-mini",
+  "scope": "Synthetic next-tool selection; no MCP writes executed; installed ChatGPT acceptance is separate.",
+  "results": [
+    {
+      "id": "search",
+      "passed": false,
+      "status": "blocked",
+      "httpStatus": 429,
+      "errorCode": "credit_balance_exhausted"
+    },
+    {
+      "id": "read",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "discover-destination",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "browse",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "open-ui",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "create",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "guarded-update",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "comment",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "retry",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "unrelated",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "local-draft",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "untrusted-instructions",
+      "passed": false,
+      "status": "not_run"
+    },
+    {
+      "id": "unsupported-table",
+      "passed": false,
+      "status": "not_run"
+    }
+  ]
+}

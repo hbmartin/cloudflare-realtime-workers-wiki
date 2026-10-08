@@ -1,0 +1,30 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "noteflare",
+  "version": "0.1.0",
+  "description": "Search, read, create, and edit your private NoteFlare wiki from ChatGPT.",
+  "author": { "name": "Harold Martin" },
+  "keywords": ["wiki", "notes", "documents"],
+  "extensions": {
+    "com.openai": {
+      "apps": "./.app.json",
+      "onboardingSkill": "./skills/setup/SKILL.md",
+      "interface": {
+        "displayName": "NoteFlare",
+        "shortDescription": "Read and edit your private wiki",
+        "longDescription": "Find wiki knowledge, save notes, update documents, and post comments. Browse and edit Markdown beside your conversation.",
+        "developerName": "Harold Martin",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "brandColor": "#98651A",
+        "composerIcon": "./assets/composer-icon.png",
+        "logo": "./assets/logo.jpg",
+        "defaultPrompt": [
+          "Find notes about this topic in NoteFlare.",
+          "Save a summary of this conversation in NoteFlare.",
+          "Open NoteFlare beside this conversation."
+        ]
+      }
+    }
+  }
+}

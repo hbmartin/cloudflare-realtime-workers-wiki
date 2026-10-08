@@ -7,6 +7,7 @@ Cloudflare Workers Paid, D1, R2, and two SQLite-backed Durable Object classes.
 
 | Task                                                    | Document                                              |
 | ------------------------------------------------------- | ----------------------------------------------------- |
+| Connect ChatGPT to the wiki and pilot the plugin        | [ChatGPT plugin](CHATGPT_PLUGIN.md)                   |
 | Stand up a new installation                             | [Deployment](DEPLOYMENT.md)                           |
 | Deploy automatically on every push to `main`            | [Continuous deployment](CONTINUOUS_DEPLOYMENT.md)     |
 | Look up a variable, secret, binding, or limit           | [Configuration](CONFIGURATION.md)                     |

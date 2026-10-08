@@ -10,8 +10,13 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "json", "json-summary"],
       reportsDirectory: "coverage/unit",
-      include: ["src/client/**/*.{ts,tsx}", "src/shared/**/*.ts", "src/worker/{archive,cleanup,http,r2}.ts"],
-      exclude: ["src/**/*.test.{ts,tsx}", "src/client/main.tsx", "src/client/test-setup.ts"],
+      include: [
+        "src/client/**/*.{ts,tsx}",
+        "src/plugin-ui/**/*.{ts,tsx}",
+        "src/shared/**/*.ts",
+        "src/worker/{archive,cleanup,http,r2}.ts",
+      ],
+      exclude: ["src/**/*.test.{ts,tsx}", "src/client/main.tsx", "src/plugin-ui/main.tsx", "src/client/test-setup.ts"],
       thresholds: {
         lines: 41,
         functions: 30,
