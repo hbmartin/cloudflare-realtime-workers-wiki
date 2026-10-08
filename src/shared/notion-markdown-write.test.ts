@@ -36,6 +36,25 @@ describe("writable Notion Markdown", () => {
     expect(blocks[0]?.content?.[1]?.content?.[0]?.content?.[0]?.type).toBe("bulletListItem");
   });
 
+  it.each(["\n", "\n\n"])("preserves task list state and labels with item separator %j", (separator) => {
+    const blocks = parseWritableMarkdown(`- [x] **done**${separator}- [ ] next\n  - [x] nested\n`);
+    expect(blocks[0]?.content?.[0]).toMatchObject({
+      type: "checkListItem",
+      attrs: { checked: true },
+      content: [{ type: "text", text: "done", marks: [{ type: "bold" }] }],
+    });
+    expect(blocks[1]?.content?.[0]).toMatchObject({
+      type: "checkListItem",
+      attrs: { checked: false },
+      content: [{ type: "text", text: "next" }],
+    });
+    expect(blocks[1]?.content?.[1]?.content?.[0]?.content?.[0]).toMatchObject({
+      type: "checkListItem",
+      attrs: { checked: true },
+      content: [{ type: "text", text: "nested" }],
+    });
+  });
+
   it("parses display math and empty content", () => {
     expect(blockTypes("$$\nx+y\n$$\n")).toEqual(["math"]);
     expect(parseWritableMarkdown(" \n")).toEqual([]);

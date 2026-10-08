@@ -150,6 +150,10 @@ function decodeText(value: string) {
     .trim();
 }
 
+function field(value: string | undefined, max: number) {
+  return decodeText(value ?? "").slice(0, max);
+}
+
 function metadata(html: string) {
   const properties = new Map<string, string>();
   for (const match of html.matchAll(/<meta\b[^>]*>/gi)) {
@@ -161,7 +165,6 @@ function metadata(html: string) {
     if (name && attributes.has("content")) properties.set(name, attributes.get("content")!);
   }
   const documentTitle = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? "";
-  const field = (value: string | undefined, max: number) => decodeText(value ?? "").slice(0, max);
   return {
     title: field(properties.get("og:title") || properties.get("twitter:title") || documentTitle, 200),
     description: field(properties.get("og:description") || properties.get("description"), 500),

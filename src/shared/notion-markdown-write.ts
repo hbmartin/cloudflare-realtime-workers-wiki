@@ -167,11 +167,14 @@ function list(token: Token): ProseMirrorJson[] {
   const tokens = token as Tokens.List;
   if (!Array.isArray(tokens.items)) throw new MarkdownWriteError("Invalid Markdown list.");
   return tokens.items.map((item) => {
-    const own = item.tokens.filter((child) => child.type !== "list");
+    const own = item.tokens.filter((child) => child.type !== "list" && child.type !== "checkbox");
     if (own.length > 1 || own.some((child) => child.type !== "text" && child.type !== "paragraph"))
       throw new MarkdownWriteError("A list item contains blocks that cannot be edited as Markdown.");
     const label = own[0];
-    const content = label && "tokens" in label && Array.isArray(label.tokens) ? inline(label.tokens) : [];
+    const content =
+      label && "tokens" in label && Array.isArray(label.tokens)
+        ? inline(label.tokens.filter((child) => child.type !== "checkbox"))
+        : [];
     const type = item.task ? "checkListItem" : tokens.ordered ? "numberedListItem" : "bulletListItem";
     const node: ProseMirrorJson = {
       type,

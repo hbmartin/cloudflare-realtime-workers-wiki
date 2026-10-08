@@ -11,7 +11,7 @@ identifiers. These deployment names are compatibility details; the product prese
 
 ## 0. Prerequisites
 
-- Node.js 22.18 or later in the Node 22 release line, or Node.js 24.2+, and pnpm 11.18.0.
+- Node.js 22.22.2+ in the Node 22 release line, 24.15+ in the Node 24 release line, or 26+; and pnpm 11.18.0.
 - A **Workers Paid** plan, for production capacity rather than feature access. Workers Free caps
   requests at 100,000 per day and applies a tighter per-invocation CPU limit, and its Durable Object
   and D1 daily row limits are well below what an active workspace uses. SQLite-backed Durable Objects

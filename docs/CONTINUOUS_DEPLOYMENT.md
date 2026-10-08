@@ -210,7 +210,7 @@ allowed 25 minutes. The build image ships no browsers, so Playwright would have 
 inside that same budget. It also has no equivalent of required reviewers, no post-deploy health
 probe, and no way to refuse a commit because a _different_ system's checks failed.
 
-Two version details need attention: the build image defaults to Node 24, which must resolve to 24.2 or
+Two version details need attention: the build image defaults to Node 24, which must resolve to 24.15 or
 newer to satisfy this repository's engine range, and it ships pnpm 10.11.1 rather than the
 `packageManager` pin of pnpm 11.18.0. Node pins cleanly with a `NODE_VERSION` build variable or an
 `.nvmrc`; confirm which pnpm the install step actually resolves before trusting a `--frozen-lockfile`
