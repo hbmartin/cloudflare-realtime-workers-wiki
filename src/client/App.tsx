@@ -72,6 +72,8 @@ import { ThemeCommand, ThemeControl } from "./ThemeControl";
 import { ShareControl } from "./ShareControl";
 import { IntegrationsSettings } from "./IntegrationsSettings";
 import { OAuthConnectionsSettings } from "./OAuthConnectionsSettings";
+import { WritingSettings } from "./WritingSettings";
+import { WritingHistory } from "./WritingHistory";
 import {
   clearRevokedOfflinePages,
   forgetOfflineAccount,
@@ -1585,17 +1587,30 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [view, setView] = useState<
-    "pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings" | "activity"
+    "pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings" | "activity" | "writing"
   >(() => {
     const requested = startupNavigation.current!.view;
     return requested &&
-      ["search", "home", "tasks", "mentions", "templates", "trash", "settings", "activity"].includes(requested)
-      ? (requested as "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings" | "activity")
+      ["search", "home", "tasks", "mentions", "templates", "trash", "settings", "activity", "writing"].includes(
+        requested,
+      )
+      ? (requested as
+          | "search"
+          | "home"
+          | "tasks"
+          | "mentions"
+          | "templates"
+          | "trash"
+          | "settings"
+          | "activity"
+          | "writing")
       : startupNavigation.current!.pageId
         ? "pages"
         : "home";
   });
   const [unreadMentions, setUnreadMentions] = useState(0);
+  const [writingLaunch, setWritingLaunch] = useState<{ pageId: string; count: number } | null>(null);
+  const [writingConversation, setWritingConversation] = useState<{ pageId: string; id: string } | null>(null);
   const [backlinksRevision, setBacklinksRevision] = useState(0);
   const [commentsRevision, setCommentsRevision] = useState(0);
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
@@ -3542,7 +3557,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     refreshTrash();
     setView("trash");
   }
-  function showView(next: "search" | "home" | "tasks" | "mentions" | "templates" | "settings" | "activity") {
+  function showView(
+    next: "search" | "home" | "tasks" | "mentions" | "templates" | "settings" | "activity" | "writing",
+  ) {
     cancelPendingSelection();
     if (next === "templates") void loadOrganization();
     setView(next);
@@ -3940,6 +3957,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             <button className={view === "search" ? "active" : ""} onClick={() => showView("search")}>
               <Icon name="search" /> Search
             </button>
+            <button className={view === "writing" ? "active" : ""} onClick={() => showView("writing")}>
+              <Icon name="page" />
+              My writing
+            </button>
             <button ref={notificationTriggerRef} onClick={openNotifications} aria-label="Inbox" aria-haspopup="dialog">
               <Icon name="inbox" />
               Inbox{" "}
@@ -4133,9 +4154,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             ☰
           </button>
           <div className="breadcrumbs">
-            {view === "home" || view === "tasks" || view === "search" || view === "activity" ? (
+            {view === "home" || view === "tasks" || view === "search" || view === "activity" || view === "writing" ? (
               <span>
-                {view === "home" ? "Home" : view === "tasks" ? "My Tasks" : view === "activity" ? "Activity" : "Search"}
+                {view === "home"
+                  ? "Home"
+                  : view === "tasks"
+                    ? "My Tasks"
+                    : view === "activity"
+                      ? "Activity"
+                      : view === "writing"
+                        ? "My writing"
+                        : "Search"}
               </span>
             ) : (
               breadcrumbs.map((page, index) => (
@@ -4181,6 +4210,16 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                   </button>
                 )}
                 <ActionMenu label="Page actions">
+                  {activeSelected.kind === "document" && (
+                    <button
+                      data-close-menu
+                      onClick={() =>
+                        setWritingLaunch((current) => ({ pageId: activeSelected.id, count: (current?.count ?? 0) + 1 }))
+                      }
+                    >
+                      Writing
+                    </button>
+                  )}
                   {!activeSelected.isTemplate && (
                     <WatchControl
                       key={`watch:${activeSelected.id}`}
@@ -4318,6 +4357,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
             onRestore={restorePage}
             onDelete={permanentlyDeletePage}
           />
+        ) : view === "writing" ? (
+          <main className="utility-view">
+            <WritingHistory
+              onOpen={(conversation) => {
+                setWritingConversation({ pageId: conversation.pageId, id: conversation.id });
+                navigateToPage(conversation.pageId);
+              }}
+            />
+          </main>
         ) : view === "settings" ? (
           <MembersView member={member} spaces={spaces} pages={pages} />
         ) : !pagesLoaded ? (
@@ -4373,6 +4421,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               onSelectPage={navigateToPage}
               backlinksRevision={backlinksRevision}
               commentsRevision={commentsRevision}
+              writingOpenRequest={writingLaunch?.pageId === activeSelected.id ? writingLaunch.count : 0}
+              writingConversationId={
+                writingConversation?.pageId === activeSelected.id ? writingConversation.id : undefined
+              }
             />
           ) : activeSelected.kind === "table" ? (
             <TablePage
@@ -4846,6 +4898,7 @@ function MembersView({ member, spaces, pages }: { member: ClientMemberContext; s
       <SecurityScreen settings />
       <SlackSettings owner={member.role === "owner"} spaces={spaces} pages={pages} />
       <OAuthConnectionsSettings owner={member.role === "owner"} />
+      <WritingSettings owner={member.role === "owner"} />
       <IntegrationsSettings owner={member.role === "owner"} pages={pages} />
     </main>
   );

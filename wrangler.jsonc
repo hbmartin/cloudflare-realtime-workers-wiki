@@ -76,6 +76,7 @@
   "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
     "BETTER_AUTH_URL": "http://localhost:5173",
+    "CHATGPT_CONNECTION_ENABLED": "false",
     "EXPANDED_EMBEDS_ENABLED": "true",
     "NOTION_MARKDOWN_WRITES_ENABLED": "true",
     "OFFLINE_EDITING_ENABLED": "true",
@@ -146,6 +147,7 @@
       ],
       "vars": {
         "BETTER_AUTH_URL": "https://cloudflare-realtime-notes.harold-martin.workers.dev",
+        "CHATGPT_CONNECTION_ENABLED": "false",
         "EXPANDED_EMBEDS_ENABLED": "false",
         "NOTION_MARKDOWN_WRITES_ENABLED": "false",
         "OFFLINE_EDITING_ENABLED": "false",
@@ -211,6 +213,7 @@
       "vars": {
         "BETTER_AUTH_URL": "http://127.0.0.1:4173",
         "WORKFLOW_INLINE": "true",
+        "CHATGPT_CONNECTION_ENABLED": "false",
         "EXPANDED_EMBEDS_ENABLED": "true",
         "NOTION_MARKDOWN_WRITES_ENABLED": "true",
         "OFFLINE_EDITING_ENABLED": "true",

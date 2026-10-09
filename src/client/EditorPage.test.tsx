@@ -103,6 +103,9 @@ vi.mock("@blocknote/react", () => ({
     return null;
   },
   ThreadsSidebar: () => <div data-testid="thread-sidebar" />,
+  FormattingToolbarController: () => null,
+  FormattingToolbar: () => null,
+  getFormattingToolbarItems: () => [],
   useCreateBlockNote: () => ({ insertInlineContent: vi.fn() }),
 }));
 

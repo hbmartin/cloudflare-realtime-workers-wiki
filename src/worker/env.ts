@@ -27,6 +27,13 @@ export interface AppBindings {
   SLACK_SIGNING_SECRET?: string;
   SLACK_TOKEN_ENCRYPTION_KEY?: string;
   WEBHOOK_ENCRYPTION_KEY?: string;
+  OPENAI_API_KEY?: string;
+  AI_TOKEN_ENCRYPTION_KEY?: string;
+  CHATGPT_CONNECTION_ENABLED?: "true" | "false";
+  CHATGPT_CLIENT_ID?: string;
+  CHATGPT_CLIENT_SECRET?: string;
+  CHATGPT_TOKEN_AUTH_METHOD?: "none" | "client_secret_basic";
+  CHATGPT_SCOPES?: string;
   ASSETS: Fetcher;
   BETTER_AUTH_SECRET: string;
   BETTER_AUTH_URL: string;
@@ -51,6 +58,7 @@ declare global {
     interface Env extends Omit<
       AppBindings,
       | "BROWSER"
+      | "CHATGPT_CONNECTION_ENABLED"
       | "EXPANDED_EMBEDS_ENABLED"
       | "NOTION_MARKDOWN_WRITES_ENABLED"
       | "OFFLINE_EDITING_ENABLED"

@@ -9,7 +9,7 @@ import { markdownMutations } from "../shared/notion-markdown-mutations";
 import { parseMarkdownCommand } from "../shared/notion-markdown-commands";
 import type { DocumentContentEnvelope } from "../shared/types";
 import type { Env } from "./env";
-import { HttpError, locationHint, sha256 } from "./http";
+import { HttpError, sha256 } from "./http";
 import { mcpAccess, mcpBearerChallenge, type McpAccess, type McpScope } from "./oauth";
 import { correlationHeaders, logger } from "./observability";
 import {
@@ -31,6 +31,7 @@ import { sourceRateLimitKey } from "./source-rate-limit";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { webhookEventStatements } from "./webhooks";
 import { MCP_MAX_REQUEST_BYTES, PLUGIN_UI_URI, pluginToolContracts } from "../shared/plugin-contracts";
+import { fetchTableSource, fetchDiagramSource, readRoomContent } from "./ai-sources";
 
 const MAX_MCP_BODY = MCP_MAX_REQUEST_BYTES;
 const RECEIPT_TTL_MS = 30 * 24 * 60 * 60_000;
@@ -40,6 +41,8 @@ export type BackgroundContext = Pick<ExecutionContext, "waitUntil">;
 const TOOL_SCOPES: Record<string, readonly McpScope[]> = {
   search_pages: ["pages:read"],
   fetch_page: ["pages:read"],
+  fetch_table: ["pages:read"],
+  fetch_diagram: ["pages:read"],
   create_page: ["pages:write"],
   update_page: ["pages:write"],
   create_comment: ["pages:read", "comments:write"],
@@ -408,20 +411,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
 }
 
 async function roomContent(env: Env, access: McpAccess, page: PageRow) {
-  const hint = locationHint(access.member.workspace.locationHint ?? undefined);
-  const response = await env.DOCUMENT.getByName(
-    `${page.id}~${page.content_epoch}`,
-    hint ? { locationHint: hint } : undefined,
-  ).fetch(
-    new Request("https://document.internal/content", {
-      headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() },
-    }),
-  );
-  if (!response.ok) throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
-  const envelope = await response.json<DocumentContentEnvelope>();
-  if (envelope.pageId !== page.id || envelope.contentEpoch !== page.content_epoch)
-    throw new HttpError(503, "content_unavailable", "Page content is temporarily unavailable.");
-  return envelope;
+  return readRoomContent<DocumentContentEnvelope>(env, access.member, page);
 }
 
 async function roomMutationReceipt(env: Env, page: PageRow, operationId: string, inputHash?: string) {
@@ -805,7 +795,7 @@ function toolMetadata(name: string, readOnly: boolean, destructive = false) {
 }
 
 function serverFor(request: Request, env: Env, context: BackgroundContext, access: McpAccess) {
-  const server = new McpServer({ name: "noteflare", version: "1.1.0" });
+  const server = new McpServer({ name: "noteflare", version: "1.2.0" });
   const wrap = async (action: () => Promise<unknown>) => {
     try {
       return result(await action());
@@ -814,6 +804,24 @@ function serverFor(request: Request, env: Env, context: BackgroundContext, acces
     }
   };
   if (access.scopes.has("pages:read")) {
+    server.registerTool(
+      "fetch_table",
+      { title: "Read table", ...pluginToolContracts.fetch_table, ...toolMetadata("fetch_table", true) },
+      (input) =>
+        wrap(async () => {
+          const current = await currentAccess(request, env, TOOL_SCOPES.fetch_table!);
+          return fetchTableSource(env, current.member, current.grantId, input);
+        }),
+    );
+    server.registerTool(
+      "fetch_diagram",
+      { title: "Read diagram", ...pluginToolContracts.fetch_diagram, ...toolMetadata("fetch_diagram", true) },
+      (input) =>
+        wrap(async () => {
+          const current = await currentAccess(request, env, TOOL_SCOPES.fetch_diagram!);
+          return fetchDiagramSource(env, current.member, current.grantId, input);
+        }),
+    );
     server.registerTool(
       "search_pages",
       {

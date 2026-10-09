@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "noteflare",
-  "version": "0.1.0",
-  "description": "Search, read, create, and edit your private NoteFlare wiki from ChatGPT.",
+  "version": "0.2.0",
+  "description": "Search documents, read tables and diagrams, and write to your private NoteFlare wiki from ChatGPT.",
   "author": { "name": "Harold Martin" },
   "keywords": ["wiki", "notes", "documents"],
   "extensions": {
@@ -12,7 +12,7 @@
       "interface": {
         "displayName": "NoteFlare",
         "shortDescription": "Read and edit your private wiki",
-        "longDescription": "Find wiki knowledge, save notes, update documents, and post comments. Browse and edit Markdown beside your conversation.",
+        "longDescription": "Find wiki knowledge across documents, typed tables, and diagrams. Save notes, update documents, and post comments. Browse and edit Markdown beside your conversation.",
         "developerName": "Harold Martin",
         "category": "Productivity",
         "capabilities": ["Read", "Write"],

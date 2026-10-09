@@ -15,9 +15,15 @@ import {
   SuggestionMenuController,
   ThreadsSidebar,
   useCreateBlockNote,
+  FormattingToolbarController,
+  FormattingToolbar,
+  getFormattingToolbarItems,
 } from "@blocknote/react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
+import { createContext, useContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { WritingPanel } from "./WritingPanel";
+import { applyWriting, captureWritingTarget, WritingTargetError, type WritingTarget } from "./writing-target";
+import { collaborationUndoLifecycleExtension } from "./collaboration-undo";
+import { yUndoPluginKey, yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
 import type { ClientMemberContext, Space } from "../shared/types";
 import type { MentionSuggestion, Page } from "../shared/types";
@@ -73,6 +79,23 @@ const SYNCED_CATALOG_WARNING = "Changes are synced, but the offline page list co
 const OFFLINE_INIT_ERROR = "Offline storage is unavailable, so editing and collaboration are disabled for this page.";
 const liveRecoveryCopies = new Map<string, string>();
 const liveRecoveryEntries = new Map<string, RecoveryEntry>();
+const WritingLaunchContext = createContext<(() => void) | null>(null);
+function WritingFormattingToolbar() {
+  const launch = useContext(WritingLaunchContext);
+  return (
+    <FormattingToolbar>
+      {getFormattingToolbarItems()}
+      <button
+        type="button"
+        aria-label="Writing with selection"
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => launch?.()}
+      >
+        Writing
+      </button>
+    </FormattingToolbar>
+  );
+}
 export function clearLiveRecoveryCopies(accountKey: string) {
   const [userId, workspaceId] = accountKey.split("\u0000");
   const prefix = `account:${userId}:${workspaceId}:`;
@@ -140,6 +163,8 @@ export type EditorPageProps = {
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
   commentsRevision?: number;
+  writingConversationId?: string;
+  writingOpenRequest?: number;
 };
 
 export function EditorPage({
@@ -154,6 +179,8 @@ export function EditorPage({
   onSelectPage,
   backlinksRevision,
   commentsRevision = 0,
+  writingConversationId,
+  writingOpenRequest = 0,
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
@@ -340,6 +367,23 @@ export function EditorPage({
     !accessQuarantine;
   const commentsVisible = commentsOpen;
   const [panelTarget, setPanelTarget] = useState<HTMLDivElement | null>(null);
+  const [writingOpen, setWritingOpen] = useState(!!writingConversationId || writingOpenRequest > 0);
+  const [previousWritingOpenRequest, setPreviousWritingOpenRequest] = useState(writingOpenRequest);
+  if (previousWritingOpenRequest !== writingOpenRequest) {
+    setPreviousWritingOpenRequest(writingOpenRequest);
+    if (writingOpenRequest) {
+      setWritingOpen(true);
+      setCommentsOpen(false);
+      setAttachmentsOpen(false);
+      setHistoryOpen(false);
+      setBacklinksOpen(false);
+    }
+  }
+  const [previousWritingConversationId, setPreviousWritingConversationId] = useState(writingConversationId);
+  if (previousWritingConversationId !== writingConversationId) {
+    setPreviousWritingConversationId(writingConversationId);
+    setWritingOpen(!!writingConversationId);
+  }
   const offlineMetadata = useRef({ page, spaceName });
   const offlineMember = useRef(member);
   useEffect(() => {
@@ -873,6 +917,7 @@ export function EditorPage({
             data-close-menu
             className="quiet-button"
             onClick={() => {
+              setWritingOpen(false);
               setCommentsOpen((open) => !open);
               setAttachmentsOpen(false);
               setHistoryOpen(false);
@@ -885,6 +930,7 @@ export function EditorPage({
             data-close-menu
             className="quiet-button"
             onClick={() => {
+              setWritingOpen(false);
               setAttachmentsOpen((open) => !open);
               setCommentsOpen(false);
               setHistoryOpen(false);
@@ -897,6 +943,7 @@ export function EditorPage({
             data-close-menu
             className="quiet-button"
             onClick={() => {
+              setWritingOpen(false);
               setHistoryOpen((open) => !open);
               setCommentsOpen(false);
               setAttachmentsOpen(false);
@@ -909,6 +956,7 @@ export function EditorPage({
             data-close-menu
             className="quiet-button"
             onClick={() => {
+              setWritingOpen(false);
               setBacklinksOpen((open) => !open);
               setCommentsOpen(false);
               setAttachmentsOpen(false);
@@ -1160,7 +1208,7 @@ export function EditorPage({
         </button>
       )}
       <div
-        className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen ? "with-panel" : ""}`}
+        className={`document-layout ${commentsVisible || historyOpen || attachmentsOpen || backlinksOpen || writingOpen ? "with-panel" : ""}`}
       >
         <article className="document-paper">
           {page.icon && <div className="page-heading-icon">{page.icon}</div>}
@@ -1205,6 +1253,17 @@ export function EditorPage({
               commentsRevision={commentsRevision}
               onPageCreated={onPageChanged}
               onError={setEditorError}
+              contentEpoch={page.contentEpoch}
+              writingOpen={writingOpen}
+              writingConversationId={writingConversationId}
+              onWritingOpen={() => {
+                setWritingOpen(true);
+                setCommentsOpen(false);
+                setAttachmentsOpen(false);
+                setHistoryOpen(false);
+                setBacklinksOpen(false);
+              }}
+              onWritingClose={() => setWritingOpen(false)}
             />
           ) : storageError ? (
             <div className="editor-loading">
@@ -1214,33 +1273,36 @@ export function EditorPage({
             <div className="editor-loading">Opening your offline copy…</div>
           )}
         </article>
-        {(commentsVisible || historyOpen || attachmentsOpen || backlinksOpen) && (
-          <aside className="side-panel page-side-panel" aria-label="Page panel">
-            <button
-              className="icon-button page-panel-close"
-              aria-label="Close page panel"
-              onClick={() => {
-                setCommentsOpen(false);
-                setHistoryOpen(false);
-                setAttachmentsOpen(false);
-                setBacklinksOpen(false);
-              }}
-            >
-              ×
-            </button>
-            <div ref={setPanelTarget} />
-            {historyOpen && (
-              <HistoryPanel
-                page={page}
-                member={member}
-                current={bundle?.doc ?? null}
-                onRestored={(epoch) => onPageChanged({ ...page, contentEpoch: epoch, revision: page.revision + 1 })}
-              />
-            )}
-            {attachmentsOpen && <AttachmentsPanel page={page} editable={editable} />}
-            {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
-          </aside>
-        )}
+        <aside
+          hidden={!(commentsVisible || historyOpen || attachmentsOpen || backlinksOpen || writingOpen)}
+          className="side-panel page-side-panel"
+          aria-label="Page panel"
+        >
+          <button
+            className="icon-button page-panel-close"
+            aria-label="Close page panel"
+            onClick={() => {
+              setCommentsOpen(false);
+              setHistoryOpen(false);
+              setAttachmentsOpen(false);
+              setBacklinksOpen(false);
+              setWritingOpen(false);
+            }}
+          >
+            ×
+          </button>
+          <div ref={setPanelTarget} />
+          {historyOpen && (
+            <HistoryPanel
+              page={page}
+              member={member}
+              current={bundle?.doc ?? null}
+              onRestored={(epoch) => onPageChanged({ ...page, contentEpoch: epoch, revision: page.revision + 1 })}
+            />
+          )}
+          {attachmentsOpen && <AttachmentsPanel page={page} editable={editable} />}
+          {backlinksOpen && <BacklinksPanel pageId={page.id} revision={backlinksRevision} onSelect={onSelectPage} />}
+        </aside>
       </div>
     </main>
   );
@@ -1343,6 +1405,7 @@ function editorOptions(
       showCursorLabels: "activity" as const,
     },
     extensions: [
+      collaborationUndoLifecycleExtension(),
       dateMentionPasteExtension(member.user.id),
       SyntaxHighlightingExtension({
         createHighlighter: async () => {
@@ -1391,6 +1454,11 @@ function CollaborativeEditor({
   commentsRevision,
   onPageCreated,
   onError,
+  contentEpoch,
+  writingOpen,
+  writingConversationId,
+  onWritingOpen,
+  onWritingClose,
 }: {
   bundle: CollaborationBundle;
   member: ClientMemberContext;
@@ -1402,6 +1470,11 @@ function CollaborativeEditor({
   commentsRevision: number;
   onPageCreated: (page: Page) => void;
   onError: (message: string) => void;
+  contentEpoch: number;
+  writingOpen: boolean;
+  writingConversationId?: string;
+  onWritingOpen: () => void;
+  onWritingClose: () => void;
 }) {
   const [commentError, setCommentError] = useState("");
   const [pasteChoice, setPasteChoice] = useState<{ url: string; blockId: string } | null>(null);
@@ -1443,6 +1516,22 @@ function CollaborativeEditor({
     [bundle, editable, member, pageId, threadStore],
   );
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
+  const [writingTargetRevision, setWritingTargetRevision] = useState(0);
+  const [capturedWritingTarget, setCapturedWritingTarget] = useState<WritingTarget | null>(null);
+  const captureWriting = useCallback(
+    (kind?: WritingTarget["kind"]) => {
+      const state = editor.prosemirrorState;
+      return captureWritingTarget(state.doc, state.selection.from, state.selection.to, contentEpoch, kind);
+    },
+    [editor, contentEpoch],
+  );
+  if (writingOpen && !capturedWritingTarget) setCapturedWritingTarget(captureWriting("page"));
+  const writingTarget = capturedWritingTarget;
+  const launchWriting = (kind?: WritingTarget["kind"]) => {
+    setCapturedWritingTarget(captureWriting(kind));
+    setWritingTargetRevision((value) => value + 1);
+    onWritingOpen();
+  };
   useEffect(() => {
     if (!pasteChoice) return undefined;
     const choice = pasteChoiceRef.current;
@@ -1513,6 +1602,17 @@ function CollaborativeEditor({
     filterSuggestionItems(
       [
         ...getDefaultReactSlashMenuItems(editor),
+        {
+          title: "AI writing",
+          subtext: "Draft or edit with the writing sidebar",
+          aliases: ["ai", "writing"],
+          group: "NoteFlare",
+          icon: <span>✦</span>,
+          onItemClick: () => {
+            insertOrUpdateBlockForSlashMenu(editor, { type: "paragraph" });
+            launchWriting("anchor");
+          },
+        },
         ...editorBlockFactories.map((item) => ({
           title: item.label,
           subtext: item.description,
@@ -1731,7 +1831,11 @@ function CollaborativeEditor({
             className="notes-editor"
             theme={colorScheme}
             slashMenu={false}
+            formattingToolbar={false}
           >
+            <WritingLaunchContext.Provider value={launchWriting}>
+              <FormattingToolbarController formattingToolbar={WritingFormattingToolbar} />
+            </WritingLaunchContext.Provider>
             {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
             {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
             {commentsOpen &&
@@ -1750,6 +1854,46 @@ function CollaborativeEditor({
                 panelTarget,
               )}
           </BlockNoteView>
+          {writingTarget &&
+            panelTarget &&
+            createPortal(
+              <div hidden={!writingOpen}>
+                <WritingPanel
+                  key={writingTargetRevision}
+                  pageId={pageId}
+                  initialTarget={writingTarget}
+                  conversationId={writingTargetRevision ? undefined : writingConversationId}
+                  editable={editable}
+                  ready={() => navigator.onLine && bundle.provider.synced && !bundle.hasUnsyncedChanges}
+                  subscribeReadiness={(update) => {
+                    bundle.doc.on("update", update);
+                    bundle.provider.on("sync", update);
+                    bundle.provider.on("custom-message", update);
+                    return () => {
+                      bundle.doc.off("update", update);
+                      bundle.provider.off("sync", update);
+                      bundle.provider.off("custom-message", update);
+                    };
+                  }}
+                  onCapture={captureWriting}
+                  onApply={(target, markdown, mode, epoch, protectedIds) => {
+                    if (!editable || !editor.isEditable)
+                      throw new WritingTargetError("This document is read-only. You can copy the result.");
+                    if (epoch !== contentEpoch)
+                      throw new WritingTargetError(
+                        "The page was restored. Reopen its current document before inserting.",
+                      );
+                    const undo = yUndoPluginKey.getState(editor.prosemirrorState)?.undoManager;
+                    undo?.stopCapturing();
+                    editor.transact((tr) => applyWriting(tr, target, epoch, markdown, mode, protectedIds));
+                    undo?.stopCapturing();
+                    editor.focus();
+                  }}
+                  onClose={onWritingClose}
+                />
+              </div>,
+              panelTarget,
+            )}
           {pasteChoice && (
             <fieldset ref={pasteChoiceRef} className="paste-url-choice">
               <legend>Paste as</legend>
