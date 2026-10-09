@@ -2462,6 +2462,56 @@ describe("ChatGPT plugin contracts", () => {
     expect(children.pages.map((page) => page.id)).toContain(child);
   });
 
+  it.each(["create_page", "update_page"])(
+    "preserves literal checkbox labels and checked states through %s and fetch_page",
+    async (tool) => {
+      const connection = await connect(await bootstrap());
+      const markdown = "- [x] First\n- [ ] [x] = completed\n";
+      const written = await toolCall(
+        connection.token,
+        tool,
+        tool === "create_page"
+          ? {
+              space_id: connection.page.spaceId,
+              title: "Literal checkbox labels",
+              markdown,
+              operation_id: "literal-checkbox-create",
+            }
+          : {
+              page_id: connection.page.id,
+              command: { type: "replace_content", replace_content: { new_str: markdown } },
+              operation_id: "literal-checkbox-update",
+            },
+      );
+      expect(written.result.isError).not.toBe(true);
+      const pageId = (JSON.parse(written.result.content[0]!.text) as { id: string }).id;
+      const response = await env.DOCUMENT.getByName(`${pageId}~1`).fetch(
+        new Request("https://document.internal/content", {
+          headers: { "x-notes-internal": env.BETTER_AUTH_SECRET },
+        }),
+      );
+      expect(response.status).toBe(200);
+      const envelope = await response.json<DocumentContentEnvelope>();
+      expect(envelope.document.content?.[0]?.content?.map((block) => block.content?.[0])).toMatchObject([
+        {
+          type: "checkListItem",
+          attrs: { checked: true },
+          content: [{ type: "text", text: "First" }],
+        },
+        {
+          type: "checkListItem",
+          attrs: { checked: false },
+          content: [{ type: "text", text: "[x] = completed" }],
+        },
+      ]);
+      const fetched = documentResultSchema.parse(
+        (await toolCall(connection.token, "fetch_page", { page_id: pageId })).result.structuredContent,
+      );
+      expect(fetched.markdown).toBe("- [x] First\n- [ ] \\[x\\] = completed\n");
+      expect(fetched.revision).toBe(envelope.sequence);
+    },
+  );
+
   it("rejects stale revisions and epochs before mutation and replays successful writes before version checks", async () => {
     const connection = await connect(await bootstrap());
     const created = await toolCall(connection.token, "create_page", {
