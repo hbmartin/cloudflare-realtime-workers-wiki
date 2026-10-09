@@ -74,6 +74,7 @@ import { IntegrationsSettings } from "./IntegrationsSettings";
 import { OAuthConnectionsSettings } from "./OAuthConnectionsSettings";
 import { WritingSettings } from "./WritingSettings";
 import { WritingHistory } from "./WritingHistory";
+import type { WritingLaunchRequest } from "./writing-target";
 import {
   clearRevokedOfflinePages,
   forgetOfflineAccount,
@@ -1609,8 +1610,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
         : "home";
   });
   const [unreadMentions, setUnreadMentions] = useState(0);
-  const [writingLaunch, setWritingLaunch] = useState<{ pageId: string; count: number } | null>(null);
-  const [writingConversation, setWritingConversation] = useState<{ pageId: string; id: string } | null>(null);
+  const [writingLaunch, setWritingLaunch] = useState<WritingLaunchRequest | null>(null);
+  const consumeWritingLaunch = useCallback(
+    (id: string) => setWritingLaunch((current) => (current?.id === id ? null : current)),
+    [],
+  );
   const [backlinksRevision, setBacklinksRevision] = useState(0);
   const [commentsRevision, setCommentsRevision] = useState(0);
   const [workspaceErrors, setWorkspaceErrors] = useState<WorkspaceError[]>([]);
@@ -4213,9 +4217,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                   {activeSelected.kind === "document" && (
                     <button
                       data-close-menu
-                      onClick={() =>
-                        setWritingLaunch((current) => ({ pageId: activeSelected.id, count: (current?.count ?? 0) + 1 }))
-                      }
+                      onClick={() => setWritingLaunch({ pageId: activeSelected.id, id: crypto.randomUUID() })}
                     >
                       Writing
                     </button>
@@ -4361,7 +4363,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
           <main className="utility-view">
             <WritingHistory
               onOpen={(conversation) => {
-                setWritingConversation({ pageId: conversation.pageId, id: conversation.id });
+                setWritingLaunch({
+                  pageId: conversation.pageId,
+                  conversationId: conversation.id,
+                  id: crypto.randomUUID(),
+                });
                 navigateToPage(conversation.pageId);
               }}
             />
@@ -4421,10 +4427,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               onSelectPage={navigateToPage}
               backlinksRevision={backlinksRevision}
               commentsRevision={commentsRevision}
-              writingOpenRequest={writingLaunch?.pageId === activeSelected.id ? writingLaunch.count : 0}
-              writingConversationId={
-                writingConversation?.pageId === activeSelected.id ? writingConversation.id : undefined
-              }
+              writingLaunchRequest={writingLaunch?.pageId === activeSelected.id ? writingLaunch : undefined}
+              onWritingLaunchConsumed={consumeWritingLaunch}
             />
           ) : activeSelected.kind === "table" ? (
             <TablePage

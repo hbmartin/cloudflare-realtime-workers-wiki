@@ -128,7 +128,12 @@ notionApi.onError((error, c) => {
   }
   if (error instanceof NotionError) return notionErrorResponse(requestId, error);
   if (error instanceof HttpError) {
-    const status = error.status === 415 || error.status === 422 ? 400 : error.status === 502 ? 503 : error.status;
+    const status =
+      error.status === 415 || error.status === 422
+        ? 400
+        : error.status === 502 || error.status === 424
+          ? 503
+          : error.status;
     const code =
       status === 401
         ? "unauthorized"

@@ -207,6 +207,42 @@ describe("hosted ChatGPT plan connection", () => {
     );
     expect(credentials).toMatchObject({ refresh_token: "rotated-refresh" });
   });
+  it.each([400, 401])("uses 424 for refresh HTTP %i and retains NoteFlare authentication", async (status) => {
+    await finishChatgptConnection(configured(), member, state, "code", browser);
+    await env.DB.prepare("UPDATE ai_connections SET expires_at=1").run();
+    const original = fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (resource: RequestInfo | URL, init?: RequestInit) =>
+        String(resource).endsWith("oauth/token")
+          ? Response.json({ error: "invalid_grant" }, { status })
+          : original(resource, init),
+      ),
+    );
+    await expect(chatgptAccessToken(configured(), member)).rejects.toMatchObject({
+      status: 424,
+      code: "chatgpt_reconnect",
+    });
+    await env.DB.prepare("INSERT INTO ai_settings VALUES(?,?)")
+      .bind(
+        member.workspace.id,
+        JSON.stringify({
+          enabled: true,
+          apiEnabled: false,
+          dailyQuota: 20,
+          models: {
+            api: { fast: { id: "", maxCharacters: 10000 }, best: { id: "", maxCharacters: 10000 } },
+            chatgpt: { fast: { id: "test", maxCharacters: 10000 }, best: { id: "", maxCharacters: 10000 } },
+          },
+        }),
+      )
+      .run();
+    const context = createExecutionContext(),
+      response = await worker.fetch(req("/api/ai/models?funding=chatgpt"), configured(), context);
+    await waitOnExecutionContext(context);
+    expect(response.status).toBe(424);
+    expect((await requireMember(req("/api/me"), env)).user.id).toBe(member.user.id);
+  });
   it("removes pending state and stored credentials on disconnect without changing NoteFlare authentication", async () => {
     await finishChatgptConnection(configured(), member, state, "code", browser);
     const context = createExecutionContext(),

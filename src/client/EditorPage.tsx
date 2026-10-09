@@ -21,7 +21,13 @@ import {
 } from "@blocknote/react";
 import { createContext, useContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { WritingPanel } from "./WritingPanel";
-import { applyWriting, captureWritingTarget, WritingTargetError, type WritingTarget } from "./writing-target";
+import {
+  applyWriting,
+  captureWritingTarget,
+  WritingTargetError,
+  type WritingTarget,
+  type WritingLaunchRequest,
+} from "./writing-target";
 import { collaborationUndoLifecycleExtension } from "./collaboration-undo";
 import { yUndoPluginKey, yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
@@ -163,8 +169,8 @@ export type EditorPageProps = {
   onSelectPage: (pageId: string) => void;
   backlinksRevision: number;
   commentsRevision?: number;
-  writingConversationId?: string;
-  writingOpenRequest?: number;
+  writingLaunchRequest?: WritingLaunchRequest;
+  onWritingLaunchConsumed?: (id: string) => void;
 };
 
 export function EditorPage({
@@ -179,8 +185,8 @@ export function EditorPage({
   onSelectPage,
   backlinksRevision,
   commentsRevision = 0,
-  writingConversationId,
-  writingOpenRequest = 0,
+  writingLaunchRequest,
+  onWritingLaunchConsumed,
 }: EditorPageProps) {
   const [bundle, setBundle] = useState<CollaborationBundle | null>(null);
   const [status, setStatus] = useState<"offline" | "connecting" | "connected">("connecting");
@@ -367,23 +373,20 @@ export function EditorPage({
     !accessQuarantine;
   const commentsVisible = commentsOpen;
   const [panelTarget, setPanelTarget] = useState<HTMLDivElement | null>(null);
-  const [writingOpen, setWritingOpen] = useState(!!writingConversationId || writingOpenRequest > 0);
-  const [previousWritingOpenRequest, setPreviousWritingOpenRequest] = useState(writingOpenRequest);
-  if (previousWritingOpenRequest !== writingOpenRequest) {
-    setPreviousWritingOpenRequest(writingOpenRequest);
-    if (writingOpenRequest) {
-      setWritingOpen(true);
-      setCommentsOpen(false);
-      setAttachmentsOpen(false);
-      setHistoryOpen(false);
-      setBacklinksOpen(false);
-    }
-  }
-  const [previousWritingConversationId, setPreviousWritingConversationId] = useState(writingConversationId);
-  if (previousWritingConversationId !== writingConversationId) {
-    setPreviousWritingConversationId(writingConversationId);
-    setWritingOpen(!!writingConversationId);
-  }
+  const [writingOpen, setWritingOpen] = useState(false);
+  const [pendingWritingLaunch, setPendingWritingLaunch] = useState<WritingLaunchRequest | undefined>();
+  const handledWritingLaunch = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!writingLaunchRequest || handledWritingLaunch.current === writingLaunchRequest.id) return;
+    handledWritingLaunch.current = writingLaunchRequest.id;
+    setPendingWritingLaunch(writingLaunchRequest);
+    setWritingOpen(true);
+    setCommentsOpen(false);
+    setAttachmentsOpen(false);
+    setHistoryOpen(false);
+    setBacklinksOpen(false);
+    onWritingLaunchConsumed?.(writingLaunchRequest.id);
+  }, [writingLaunchRequest, onWritingLaunchConsumed]);
   const offlineMetadata = useRef({ page, spaceName });
   const offlineMember = useRef(member);
   useEffect(() => {
@@ -1255,7 +1258,7 @@ export function EditorPage({
               onError={setEditorError}
               contentEpoch={page.contentEpoch}
               writingOpen={writingOpen}
-              writingConversationId={writingConversationId}
+              writingLaunchRequest={pendingWritingLaunch}
               onWritingOpen={() => {
                 setWritingOpen(true);
                 setCommentsOpen(false);
@@ -1456,7 +1459,7 @@ function CollaborativeEditor({
   onError,
   contentEpoch,
   writingOpen,
-  writingConversationId,
+  writingLaunchRequest,
   onWritingOpen,
   onWritingClose,
 }: {
@@ -1472,7 +1475,7 @@ function CollaborativeEditor({
   onError: (message: string) => void;
   contentEpoch: number;
   writingOpen: boolean;
-  writingConversationId?: string;
+  writingLaunchRequest?: WritingLaunchRequest;
   onWritingOpen: () => void;
   onWritingClose: () => void;
 }) {
@@ -1516,7 +1519,34 @@ function CollaborativeEditor({
     [bundle, editable, member, pageId, threadStore],
   );
   const editor = useCreateBlockNote(options, [bundle, editable, pageId]);
-  const [writingTargetRevision, setWritingTargetRevision] = useState(0);
+  const [panelLaunch, setPanelLaunch] = useState<WritingLaunchRequest | undefined>();
+  const writingBusy = useRef(false);
+  const writingBusyChanged = useCallback((busy: boolean) => {
+    writingBusy.current = busy;
+  }, []);
+  useEffect(() => {
+    // eslint-disable-next-line react/set-state-in-effect -- Deliver the page-scoped one-shot launch to the retained panel instance.
+    if (writingLaunchRequest) setPanelLaunch(writingLaunchRequest);
+  }, [writingLaunchRequest]);
+  const writingReady = useCallback(
+    () => navigator.onLine && bundle.provider.synced && !bundle.hasUnsyncedChanges,
+    [bundle],
+  );
+  const subscribeWritingReadiness = useCallback(
+    (update: () => void) => {
+      bundle.doc.on("update", update);
+      bundle.provider.on("sync", update);
+      bundle.provider.on("status", update);
+      bundle.provider.on("custom-message", update);
+      return () => {
+        bundle.doc.off("update", update);
+        bundle.provider.off("sync", update);
+        bundle.provider.off("status", update);
+        bundle.provider.off("custom-message", update);
+      };
+    },
+    [bundle],
+  );
   const [capturedWritingTarget, setCapturedWritingTarget] = useState<WritingTarget | null>(null);
   const captureWriting = useCallback(
     (kind?: WritingTarget["kind"]) => {
@@ -1528,8 +1558,9 @@ function CollaborativeEditor({
   if (writingOpen && !capturedWritingTarget) setCapturedWritingTarget(captureWriting("page"));
   const writingTarget = capturedWritingTarget;
   const launchWriting = (kind?: WritingTarget["kind"]) => {
-    setCapturedWritingTarget(captureWriting(kind));
-    setWritingTargetRevision((value) => value + 1);
+    const target = writingBusy.current ? undefined : captureWriting(kind);
+    if (!capturedWritingTarget && target) setCapturedWritingTarget(target);
+    setPanelLaunch({ id: crypto.randomUUID(), pageId, target });
     onWritingOpen();
   };
   useEffect(() => {
@@ -1609,6 +1640,10 @@ function CollaborativeEditor({
           group: "NoteFlare",
           icon: <span>✦</span>,
           onItemClick: () => {
+            if (writingBusy.current) {
+              launchWriting();
+              return;
+            }
             insertOrUpdateBlockForSlashMenu(editor, { type: "paragraph" });
             launchWriting("anchor");
           },
@@ -1859,22 +1894,14 @@ function CollaborativeEditor({
             createPortal(
               <div hidden={!writingOpen}>
                 <WritingPanel
-                  key={writingTargetRevision}
                   pageId={pageId}
                   initialTarget={writingTarget}
-                  conversationId={writingTargetRevision ? undefined : writingConversationId}
+                  launchRequest={panelLaunch}
+                  visible={writingOpen}
+                  onBusyChange={writingBusyChanged}
                   editable={editable}
-                  ready={() => navigator.onLine && bundle.provider.synced && !bundle.hasUnsyncedChanges}
-                  subscribeReadiness={(update) => {
-                    bundle.doc.on("update", update);
-                    bundle.provider.on("sync", update);
-                    bundle.provider.on("custom-message", update);
-                    return () => {
-                      bundle.doc.off("update", update);
-                      bundle.provider.off("sync", update);
-                      bundle.provider.off("custom-message", update);
-                    };
-                  }}
+                  ready={writingReady}
+                  subscribeReadiness={subscribeWritingReadiness}
                   onCapture={captureWriting}
                   onApply={(target, markdown, mode, epoch, protectedIds) => {
                     if (!editable || !editor.isEditable)
