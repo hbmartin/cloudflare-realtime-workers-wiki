@@ -1,11 +1,14 @@
 import {
+  AI_ACTIONS,
   AI_MAX_CHARACTERS,
+  AI_GENERATION_TIMEOUT_MS,
+  AI_GENERATION_DEADLINE_MS,
+  type AiConversationAccess,
   AI_RETENTION_MS,
   aiGenerateSchema,
   aiInstructions,
   aiSettingsSchema,
   type AiConversation,
-  type AiGenerate,
   type AiMessage,
   type AiSettings,
   type AiSource,
@@ -20,7 +23,9 @@ import { HttpError, sha256, assertSameOrigin } from "./http";
 import { chatgptAccessToken, chatgptConfigured } from "./ai-auth";
 import { seal, unseal } from "./ai-auth";
 import { readAiSource } from "./ai-sources";
-import { pageForMember } from "./page-access";
+import { pageForMember, spaceVisibleSql } from "./page-access";
+import { requireSecurity } from "./security";
+import { providerModels, invalidateProviderModels } from "./ai-models";
 import { readRoomContent } from "./ai-sources";
 import type { DocumentContentEnvelope } from "../shared/types";
 import { protectedCommentBlockIds } from "./comments";
@@ -145,13 +150,21 @@ async function conversationRow(env: Env, member: MemberContext, id: string) {
   if (!row) throw new HttpError(404, "conversation_not_found", "This conversation was deleted or expired.");
   return row;
 }
+function conversationLockSql(workspace: string, user: string, conversation: string, role = "?") {
+  return `EXISTS(SELECT 1 FROM ai_conversation_pages cp LEFT JOIN pages p ON p.id=cp.page_id AND p.workspace_id=${workspace} LEFT JOIN spaces s ON s.id=p.space_id AND s.workspace_id=p.workspace_id LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=${user} WHERE cp.conversation_id=${conversation} AND (p.id IS NULL OR p.archived_at IS NOT NULL OR p.import_job_id IS NOT NULL OR s.id IS NULL OR NOT ${spaceVisibleSql(role)}))`;
+}
 async function conversationLocked(env: Env, member: MemberContext, id: string) {
-  const row = await env.DB.prepare(
-    `SELECT 1 locked FROM ai_conversation_pages cp LEFT JOIN pages p ON p.id=cp.page_id AND p.workspace_id=? LEFT JOIN spaces s ON s.id=p.space_id AND s.workspace_id=p.workspace_id LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=? WHERE cp.conversation_id=? AND (p.id IS NULL OR p.archived_at IS NOT NULL OR p.import_job_id IS NOT NULL OR s.id IS NULL OR (?<>'owner' AND s.visibility<>'workspace' AND sm.user_id IS NULL)) LIMIT 1`,
-  )
+  const row = await env.DB.prepare(`SELECT ${conversationLockSql("?", "?", "?")} locked`)
     .bind(member.workspace.id, member.user.id, id, member.role)
-    .first();
-  return !!row;
+    .first<{ locked: number }>();
+  return !!row?.locked;
+}
+async function expireGenerations(env: Env, member: MemberContext, id: string) {
+  await env.DB.prepare(
+    "UPDATE ai_messages SET status='failed' WHERE status='running' AND created_at<=? AND conversation_id IN (SELECT id FROM ai_conversations WHERE id=? AND workspace_id=? AND user_id=?)",
+  )
+    .bind(Date.now() - AI_GENERATION_DEADLINE_MS, id, member.workspace.id, member.user.id)
+    .run();
 }
 function conversationJson(row: ConversationRow, locked: boolean): AiConversation {
   return {
@@ -194,7 +207,7 @@ export async function listAiConversations(request: Request, env: Env) {
   // Access and search are evaluated in the same statement. A locked title or
   // output cannot leak through the search result count or pagination.
   const rows = await env.DB.prepare(`WITH entries AS (
-    SELECT c.*, EXISTS(SELECT 1 FROM ai_conversation_pages cp LEFT JOIN pages p ON p.id=cp.page_id AND p.workspace_id=c.workspace_id LEFT JOIN spaces s ON s.id=p.space_id AND s.workspace_id=p.workspace_id LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=c.user_id WHERE cp.conversation_id=c.id AND (p.id IS NULL OR p.archived_at IS NOT NULL OR p.import_job_id IS NOT NULL OR s.id IS NULL OR (?<>'owner' AND s.visibility<>'workspace' AND sm.user_id IS NULL))) locked
+    SELECT c.*, ${conversationLockSql("c.workspace_id", "c.user_id", "c.id")} locked
     FROM ai_conversations c WHERE c.workspace_id=? AND c.user_id=? AND c.updated_at>? AND (? IS NULL OR c.page_id=?) AND (? IS NULL OR c.updated_at<? OR (c.updated_at=? AND c.id>?)))
     SELECT * FROM entries WHERE ?='' OR (locked=0 AND (instr(lower(title),lower(?))>0 OR EXISTS(SELECT 1 FROM ai_messages WHERE conversation_id=entries.id AND (instr(lower(prompt),lower(?))>0 OR instr(lower(output),lower(?))>0)))) ORDER BY updated_at DESC,id LIMIT 51`)
     .bind(
@@ -231,12 +244,30 @@ export async function listAiConversations(request: Request, env: Env) {
 export async function aiConversationAccess(request: Request, env: Env, id: string) {
   const member = await requireMember(request, env),
     row = await conversationRow(env, member, id);
-  return json({ locked: await conversationLocked(env, member, id), expiresAt: row.updated_at + AI_RETENTION_MS });
+  await expireGenerations(env, member, id);
+  const locked = await conversationLocked(env, member, id);
+  const active = locked
+    ? null
+    : await env.DB.prepare("SELECT id,created_at FROM ai_messages WHERE conversation_id=? AND status='running'")
+        .bind(id)
+        .first<{ id: string; created_at: number }>();
+  return json({
+    locked,
+    expiresAt: row.updated_at + AI_RETENTION_MS,
+    activeGeneration: active
+      ? {
+          messageId: active.id,
+          createdAt: active.created_at,
+          deadlineAt: active.created_at + AI_GENERATION_DEADLINE_MS,
+        }
+      : null,
+  } satisfies AiConversationAccess);
 }
 export async function openAiConversation(request: Request, env: Env, id: string, touch = true) {
   if (touch) assertSameOrigin(request, env.BETTER_AUTH_URL);
   const member = await requireMember(request, env),
     row = await conversationRow(env, member, id);
+  await expireGenerations(env, member, id);
   const locked = await conversationLocked(env, member, id);
   if (touch) {
     const opened = Date.now();
@@ -306,39 +337,13 @@ export async function pruneAi(env: Env) {
     env.DB.prepare("DELETE FROM ai_oauth_states WHERE expires_at<=?").bind(Date.now()),
     env.DB.prepare("DELETE FROM ai_requests WHERE created_at<=?").bind(Date.now() - AI_RETENTION_MS),
     env.DB.prepare("UPDATE ai_messages SET status='failed' WHERE status='running' AND created_at<?").bind(
-      Date.now() - 10 * 60_000,
+      Date.now() - AI_GENERATION_DEADLINE_MS,
     ),
   ]);
 }
 function sourceMetadata(source: AiSourceSnapshot) {
   const { text: _text, ...metadata } = source;
   return metadata;
-}
-async function providerModels(token: string, funding: AiGenerate["funding"]) {
-  const response = await fetch("https://api.openai.com/v1/models", {
-    headers: { authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(20_000),
-    redirect: "error",
-  });
-  if (!response.ok)
-    throw new HttpError(
-      response.status === 401 || response.status === 403 ? 401 : 503,
-      "ai_model_unavailable",
-      "Model access could not be verified for this funding choice. Reconnect or contact an owner.",
-    );
-  const data = await response.json<{
-    data?: { id: string }[];
-    models?: { slug: string; visibility?: string; context_window?: number }[];
-  }>();
-  return funding === "chatgpt"
-    ? (data.models ?? [])
-        .filter((item) => !item.visibility || item.visibility === "list")
-        .map((item) => ({
-          id: item.slug,
-          maxCharacters: item.context_window ? Math.min(AI_MAX_CHARACTERS, item.context_window) : AI_MAX_CHARACTERS,
-          contextTokens: item.context_window,
-        }))
-    : (data.data ?? []).map((item) => ({ id: item.id, maxCharacters: AI_MAX_CHARACTERS, contextTokens: undefined }));
 }
 export async function aiModelAvailability(request: Request, env: Env) {
   const member = await requireMember(request, env),
@@ -349,7 +354,7 @@ export async function aiModelAvailability(request: Request, env: Env) {
   if (!settings.enabled || (funding === "api" && (!settings.apiEnabled || !env.OPENAI_API_KEY)))
     return json({ fast: false, best: false });
   const token = funding === "api" ? env.OPENAI_API_KEY! : await chatgptAccessToken(env, member);
-  const models = await providerModels(token, funding);
+  const models = await providerModels(member.workspace.id, token, funding);
   return json({
     fast: models.some((model) => model.id === settings.models[funding].fast.id),
     best: models.some((model) => model.id === settings.models[funding].best.id),
@@ -467,6 +472,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
   let history: MessageRow[] = [];
   if (input.conversationId) {
     const conversation = await conversationRow(env, member, conversationId);
+    await expireGenerations(env, member, conversationId);
     if (conversation.page_id !== page.id)
       throw new HttpError(422, "conversation_page_mismatch", "Continue from the conversation's original document.");
     if (await conversationLocked(env, member, conversationId))
@@ -504,7 +510,9 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       );
   }
   const token = input.funding === "api" ? env.OPENAI_API_KEY! : await chatgptAccessToken(env, member);
-  const providerModel = (await providerModels(token, input.funding)).find((item) => item.id === model.id);
+  const providerModel = (await providerModels(member.workspace.id, token, input.funding)).find(
+    (item) => item.id === model.id,
+  );
   if (!providerModel)
     throw new HttpError(
       422,
@@ -519,7 +527,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
     );
   const providerInput = [
     ...history.flatMap((message) => [
-      { role: "user", content: `Action: ${AI_ACTIONS_LABEL(message.action)}\n${message.prompt}` },
+      { role: "user", content: `Action: ${AI_ACTIONS[message.action]}\n${message.prompt}` },
       ...(message.status === "complete" ? [{ role: "assistant", content: message.output }] : []),
     ]),
     { role: "user", content: JSON.stringify({ instruction: savedPrompt, currentPageId: page.id, sources }) },
@@ -571,7 +579,7 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
             member.workspace.id,
             member.user.id,
             page.id,
-            (input.prompt || AI_ACTIONS_LABEL(input.action)).slice(0, 100),
+            (input.prompt || AI_ACTIONS[input.action]).slice(0, 100),
             JSON.stringify(input.sources),
             createdAt,
             input.operationId,
@@ -655,39 +663,70 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       completed = false,
       cancelled = false;
     const upstreamAbort = new AbortController();
-    const combinedSignal = AbortSignal.any([signal, upstreamAbort.signal, AbortSignal.timeout(5 * 60_000)]);
-    let checkingAccess = false,
+    const combinedSignal = AbortSignal.any([
+      signal,
+      upstreamAbort.signal,
+      AbortSignal.timeout(AI_GENERATION_TIMEOUT_MS),
+    ]);
+    let accessCheck: Promise<boolean> | null = null,
       accessError: HttpError | undefined;
-    const poll = setInterval(() => {
-      if (checkingAccess || upstreamAbort.signal.aborted) return;
-      checkingAccess = true;
-      void (async () => {
-        const currentMember = await requireMember(request, env);
-        if (await conversationLocked(env, currentMember, conversationId))
-          throw new HttpError(403, "conversation_locked", "A referenced page is no longer accessible.");
-        const row = await env.DB.prepare("SELECT status FROM ai_messages WHERE id=?")
-          .bind(input.operationId)
-          .first<{ status: string }>();
-        if (row?.status !== "running") {
-          cancelled = true;
-          upstreamAbort.abort();
+    const checkAccess = async () => {
+      // Identity was authenticated once at dispatch. Revalidate the live session,
+      // protection and grants without rebuilding Better Auth on every tick.
+      await requireSecurity(env, member.user.id, member.session.id);
+      const row = await env.DB.prepare(
+        `SELECT m.status,wm.user_id member_id,${conversationLockSql("c.workspace_id", "c.user_id", "c.id", "wm.role")} locked FROM (SELECT ? workspace_id,? user_id) actor LEFT JOIN workspace_members wm ON wm.workspace_id=actor.workspace_id AND wm.user_id=actor.user_id LEFT JOIN ai_conversations c ON c.id=? AND c.workspace_id=actor.workspace_id AND c.user_id=actor.user_id LEFT JOIN ai_messages m ON m.id=? AND m.conversation_id=c.id`,
+      )
+        .bind(member.workspace.id, member.user.id, conversationId, input.operationId)
+        .first<{ status: string | null; member_id: string | null; locked: number }>();
+      if (row && (!row.member_id || row.locked))
+        throw new HttpError(403, "conversation_locked", "A referenced page or workspace is no longer accessible.");
+      if (!row || row.status !== "running") {
+        cancelled = true;
+        upstreamAbort.abort();
+        return false;
+      }
+      return true;
+    };
+    const verifyAccess = async () => {
+      for (const delay of [0, 250, 750]) {
+        if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+        if (combinedSignal.aborted) return false;
+        try {
+          return await checkAccess();
+        } catch (error) {
+          if (error instanceof HttpError && [401, 403, 404].includes(error.status)) {
+            accessError =
+              error.status === 401
+                ? error
+                : new HttpError(
+                    403,
+                    "conversation_locked",
+                    "This conversation is unavailable because access was removed.",
+                  );
+            upstreamAbort.abort();
+            return false;
+          }
+          if (delay === 750) {
+            accessError = new HttpError(503, "ai_access_unavailable", "Access could not be checked. Retry explicitly.");
+            upstreamAbort.abort();
+          }
         }
-      })()
-        .catch((error: unknown) => {
-          accessError =
-            error instanceof HttpError && [401, 403, 404].includes(error.status)
-              ? new HttpError(
-                  403,
-                  "conversation_locked",
-                  "This conversation is unavailable because access was removed.",
-                )
-              : new HttpError(503, "ai_access_unavailable", "Access could not be checked. Retry explicitly.");
-          upstreamAbort.abort();
-        })
-        .finally(() => {
-          checkingAccess = false;
-        });
+      }
+      return false;
+    };
+    const poll = setInterval(() => {
+      if (accessCheck || combinedSignal.aborted) return;
+      const task = verifyAccess();
+      accessCheck = task;
+      void task.finally(() => {
+        if (accessCheck === task) accessCheck = null;
+      });
     }, 1000);
+    const waitForAccessCheck = async () => {
+      const pending = accessCheck;
+      return pending ? pending : true;
+    };
     try {
       send({
         type: "start",
@@ -712,12 +751,14 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
         redirect: "error",
       });
       if (!upstream.ok) {
+        if ([401, 403].includes(upstream.status))
+          await invalidateProviderModels(member.workspace.id, token, input.funding);
         // A definite pre-generation rejection refunds the reservation. Network
         // failures and 5xx responses retain it because dispatch may have started.
         if ([400, 401, 403, 404, 422, 429].includes(upstream.status))
           await env.DB.prepare("UPDATE ai_requests SET counted=0 WHERE id=?").bind(input.operationId).run();
         throw new HttpError(
-          upstream.status === 429 ? 429 : 502,
+          upstream.status === 429 ? 429 : upstream.status >= 500 ? 503 : 502,
           "ai_provider_rejected",
           `The provider declined this ${input.funding === "api" ? "workspace API" : "ChatGPT plan"} request. Check model access or allowance and retry explicitly.`,
         );
@@ -739,17 +780,18 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
               "ai_output_too_large",
               "The generated result exceeded the writing limit. Narrow the request.",
             );
+          if (!(await waitForAccessCheck())) throw new Error("Access check stopped generation.");
+          if (combinedSignal.aborted) throw new Error("Generation stopped.");
           send({ type: "delta", text: event.delta });
         } else if (event.type === "response.completed" && event.response?.status === "completed") {
           // Check the cumulative access union and membership again immediately
           // before releasing the complete result. Deletion/cancellation wins.
-          const currentMember = await requireMember(request, env);
-          if (await conversationLocked(env, currentMember, conversationId))
-            throw new HttpError(403, "conversation_locked", "A referenced page is no longer accessible.");
+          if (!(await waitForAccessCheck())) throw new Error("Access check stopped generation.");
+          if (!(await verifyAccess())) throw new Error("Access check stopped generation.");
           const saved = await env.DB.prepare(
-            "UPDATE ai_messages SET output=?,status='complete' WHERE id=? AND status='running'",
+            "UPDATE ai_messages SET output=?,status='complete' WHERE id=? AND status='running' AND created_at>?",
           )
-            .bind(output, input.operationId)
+            .bind(output, input.operationId, Date.now() - AI_GENERATION_DEADLINE_MS)
             .run();
           if (!saved.meta.changes) {
             cancelled = true;
@@ -777,12 +819,13 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       const error = accessError ?? cause;
       if (!completed) {
         await env.DB.prepare(
-          "UPDATE ai_messages SET output=?,status=CASE WHEN status='cancelled' OR ? THEN 'cancelled' ELSE 'failed' END WHERE id=? AND status<>'complete'",
+          "UPDATE ai_messages SET output=CASE WHEN length(output)>length(?) THEN output ELSE ? END,status=CASE WHEN status='running' THEN CASE WHEN ? THEN 'cancelled' ELSE 'failed' END ELSE status END WHERE id=? AND status<>'complete'",
         )
-          .bind(output, cancelled || signal.aborted ? 1 : 0, input.operationId)
+          .bind(output, output, cancelled || signal.aborted ? 1 : 0, input.operationId)
           .run();
         send({
           type: "error",
+          status: error instanceof HttpError ? error.status : 502,
           code: error instanceof HttpError ? error.code : "ai_stream_failed",
           message:
             cancelled || signal.aborted
@@ -797,7 +840,4 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       upstreamAbort.abort();
     }
   }, context);
-}
-function AI_ACTIONS_LABEL(action: AiGenerate["action"]) {
-  return action.replaceAll("_", " ");
 }

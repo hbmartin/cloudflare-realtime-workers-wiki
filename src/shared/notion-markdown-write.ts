@@ -9,6 +9,16 @@ export const MAX_MARKDOWN_DELIMITERS = 4096;
 
 export class MarkdownWriteError extends Error {}
 
+export type MarkdownParseLimits = {
+  maxCharacters?: number;
+  maxBytes?: number;
+  maxBlocks?: number;
+  maxDelimiters?: number;
+  maxInlineDelimiters?: number;
+  maxDepth?: number;
+  delimiterCharacters?: string;
+};
+
 function validHref(value: string) {
   if (!value || hasUrlControls(value)) throw new MarkdownWriteError("A Markdown link has an invalid URL.");
   if (/^(?:\/|\.\.?\/|#)/.test(value)) return value;
@@ -190,28 +200,53 @@ function list(token: Token): ProseMirrorJson[] {
 export function parseWritableMarkdownWithSource(
   source: string,
   maxDelimiters = MAX_MARKDOWN_DELIMITERS,
+  limits: MarkdownParseLimits = {},
 ): { blocks: ProseMirrorJson[]; rawBlocks: string[]; delimiterCount: number } {
-  if (new TextEncoder().encode(source).length > MAX_INPUT_BYTES)
-    throw new MarkdownWriteError("Markdown content exceeds 128 KiB.");
+  if (limits.maxCharacters !== undefined && source.length > limits.maxCharacters)
+    throw new MarkdownWriteError(`Markdown content exceeds ${limits.maxCharacters} characters.`);
+  const maxBytes = limits.maxBytes ?? MAX_INPUT_BYTES;
+  if (new TextEncoder().encode(source).length > maxBytes)
+    throw new MarkdownWriteError(
+      maxBytes === MAX_INPUT_BYTES
+        ? "Markdown content exceeds 128 KiB."
+        : `Markdown content exceeds ${maxBytes} bytes.`,
+    );
   if (source.includes("\0")) throw new MarkdownWriteError("Markdown content contains an invalid character.");
   const normalized = source.replaceAll(/\r\n?/g, "\n");
   const blocks = new Lexer({ gfm: true }).blockTokens(normalized);
-  let delimiterCount = 0;
-  const countInline = (tokens: Token[]) => {
+  const delimiterCharacters = limits.delimiterCharacters ?? "<\\[]`*_!";
+  let delimiterCount = 0,
+    blockCount = 0;
+  const countInline = (tokens: Token[], depth = 1, insideBlock = false) => {
     for (const token of tokens) {
-      if (token.type === "code" || token.type === "space") continue;
+      if (token.type === "space") continue;
+      if (
+        (!insideBlock || token.type === "list" || token.type === "blockquote") &&
+        depth > (limits.maxDepth ?? Infinity)
+      )
+        throw new MarkdownWriteError("Markdown nesting is too deep.");
       if (token.type === "list") {
-        for (const item of token.items) countInline(item.tokens);
-        continue;
+        blockCount += token.items.length;
+        for (const item of token.items) countInline(item.tokens, depth + 1, true);
+      } else if (token.type === "blockquote") {
+        blockCount++;
+        countInline(token.tokens ?? [], depth + 1, true);
+      } else {
+        if (!insideBlock) blockCount++;
+        if (token.type !== "code") {
+          const inlineSource = "text" in token && typeof token.text === "string" ? token.text : token.raw;
+          let inlineDelimiters = 0;
+          for (const character of inlineSource) {
+            if (!delimiterCharacters.includes(character)) continue;
+            if (++delimiterCount > maxDelimiters)
+              throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
+            if (++inlineDelimiters > (limits.maxInlineDelimiters ?? maxDelimiters))
+              throw new MarkdownWriteError("A Markdown block has too many markup delimiters.");
+          }
+        }
       }
-      if (token.type === "blockquote") {
-        countInline(token.tokens ?? []);
-        continue;
-      }
-      const inlineSource = "text" in token && typeof token.text === "string" ? token.text : token.raw;
-      for (const character of inlineSource)
-        if ("<\\[]`*_!".includes(character) && ++delimiterCount > maxDelimiters)
-          throw new MarkdownWriteError("Markdown content has too many markup delimiters.");
+      if (limits.maxBlocks !== undefined && blockCount > limits.maxBlocks)
+        throw new MarkdownWriteError(`Markdown content exceeds ${limits.maxBlocks} blocks.`);
     }
   };
   countInline(blocks);
@@ -277,11 +312,12 @@ export function parseWritableMarkdownWithSource(
       throw new MarkdownWriteError(`Markdown blocks of type ${token.type} cannot be edited.`);
     }
     if (token.type !== "list") rawBlocks.push(token.raw.trimEnd());
-    if (output.length > MAX_INPUT_BLOCKS) throw new MarkdownWriteError("Markdown content exceeds 1000 blocks.");
+    if (output.length > (limits.maxBlocks ?? MAX_INPUT_BLOCKS))
+      throw new MarkdownWriteError(`Markdown content exceeds ${limits.maxBlocks ?? MAX_INPUT_BLOCKS} blocks.`);
   }
   return { blocks: output, rawBlocks, delimiterCount };
 }
 
-export function parseWritableMarkdown(source: string): ProseMirrorJson[] {
-  return parseWritableMarkdownWithSource(source).blocks;
+export function parseWritableMarkdown(source: string, limits?: MarkdownParseLimits): ProseMirrorJson[] {
+  return parseWritableMarkdownWithSource(source, limits?.maxDelimiters ?? MAX_MARKDOWN_DELIMITERS, limits).blocks;
 }

@@ -2,6 +2,7 @@ import { Fragment, Slice, type Node } from "prosemirror-model";
 import type { Transaction } from "prosemirror-state";
 import type { AiSource } from "../shared/ai";
 import { writingProtected, parseAiMarkdown } from "../shared/ai-writing";
+import { projectionLeafText } from "../shared/document-projection";
 
 export class WritingTargetError extends Error {}
 
@@ -14,6 +15,7 @@ export type WritingTarget = {
   toOffset: number;
   text: string;
 };
+export type WritingLaunchRequest = { id: string; pageId: string; target?: WritingTarget; conversationId?: string };
 function positions(doc: Node): BlockPosition[] {
   const output: BlockPosition[] = [];
   doc.descendants((node, pos) => {
@@ -43,7 +45,7 @@ export function captureWritingTarget(
     blocks: blocks.map((block) => ({ id: block.id, fingerprint: JSON.stringify(block.node.toJSON()) })),
     fromOffset: from - (first?.pos ?? 0),
     toOffset: to - (first?.pos ?? 0),
-    text: kind === "selection" ? doc.textBetween(from, to, "\n") : "",
+    text: kind === "selection" ? doc.textBetween(from, to, "\n", (leaf) => projectionLeafText(leaf.toJSON())) : "",
   };
 }
 export function targetSource(target: WritingTarget, pageId: string): AiSource {

@@ -10,8 +10,15 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { enrollAccount } from "../../tests/helpers/security";
-import type { AiConversation, AiGenerate, AiSettings, AiStatus, AiStreamEvent } from "../shared/ai";
-import { AI_RETENTION_MS } from "../shared/ai";
+import type {
+  AiConversation,
+  AiConversationAccess,
+  AiGenerate,
+  AiSettings,
+  AiStatus,
+  AiStreamEvent,
+} from "../shared/ai";
+import { AI_GENERATION_DEADLINE_MS, AI_RETENTION_MS } from "../shared/ai";
 import type { Page } from "../shared/types";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
 import type { Env, MemberContext } from "./env";
@@ -96,6 +103,56 @@ async function documentText(value: string, blockId = "selected") {
     });
     await object.compact();
   });
+}
+async function liveGeneration() {
+  let upstream!: ReadableStreamDefaultController<Uint8Array>, ready!: () => void;
+  const started = new Promise<void>((resolve) => {
+    ready = resolve;
+  });
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (resource: RequestInfo | URL, init?: RequestInit) => {
+      if (String(resource).endsWith("/models")) return Response.json({ data: [{ id: "test-fast" }] });
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            upstream = controller;
+            ready();
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                try {
+                  controller.error(new DOMException("Stopped", "AbortError"));
+                } catch {
+                  /* The upstream may already be closed. */
+                }
+              },
+              { once: true },
+            );
+          },
+        }),
+        { headers: { "content-type": "text/event-stream" } },
+      );
+    }),
+  );
+  const value = input(),
+    context = createExecutionContext();
+  const response = await worker.fetch(request("/api/ai/generate", "POST", value), bindings(), context),
+    reader = response.body!.getReader();
+  const start = JSON.parse(
+    new TextDecoder()
+      .decode((await reader.read()).value)
+      .slice(6)
+      .trim(),
+  ) as Extract<AiStreamEvent, { type: "start" }>;
+  await started;
+  return {
+    value,
+    context,
+    reader,
+    start,
+    send: (event: unknown) => upstream.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`)),
+  };
 }
 async function anotherOwner() {
   await env.DB.prepare(
@@ -332,6 +389,94 @@ describe("AI writing dispatch and quota", () => {
     expect(saved.conversation).not.toHaveProperty("messages");
     expect(JSON.stringify(saved)).not.toContain("Private partial draft");
   });
+  it.each(["membership", "session"])("stops a running stream on live %s revocation", async (kind) => {
+    const live = await liveGeneration();
+    if (kind === "membership") {
+      await anotherOwner();
+      await env.DB.prepare("DELETE FROM workspace_members WHERE user_id=? AND workspace_id=?")
+        .bind(member.user.id, member.workspace.id)
+        .run();
+    } else await env.DB.prepare("DELETE FROM session WHERE id=?").bind(member.session.id).run();
+    await waitOnExecutionContext(live.context);
+    const event = JSON.parse(
+      new TextDecoder()
+        .decode((await live.reader.read()).value)
+        .slice(6)
+        .trim(),
+    );
+    expect(event).toMatchObject({ type: "error", status: kind === "session" ? 401 : 403 });
+    await live.reader.cancel();
+  });
+  it.each(["cancelled", "expired"])("prevents a late completion after the request is %s", async (kind) => {
+    const live = await liveGeneration();
+    live.send({ type: "response.output_text.delta", delta: "Partial saved text" });
+    await live.reader.read();
+    if (kind === "cancelled") await call(`/api/ai/generations/${live.value.operationId}/cancel`, "POST");
+    else {
+      await env.DB.prepare("UPDATE ai_messages SET created_at=? WHERE id=?")
+        .bind(Date.now() - AI_GENERATION_DEADLINE_MS - 1, live.value.operationId)
+        .run();
+      await call(`/api/ai/conversations/${live.start.conversationId}/access`);
+    }
+    live.send({ type: "response.completed", response: { status: "completed" } });
+    await waitOnExecutionContext(live.context);
+    const event = new TextDecoder().decode((await live.reader.read()).value);
+    expect(event).toContain('"type":"error"');
+    expect(event).not.toContain('"type":"complete"');
+    expect(
+      await env.DB.prepare("SELECT status,output FROM ai_messages WHERE id=?").bind(live.value.operationId).first(),
+    ).toEqual({ status: kind === "cancelled" ? "cancelled" : "failed", output: "Partial saved text" });
+    await live.reader.cancel();
+  });
+  it("uses two SQL queries for the final live authorization check", async () => {
+    const live = await liveGeneration();
+    const original = env.DB.prepare.bind(env.DB),
+      queries: string[] = [];
+    vi.spyOn(env.DB, "prepare").mockImplementation((sql: string) => {
+      queries.push(sql);
+      return original(sql);
+    });
+    live.send({ type: "response.completed", response: { status: "completed" } });
+    await waitOnExecutionContext(live.context);
+    expect(new TextDecoder().decode((await live.reader.read()).value)).toContain('"type":"complete"');
+    expect(queries.filter((sql) => sql.trimStart().startsWith("SELECT"))).toHaveLength(2);
+    expect(queries.some((sql) => sql.startsWith("SELECT m.status"))).toBe(true);
+    await live.reader.cancel();
+  });
+  it.each([1, 3])("withholds deltas during access failures and %i attempts", async (failures) => {
+    const live = await liveGeneration();
+    const original = env.DB.prepare.bind(env.DB);
+    let attempts = 0,
+      firstFailure!: () => void;
+    const failed = new Promise<void>((resolve) => {
+      firstFailure = resolve;
+    });
+    vi.spyOn(env.DB, "prepare").mockImplementation((sql: string) => {
+      if (sql.startsWith("SELECT m.status") && ++attempts <= failures) {
+        firstFailure();
+        throw new Error("Transient D1 failure");
+      }
+      return original(sql);
+    });
+    await failed;
+    live.send({ type: "response.output_text.delta", delta: "Withheld private text" });
+    let released = false;
+    const next = live.reader.read().then((value) => {
+      released = true;
+      return value;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(released).toBe(false);
+    const event = new TextDecoder().decode((await next).value);
+    expect(event).toContain(failures === 1 ? '"type":"delta"' : "ai_access_unavailable");
+    expect(attempts).toBe(failures === 1 ? 2 : 3);
+    expect(event.includes("Withheld private text")).toBe(failures === 1);
+    if (failures === 1) live.send({ type: "response.completed", response: { status: "completed" } });
+    await waitOnExecutionContext(live.context);
+    const terminal = failures === 1 ? new TextDecoder().decode((await live.reader.read()).value) : event;
+    expect(terminal).toContain(failures === 1 ? '"type":"complete"' : "ai_access_unavailable");
+    await live.reader.cancel();
+  });
   it("lets effective viewers generate and copy, while refusing application and owner settings", async () => {
     await anotherOwner();
     await env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE workspace_id=? AND user_id=?")
@@ -347,6 +492,131 @@ describe("AI writing dispatch and quota", () => {
     expect(result.events.at(-1)?.type).toBe("complete");
     expect((await call(`/api/ai/results/${start.messageId}/apply-check`, "POST", {})).status).toBe(403);
     expect((await call("/api/ai/settings", "POST", settings)).status).toBe(403);
+  });
+});
+describe("writing failure contracts and stale recovery", () => {
+  it.each([401, 403, 503])(
+    "isolates model discovery HTTP %i from NoteFlare sign-in and preserves quota",
+    async (status) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => Response.json({ error: "provider" }, { status })),
+      );
+      const response = await call("/api/ai/models?funding=api");
+      expect(response.status).toBe(status === 503 ? 503 : 502);
+      expect((await call("/api/me")).status).toBe(200);
+      expect((await (await call("/api/ai/status")).json<AiStatus>()).quota.remaining).toBe(20);
+    },
+  );
+  it("invalidates model access on upstream credential rejection and refunds only confirmed rejection", async () => {
+    providerStatus = 401;
+    const result = await generate();
+    expect(result.events.at(-1)).toMatchObject({ type: "error", status: 502 });
+    expect((await (await call("/api/ai/status")).json<AiStatus>()).quota.remaining).toBe(20);
+    const fetcher = vi.mocked(fetch);
+    const modelCount = () => fetcher.mock.calls.filter(([resource]) => String(resource).endsWith("/models")).length;
+    expect(modelCount()).toBe(1);
+    await call("/api/ai/models?funding=api");
+    expect(modelCount()).toBe(2);
+    providerStatus = 503;
+    expect((await generate()).events.at(-1)).toMatchObject({ type: "error", status: 503 });
+    expect((await (await call("/api/ai/status")).json<AiStatus>()).quota.remaining).toBe(19);
+  });
+  it("keeps actual session failure a NoteFlare 401", async () => {
+    await env.DB.prepare("DELETE FROM session WHERE id=?").bind(member.session.id).run();
+    expect((await call("/api/ai/models?funding=api")).status).toBe(401);
+    expect((await generate()).response.status).toBe(401);
+    expect(providerCalls).toHaveLength(0);
+  });
+  it.each(["read", "open", "access", "follow-up"])(
+    "recovers an abandoned request during %s without cron, preserving output and receipts",
+    async (kind) => {
+      const value = input(),
+        first = await generate(value);
+      const start = first.events[0] as Extract<AiStreamEvent, { type: "start" }>;
+      await env.DB.prepare("UPDATE ai_messages SET status='running',created_at=?,output='Saved partial' WHERE id=?")
+        .bind(Date.now() - AI_GENERATION_DEADLINE_MS - 1, value.operationId)
+        .run();
+      const suffix = kind === "read" ? "" : `/${kind}`;
+      const response =
+        kind === "follow-up"
+          ? (await generate(input({ conversationId: start.conversationId }))).response
+          : await call(`/api/ai/conversations/${start.conversationId}${suffix}`, kind === "open" ? "POST" : "GET");
+      expect(response.ok).toBe(true);
+      expect(
+        await env.DB.prepare("SELECT status,output FROM ai_messages WHERE id=?").bind(value.operationId).first(),
+      ).toEqual({ status: "failed", output: "Saved partial" });
+      expect(
+        await env.DB.prepare("SELECT counted FROM ai_requests WHERE id=?").bind(value.operationId).first(),
+      ).toEqual({ counted: 1 });
+      expect((await (await call("/api/ai/status")).json<AiStatus>()).quota.remaining).toBe(
+        kind === "follow-up" ? 18 : 19,
+      );
+    },
+  );
+  it("exposes and cancels saved running work without extending retention", async () => {
+    const value = input(),
+      first = await generate(value),
+      start = first.events[0] as Extract<AiStreamEvent, { type: "start" }>;
+    const createdAt = Date.now(),
+      yesterday = createdAt - 86400000;
+    await env.DB.prepare("UPDATE ai_messages SET status='running',created_at=? WHERE id=?")
+      .bind(createdAt, value.operationId)
+      .run();
+    await env.DB.prepare("UPDATE ai_conversations SET updated_at=? WHERE id=?")
+      .bind(yesterday, start.conversationId)
+      .run();
+    const response = await call(`/api/ai/conversations/${start.conversationId}/access`);
+    expect(await response.json()).toMatchObject({
+      activeGeneration: { messageId: value.operationId, createdAt, deadlineAt: createdAt + AI_GENERATION_DEADLINE_MS },
+    });
+    expect((await generate(input({ conversationId: start.conversationId }))).response.status).toBe(409);
+    expect((await call(`/api/ai/generations/${value.operationId}/cancel`, "POST")).status).toBe(200);
+    expect(
+      await env.DB.prepare("SELECT updated_at FROM ai_conversations WHERE id=?").bind(start.conversationId).first(),
+    ).toEqual({ updated_at: yesterday });
+    expect(
+      (await (await call(`/api/ai/conversations/${start.conversationId}/access`)).json<AiConversationAccess>())
+        .activeGeneration,
+    ).toBeNull();
+    expect((await generate(input({ conversationId: start.conversationId }))).events.at(-1)).toEqual({
+      type: "complete",
+    });
+  });
+  it("admits only one concurrent follow-up after stale recovery", async () => {
+    const value = input(),
+      first = await generate(value),
+      start = first.events[0] as Extract<AiStreamEvent, { type: "start" }>;
+    await env.DB.prepare("UPDATE ai_messages SET status='running',created_at=? WHERE id=?")
+      .bind(Date.now() - AI_GENERATION_DEADLINE_MS - 1, value.operationId)
+      .run();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const original = fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (resource: RequestInfo | URL, init?: RequestInit) => {
+        if (String(resource).endsWith("/responses")) await gate;
+        return original(resource, init);
+      }),
+    );
+    const contexts = [createExecutionContext(), createExecutionContext()];
+    const responses = await Promise.all(
+      contexts.map((context) =>
+        worker.fetch(
+          request("/api/ai/generate", "POST", input({ conversationId: start.conversationId })),
+          bindings(),
+          context,
+        ),
+      ),
+    );
+    expect(responses.map((response) => response.status).sort((a, b) => a - b)).toEqual([200, 409]);
+    release();
+    await Promise.all(responses.map((response) => response.text()));
+    await Promise.all(contexts.map(waitOnExecutionContext));
+    expect((await (await call("/api/ai/status")).json<AiStatus>()).quota.remaining).toBe(18);
   });
 });
 describe("private conversation retention and sources", () => {

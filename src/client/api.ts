@@ -215,6 +215,24 @@ export function invalidateUnauthorizedRequests() {
   unauthorizedRequestEpoch += 1;
 }
 
+export function apiRequestEpoch() {
+  return unauthorizedRequestEpoch;
+}
+export function notifyApiUnauthorized(error: ApiClientError, requestEpoch: number) {
+  if (error.status !== 401 || requestEpoch !== unauthorizedRequestEpoch) return;
+  for (const handler of unauthorizedHandlers) {
+    try {
+      handler(error);
+    } catch (handlerError) {
+      console.error("API unauthorized handler failed", handlerError);
+      void reportClientError("client.api_unauthorized_handler_failed", handlerError, {
+        requestId: error.requestId,
+        release: error.workerVersion,
+      });
+    }
+  }
+}
+
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const requestEpoch = unauthorizedRequestEpoch;
   const headers = new Headers(init?.headers);
@@ -260,19 +278,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       workerVersion,
     });
     if (responseBodyFailure) reportApiResponseFailure(clientError);
-    if (response.status === 401 && requestEpoch === unauthorizedRequestEpoch) {
-      for (const handler of unauthorizedHandlers) {
-        try {
-          handler(clientError);
-        } catch (handlerError) {
-          console.error("API unauthorized handler failed", handlerError);
-          void reportClientError("client.api_unauthorized_handler_failed", handlerError, {
-            requestId,
-            release: workerVersion,
-          });
-        }
-      }
-    }
+    notifyApiUnauthorized(clientError, requestEpoch);
     throw clientError;
   }
   if (response.status === 204) return undefined as T;

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Schema } from "prosemirror-model";
 import { EditorState } from "prosemirror-state";
 import { applyWriting, captureWritingTarget, targetSource, writingTargetState } from "./writing-target";
+import { projectDocument } from "../shared/document-projection";
 
 const schema = new Schema({
   nodes: {
@@ -10,7 +11,13 @@ const schema = new Schema({
     blockContainer: { content: "paragraph blockGroup?", attrs: { id: { default: null } } },
     paragraph: { content: "inline*" },
     text: { group: "inline" },
-    mention: { inline: true, group: "inline", atom: true, attrs: { label: { default: "Mention" } } },
+    mention: {
+      inline: true,
+      group: "inline",
+      atom: true,
+      attrs: { label: { default: "Alice" }, entityId: { default: "alice" }, entityType: { default: "user" } },
+    },
+    dateMention: { inline: true, group: "inline", atom: true, attrs: { value: { default: "2026-10-09" } } },
   },
   marks: { bold: {}, link: { attrs: { href: {} } } },
 });
@@ -23,6 +30,37 @@ const document = () =>
     schema.node("blockGroup", null, [block("one", "Before target after"), block("two", "Second paragraph")]),
   );
 describe("writing application", () => {
+  it("captures mentions and dates with the same text and separators as server projection", () => {
+    const doc = schema.node(
+      "doc",
+      null,
+      schema.node(
+        "blockGroup",
+        null,
+        schema.node("blockContainer", { id: "atoms" }, [
+          schema.node("paragraph", null, [
+            schema.text("A"),
+            schema.node("mention"),
+            schema.text("about "),
+            schema.node("dateMention"),
+            schema.text("meeting"),
+          ]),
+        ]),
+      ),
+    );
+    const selected = captureWritingTarget(doc, 3, 3 + doc.firstChild!.firstChild!.firstChild!.content.size, 1);
+    expect(selected.text).toBe("AAlice about 2026-10-09 meeting");
+    expect(projectDocument(doc.toJSON()).plainText).toBe(selected.text);
+    expect(targetSource(selected, "doc").scope.kind).toBe("selection");
+    expect(() =>
+      applyWriting(EditorState.create({ doc }).tr, selected, 1, "Replacement", "replace", new Set()),
+    ).toThrow(/mention/);
+    for (const from of [4, 11]) {
+      const atomOnly = captureWritingTarget(doc, from, from + 1, 1);
+      expect(atomOnly.text.trim()).not.toBe("");
+      expect(targetSource(atomOnly, "doc").scope.kind).toBe("selection");
+    }
+  });
   it("preserves text outside an inline selection and formats the replacement", () => {
     const doc = document(),
       from = 10,

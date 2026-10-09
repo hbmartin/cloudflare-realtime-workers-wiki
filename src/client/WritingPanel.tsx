@@ -1,7 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+/* oxlint-disable react/set-state-in-effect -- This panel synchronizes external launches, visibility access checks, and provider availability; each requires updating retained state. */
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   AI_ACTIONS,
+  AI_GENERATION_DEADLINE_MS,
+  aiGenerateSchema,
   type AiConversation,
+  type AiConversationAccess,
   type AiFunding,
   type AiGenerate,
   type AiMessage,
@@ -12,16 +16,55 @@ import {
 import type { Page } from "../shared/types";
 import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { streamWriting } from "./writing-api";
-import { targetSource, WritingTargetError, type WritingTarget } from "./writing-target";
-import { WritingPreview } from "./WritingPreview";
+import { targetSource, WritingTargetError, type WritingTarget, type WritingLaunchRequest } from "./writing-target";
+import { WritingPreview, useWritingMarkdown } from "./WritingPreview";
 import { WritingSources } from "./WritingSources";
 import { WritingHistory } from "./WritingHistory";
-import { parseAiMarkdown } from "../shared/ai-writing";
+
+const HistoryMessage = memo(
+  function HistoryMessage({ message }: { message: AiMessage }) {
+    return (
+      <article>
+        <h3>
+          {AI_ACTIONS[message.action]} · {message.funding === "api" ? "Workspace API" : "ChatGPT plan"} ·{" "}
+          {message.quality === "fast" ? "Fast" : "Best"}
+        </h3>
+        <p>{message.prompt}</p>
+        <WritingPreview markdown={message.output} />
+        <small>{message.status === "complete" ? "Complete" : "Partial — copy only"}</small>
+        <ul>
+          {message.sources.map((source) => (
+            <li key={source.pageId}>
+              <a href={source.url}>{source.title}</a>
+            </li>
+          ))}
+        </ul>
+      </article>
+    );
+  },
+  (previous, next) => {
+    const a = previous.message,
+      b = next.message;
+    if (a === b) return true;
+    return (
+      a.output === b.output &&
+      a.prompt === b.prompt &&
+      a.action === b.action &&
+      a.funding === b.funding &&
+      a.quality === b.quality &&
+      a.status === b.status &&
+      JSON.stringify(a.sources) === JSON.stringify(b.sources)
+    );
+  },
+);
 
 export function WritingPanel({
   pageId,
   initialTarget,
   conversationId,
+  launchRequest,
+  visible = true,
+  onBusyChange,
   onCapture,
   onApply,
   onClose,
@@ -32,6 +75,9 @@ export function WritingPanel({
   pageId: string;
   initialTarget: WritingTarget;
   conversationId?: string;
+  launchRequest?: WritingLaunchRequest;
+  visible?: boolean;
+  onBusyChange?: (busy: boolean) => void;
   onCapture: (kind?: WritingTarget["kind"]) => WritingTarget;
   onApply: (
     target: WritingTarget,
@@ -54,89 +100,98 @@ export function WritingPanel({
     [prompt, setPrompt] = useState(""),
     [tone, setTone] = useState("Professional"),
     [targetLanguage, setTargetLanguage] = useState("");
-  const [threadId, setThreadId] = useState<string | undefined>(undefined),
+  const [threadId, setThreadId] = useState<string | undefined>(),
     [messages, setMessages] = useState<AiMessage[]>([]),
     [result, setResult] = useState(""),
     [resultState, setResultState] = useState<"empty" | "running" | "complete" | "partial">("empty"),
     [messageId, setMessageId] = useState("");
-  const [resultTarget, setResultTarget] = useState<WritingTarget | null>(null);
-  const [target, setTarget] = useState<WritingTarget | null>(initialTarget),
+  const [resultTarget, setResultTarget] = useState<WritingTarget | null>(null),
+    [target, setTarget] = useState<WritingTarget | null>(initialTarget),
     [error, setError] = useState(""),
     [notice, setNotice] = useState(""),
     [historyOpen, setHistoryOpen] = useState(false),
     [locked, setLocked] = useState(false),
+    [unavailable, setUnavailable] = useState(false),
     [applying, setApplying] = useState(false),
-    [online, setOnline] = useState(navigator.onLine);
+    [online, setOnline] = useState(navigator.onLine),
+    [foreground, setForeground] = useState(!document.hidden),
+    [checkingAccess, setCheckingAccess] = useState(false),
+    [remoteGeneration, setRemoteGeneration] = useState<AiConversationAccess["activeGeneration"]>(null);
   const controller = useRef<AbortController | null>(null),
     activeId = useRef<string | null>(null),
-    mounted = useRef(true);
-  const [availability, setAvailability] = useState<{ funding: AiFunding; fast: boolean; best: boolean } | null>(null);
-  const [synced, setSynced] = useState(() => ready());
+    mounted = useRef(true),
+    operation = useRef<"generate" | "apply" | null>(null),
+    remoteId = useRef<string | null>(null),
+    outputBuffer = useRef(""),
+    displayTimer = useRef<ReturnType<typeof setTimeout> | null>(null),
+    visibleRef = useRef(visible),
+    handledLaunch = useRef<string | undefined>(undefined),
+    loadRevision = useRef(0),
+    historyHidden = useRef(false),
+    latestMessageId = useRef("");
+  const [availability, setAvailability] = useState<{
+      funding: AiFunding;
+      fast: boolean;
+      best: boolean;
+      attempt: number;
+    } | null>(null),
+    [modelCheck, setModelCheck] = useState(0),
+    [synced, setSynced] = useState(() => ready()),
+    [resultSources, setResultSources] = useState<AiMessage["sources"]>([]);
+  const parsed = useWritingMarkdown(visible && !checkingAccess ? result : "");
+  const formatError = resultState === "complete" && result ? parsed.error : "";
+  const running = resultState === "running" || !!remoteGeneration;
+  const busy = running || applying;
   useEffect(() => {
+    onBusyChange?.(busy);
+  }, [busy, onBusyChange]);
+  const flushResult = useCallback(() => {
+    if (displayTimer.current !== null) clearTimeout(displayTimer.current);
+    displayTimer.current = null;
+    if (mounted.current) setResult(outputBuffer.current);
+  }, []);
+  useLayoutEffect(() => {
+    visibleRef.current = visible;
+    if (visible) flushResult();
+    else if (displayTimer.current !== null) {
+      clearTimeout(displayTimer.current);
+      displayTimer.current = null;
+    }
+    if (visible && foreground && threadId) setCheckingAccess(true);
+  }, [visible, foreground, threadId, flushResult]);
+  useEffect(() => {
+    if (!visible) return undefined;
     const update = () => setSynced(ready());
+    update();
     const unsubscribe = subscribeReadiness?.(update);
-    const timer = setInterval(update, 250);
+    window.addEventListener("online", update);
+    window.addEventListener("offline", update);
     return () => {
       unsubscribe?.();
-      clearInterval(timer);
+      window.removeEventListener("online", update);
+      window.removeEventListener("offline", update);
     };
-  }, [ready, subscribeReadiness]);
-  const [resultSources, setResultSources] = useState<AiMessage["sources"]>([]);
-  const formatError = useMemo(() => {
-    if (resultState !== "complete" || !result) return "";
-    try {
-      parseAiMarkdown(result);
-      return "";
-    } catch (cause) {
-      return apiErrorMessage(cause, "The result cannot be safely applied. Copy or refine it.");
-    }
-  }, [result, resultState]);
-  const configuredFast = funding ? status?.settings?.models[funding].fast.id : "";
-  const configuredBest = funding ? status?.settings?.models[funding].best.id : "";
+  }, [ready, subscribeReadiness, visible]);
+  const configuredFast = funding ? status?.settings.models[funding].fast.id : "";
+  const configuredBest = funding ? status?.settings.models[funding].best.id : "";
   useEffect(() => {
-    if (!funding || (!configuredFast && !configuredBest)) return undefined;
+    if (!visible || !funding || (!configuredFast && !configuredBest)) return undefined;
     const abort = new AbortController();
+    setAvailability(null);
     void api<{ fast: boolean; best: boolean }>(`/api/ai/models?funding=${funding}`, { signal: abort.signal })
       .then((value) => {
-        setAvailability({ ...value, funding });
+        if (!abort.signal.aborted) setAvailability({ ...value, funding, attempt: modelCheck });
       })
       .catch((cause) => {
         if (!abort.signal.aborted) setError(apiErrorMessage(cause, "Model access could not be checked."));
       });
     return () => abort.abort();
-  }, [funding, configuredFast, configuredBest]);
-  useEffect(() => {
-    if (!threadId) return undefined;
-    const abort = new AbortController();
-    const check = () => {
-      void api<{ locked: boolean }>(`/api/ai/conversations/${threadId}/access`, { signal: abort.signal })
-        .then((value) => {
-          if (value.locked) {
-            setLocked(true);
-            setResult("");
-            setMessages([]);
-          }
-        })
-        .catch((cause) => {
-          if (cause instanceof ApiClientError && [401, 403, 404].includes(cause.status)) {
-            setLocked(true);
-            setResult("");
-            setMessages([]);
-            setError("This conversation is unavailable or expired.");
-          }
-        });
-    };
-    const timer = setInterval(check, 5000);
-    window.addEventListener("focus", check);
-    return () => {
-      clearInterval(timer);
-      window.removeEventListener("focus", check);
-      abort.abort();
-    };
-  }, [threadId]);
+  }, [visible, funding, configuredFast, configuredBest, modelCheck]);
   function chooseFunding(value: AiFunding) {
+    if (operation.current || remoteId.current) return;
     setFunding(value);
     setError("");
+    setModelCheck((attempt) => attempt + 1);
     void api("/api/ai/preference", { method: "POST", body: json({ funding: value }) }).catch((cause) =>
       setError(apiErrorMessage(cause, "Funding is selected for this request but could not be remembered.")),
     );
@@ -160,60 +215,193 @@ export function WritingPanel({
       .catch(() => undefined);
     return () => {
       mounted.current = false;
+      if (displayTimer.current !== null) clearTimeout(displayTimer.current);
       controller.current?.abort();
-      if (activeId.current)
-        void api(`/api/ai/generations/${activeId.current}/cancel`, { method: "POST" }).catch(() => undefined);
+      const disposedOperation = activeId.current;
+      if (disposedOperation)
+        void api(`/api/ai/generations/${disposedOperation}/cancel`, { method: "POST" }).catch(() => undefined);
     };
   }, [refreshStatus]);
   useEffect(() => {
-    const update = () => setOnline(navigator.onLine);
+    const update = () => setOnline(navigator.onLine),
+      visibility = () => setForeground(!document.hidden);
     window.addEventListener("online", update);
     window.addEventListener("offline", update);
+    document.addEventListener("visibilitychange", visibility);
     return () => {
       window.removeEventListener("online", update);
       window.removeEventListener("offline", update);
+      document.removeEventListener("visibilitychange", visibility);
     };
   }, []);
+  const clearPrivateContent = useCallback(() => {
+    historyHidden.current = true;
+    outputBuffer.current = "";
+    setResult("");
+    setMessages([]);
+    remoteId.current = null;
+    setRemoteGeneration(null);
+    if (displayTimer.current !== null) clearTimeout(displayTimer.current);
+    displayTimer.current = null;
+  }, []);
+  const accessFailure = useCallback(
+    (cause: unknown) => {
+      if (!(cause instanceof ApiClientError)) return false;
+      if (cause.status === 401) {
+        clearPrivateContent();
+        return true;
+      }
+      if (cause.code === "conversation_not_found") {
+        setUnavailable(true);
+        clearPrivateContent();
+        return true;
+      } else if (["conversation_locked", "page_not_found", "space_not_found"].includes(cause.code)) {
+        setLocked(true);
+        clearPrivateContent();
+        return true;
+      }
+      return false;
+    },
+    [clearPrivateContent],
+  );
   const open = useCallback(
-    async (id: string) => {
+    async (id: string, touch = true, preserveTarget = false) => {
+      if (operation.current || (touch && remoteId.current)) {
+        if (touch) setNotice("Finish or cancel the current operation before changing its source.");
+        return;
+      }
+      const revision = ++loadRevision.current;
+      setCheckingAccess(true);
       try {
-        const { conversation } = await api<{ conversation: AiConversation }>(`/api/ai/conversations/${id}/open`, {
-          method: "POST",
-        });
+        const { conversation } = await api<{ conversation: AiConversation }>(
+          `/api/ai/conversations/${id}${touch ? "/open" : ""}`,
+          touch ? { method: "POST" } : undefined,
+        );
+        if (!mounted.current || revision !== loadRevision.current) return;
         setLocked(conversation.locked);
+        setUnavailable(false);
         setThreadId(conversation.id);
-        setHistoryOpen(false);
-        setError("");
-        setTarget(null);
-        setResultTarget(null);
+        if (touch) {
+          setHistoryOpen(false);
+          setError("");
+        }
+        if (!preserveTarget) {
+          setTarget(null);
+          setResultTarget(null);
+          setSources(conversation.sources ?? [{ pageId, scope: { kind: "page" } }]);
+        }
         if (conversation.locked) {
-          setMessages([]);
-          setResult("");
+          clearPrivateContent();
           setResultState("empty");
           return;
         }
-        setSources(conversation.sources ?? [{ pageId, scope: { kind: "page" } }]);
-        setMessages(conversation.messages ?? []);
         const latest = conversation.messages?.at(-1);
-        setResult(latest?.output ?? "");
+        if (preserveTarget && latest?.id !== latestMessageId.current) {
+          setTarget(null);
+          setResultTarget(null);
+        }
+        historyHidden.current = false;
+        latestMessageId.current = latest?.id ?? "";
+        setMessages(conversation.messages ?? []);
+        outputBuffer.current = latest?.output ?? "";
+        flushResult();
         setResultState(latest?.status === "complete" ? "complete" : latest?.output ? "partial" : "empty");
         setMessageId(latest?.id ?? "");
         setResultSources(latest?.sources ?? []);
-        setNotice(
-          "Saved result opened. Choose a current insertion location to use it, or generate again from the latest sources.",
-        );
+        const active =
+          latest?.status === "running"
+            ? {
+                messageId: latest.id,
+                createdAt: latest.createdAt,
+                deadlineAt: latest.createdAt + AI_GENERATION_DEADLINE_MS,
+              }
+            : null;
+        remoteId.current = active?.messageId ?? null;
+        setRemoteGeneration(active);
+        if (touch)
+          setNotice(
+            active
+              ? "A saved generation is still running. Cancel it or wait for completion."
+              : "Saved result opened. Choose a current insertion location to use it, or generate again from the latest sources.",
+          );
       } catch (cause) {
-        setError(apiErrorMessage(cause, "The conversation could not be opened."));
+        if (mounted.current && revision === loadRevision.current) {
+          accessFailure(cause);
+          setError(apiErrorMessage(cause, "The conversation could not be opened."));
+        }
+      } finally {
+        if (mounted.current && revision === loadRevision.current) setCheckingAccess(false);
       }
     },
-    [pageId],
+    [pageId, clearPrivateContent, flushResult, accessFailure],
   );
   useEffect(() => {
-    if (conversationId) {
-      void Promise.resolve().then(() => open(conversationId));
+    const id = launchRequest?.id ?? (conversationId ? `initial:${conversationId}` : undefined);
+    if (!id || handledLaunch.current === id) return;
+    handledLaunch.current = id;
+    if (operation.current || remoteId.current) {
+      setNotice("Finish or cancel the current operation before changing its source.");
+      return;
     }
-  }, [conversationId, open]);
+    const savedId = launchRequest?.conversationId ?? conversationId;
+    if (savedId) {
+      void open(savedId);
+      return;
+    }
+    if (launchRequest?.target) {
+      const next = launchRequest.target;
+      setTarget(next);
+      setSources((items) => items.map((source) => (source.pageId === pageId ? targetSource(next, pageId) : source)));
+    }
+  }, [launchRequest, conversationId, open, pageId]);
+  useEffect(() => {
+    if (!threadId || !visible || !foreground) return undefined;
+    const abort = new AbortController();
+    let inFlight = false;
+    const check = async (refresh = false) => {
+      if (inFlight || abort.signal.aborted) return;
+      inFlight = true;
+      try {
+        const value = await api<AiConversationAccess>(`/api/ai/conversations/${threadId}/access`, {
+          signal: abort.signal,
+        });
+        if (abort.signal.aborted) return;
+        if (value.locked) {
+          setLocked(true);
+          clearPrivateContent();
+        } else {
+          const wasRemote = !!remoteId.current;
+          setLocked(false);
+          setUnavailable(false);
+          if (!controller.current) {
+            remoteId.current = value.activeGeneration?.messageId ?? null;
+            setRemoteGeneration(value.activeGeneration ?? null);
+            if (refresh || historyHidden.current || (wasRemote && !value.activeGeneration))
+              await open(threadId, false, true);
+          }
+        }
+        if (!abort.signal.aborted) setCheckingAccess(false);
+      } catch (cause) {
+        if (!abort.signal.aborted) {
+          if (accessFailure(cause)) setCheckingAccess(false);
+          setError(apiErrorMessage(cause, "Conversation access could not be checked. Reopen Writing to retry."));
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    void check();
+    const timer = setInterval(() => void check(), 5000),
+      focus = () => void check(true);
+    window.addEventListener("focus", focus);
+    return () => {
+      abort.abort();
+      clearInterval(timer);
+      window.removeEventListener("focus", focus);
+    };
+  }, [threadId, visible, foreground, open, clearPrivateContent, accessFailure]);
   function captureSelection() {
+    if (operation.current || remoteId.current) return;
     const current = onCapture();
     if (current.kind !== "selection" || !current.text) {
       setError("Select text in the document first.");
@@ -223,143 +411,207 @@ export function WritingPanel({
     setSources((items) => items.map((source) => (source.pageId === pageId ? targetSource(current, pageId) : source)));
     setError("");
   }
+  const modeAvailable =
+    !!funding &&
+    !!status?.settings.models[funding][quality].id &&
+    availability?.funding === funding &&
+    availability.attempt === modelCheck &&
+    !!availability[quality];
+  const validInstruction =
+    !(["draft", "custom"].includes(action) && !prompt.trim()) &&
+    !(action === "translate" && !targetLanguage.trim()) &&
+    !(action === "change_tone" && !tone.trim());
+  const canGenerate =
+    online &&
+    synced &&
+    !!status?.settings.enabled &&
+    modeAvailable &&
+    validInstruction &&
+    !busy &&
+    !checkingAccess &&
+    !locked &&
+    !unavailable &&
+    (funding === "api"
+      ? !!status?.apiConfigured && status.settings.apiEnabled && status.quota.remaining > 0
+      : !!status?.connected && status.chatgptConfigured);
   async function generate() {
-    if (!funding) {
-      setError("Choose ChatGPT plan or workspace API funding before generating.");
+    if (!canGenerate || operation.current || remoteId.current || !ready()) {
+      setError("Check writing availability, funding, allowance and document sync before generating.");
       return;
     }
-    if (!online || !ready()) {
-      setError("Wait for the document to finish syncing and a network connection before generating.");
+    const input = aiGenerateSchema.safeParse({
+      operationId: crypto.randomUUID(),
+      ...(threadId ? { conversationId: threadId } : {}),
+      pageId,
+      action,
+      prompt,
+      targetLanguage,
+      tone,
+      funding,
+      quality,
+      sources,
+    });
+    if (!input.success) {
+      setError(input.error.issues[0]?.message ?? "Check the writing request.");
       return;
     }
+    const previous = {
+      result: outputBuffer.current,
+      state: resultState,
+      target: resultTarget,
+      requestTarget: target,
+      messageId,
+      sources: resultSources,
+    };
     const nextTarget = target?.kind === "page" || !target ? onCapture("page") : target;
+    const abort = new AbortController();
+    operation.current = "generate";
+    onBusyChange?.(true);
+    controller.current = abort;
+    activeId.current = input.data.operationId;
     setTarget(nextTarget);
     setResultTarget(nextTarget);
     setError("");
     setNotice("");
-    setLocked(false);
-    setResult("");
+    outputBuffer.current = "";
+    flushResult();
     setResultState("running");
-    const abort = new AbortController(),
-      operationId = crypto.randomUUID();
-    controller.current = abort;
-    activeId.current = operationId;
-    let output = "",
-      terminal = false,
+    let terminal = false,
+      terminalFailure = false,
+      started = false,
+      denied = false,
       savedThread = threadId;
     try {
-      await streamWriting(
-        {
-          operationId,
-          ...(threadId ? { conversationId: threadId } : {}),
-          pageId,
-          action,
-          prompt,
-          ...(action === "translate" ? { targetLanguage } : {}),
-          ...(action === "change_tone" ? { tone } : {}),
-          funding,
-          quality,
-          sources,
-        },
-        abort.signal,
-        (event) => {
-          if (!mounted.current) return;
-          if (event.type === "start") {
-            savedThread = event.conversationId;
-            setThreadId(event.conversationId);
-            setMessageId(event.messageId);
-            setResultSources(event.sources);
-            setStatus((current) => (current ? { ...current, quota: event.quota } : null));
-            if (event.changedPageIds.length) setNotice("Some sources changed. This result uses their latest contents.");
-          } else if (event.type === "delta") {
-            output += event.text;
-            setResult(output);
-          } else if (event.type === "complete") {
-            terminal = true;
-            setResultState("complete");
-          } else {
-            terminal = true;
-            setResultState("partial");
+      await streamWriting(input.data, abort.signal, (event) => {
+        if (!mounted.current) return;
+        if (event.type === "start") {
+          started = true;
+          savedThread = event.conversationId;
+          setThreadId(event.conversationId);
+          setMessageId(event.messageId);
+          latestMessageId.current = event.messageId;
+          setResultSources(event.sources);
+          setStatus((current) => (current ? { ...current, quota: event.quota } : null));
+          if (event.changedPageIds.length) setNotice("Some sources changed. This result uses their latest contents.");
+        } else if (event.type === "delta") {
+          outputBuffer.current += event.text;
+          if (visibleRef.current && displayTimer.current === null) displayTimer.current = setTimeout(flushResult, 100);
+        } else {
+          terminal = true;
+          flushResult();
+          setResultState(event.type === "complete" ? "complete" : "partial");
+          if (event.type === "error") {
+            terminalFailure = true;
             setError(event.message);
-            if (event.code === "conversation_locked" || event.code === "unauthorized") {
+            if (event.status === 401) {
+              denied = true;
+              clearPrivateContent();
+            }
+            if (event.code === "conversation_locked") {
+              denied = true;
               setLocked(true);
-              output = "";
-              setResult("");
-              setMessages([]);
+              clearPrivateContent();
             }
           }
-        },
-      );
+        }
+      });
     } catch (cause) {
-      if (cause instanceof ApiClientError && [401, 403, 404].includes(cause.status)) {
-        setLocked(true);
-        output = "";
-        setResult("");
-        setMessages([]);
-      }
+      denied = accessFailure(cause) ?? false;
       if (mounted.current && !abort.signal.aborted)
         setError(apiErrorMessage(cause, "Generation failed. Retry explicitly."));
     } finally {
       activeId.current = null;
       controller.current = null;
+      operation.current = null;
+      onBusyChange?.(!!remoteId.current);
       if (mounted.current) {
-        if (!terminal) {
-          setResultState(output ? "partial" : "empty");
+        if ((!started || (terminalFailure && !outputBuffer.current)) && !denied && !abort.signal.aborted) {
+          outputBuffer.current = previous.result;
+          setResultState(previous.state);
+          setResultTarget(previous.target);
+          setTarget(previous.requestTarget);
+          setMessageId(previous.messageId);
+          latestMessageId.current = previous.messageId;
+          setResultSources(previous.sources);
+        } else if (!terminal) {
+          setResultState(outputBuffer.current ? "partial" : "empty");
           if (abort.signal.aborted) setNotice("Generation cancelled. Partial text can be copied.");
         }
+        flushResult();
         void refreshStatus().catch(() => undefined);
+        const revision = loadRevision.current;
         if (savedThread && !abort.signal.aborted)
           void api<{ conversation: AiConversation }>(`/api/ai/conversations/${savedThread}`)
             .then(({ conversation }) => {
-              if (mounted.current) {
-                if (conversation.locked) {
-                  setLocked(true);
-                  setResult("");
-                  setMessages([]);
-                } else setMessages(conversation.messages ?? []);
-              }
+              if (!mounted.current || revision !== loadRevision.current) return;
+              if (conversation.locked) {
+                setLocked(true);
+                clearPrivateContent();
+              } else setMessages(conversation.messages ?? []);
             })
             .catch(() => undefined);
       }
     }
   }
   async function cancel() {
-    const id = activeId.current;
+    if (operation.current === "apply") return;
+    const id = activeId.current ?? remoteId.current;
+    flushResult();
     controller.current?.abort();
-    if (id) await api(`/api/ai/generations/${id}/cancel`, { method: "POST" }).catch(() => undefined);
+    if (id) {
+      try {
+        await api(`/api/ai/generations/${id}/cancel`, { method: "POST" });
+        if (remoteId.current && threadId) await open(threadId, false, true);
+      } catch (cause) {
+        setError(apiErrorMessage(cause, "Cancellation could not be confirmed. Retry explicitly."));
+      }
+    }
   }
   async function apply(mode: "replace" | "insert") {
-    if (!target || resultState !== "complete" || !editable || (mode === "replace" && target !== resultTarget)) return;
+    if (
+      operation.current ||
+      remoteId.current ||
+      checkingAccess ||
+      locked ||
+      unavailable ||
+      !target ||
+      resultState !== "complete" ||
+      formatError ||
+      !editable ||
+      (mode === "replace" && target !== resultTarget)
+    )
+      return;
+    operation.current = "apply";
     setApplying(true);
+    onBusyChange?.(true);
     setError("");
     try {
       const check = await api<{ contentEpoch: number; protectedBlockIds: string[] }>(
         `/api/ai/results/${messageId}/apply-check`,
         { method: "POST", body: json({}) },
       );
-      onApply(target, result, mode, check.contentEpoch, new Set(check.protectedBlockIds));
+      if (!mounted.current) return;
+      onApply(target, outputBuffer.current, mode, check.contentEpoch, new Set(check.protectedBlockIds));
       setNotice(`Result ${mode === "insert" ? "inserted" : "applied"}. Use the document's Undo to reverse it.`);
       setTarget(null);
     } catch (cause) {
+      accessFailure(cause);
       setError(
         cause instanceof WritingTargetError
           ? cause.message
           : apiErrorMessage(cause, "The result could not be applied."),
       );
     } finally {
+      operation.current = null;
       setApplying(false);
+      onBusyChange?.(!!remoteId.current);
     }
   }
-  const running = resultState === "running";
-  const modeAvailable =
-    funding &&
-    !!status?.settings?.models[funding][quality].id &&
-    availability?.funding === funding &&
-    availability?.[quality];
   const currentScope = sources.find((source) => source.pageId === pageId)?.scope;
   const replaceScopeMatches =
     (target?.kind === "page" && currentScope?.kind === "page") ||
     (target?.kind === "selection" && currentScope?.kind === "selection" && target.text === currentScope.text);
+  if (!visible) return null;
   return (
     <aside className="writing-panel" aria-label="AI writing">
       <div className="writing-panel-heading">
@@ -377,11 +629,16 @@ export function WritingPanel({
         </p>
       )}
       {notice && <output aria-live="polite">{notice}</output>}
-      {locked ? (
+      {running && <button onClick={() => void cancel()}>Cancel generation</button>}
+      {checkingAccess ? (
+        <output aria-live="polite">Checking conversation access…</output>
+      ) : unavailable ? (
+        <p>This conversation was deleted or expired. Start a new conversation.</p>
+      ) : locked ? (
         <p>Access to a referenced page is unavailable. This conversation is locked until access returns.</p>
       ) : (
         <>
-          <fieldset disabled={running}>
+          <fieldset disabled={busy}>
             <legend>Funding</legend>
             <label>
               <input
@@ -409,15 +666,16 @@ export function WritingPanel({
                 {new Date(status.quota.resetsAt).toLocaleString()}.
               </p>
             )}
+            {funding && !availability && (
+              <button type="button" disabled={busy} onClick={() => setModelCheck((value) => value + 1)}>
+                Retry model access
+              </button>
+            )}
             <p className="muted">Funding never switches automatically. Connect ChatGPT in Settings.</p>
           </fieldset>
           <label>
             Quality
-            <select
-              value={quality}
-              disabled={running}
-              onChange={(event) => setQuality(event.target.value as AiQuality)}
-            >
+            <select value={quality} disabled={busy} onChange={(event) => setQuality(event.target.value as AiQuality)}>
               {(["fast", "best"] as const).map((mode) => (
                 <option
                   key={mode}
@@ -438,7 +696,7 @@ export function WritingPanel({
             Writing action
             <select
               value={action}
-              disabled={running}
+              disabled={busy}
               onChange={(event) => setAction(event.target.value as AiGenerate["action"])}
             >
               {Object.entries(AI_ACTIONS).map(([value, label]) => (
@@ -453,7 +711,7 @@ export function WritingPanel({
               Target language
               <input
                 value={targetLanguage}
-                disabled={running}
+                disabled={busy}
                 onChange={(event) => setTargetLanguage(event.target.value)}
               />
             </label>
@@ -461,14 +719,14 @@ export function WritingPanel({
           {action === "change_tone" && (
             <label>
               Target tone
-              <input value={tone} disabled={running} onChange={(event) => setTone(event.target.value)} />
+              <input value={tone} disabled={busy} onChange={(event) => setTone(event.target.value)} />
             </label>
           )}
           <label>
             {messages.length ? "Follow-up instruction" : "Writing instruction"}
             <textarea
               value={prompt}
-              disabled={running}
+              disabled={busy}
               onChange={(event) => setPrompt(event.target.value)}
               placeholder="Describe what you want, or use a preset action"
             />
@@ -479,28 +737,16 @@ export function WritingPanel({
             pageId={pageId}
             onChange={setSources}
             onSelection={captureSelection}
-            disabled={running}
+            disabled={busy}
           />
           <div className="writing-actions">
-            {running ? (
-              <button onClick={() => void cancel()}>Cancel generation</button>
-            ) : (
-              <button
-                disabled={
-                  !online ||
-                  !synced ||
-                  !status?.settings?.enabled ||
-                  !modeAvailable ||
-                  applying ||
-                  (funding === "api" && !status?.quota.remaining)
-                }
-                onClick={() => void generate()}
-              >
+            {!running && (
+              <button disabled={!canGenerate} onClick={() => void generate()}>
                 {messages.length ? "Generate follow-up" : "Generate"}
               </button>
             )}
             {!running && result && (
-              <button disabled={!online || !synced || !modeAvailable} onClick={() => void generate()}>
+              <button disabled={!canGenerate} onClick={() => void generate()}>
                 Regenerate
               </button>
             )}
@@ -514,7 +760,7 @@ export function WritingPanel({
                     ? "Partial result — copy only"
                     : "Complete result"}
               </output>
-              <WritingPreview markdown={result} />
+              <WritingPreview markdown={result} blocks={parsed.blocks} />
               {formatError && <p className="form-error">{formatError}</p>}
               {!!resultSources.length && (
                 <div aria-label="Result sources">
@@ -538,14 +784,14 @@ export function WritingPanel({
                     target !== resultTarget ||
                     !target ||
                     target.kind === "anchor" ||
-                    applying
+                    busy
                   }
                   onClick={() => void apply("replace")}
                 >
                   Replace
                 </button>
                 <button
-                  disabled={resultState !== "complete" || !!formatError || !editable || !target || applying}
+                  disabled={resultState !== "complete" || !!formatError || !editable || !target || busy}
                   onClick={() => void apply("insert")}
                 >
                   Insert
@@ -553,7 +799,7 @@ export function WritingPanel({
                 <button
                   onClick={() =>
                     void navigator.clipboard
-                      .writeText(result)
+                      .writeText(outputBuffer.current)
                       .then(() => setNotice("Result copied."))
                       .catch(() => setError("Copy failed. Select the result text and copy it manually."))
                   }
@@ -561,8 +807,10 @@ export function WritingPanel({
                   Copy
                 </button>
                 <button
-                  disabled={running}
+                  disabled={busy}
                   onClick={() => {
+                    if (operation.current || remoteId.current) return;
+                    outputBuffer.current = "";
                     setResult("");
                     setResultState("empty");
                   }}
@@ -571,7 +819,9 @@ export function WritingPanel({
                 </button>
                 {editable && resultState === "complete" && (
                   <button
+                    disabled={busy}
                     onClick={() => {
+                      if (operation.current || remoteId.current) return;
                       setTarget(onCapture("anchor"));
                       setNotice("Insertion location selected from the current document cursor.");
                     }}
@@ -586,22 +836,7 @@ export function WritingPanel({
             <details>
               <summary>Conversation ({messages.length} requests)</summary>
               {messages.map((message) => (
-                <article key={message.id}>
-                  <h3>
-                    {AI_ACTIONS[message.action]} · {message.funding === "api" ? "Workspace API" : "ChatGPT plan"} ·{" "}
-                    {message.quality === "fast" ? "Fast" : "Best"}
-                  </h3>
-                  <p>{message.prompt}</p>
-                  <WritingPreview markdown={message.output} />
-                  <small>{message.status === "complete" ? "Complete" : "Partial — copy only"}</small>
-                  <ul>
-                    {message.sources.map((source) => (
-                      <li key={source.pageId}>
-                        <a href={source.url}>{source.title}</a>
-                      </li>
-                    ))}
-                  </ul>
-                </article>
+                <HistoryMessage key={message.id} message={message} />
               ))}
             </details>
           )}
@@ -609,8 +844,16 @@ export function WritingPanel({
       )}
       <div className="writing-actions">
         <button
-          disabled={running}
+          disabled={busy || checkingAccess}
           onClick={() => {
+            if (operation.current || remoteId.current || checkingAccess) return;
+            loadRevision.current++;
+            historyHidden.current = false;
+            latestMessageId.current = "";
+            remoteId.current = null;
+            setRemoteGeneration(null);
+            outputBuffer.current = "";
+            setUnavailable(false);
             setThreadId(undefined);
             setResultTarget(null);
             setMessages([]);
@@ -626,7 +869,7 @@ export function WritingPanel({
         >
           New conversation
         </button>
-        <button disabled={running} onClick={() => setHistoryOpen((value) => !value)}>
+        <button disabled={busy || checkingAccess} onClick={() => setHistoryOpen((value) => !value)}>
           Document writing history
         </button>
       </div>

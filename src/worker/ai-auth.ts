@@ -262,7 +262,7 @@ export async function chatgptAccessToken(env: Env, member: MemberContext) {
       .bind(member.workspace.id, member.user.id)
       .first<Connection>();
   let current = await read();
-  if (!current) throw new HttpError(401, "chatgpt_reconnect", "Connect your ChatGPT account to use plan funding.");
+  if (!current) throw new HttpError(424, "chatgpt_reconnect", "Connect your ChatGPT account to use plan funding.");
   if (current.expires_at > Date.now() + 60_000)
     return (await unseal<Tokens>(env.AI_TOKEN_ENCRYPTION_KEY!, tokenContext(member), current.tokens_ciphertext))
       .access_token;
@@ -276,7 +276,7 @@ export async function chatgptAccessToken(env: Env, member: MemberContext) {
     for (let attempt = 0; attempt < 20; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 250));
       current = await read();
-      if (!current) throw new HttpError(401, "chatgpt_reconnect", "Reconnect ChatGPT to continue.");
+      if (!current) throw new HttpError(424, "chatgpt_reconnect", "Reconnect ChatGPT to continue.");
       if (current.expires_at > Date.now() + 60_000)
         return (await unseal<Tokens>(env.AI_TOKEN_ENCRYPTION_KEY!, tokenContext(member), current.tokens_ciphertext))
           .access_token;
@@ -297,7 +297,7 @@ export async function chatgptAccessToken(env: Env, member: MemberContext) {
           .bind(member.workspace.id, member.user.id, lease)
           .run();
       throw new HttpError(
-        response.status === 400 || response.status === 401 ? 401 : 503,
+        response.status === 400 || response.status === 401 ? 424 : 503,
         "chatgpt_reconnect",
         "ChatGPT could not renew plan access. Reconnect or explicitly choose workspace API funding.",
       );
@@ -309,7 +309,7 @@ export async function chatgptAccessToken(env: Env, member: MemberContext) {
     value.refresh_token ??= tokens.refresh_token;
     value.scope ??= tokens.scope;
     if (!validateTokens(value))
-      throw new HttpError(401, "chatgpt_reconnect", "ChatGPT returned incomplete plan credentials. Reconnect.");
+      throw new HttpError(424, "chatgpt_reconnect", "ChatGPT returned incomplete plan credentials. Reconnect.");
     const saved = await env.DB.prepare(
       "UPDATE ai_connections SET tokens_ciphertext=?,expires_at=?,refresh_lease=NULL,refresh_lease_until=NULL WHERE workspace_id=? AND user_id=? AND refresh_lease=?",
     )
@@ -326,7 +326,7 @@ export async function chatgptAccessToken(env: Env, member: MemberContext) {
       )
       .run();
     if (!saved.meta.changes)
-      throw new HttpError(401, "chatgpt_reconnect", "The ChatGPT connection was removed during renewal.");
+      throw new HttpError(424, "chatgpt_reconnect", "The ChatGPT connection was removed during renewal.");
     return value.access_token;
   } finally {
     await env.DB.prepare(

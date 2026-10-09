@@ -1,4 +1,4 @@
-import { createElement, type ReactNode } from "react";
+import { createElement, memo, useMemo, type ReactNode } from "react";
 import type { ProseMirrorJson } from "../shared/types";
 import { parseAiMarkdown } from "../shared/ai-writing";
 
@@ -62,20 +62,40 @@ function renderNode(node: ProseMirrorJson, index: number, ordinal = 1): ReactNod
   if (node.type === "paragraph") return <p key={index}>{children}</p>;
   return <div key={index}>{children}</div>;
 }
-export function WritingPreview({ markdown }: { markdown: string }) {
-  let blocks: ProseMirrorJson[] | null = null;
-  try {
-    blocks = parseAiMarkdown(markdown);
-  } catch {
-    /* Invalid or partial Markdown remains copyable as inert text. */
-  }
-  return blocks ? (
+export function useWritingMarkdown(markdown: string) {
+  return useMemo(() => {
+    if (!markdown) return { blocks: null, error: "" };
+    try {
+      return { blocks: parseAiMarkdown(markdown), error: "" };
+    } catch (cause) {
+      return {
+        blocks: null,
+        error: cause instanceof Error ? cause.message : "The result cannot be safely applied. Copy or refine it.",
+      };
+    }
+  }, [markdown]);
+}
+export const WritingPreview = memo(function WritingPreview({
+  markdown,
+  blocks: parsed,
+}: {
+  markdown: string;
+  blocks?: ProseMirrorJson[] | null;
+}) {
+  const content = useMemo(() => {
+    try {
+      return renderBlocks(parsed === undefined ? parseAiMarkdown(markdown) : (parsed ?? []));
+    } catch {
+      return null;
+    }
+  }, [markdown, parsed]);
+  return content && parsed !== null ? (
     <div className="writing-preview" aria-label="Writing result">
-      {renderBlocks(blocks)}
+      {content}
     </div>
   ) : (
     <pre className="writing-preview" aria-label="Writing result">
       {markdown}
     </pre>
   );
-}
+});

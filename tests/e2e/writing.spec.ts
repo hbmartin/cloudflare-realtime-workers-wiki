@@ -33,7 +33,9 @@ test("writing streams into a read-only preview, applies with undo, preserves con
     quota: { remaining: 20, limit: 20, resetsAt: Date.now() + 86400000 },
   };
   let saved: AiConversation | null = null,
-    requests = 0;
+    requests = 0,
+    explicitOpens = 0;
+  let releaseGeneration: (() => void) | undefined;
   await page.route("**/api/ai/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/ai/status") return route.fulfill({ json: status });
@@ -43,6 +45,9 @@ test("writing streams into a read-only preview, applies with undo, preserves con
       expect(input.funding).toBe("api");
       expect(input.quality).toBe("fast");
       requests++;
+      await new Promise<void>((resolve) => {
+        releaseGeneration = resolve;
+      });
       const sources = [
         {
           pageId: document.id,
@@ -56,7 +61,7 @@ test("writing streams into a read-only preview, applies with undo, preserves con
       ];
       const output = "## Improved draft\n\nClear **writing** result.";
       saved = {
-        id: "browser-conversation",
+        id: "22222222-2222-4222-8222-222222222222",
         pageId: document.id,
         title: "Browser writing",
         locked: false,
@@ -77,6 +82,7 @@ test("writing streams into a read-only preview, applies with undo, preserves con
           },
         ],
       };
+      if (requests === 2) status.quota.remaining = 0;
       const events = [
         {
           type: "start",
@@ -99,8 +105,14 @@ test("writing streams into a read-only preview, applies with undo, preserves con
       return route.fulfill({ json: { contentEpoch: document.contentEpoch, protectedBlockIds: [] } });
     if (path === "/api/ai/conversations")
       return route.fulfill({ json: { conversations: saved ? [saved] : [], nextCursor: null } });
-    if (path.includes("/conversations/"))
-      return route.fulfill({ json: path.endsWith("/access") ? { locked: false } : { conversation: saved } });
+    if (path.includes("/conversations/")) {
+      if (path.endsWith("/open")) explicitOpens++;
+      return route.fulfill({
+        json: path.endsWith("/access")
+          ? { locked: false, activeGeneration: null, expiresAt: saved?.expiresAt }
+          : { conversation: saved },
+      });
+    }
     return route.fulfill({ json: { ok: true } });
   });
   await page.goto(`/?page=${document.id}`);
@@ -116,7 +128,19 @@ test("writing streams into a read-only preview, applies with undo, preserves con
   await expect(writing).toBeVisible();
   await writing.getByLabel("Workspace API").check();
   await expect(writing.getByRole("button", { name: "Generate", exact: true })).toBeEnabled();
+  await writing.getByLabel("Writing instruction").fill("Keep a clear tone");
   await writing.getByRole("button", { name: "Generate", exact: true }).click();
+  await expect.poll(() => requests).toBe(1);
+  await writing.getByRole("button", { name: "Close writing" }).click();
+  await expect(writing).not.toBeVisible();
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
+  await page.locator(".action-menu-portal").getByRole("button", { name: "Writing", exact: true }).click();
+  await expect(writing.getByRole("button", { name: "Cancel generation" })).toBeVisible();
+  await expect(writing.getByLabel("Writing instruction")).toHaveValue("Keep a clear tone");
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
+  await page.locator(".action-menu-portal").getByRole("button", { name: "Writing", exact: true }).click();
+  await expect(writing.getByText(/Finish or cancel the current operation/)).toBeVisible();
+  releaseGeneration!();
   await expect(writing.getByRole("heading", { name: "Improved draft" }).first()).toBeVisible();
   await expect(writing.locator('[contenteditable="true"]')).toHaveCount(0);
   await writing.getByRole("button", { name: "Replace", exact: true }).click();
@@ -134,7 +158,23 @@ test("writing streams into a read-only preview, applies with undo, preserves con
     .poll(async () => JSON.stringify(await (await page.request.get(`/api/pages/${document.id}/content`)).json()))
     .toContain("Original writing source.");
   await writing.getByRole("button", { name: "Generate", exact: true }).click();
+  await expect.poll(() => requests).toBe(2);
+  await writing.getByRole("button", { name: "Close writing" }).click();
+  await editor.click();
+  await page.keyboard.press(
+    await page.evaluate(() => (/Mac|iPhone|iPad/.test(navigator.platform) ? "Meta+End" : "Control+End")),
+  );
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("/ai");
+  await page.getByRole("option", { name: /AI writing/ }).click();
+  await expect(writing).toBeVisible();
+  await expect(writing.getByText(/Finish or cancel the current operation/)).toBeVisible();
+  await expect(writing.getByRole("button", { name: "Cancel generation" })).toBeVisible();
+  expect(requests).toBe(2);
+  releaseGeneration!();
   await expect(writing.getByRole("button", { name: "Replace", exact: true })).toBeEnabled();
+  await expect(writing.getByRole("button", { name: "Regenerate", exact: true })).toBeDisabled();
+  await expect(writing.getByRole("button", { name: /^Generate/ })).toBeDisabled();
   await writing.getByRole("button", { name: "Close writing" }).click();
   await editor.fill("Collaborator changed this source.");
   await page.getByRole("button", { name: "Page actions", exact: true }).click();
@@ -156,14 +196,27 @@ test("writing streams into a read-only preview, applies with undo, preserves con
   await page.getByRole("button", { name: "Browser writing", exact: true }).click();
   await expect(page.getByRole("complementary", { name: "AI writing" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Replace", exact: true })).toBeDisabled();
+  expect(explicitOpens).toBe(1);
   await writing.getByRole("button", { name: "Close writing" }).click();
+  const otherDocument = tree.pages.find((item) => item.kind === "document" && item.id !== document.id)!;
+  if (await navigation.isVisible()) await navigation.click();
+  await page.getByRole("treeitem", { name: otherDocument.title, exact: true }).click();
+  await expect(page).toHaveURL(new RegExp(`page=${otherDocument.id}`));
+  if (await navigation.isVisible()) await navigation.click();
+  await page.getByRole("treeitem", { name: document.title, exact: true }).click();
+  await expect(editor).toBeVisible();
+  await expect(editor).toContainText("Collaborator changed this source.");
+  await expect(editor).toContainText("Clear writing result.");
+  await expect(writing).not.toBeVisible();
+  expect(explicitOpens).toBe(1);
   await editor.click();
   await page.keyboard.press(
     await page.evaluate(() => (/Mac|iPhone|iPad/.test(navigator.platform) ? "Meta+a" : "Control+a")),
   );
   await page.getByRole("button", { name: "Writing with selection", exact: true }).click();
   await expect(writing.getByText("Selected text", { exact: true })).toBeVisible();
-  await expect(writing.getByRole("button", { name: "Generate", exact: true })).toBeVisible();
+  expect(explicitOpens).toBe(1);
+  await expect(writing.getByRole("button", { name: /^Generate/ })).toBeVisible();
   await writing.getByRole("button", { name: "Close writing" }).click();
   await editor.click();
   await page.keyboard.press(
@@ -173,5 +226,5 @@ test("writing streams into a read-only preview, applies with undo, preserves con
   await page.keyboard.type("/ai");
   await page.getByRole("option", { name: /AI writing/ }).click();
   await expect(writing).toBeVisible();
-  await expect(writing.getByRole("button", { name: "Generate", exact: true })).toBeVisible();
+  await expect(writing.getByRole("button", { name: /^Generate/ })).toBeVisible();
 });

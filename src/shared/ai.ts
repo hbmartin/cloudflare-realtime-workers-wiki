@@ -13,6 +13,8 @@ export const AI_ACTIONS = {
   custom: "Custom instruction",
 } as const;
 export const AI_MAX_CHARACTERS = 250_000;
+export const AI_GENERATION_TIMEOUT_MS = 5 * 60_000;
+export const AI_GENERATION_DEADLINE_MS = AI_GENERATION_TIMEOUT_MS + 30_000;
 const AI_MAX_SOURCES = 20;
 export const AI_RETENTION_MS = 30 * 86_400_000;
 const aiFundingSchema = z.enum(["chatgpt", "api"]);
@@ -116,6 +118,11 @@ export type AiStatus = {
   preference: AiFunding | null;
   quota: { remaining: number; limit: number; resetsAt: number };
 };
+export type AiConversationAccess = {
+  locked: boolean;
+  expiresAt: number;
+  activeGeneration: { messageId: string; createdAt: number; deadlineAt: number } | null;
+};
 export type AiStreamEvent =
   | {
       type: "start";
@@ -128,7 +135,7 @@ export type AiStreamEvent =
     }
   | { type: "delta"; text: string }
   | { type: "complete" }
-  | { type: "error"; code: string; message: string };
+  | { type: "error"; code: string; message: string; status?: number };
 
 export function aiInstructions(input: Pick<AiGenerate, "action" | "targetLanguage" | "tone">) {
   const action = {

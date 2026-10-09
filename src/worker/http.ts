@@ -6,9 +6,9 @@ import { logger } from "./observability";
 
 // This versioned wire discriminator is compatibility-sensitive and is not a display name.
 const HTTP_ERROR_KIND = "realtime-notes.http-error.v1";
-const HTTP_ERROR_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422, 429, 500, 502, 503]);
+const HTTP_ERROR_STATUSES = new Set([400, 401, 403, 404, 409, 413, 415, 422, 424, 429, 500, 502, 503]);
 
-export type HttpErrorStatus = 400 | 401 | 403 | 404 | 409 | 413 | 415 | 422 | 429 | 500 | 502 | 503;
+export type HttpErrorStatus = 400 | 401 | 403 | 404 | 409 | 413 | 415 | 422 | 424 | 429 | 500 | 502 | 503;
 
 export type DecodedHttpError = {
   status: HttpErrorStatus;

@@ -1,5 +1,16 @@
 import { parseWritableMarkdown } from "./notion-markdown-write";
 import type { ProseMirrorJson } from "./types";
+import { AI_MAX_CHARACTERS } from "./ai";
+
+const AI_MARKDOWN_LIMITS = {
+  maxCharacters: AI_MAX_CHARACTERS,
+  maxBytes: 1_000_000,
+  maxDelimiters: 65_536,
+  maxInlineDelimiters: 8_192,
+  maxBlocks: 4_096,
+  maxDepth: 16,
+  delimiterCharacters: "<\\[]`*_!~$",
+};
 
 const STANDARD_BLOCKS = new Set([
   "paragraph",
@@ -40,7 +51,7 @@ const normalize = (node: ProseMirrorJson): ProseMirrorJson =>
     : { ...node, ...(node.content ? { content: node.content.map(normalize) } : {}) };
 
 export function parseAiMarkdown(markdown: string): ProseMirrorJson[] {
-  const blocks = parseWritableMarkdown(markdown);
+  const blocks = parseWritableMarkdown(markdown, AI_MARKDOWN_LIMITS);
   const normalized = blocks.map(normalize);
   if (normalized.some((node) => writingProtected(node)))
     throw new Error(

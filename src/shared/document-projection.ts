@@ -54,6 +54,17 @@ export function dateMentionText(node: ProseMirrorJson) {
   return mention ? readableDateMention(mention) : stringAttr(node, "value") || "Date";
 }
 
+/** Match the readable atom text and separators used by the document projection. */
+export function projectionLeafText(node: ProseMirrorJson): string {
+  if (node.type === "mention") {
+    const type = stringAttr(node, "entityType"),
+      label = stringAttr(node, "label");
+    return stringAttr(node, "entityId") && label && (type === "page" || type === "user") ? `${label} ` : "";
+  }
+  if (node.type === "dateMention") return `${dateMentionText(node)} `;
+  return node.type === "hardBreak" ? "\n" : "";
+}
+
 export function collectLinkedDiagramIds(
   node: ProseMirrorJson,
   ids = new Set<string>(),
@@ -506,14 +517,12 @@ export function projectDocument(root: ProseMirrorJson): DocumentProjection {
       if (entityId && label && (entityType === "page" || entityType === "user")) {
         const offsets = entityType === "page" ? pageOffsets : userOffsets;
         if (!offsets.has(entityId)) offsets.set(entityId, textLength);
-        append(label);
-        append(" ");
+        append(projectionLeafText(node));
       }
     }
 
     if (node.type === "dateMention") {
-      append(nodeText(node));
-      append(" ");
+      append(projectionLeafText(node));
     }
 
     if (node.type === "linkedDiagram") {

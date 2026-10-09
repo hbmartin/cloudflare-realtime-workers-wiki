@@ -30,12 +30,17 @@ export function requirePageEditor(page: PageRow) {
   if (page.effective_role === "viewer") throw new HttpError(403, "read_only", "Your role in this space is read-only.");
 }
 
+/** SQL expressions supplied here are fixed by callers, never request input. */
+export function spaceVisibleSql(role = "?") {
+  return `(${role} = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`;
+}
+
 export async function spaceForMember(env: Env, member: MemberContext, spaceId: string) {
   const row = await env.DB.prepare(
     `SELECT s.*, sm.role space_role FROM spaces s
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE s.id = ? AND s.workspace_id = ?
-       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
+       AND ${spaceVisibleSql()}`,
   )
     .bind(member.user.id, spaceId, member.workspace.id, member.role)
     .first<SpaceRow>();
@@ -55,7 +60,7 @@ export async function spacesForMember(env: Env, member: MemberContext) {
     `SELECT s.*, sm.role space_role FROM spaces s
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE s.workspace_id = ?
-       AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)
+       AND ${spaceVisibleSql()}
      ORDER BY s.position, s.id`,
   )
     .bind(member.user.id, member.workspace.id, member.role)
@@ -71,7 +76,7 @@ export async function pageForMember(env: Env, member: MemberContext, pageId: str
        LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
       WHERE p.id = ? AND p.workspace_id = ? ${includeArchived ? "" : "AND p.archived_at IS NULL"}
         AND p.import_job_id IS NULL
-        AND (? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)`,
+        AND ${spaceVisibleSql()}`,
   )
     .bind(member.user.id, pageId, member.workspace.id, member.role)
     .first<PageRow>();
