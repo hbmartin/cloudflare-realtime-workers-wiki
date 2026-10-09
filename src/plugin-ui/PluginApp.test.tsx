@@ -656,6 +656,126 @@ describe("NoteFlare embedded editor", () => {
     expect(api.create.mock.calls[1]![0]).toMatchObject({ title: "Corrected title", markdown: "Corrected draft" });
   });
 
+  it.each([false, true])("starts a fresh create after staging expires, with newer edits: %s", async (edited) => {
+    const { api, page } = fixture();
+    const expiry = deferred<Awaited<ReturnType<PluginApi["create"]>>>();
+    api.pages.mockResolvedValue({
+      pages: [{ ...page, id: "parent", title: "Parent notes", kind: "document" }],
+      nextCursor: null,
+    });
+    api.create
+      .mockRejectedValueOnce(new Error("Network interrupted after staging"))
+      .mockReturnValueOnce(expiry.promise);
+    render(<PluginApp api={api} />);
+    fireEvent.click(await screen.findByRole("button", { name: "Browse children of Parent notes" }));
+    await beginCreate();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Recovered notes" } });
+    fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Submitted text" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Network interrupted after staging");
+    expect(screen.getByLabelText("Title")).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Retry previous save" }));
+    expect(api.create.mock.calls[1]![0]).toEqual(api.create.mock.calls[0]![0]);
+    if (edited) fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Typed during retry" } });
+    await act(async () =>
+      expiry.reject(
+        new PluginToolError("Staged page creation expired. Start a new operation.", "page_creation_expired", false),
+      ),
+    );
+    await screen.findByText("Staged page creation expired. Start a new operation.");
+    expect(screen.getByLabelText("Title")).toBeEnabled();
+    expect(screen.getByLabelText("Title")).toHaveValue("Recovered notes");
+    expect(screen.getByLabelText("Markdown draft")).toHaveValue(edited ? "Typed during retry" : "Submitted text");
+    if (edited) {
+      fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Revised notes" } });
+      fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Revised text" } });
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Document saved.");
+    expect(api.create).toHaveBeenCalledTimes(3);
+    expect(api.create.mock.calls[2]![0]).toEqual({
+      space_id: "space",
+      parent_id: "parent",
+      title: edited ? "Revised notes" : "Recovered notes",
+      markdown: edited ? "Revised text" : "Submitted text",
+      operation_id: expect.any(String),
+    });
+    expect(api.create.mock.calls[2]![0].operation_id).not.toBe(api.create.mock.calls[0]![0].operation_id);
+    expect(screen.queryByLabelText("Title")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Edit Markdown" }));
+    fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Follow-up edit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Document saved.");
+    expect(api.create).toHaveBeenCalledTimes(3);
+    expect(api.save).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        page_id: page.id,
+        expected_revision: 1,
+        expected_content_epoch: 1,
+        command: { type: "replace_content", replace_content: { new_str: "Follow-up edit" } },
+      }),
+    );
+  });
+
+  it("does not release a successor create when an abandoned create expires", async () => {
+    const { api } = fixture();
+    const expiry = deferred<Awaited<ReturnType<PluginApi["create"]>>>();
+    api.create.mockReturnValueOnce(expiry.promise).mockRejectedValueOnce(new Error("Successor outcome unknown"));
+    render(<PluginApp api={api} />);
+    await beginCreate();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Abandoned notes" } });
+    fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Abandoned text" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    fireEvent.click(screen.getByRole("button", { name: "New document" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Discard and continue" }));
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Successor notes" } });
+    fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Successor text" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Successor outcome unknown");
+    await act(async () =>
+      expiry.reject(new PluginToolError("Abandoned create expired", "page_creation_expired", false)),
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Successor outcome unknown");
+    expect(screen.getByLabelText("Title")).toHaveValue("Successor notes");
+    expect(screen.getByLabelText("Title")).toBeDisabled();
+    expect(screen.getByLabelText("Markdown draft")).toHaveValue("Successor text");
+    fireEvent.click(screen.getByRole("button", { name: "Retry previous save" }));
+    await screen.findByText("Document saved.");
+    expect(api.create.mock.calls[2]![0]).toEqual(api.create.mock.calls[1]![0]);
+  });
+
+  it("retains an acknowledged create when its refresh reports staging expiry", async () => {
+    const { api } = fixture();
+    render(<PluginApp api={api} />);
+    await beginCreate();
+    fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Acknowledged notes" } });
+    fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Submitted text" } });
+    api.document.mockRejectedValueOnce(new PluginToolError("Refresh reported expiry", "page_creation_expired", false));
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Refresh reported expiry");
+    expect(screen.getByLabelText("Title")).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Newer text" } });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh saved document" }));
+    await screen.findByText("Previous save confirmed. Your newer changes are still unsaved.");
+    expect(api.create).toHaveBeenCalledTimes(1);
+    expect(api.document).toHaveBeenCalledTimes(2);
+    expect(screen.getByLabelText("Markdown draft")).toHaveValue("Newer text");
+  });
+
+  it("does not treat staging expiry as a definite update rejection", async () => {
+    const { api } = fixture();
+    api.save.mockRejectedValueOnce(new PluginToolError("Update reported expiry", "page_creation_expired", false));
+    await edit(api);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Update reported expiry");
+    fireEvent.change(screen.getByLabelText("Markdown draft"), { target: { value: "Newer text" } });
+    fireEvent.click(screen.getByRole("button", { name: "Retry previous save" }));
+    await screen.findByText("Previous save confirmed. Your newer changes are still unsaved.");
+    expect(api.save.mock.calls[1]![0]).toEqual(api.save.mock.calls[0]![0]);
+    expect(screen.getByLabelText("Markdown draft")).toHaveValue("Newer text");
+    expect(api.create).not.toHaveBeenCalled();
+  });
+
   it.each(["create", "update"] as const)(
     "allows correcting a rejected %s after a document limit failure",
     async (kind) => {

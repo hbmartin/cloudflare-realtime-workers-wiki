@@ -139,7 +139,7 @@ function markdownInline(
     if (value.length > INLINE_SECTION_LIMIT || hasDenseInlineMarkup(value))
       return boundedMarkdownInline(value, issues, references);
     if (value.includes("data:image/"))
-      return markdownInline(value, issues, references, markdownLexer().lexer.inlineTokens(value), undefined, true);
+      return markdownInline(value, issues, references, Lexer.lexInline(value, { gfm: false }), undefined, true);
   }
   const output: ProseMirrorJson[] = [];
   const appendPlain = (text: string, marks: ProseMirrorJson["marks"] = []) => {
@@ -203,8 +203,7 @@ function markdownInline(
         const candidateEnd = wantsRawLabel && !token.raw.startsWith("<") ? linkLabelEnd(token.raw, 0, 8192) : null;
         const labelEnd =
           candidateEnd !== null &&
-          unescapeMarkdown(token.raw.slice(token.type === "image" ? 2 : 1, candidateEnd)) ===
-            unescapeMarkdown(token.text)
+          unescapeMarkdown(token.raw.slice(token.type === "image" ? 2 : 1, candidateEnd)) === token.text
             ? candidateEnd
             : null;
         const rawLabel = labelEnd === null ? token.text : token.raw.slice(token.type === "image" ? 2 : 1, labelEnd);
@@ -248,7 +247,7 @@ function markdownInline(
       else append(token.raw, marks);
     }
   };
-  walk(prepared ?? markdownLexer().lexer.inlineTokens(value));
+  walk(prepared ?? Lexer.lexInline(value, { gfm: false }));
   return output;
 }
 
@@ -770,14 +769,7 @@ function simpleLongLink(value: string, start: number, labelEnd: number) {
 
 function markdownLexer() {
   const tokenizer = new Tokenizer({ gfm: false });
-  const lexer = new Lexer({ gfm: false, tokenizer });
-  // Marked 18 removes bracket escapes before checking for nested links.
-  // Preserve them until our inline walk so literal brackets stay literal.
-  tokenizer.rules = {
-    ...tokenizer.rules,
-    other: { ...tokenizer.rules.other, outputLinkReplace: /\b\B/g },
-  };
-  return { tokenizer, lexer };
+  return { tokenizer, lexer: new Lexer({ gfm: false, tokenizer }) };
 }
 
 function boundedMarkdownInline(

@@ -56,6 +56,72 @@ describe("Notion Markdown block mutations", () => {
     ]);
   });
 
+  it.each(["\n", "\n\n"])("persists literal checkbox labels in inserted tasks with separator %j", (separator) => {
+    const { first, second, document, projection } = fixture();
+    const command = parseMarkdownCommand(
+      {
+        type: "insert_content",
+        insert_content: {
+          content: `- [x] **First**${separator}- [ ] [x] = *completed*\n  - [x] \\[ \\] [link](https://example.com)\n`,
+          position: { type: "end" },
+        },
+      },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, false);
+    expect(operations).toMatchObject([
+      {
+        type: "append_children",
+        position: { type: "after_block", afterInternalId: second.attrs?.id },
+        children: [
+          {
+            content: [
+              {
+                type: "checkListItem",
+                attrs: { checked: true },
+                content: [{ type: "text", text: "First", marks: [{ type: "bold" }] }],
+              },
+            ],
+          },
+          {
+            content: [
+              {
+                type: "checkListItem",
+                attrs: { checked: false },
+                content: [
+                  { type: "text", text: "[x] = " },
+                  { type: "text", text: "completed", marks: [{ type: "italic" }] },
+                ],
+              },
+              {
+                type: "blockGroup",
+                content: [
+                  {
+                    content: [
+                      {
+                        type: "checkListItem",
+                        attrs: { checked: true },
+                        content: [
+                          { type: "text", text: "[ ] " },
+                          {
+                            type: "text",
+                            text: "link",
+                            marks: [{ type: "link", attrs: { href: "https://example.com" } }],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    expect(JSON.stringify(operations)).not.toContain(first.attrs?.id);
+  });
+
   it("appends body content before a child-page marker", () => {
     const { document } = fixture();
     const projection = projectNotionMarkdown(document, new Map(), {}, [

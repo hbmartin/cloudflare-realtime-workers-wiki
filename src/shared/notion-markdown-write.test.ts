@@ -55,6 +55,42 @@ describe("writable Notion Markdown", () => {
     });
   });
 
+  it.each([
+    { name: "tight", separator: "\n", indentation: "" },
+    { name: "loose", separator: "\n\n", indentation: "" },
+    { name: "nested", separator: "\n", indentation: "  " },
+  ])("preserves literal checkbox labels and formatting in $name tasks", ({ separator, indentation }) => {
+    const blocks = parseWritableMarkdown(
+      `- [x] **First**${separator}${indentation}- [ ] [x] = *completed*\n${indentation}- [x] \\[ \\] [link](https://example.com)\n`,
+    );
+    const tasks = indentation
+      ? [blocks[0]!.content![0]!, ...blocks[0]!.content![1]!.content!.map((block) => block.content![0]!)]
+      : blocks.map((block) => block.content![0]!);
+    expect(tasks).toMatchObject([
+      {
+        type: "checkListItem",
+        attrs: { checked: true },
+        content: [{ type: "text", text: "First", marks: [{ type: "bold" }] }],
+      },
+      {
+        type: "checkListItem",
+        attrs: { checked: false },
+        content: [
+          { type: "text", text: "[x] = " },
+          { type: "text", text: "completed", marks: [{ type: "italic" }] },
+        ],
+      },
+      {
+        type: "checkListItem",
+        attrs: { checked: true },
+        content: [
+          { type: "text", text: "[ ] " },
+          { type: "text", text: "link", marks: [{ type: "link", attrs: { href: "https://example.com" } }] },
+        ],
+      },
+    ]);
+  });
+
   it("parses display math and empty content", () => {
     expect(blockTypes("$$\nx+y\n$$\n")).toEqual(["math"]);
     expect(parseWritableMarkdown(" \n")).toEqual([]);
