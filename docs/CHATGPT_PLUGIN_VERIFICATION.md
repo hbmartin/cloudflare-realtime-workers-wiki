@@ -1,5 +1,46 @@
 # ChatGPT plugin verification — 8 October 2026
 
+## PR #234 review fixes
+
+The corrections for [PR #234](https://github.com/hbmartin/cloudflare-realtime-workers-wiki/pull/234) are on source commit `5c9584f7722ce161984b286ae5407b8914a382bf`. They retain the upgraded dependencies. The implementation fingerprint is `87f1e35e7266042b5425dce95ea7caf5b342df5cc45b2c75429ddcee83d45b58`, using the same SHA-256 method described below for all 42 changed non-Markdown paths relative to `22593af2dab6aebc8cc092263deb377ca4fb5bb0`. The source commit and all hashes were verified again after the complete acceptance run and remained unchanged. The later verification commit changes this Markdown document only.
+
+Code-block node views construct and own one copy button, filter only that control's non-selection mutations, and clean up their listeners, feedback timers, and late clipboard completions. The real mounted-editor regressions preserve native edits, selection, Dark Reader filtering, language changes, unknown stored languages, and HTML export behavior. Plugin create and update drafts can be corrected after a definite `document_limit` rejection and saved with fresh operation IDs; uncertain outcomes and acknowledged writes retain their existing recovery behavior.
+
+The backend boundary regression constructs a real 9,999-block document whose nested content is not fully represented in Markdown. A two-paragraph append through the guarded Markdown adapter returns `document_limit`, preserves the entire authoritative document envelope, and creates no successful Durable Object or D1 receipt. A smaller corrected draft succeeds with a fresh operation ID and the same revision and epoch guards.
+
+Diagnostics runs through its dedicated client-only Chromium/Vite harness on port 4174 in both PR CI and nightly checks. Main browser discovery excludes that test; diagnostic results and HTML reports have separate directories beneath the existing artifact roots. Both workflows run diagnostics with `!cancelled()` after other checks, and retain failure traces and screenshots. Four offline tests now wait for automatic recovery after connectivity returns while retaining draft, version-quarantine, export, and revoked-access assertions.
+
+Runtime: Node `v24.21.0`, pnpm `11.18.0`. These are local results; no new published CI result is claimed.
+
+Two attempts at `pnpm check` with the default test concurrency failed only the existing near-linear redaction timing benchmark in `src/worker/observability.test.ts`: ratios 8.32 and 12.87 exceeded its limit of 8. Its implementation, tests, and configuration are byte-identical to the PR base. The focused observability suite passed all 76 tests, and five separate measurements of the same workload stayed below the threshold. The complete final acceptance run passed with `VITEST_MAX_WORKERS=1 pnpm check`, keeping every test, assertion, coverage threshold, and benchmark threshold enabled. No timing-test or concurrency configuration change is part of this patch.
+
+| Check                                               | Result                                                                                        |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Complete check pipeline                             | Passed: `VITEST_MAX_WORKERS=1 pnpm check` exited successfully                                 |
+| Formatting, lint, middleware Semgrep and rule tests | Passed; no findings, 10/10 policy tests                                                       |
+| All five TypeScript projects                        | Passed                                                                                        |
+| Full unit and component coverage                    | 1,702 passed, one existing skipped; 102 passed files and one skipped file; thresholds passed  |
+| Full Worker integration coverage                    | 1,612 passed across 22 files; thresholds passed                                               |
+| Mounted code-block and language regressions         | 8 passed; included in the full unit run                                                       |
+| Focused plugin UI and bridge API regressions        | 60 passed; included in the full unit run                                                      |
+| Real MCP document-limit boundary regression         | Passed in isolation and in the full Worker run                                                |
+| Playwright discovery                                | 24 main Chromium tests; one dedicated diagnostic; 25 built-production desktop and touch tests |
+| Main Chromium suite                                 | 24 passed in 2.2 minutes                                                                      |
+| Mobile sidebar suite                                | Two passed in 31.9 seconds                                                                    |
+| Built-production browser suite                      | 25 passed in 1.1 minutes, including desktop copy/edit/reload and touch code-block editing     |
+| Offline reconnect stability                         | All four corrected scenarios passed three times each with retries disabled: 12/12             |
+| Dedicated diagnostics under CI settings             | One passed in 2.0 seconds through the port 4174 harness                                       |
+| Diagnostic failure artifact retention               | Intentional temporary failure produced a nonempty screenshot, trace archive, and HTML report  |
+| GitHub Actions workflow lint                        | Passed with actionlint                                                                        |
+| Dead-code analysis and generated Worker bindings    | Passed                                                                                        |
+| Production build and Worker dry run                 | Passed; `wrangler deploy --env production --dry-run` exited successfully                      |
+
+The offline stability command was `pnpm exec playwright test --config playwright.production.config.ts tests/e2e/phase4-offline-shell.spec.ts --project=chromium --grep 'opens two visited documents offline|recovers a saved draft when the catalog pending write fails|opens the online workspace from a quarantined offline draft|removes a clean cached copy when live page access is revoked' --repeat-each=3 --retries=0 --output=test-results/offline-reconnect-stability`. Diagnostics ran with `CI=1 pnpm test:e2e:diagnostics`. A temporary artifact probe outside the tracked source imported the real diagnostic configuration, intentionally failed an assertion, and verified nonempty `test-failed-1.png`, `trace.zip`, and HTML report output in separate ignored probe directories.
+
+Full unit coverage: 73.27% lines, 64.66% functions, 70.49% statements, and 66.23% branches. Full Worker coverage: 84.66% lines, 88.21% functions, 81.18% statements, and 74.36% branches. The final unit suite took 108.86 seconds and the final Worker suite took 766.68 seconds with the one-worker limit.
+
+## Earlier save recovery and dependency migration verification
+
 This follow-up implements the save recovery, durable receipt identity, and retry evaluation fixes reviewed in [PR #233](https://github.com/hbmartin/cloudflare-realtime-workers-wiki/pull/233), plus compatibility migrations for the updated dependencies. PR #233 merged during implementation, so the fixes are on branch `codex/plugin-save-recovery`, based on merged commit `22593af2dab6aebc8cc092263deb377ca4fb5bb0`.
 
 The complete `pnpm check` passed on source commit `bb12702431f8c25206c5182bce790312d5a26d5d`. The tested implementation fingerprint is `a800a6d1c6b9d5309c02319d35d4ceb885d108ccf4297967b0906fc222f6aa9d`: SHA-256 of the compact, key-sorted JSON object mapping all 33 changed non-Markdown paths, relative to the base commit above, to their file SHA-256 digests. This includes source, tests, configuration, and the lockfile. All hashes and the source commit were checked again after the full run and remained unchanged. The later verification commit changes documentation only.
