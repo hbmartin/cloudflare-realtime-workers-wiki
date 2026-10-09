@@ -1458,41 +1458,6 @@ function CollaborativeEditor({
     choice?.addEventListener("keydown", onKeyDown);
     return () => choice?.removeEventListener("keydown", onKeyDown);
   }, [editor, pasteChoice]);
-  useEffect(() => {
-    const root = editorShellRef.current;
-    if (!root) return undefined;
-    const attachCopyButtons = () => {
-      for (const content of root.querySelectorAll<HTMLElement>('[data-content-type="codeBlock"]')) {
-        if (content.querySelector(".code-copy-button")) continue;
-        const code = content.querySelector("pre code");
-        if (!code) continue;
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "code-copy-button";
-        button.textContent = "Copy code";
-        button.contentEditable = "false";
-        button.setAttribute("aria-label", "Copy code");
-        button.addEventListener("click", () => {
-          void navigator.clipboard
-            .writeText(code.textContent ?? "")
-            .then(() => {
-              button.textContent = "Copied";
-              window.setTimeout(() => {
-                if (button.isConnected) button.textContent = "Copy code";
-              }, 2_000);
-            })
-            .catch(() => {
-              button.textContent = "Copy failed";
-            });
-        });
-        content.appendChild(button);
-      }
-    };
-    attachCopyButtons();
-    const observer = new MutationObserver(attachCopyButtons);
-    observer.observe(root, { childList: true, subtree: true });
-    return () => observer.disconnect();
-  }, []);
   const choosePaste = (kind: "link" | "preview" | "embed") => {
     if (!pasteChoice) return;
     const { url, blockId } = pasteChoice;

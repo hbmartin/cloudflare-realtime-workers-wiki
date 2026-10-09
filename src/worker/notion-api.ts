@@ -70,7 +70,7 @@ import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } f
 import { webhookEventStatements, type WebhookEventType } from "./webhooks";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 
-type ApiContext = { Bindings: Env; Variables: { principal: IntegrationPrincipal; requestId: string } };
+export type ApiContext = { Bindings: Env; Variables: { principal: IntegrationPrincipal; requestId: string } };
 
 class NotionError extends Error {
   override name = "NotionError";

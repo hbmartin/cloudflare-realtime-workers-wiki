@@ -40,6 +40,8 @@ describe("workspace navigation", () => {
       configurable: true,
       value(this: HTMLDialogElement) {
         this.open = true;
+        // Native showModal focuses a control after opening; closed dialogs are not focusable in jsdom.
+        this.querySelector<HTMLElement>("input, button, [tabindex]")?.focus();
       },
     });
     Object.defineProperty(HTMLDialogElement.prototype, "close", {

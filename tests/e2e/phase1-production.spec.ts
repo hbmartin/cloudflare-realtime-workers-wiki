@@ -1,5 +1,6 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { embedProviders } from "../../src/shared/embed-providers";
+import type { ProseMirrorJson } from "../../src/shared/types";
 import { signInOwner } from "./security-helpers";
 
 test.setTimeout(90_000);
@@ -36,6 +37,38 @@ async function watchCsp(page: Page) {
 
 async function expectNoCspViolations(page: Page) {
   expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem("phase1:csp") ?? "[]"))).toEqual([]);
+}
+
+async function placeCaretAtEnd(code: Locator) {
+  await code.evaluate((element) => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  });
+}
+
+async function expectCodeSynced(page: Page, text: string, language: string) {
+  const pageId = new URL(page.url()).searchParams.get("page");
+  const codeBlocks = (node: ProseMirrorJson): Array<{ text: string; language: string }> =>
+    node.type === "codeBlock"
+      ? [
+          {
+            text: (node.content ?? []).map((child) => child.text ?? "").join(""),
+            language: typeof node.attrs?.language === "string" ? node.attrs.language : "text",
+          },
+        ]
+      : (node.content ?? []).flatMap(codeBlocks);
+  await expect
+    .poll(async () => {
+      const response = await page.request.get(`/api/pages/${pageId}/content`);
+      if (!response.ok()) return [];
+      const { document } = (await response.json()) as { document: ProseMirrorJson };
+      return codeBlocks(document);
+    })
+    .toContainEqual({ text, language });
 }
 
 test("serves the built app with frame policy and editor shortcuts", async ({ page }) => {
@@ -91,7 +124,8 @@ test("serves the built app with frame policy and editor shortcuts", async ({ pag
   await expectNoCspViolations(page);
 });
 
-test("renders math, Mermaid, and highlighted code with the built policy", async ({ page }) => {
+test("renders math, Mermaid, and highlighted code with the built policy", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await watchCsp(page);
   await signInOwner(page);
   await createDocument(page);
@@ -102,13 +136,37 @@ test("renders math, Mermaid, and highlighted code with the built policy", async 
   await expect(diagram).toBeVisible();
   await expect.poll(async () => diagram.getAttribute("srcdoc")).toContain("<svg");
   await insertSlashBlock(page, "Code Block");
-  await expect(page.locator('[data-content-type="codeBlock"]')).toBeVisible();
-  await expect(page.getByRole("button", { name: "Copy code" })).toBeVisible();
-  const code = page.locator('[data-content-type="codeBlock"] pre code');
+  const block = page.locator('[data-content-type="codeBlock"]');
+  const copy = block.getByRole("button", { name: "Copy code" });
+  const code = block.locator("pre code");
+  await expect(block).toBeVisible();
+  await expect(copy).toHaveCount(1);
   await page.keyboard.type("const value = 1;");
-  await page.locator('[data-content-type="codeBlock"] select').selectOption("javascript");
+  await block.locator("select").selectOption("javascript");
   await expect(code).toContainText("const value = 1;");
   await expect.poll(() => code.locator("span").count()).toBeGreaterThan(0);
+  await copy.click();
+  await expect(copy).toHaveText("Copied");
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("const value = 1;");
+  await expect(copy).toHaveCount(1);
+
+  await code.click();
+  await placeCaretAtEnd(code);
+  await page.keyboard.type(" // edited after copying");
+  const editedCode = "const value = 1; // edited after copying";
+  await expect(code).toHaveText(editedCode);
+  await expect(copy).toHaveCount(1);
+  await expectCodeSynced(page, editedCode, "javascript");
+  const documentUrl = page.url();
+  await page.reload();
+  await expect(page).toHaveURL(documentUrl);
+  await expect(code).toHaveText(editedCode);
+  await expect(block.locator("select")).toHaveValue("javascript");
+  await expect.poll(() => code.locator("span").count()).toBeGreaterThan(0);
+  await expect(copy).toHaveCount(1);
+  await copy.click();
+  await expect(copy).toHaveText("Copied");
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(editedCode);
   await expectNoCspViolations(page);
 });
 
@@ -274,4 +332,33 @@ test("@touch opens the palette and runs a command", async ({ page }) => {
   await expect(palette).toBeVisible();
   await palette.getByRole("option", { name: /Toggle theme/ }).tap();
   await expect(palette).toHaveCount(0);
+});
+
+test("@touch keeps code editing responsive through Enter and a language change", async ({ page }) => {
+  await watchCsp(page);
+  await signInOwner(page);
+  await createDocument(page);
+  await insertSlashBlock(page, "Code Block");
+  const block = page.locator('[data-content-type="codeBlock"]');
+  const code = block.locator("pre code");
+  const copy = block.getByRole("button", { name: "Copy code" });
+  await page.keyboard.type("const first = 1;");
+  await expect(code).toHaveText("const first = 1;");
+  await code.tap();
+  await placeCaretAtEnd(code);
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("const second = 2;");
+  const codeText = "const first = 1;\nconst second = 2;";
+  await expect.poll(() => code.textContent()).toBe(codeText);
+  await block.locator("select").selectOption("javascript");
+  await expect(block.locator("select")).toHaveValue("javascript");
+  await expect.poll(() => code.textContent()).toBe(codeText);
+  await expect.poll(() => code.locator("span").count()).toBeGreaterThan(0);
+  await expect(copy).toHaveCount(1);
+  await expectCodeSynced(page, codeText, "javascript");
+  await page.reload();
+  await expect.poll(() => code.textContent()).toBe(codeText);
+  await expect(block.locator("select")).toHaveValue("javascript");
+  await expect(copy).toHaveCount(1);
+  await expectNoCspViolations(page);
 });

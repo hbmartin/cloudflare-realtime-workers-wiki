@@ -33,7 +33,7 @@ CSS builds target that same matrix. Because build targets do not polyfill runtim
 
 ## Local development
 
-Requires Node.js 22.18 or later in the Node 22 release line, or Node.js 24.2+, pnpm 11.18.0, and
+Requires Node.js 22.22.2+ in the Node 22 release line, 24.15+ in the Node 24 release line, or 26+; pnpm 11.18.0; and
 [uv](https://docs.astral.sh/uv/) to provision Python 3.13.15 for the pinned Semgrep middleware-policy check.
 
 ```sh

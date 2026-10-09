@@ -1758,16 +1758,16 @@ export function TablePage({
   ) {
     mutationGenerationRef.current += 1;
     pendingMutationsRef.current += 1;
+    const failForLostLease = () => {
+      // Once the page itself is gone the missing lease is not news: the
+      // page-unavailable notice already explains why edits stopped, and the
+      // draft stays visible in its disabled input.
+      if (pageUnavailableRef.current) return null;
+      resetCellInput(resetKey);
+      if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
+      return null;
+    };
     const execute = async () => {
-      const failForLostLease = () => {
-        // Once the page itself is gone the missing lease is not news: the
-        // page-unavailable notice already explains why edits stopped, and the
-        // draft stays visible in its disabled input.
-        if (pageUnavailableRef.current) return null;
-        resetCellInput(resetKey);
-        if (isMounted()) setSaveError(LEASE_LOST_SAVE_MESSAGE);
-        return null;
-      };
       const currentLease = leaseTokenRef.current;
       if (!currentLease) return failForLostLease();
       let revisionConflictRetried = false;

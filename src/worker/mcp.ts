@@ -170,6 +170,14 @@ async function mutationFailure(response: Response) {
       return new HttpError(409, "duplicate_date_token", "Move the original date token before reusing its ID.");
     if (conflict.error === "idempotency_key_reused")
       return new HttpError(409, "idempotency_key_reused", "Use a new operation ID for a different mutation.");
+    if (conflict.error === "operation_id_reused")
+      return new HttpError(409, "operation_id_reused", "This operation ID was used with different input.");
+    if (conflict.error === "operation_receipt_unverifiable")
+      return new HttpError(
+        409,
+        "operation_receipt_unverifiable",
+        "The prior save cannot be verified in this document version. Read the current document and reconcile your edits.",
+      );
     return new HttpError(409, "mutation_conflict", "The document could not be changed.");
   }
   if (response.status === 404)
@@ -416,13 +424,15 @@ async function roomContent(env: Env, access: McpAccess, page: PageRow) {
   return envelope;
 }
 
-async function roomMutationReceipt(env: Env, page: PageRow, operationId: string) {
+async function roomMutationReceipt(env: Env, page: PageRow, operationId: string, inputHash?: string) {
   const url = new URL("https://document.internal/api-mutate-receipt");
   url.searchParams.set("operationId", operationId);
+  if (inputHash) url.searchParams.set("mcpInputHash", inputHash);
   const response = await env.DOCUMENT.getByName(`${page.id}~${page.content_epoch}`).fetch(
     new Request(url, { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET, ...correlationHeaders() } }),
   );
   if (response.status === 404) return null;
+  if (response.status === 409) throw await mutationFailure(response);
   if (!response.ok) throw new HttpError(503, "receipt_unavailable", "The document receipt is unavailable.");
   return response.json<{ found: true; sequence: number }>();
 }
@@ -445,7 +455,7 @@ async function updatePageTool(
   const inputHash = await sha256(JSON.stringify(input));
   const cached = await receiptFor(env, access.grantId, input.operation_id, "update_page", inputHash);
   if (cached) return cached;
-  const operationId = `mcp:${access.grantId}:${input.operation_id}`;
+  const operationId = `mcp:v2:${access.grantId}:${input.operation_id}`;
   const complete = async (sequence: number) => {
     access = await currentAccess(request, env, ["pages:write"]);
     page = await pageForMember(env, access.member, input.page_id);
@@ -466,7 +476,9 @@ async function updatePageTool(
     }
     return value;
   };
-  const prior = await roomMutationReceipt(env, page, operationId);
+  const prior =
+    (await roomMutationReceipt(env, page, operationId, inputHash)) ??
+    (await roomMutationReceipt(env, page, `mcp:${access.grantId}:${input.operation_id}`));
   if (prior) return complete(prior.sequence);
   requireMarkdownWrites(env);
   const envelope = await roomContent(env, access, page);
@@ -510,11 +522,12 @@ async function updatePageTool(
         operations,
         expectedSequence: envelope.sequence,
         operationId,
+        mcpInputHash: inputHash,
       }),
     }),
   );
   if (!response.ok) {
-    const committed = await roomMutationReceipt(env, page, operationId);
+    const committed = await roomMutationReceipt(env, page, operationId, inputHash);
     if (committed) return complete(committed.sequence);
     throw await mutationFailure(response);
   }

@@ -52,6 +52,10 @@ export function dateMentionPasteExtension(userId: string) {
   let dragSource: HTMLElement | null = null;
   let preserveDrop = false;
   let cutIds: Set<string> | null = null;
+  const onDragEnd = () => {
+    dragSource = null;
+    preserveDrop = false;
+  };
   return createExtension({
     key: "dateMentionPaste",
     prosemirrorPlugins: [
@@ -60,16 +64,13 @@ export function dateMentionPasteExtension(userId: string) {
           const onDragStart = (event: DragEvent) => {
             dragSource = view.dom.parentElement?.contains(event.target as Node) ? view.dom.parentElement : null;
           };
-          const onDragEnd = () => {
-            dragSource = null;
-            preserveDrop = false;
-          };
+          const dragEndListener = onDragEnd.bind(null);
           window.addEventListener("dragstart", onDragStart);
-          window.addEventListener("dragend", onDragEnd);
+          window.addEventListener("dragend", dragEndListener);
           return {
             destroy: () => {
               window.removeEventListener("dragstart", onDragStart);
-              window.removeEventListener("dragend", onDragEnd);
+              window.removeEventListener("dragend", dragEndListener);
             },
           };
         },

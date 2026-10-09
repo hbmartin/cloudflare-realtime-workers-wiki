@@ -1,5 +1,14 @@
-import { applyD1Migrations, createExecutionContext, env, reset, SELF, waitOnExecutionContext } from "cloudflare:test";
+import {
+  applyD1Migrations,
+  createExecutionContext,
+  env,
+  reset,
+  runInDurableObject,
+  SELF,
+  waitOnExecutionContext,
+} from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as Y from "yjs";
 import { enrollAccount } from "../../tests/helpers/security";
 import {
   authorizeOAuthGet,
@@ -1716,6 +1725,254 @@ function markdownWriteBindings(flag: "false" | undefined): Env {
   else bindings.NOTION_MARKDOWN_WRITES_ENABLED = flag;
   return bindings;
 }
+
+describe("MCP durable update input identity", () => {
+  it("checks original input and revision when D1 receipts are missing, including disabled writes", async () => {
+    const connection = await connect(await bootstrap());
+    const before = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+    );
+    const input = {
+      page_id: connection.page.id,
+      command: { type: "insert_content", insert_content: { content: "Identity append" } },
+      operation_id: "protected-update",
+      expected_revision: before.revision,
+      expected_content_epoch: before.contentEpoch,
+    };
+    const updated = await toolCall(connection.token, "update_page", input);
+    expect(updated.result.isError).not.toBe(true);
+    expect(
+      (
+        await toolCall(connection.token, "update_page", {
+          page_id: connection.page.id,
+          command: { type: "insert_content", insert_content: { content: "Later append" } },
+          operation_id: "later-update",
+        })
+      ).result.isError,
+    ).not.toBe(true);
+    for (const flag of ["true", "false", undefined] as const) {
+      await env.DB.prepare("DELETE FROM oauth_operation_receipts WHERE grant_id=? AND operation_id=?")
+        .bind(connection.grantId, input.operation_id)
+        .run();
+      const bindings = flag === "true" ? env : markdownWriteBindings(flag);
+      for (const changed of [
+        { ...input, command: { type: "insert_content", insert_content: { content: "Different append" } } },
+        { ...input, expected_revision: before.revision + 1 },
+        { ...input, expected_content_epoch: before.contentEpoch + 1 },
+      ]) {
+        expect((await toolCall(connection.token, "update_page", changed, bindings)).result).toMatchObject({
+          isError: true,
+          structuredContent: { error: { code: "operation_id_reused", retryable: false } },
+        });
+        expect(
+          await env.DB.prepare("SELECT 1 FROM oauth_operation_receipts WHERE grant_id=? AND operation_id=?")
+            .bind(connection.grantId, input.operation_id)
+            .first(),
+        ).toBeNull();
+      }
+      expect(await toolCall(connection.token, "update_page", input, bindings)).toEqual(updated);
+    }
+    const fetched = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+    );
+    expect(fetched.markdown.match(/Identity append/g)).toHaveLength(1);
+    expect(fetched.markdown.match(/Later append/g)).toHaveLength(1);
+    expect(fetched.markdown).not.toContain("Different append");
+  });
+
+  it("preserves legacy ID-only receipt replay without creating a v2 identity", async () => {
+    const connection = await connect(await bootstrap());
+    const input = {
+      page_id: connection.page.id,
+      command: { type: "insert_content", insert_content: { content: "Requested differently" } },
+      operation_id: "legacy-update",
+    };
+    const room = env.DOCUMENT.getByName(`${connection.page.id}~1`);
+    const legacy = await room.fetch(
+      new Request("https://document.internal/api-mutate", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+        body: JSON.stringify({
+          actorId: connection.user.id,
+          operationId: `mcp:${connection.grantId}:${input.operation_id}`,
+          operations: [
+            {
+              type: "append_children",
+              children: [
+                {
+                  type: "blockContainer",
+                  attrs: { id: "legacy-block" },
+                  content: [{ type: "paragraph", content: [{ type: "text", text: "Legacy append" }] }],
+                },
+              ],
+            },
+          ],
+        }),
+      }),
+    );
+    expect(legacy.status).toBe(200);
+    const { sequence } = await legacy.json<{ sequence: number }>();
+    const replay = await toolCall(connection.token, "update_page", input, markdownWriteBindings("false"));
+    expect(replay.result.isError).not.toBe(true);
+    expect(JSON.parse(replay.result.content[0]!.text)).toMatchObject({ revision: sequence });
+    await runInDurableObject(room, async (_instance, state) => {
+      expect(state.storage.sql.exec("SELECT * FROM api_operation_inputs").toArray()).toEqual([]);
+    });
+    const fetched = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+    );
+    expect(fetched.markdown.match(/Legacy append/g)).toHaveLength(1);
+    expect(fetched.markdown).not.toContain("Requested differently");
+  });
+
+  it.each(["identity", "receipt"])("does not fall back to a legacy receipt when a v2 %s is missing", async (lost) => {
+    const connection = await connect(await bootstrap());
+    const input = {
+      page_id: connection.page.id,
+      command: { type: "insert_content", insert_content: { content: "Unverifiable append" } },
+      operation_id: "unverifiable-update",
+    };
+    expect((await toolCall(connection.token, "update_page", input)).result.isError).not.toBe(true);
+    await env.DB.prepare("DELETE FROM oauth_operation_receipts WHERE grant_id=? AND operation_id=?")
+      .bind(connection.grantId, input.operation_id)
+      .run();
+    const room = env.DOCUMENT.getByName(`${connection.page.id}~1`);
+    await runInDurableObject(room, async (instance, state) => {
+      const instanceRoom = instance as unknown as { document: Y.Doc; compact(): Promise<void> };
+      const document = instanceRoom.document;
+      if (lost === "identity") state.storage.sql.exec("DELETE FROM api_operation_inputs");
+      else document.getMap("api-operation-receipts").delete(`mcp:v2:${connection.grantId}:${input.operation_id}`);
+      document.getMap("api-operation-receipts").set(`mcp:${connection.grantId}:${input.operation_id}`, "legacy");
+      await instanceRoom.compact();
+    });
+    for (const bindings of [env, markdownWriteBindings("false")])
+      expect((await toolCall(connection.token, "update_page", input, bindings)).result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "operation_receipt_unverifiable", retryable: false } },
+      });
+    expect(
+      await env.DB.prepare("SELECT 1 FROM oauth_operation_receipts WHERE grant_id=? AND operation_id=?")
+        .bind(connection.grantId, input.operation_id)
+        .first(),
+    ).toBeNull();
+    const fetched = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+    );
+    expect(fetched.markdown.match(/Unverifiable append/g)).toHaveLength(1);
+  });
+});
+
+describe("MCP document limits", () => {
+  it("rejects an oversized editable draft before commit and accepts a corrected draft with the same version guards", async () => {
+    const connection = await connect(await bootstrap());
+    const room = env.DOCUMENT.getByName(`${connection.page.id}~1`);
+    await room.fetch(
+      new Request("https://document.internal/noop", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+    );
+    await runInDurableObject(room, async (instance) => {
+      const instanceRoom = instance as unknown as { document: Y.Doc; compact(): Promise<void> };
+      const block = (id: string, value: string) => {
+        const container = new Y.XmlElement("blockContainer");
+        container.setAttribute("id", id);
+        const paragraph = new Y.XmlElement("paragraph");
+        const text = new Y.XmlText();
+        text.insert(0, value);
+        paragraph.insert(0, [text]);
+        container.insert(0, [paragraph]);
+        return container;
+      };
+      // The nested subtree projects as one unknown marker, leaving this 9,999-block document editable without truncation.
+      const parent = block("folded-parent", "Folded parent");
+      const nested = new Y.XmlElement("blockGroup");
+      nested.insert(
+        0,
+        Array.from({ length: 9_997 }, (_, index) => block(`nested-${index}`, `Nested paragraph ${index}`)),
+      );
+      parent.insert(1, [nested]);
+      const group = new Y.XmlElement("blockGroup");
+      group.insert(0, [block("ordinary", "Ordinary paragraph"), parent]);
+      instanceRoom.document.transact(() => {
+        const fragment = instanceRoom.document.getXmlFragment("document-store");
+        if (fragment.length) fragment.delete(0, fragment.length);
+        fragment.insert(0, [group]);
+      });
+      await instanceRoom.compact();
+    });
+    const fullDocument = async () =>
+      (
+        await room.fetch(
+          new Request("https://document.internal/content", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+        )
+      ).json<DocumentContentEnvelope>();
+    const originalDocument = await fullDocument();
+    const before = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+    );
+    expect(before.canEdit).toBe(true);
+    expect(before.truncated).toBe(false);
+    expect(before.markdown.length).toBeLessThan(4_000);
+    expect(before.markdown).toContain('<unknown url="notion://blocks/');
+    const input = {
+      page_id: connection.page.id,
+      operation_id: "oversized-draft",
+      expected_revision: before.revision,
+      expected_content_epoch: before.contentEpoch,
+      command: {
+        type: "replace_content",
+        replace_content: { new_str: `${before.markdown}\nNew A\n\nNew B\n` },
+      },
+    };
+    expect((await toolCall(connection.token, "update_page", input)).result).toMatchObject({
+      isError: true,
+      structuredContent: { error: { code: "document_limit", retryable: false } },
+    });
+    expect(
+      documentResultSchema.parse(
+        (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+      ),
+    ).toEqual(before);
+    expect(await fullDocument()).toEqual(originalDocument);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM oauth_operation_receipts WHERE grant_id=? AND operation_id=?")
+        .bind(connection.grantId, input.operation_id)
+        .first(),
+    ).toBeNull();
+    await runInDurableObject(room, async (instance, state) => {
+      const document = (instance as unknown as { document: Y.Doc }).document;
+      expect(document.getMap("api-operation-receipts").has(`mcp:v2:${connection.grantId}:${input.operation_id}`)).toBe(
+        false,
+      );
+      expect(state.storage.sql.exec("SELECT * FROM api_operation_inputs").toArray()).toEqual([]);
+    });
+    const corrected = {
+      ...input,
+      operation_id: "corrected-draft",
+      command: { type: "replace_content", replace_content: { new_str: `${before.markdown}\nNew A\n` } },
+    };
+    expect((await toolCall(connection.token, "update_page", corrected)).result.isError).not.toBe(true);
+    const after = documentResultSchema.parse(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id })).result.structuredContent,
+    );
+    expect(after.markdown).toContain("New A");
+    expect(after.markdown).not.toContain("New B");
+    expect(after.revision).toBeGreaterThan(before.revision);
+    expect(after.contentEpoch).toBe(before.contentEpoch);
+    expect(
+      await env.DB.prepare("SELECT 1 FROM oauth_operation_receipts WHERE grant_id=? AND operation_id=?")
+        .bind(connection.grantId, corrected.operation_id)
+        .first(),
+    ).not.toBeNull();
+    await runInDurableObject(room, async (instance, state) => {
+      const document = (instance as unknown as { document: Y.Doc }).document;
+      expect(
+        document.getMap("api-operation-receipts").has(`mcp:v2:${connection.grantId}:${corrected.operation_id}`),
+      ).toBe(true);
+      expect(state.storage.sql.exec("SELECT operation_id FROM api_operation_inputs").toArray()).toEqual([
+        { operation_id: `mcp:v2:${connection.grantId}:${corrected.operation_id}` },
+      ]);
+    });
+  });
+});
 
 describe("MCP Markdown write gate", () => {
   it.each(["false", undefined] as const)("blocks new creates and updates when the write flag is %s", async (flag) => {

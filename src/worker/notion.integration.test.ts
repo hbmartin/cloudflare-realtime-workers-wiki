@@ -79,6 +79,8 @@ async function integration(cookie: string, pageId: string) {
 function notion(token: string) {
   return new Client({
     auth: token,
+    // workerd exposes WorkerGlobalScope, which the SDK classifies as a browser.
+    dangerouslyAllowBrowser: true,
     baseUrl: "http://example.test",
     notionVersion: "2026-03-11",
     retry: false,

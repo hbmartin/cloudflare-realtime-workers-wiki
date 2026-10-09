@@ -31,7 +31,7 @@ display states; property deletion warns about affected view filters and grouping
   receive explicit mappings for new types, with an unsupported-value error instead of coercion.
 - Add view commands and reads to the table DO: list/create/update/delete view, query rows for a
   view, and `move_row` with `{operationId,rowId,viewId,targetOptionId|targetDate,
-expectedCellRevision}`. The DO validates that the view's grouping or date column still exists,
+  expectedCellRevision}`. The DO validates that the view's grouping or date column still exists,
   checks write permission, changes exactly one typed cell, and broadcasts the row delta. A
   revision conflict returns the current row so the client can restore it. View definitions have
   stable IDs and optimistic revisions; delete of the active view falls back to Grid.

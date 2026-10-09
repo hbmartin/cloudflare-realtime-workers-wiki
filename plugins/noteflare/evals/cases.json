@@ -33,7 +33,16 @@
     "context": "The last update_page call failed with document_busy, retryable true. Its exact arguments were {\"page_id\":\"test-document\",\"command\":{\"type\":\"insert_content\",\"insert_content\":{\"content\":\"Review complete\",\"position\":{\"type\":\"end\"}}},\"operation_id\":\"retry-operation\",\"expected_revision\":10,\"expected_content_epoch\":3}.",
     "prompt": "Retry that same save.",
     "expected": ["update_page"],
-    "arguments": { "operation_id": "retry-operation", "expected_revision": 10, "expected_content_epoch": 3 }
+    "arguments": {
+      "page_id": "test-document",
+      "command": {
+        "type": "insert_content",
+        "insert_content": { "content": "Review complete", "position": { "type": "end" } }
+      },
+      "operation_id": "retry-operation",
+      "expected_revision": 10,
+      "expected_content_epoch": 3
+    }
   },
   { "id": "unrelated", "prompt": "What is 12 times 8?", "expected": [null] },
   {

@@ -1,6 +1,11 @@
 allowBuilds:
   esbuild: true
   workerd: true
+overrides:
+  # BlockNote, Tiptap, and Yjs must share ProseMirror class identities.
+  prosemirror-model: 1.25.12
+  prosemirror-transform: 1.12.2
+  prosemirror-view: 1.42.6
 minimumReleaseAgeExclude:
   - "@better-auth/core@1.6.28"
   - "@better-auth/drizzle-adapter@1.6.28"
@@ -13,7 +18,8 @@ minimumReleaseAgeExclude:
   - "@cloudflare/vitest-pool-workers@0.21.3"
   - "@cloudflare/workers-types@5.20260814.1"
   - better-auth@1.6.28
-  - miniflare@5.20260811.1-alpha
-  - wrangler@4.123.0
+  - miniflare@5.20260811.1-alpha || 5.20261006.1-alpha
+  - wrangler@4.123.0 || 4.149.0
   - "@modelcontextprotocol/core@2.2.0"
   - "@modelcontextprotocol/server@2.2.0"
+  - "@cloudflare/vitest-plugin@1.4.0"

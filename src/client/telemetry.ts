@@ -139,12 +139,19 @@ export async function reportClientError(event: ClientErrorEvent, error: unknown,
   await queued;
 }
 
+function handleWindowError(event: ErrorEvent) {
+  void reportClientError("client.global_error", event.error ?? event.message);
+}
+
+function handleUnhandledRejection(event: PromiseRejectionEvent) {
+  void reportClientError("client.unhandled_rejection", event.reason);
+}
+
 export function installClientTelemetry() {
   if (installed) return () => undefined;
   installed = true;
-  const error = (event: ErrorEvent) => void reportClientError("client.global_error", event.error ?? event.message);
-  const rejection = (event: PromiseRejectionEvent) =>
-    void reportClientError("client.unhandled_rejection", event.reason);
+  const error = handleWindowError.bind(null);
+  const rejection = handleUnhandledRejection.bind(null);
   window.addEventListener("error", error);
   window.addEventListener("unhandledrejection", rejection);
   return () => {

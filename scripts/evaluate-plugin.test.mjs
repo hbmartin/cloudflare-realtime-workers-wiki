@@ -84,6 +84,90 @@ describe("synthetic tool-selection scoring", () => {
       failureReason: "argument_mismatch",
     });
   });
+
+  const updateArguments = {
+    page_id: "test-document",
+    command: {
+      type: "insert_content",
+      insert_content: { content: "Review complete", position: { type: "end" }, allow_deleting_content: false },
+    },
+    operation_id: "update-operation",
+    expected_revision: 10,
+    expected_content_epoch: 3,
+  };
+
+  it("compares asserted nested objects exactly while allowing unasserted top-level arguments", () => {
+    const example = { id: "nested", expected: ["update_page"], arguments: { command: updateArguments.command } };
+    const reordered = {
+      insert_content: { allow_deleting_content: false, position: { type: "end" }, content: "Review complete" },
+      type: "insert_content",
+    };
+    expect(
+      scoreCase(example, selected("update_page", { ...updateArguments, command: reordered, operation_id: "other-id" })),
+    ).toMatchObject({ passed: true });
+    for (const command of [
+      { ...updateArguments.command, insert_content: { ...reordered.insert_content, content: "Different" } },
+      { ...updateArguments.command, insert_content: { content: "Review complete", position: { type: "end" } } },
+      { ...updateArguments.command, insert_content: { ...reordered.insert_content, extra: true } },
+      { ...updateArguments.command, insert_content: { ...reordered.insert_content, position: { type: "start" } } },
+    ]) {
+      expect(scoreCase(example, selected("update_page", { ...updateArguments, command }))).toMatchObject({
+        passed: false,
+        failureReason: "argument_mismatch",
+      });
+    }
+  });
+
+  it("requires exact nested arrays, including their order and element keys", () => {
+    const changes = [
+      { old_str: "First", new_str: "One" },
+      { old_str: "Second", new_str: "Two" },
+    ];
+    const command = { type: "update_content", update_content: { content_updates: changes } };
+    const example = { id: "array", expected: ["update_page"], arguments: { command } };
+    expect(scoreCase(example, selected("update_page", { ...updateArguments, command }))).toMatchObject({
+      passed: true,
+    });
+    for (const content_updates of [
+      changes.toReversed(),
+      changes.slice(0, 1),
+      [...changes, { old_str: "Third", new_str: "Three" }],
+      [{ ...changes[0], replace_all_matches: false }, changes[1]],
+    ]) {
+      expect(
+        scoreCase(
+          example,
+          selected("update_page", { ...updateArguments, command: { ...command, update_content: { content_updates } } }),
+        ),
+      ).toMatchObject({ passed: false, failureReason: "argument_mismatch" });
+    }
+  });
+
+  it("asserts the retry's original page and complete command as well as its ID and version guards", () => {
+    const retry = cases.find((example) => example.id === "retry");
+    const original = JSON.parse(retry.context.match(/exact arguments were (\{.*\})\./)[1]);
+    expect(retry.arguments).toEqual(original);
+    expect(scoreCase(retry, selected("update_page", original))).toMatchObject({ passed: true });
+    for (const args of [
+      { ...original, page_id: "other-document" },
+      {
+        ...original,
+        command: { ...original.command, insert_content: { ...original.command.insert_content, content: "Changed" } },
+      },
+      {
+        ...original,
+        command: {
+          ...original.command,
+          insert_content: { ...original.command.insert_content, position: { type: "start" } },
+        },
+      },
+    ]) {
+      expect(scoreCase(retry, selected("update_page", args))).toMatchObject({
+        passed: false,
+        failureReason: "argument_mismatch",
+      });
+    }
+  });
 });
 
 describe("synthetic evaluation reporting", () => {

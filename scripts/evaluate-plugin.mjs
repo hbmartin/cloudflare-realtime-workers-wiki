@@ -1,4 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { pluginToolContracts } from "../src/shared/plugin-contracts.ts";
 
@@ -45,7 +46,7 @@ export function scoreCase(example, output) {
   if (!example.expected.includes(result.selectedTool)) return { ...result, failureReason: "unexpected_tool" };
   if (
     example.arguments &&
-    !Object.entries(example.arguments).every(([key, value]) => result.arguments?.[key] === value)
+    !Object.entries(example.arguments).every(([key, value]) => isDeepStrictEqual(result.arguments?.[key], value))
   )
     return { ...result, failureReason: "argument_mismatch" };
   return { ...result, passed: true };

@@ -6,6 +6,14 @@ import { MarkdownPreview } from "./MarkdownPreview";
 
 type Destination = { id: string; title: string };
 type Navigation = { token: number; run: () => void | Promise<void> };
+type PendingMutation = {
+  session: number;
+  markdown: string;
+  expectedEpoch: number;
+  spaceId: string;
+  parentId?: string;
+  acknowledgement?: Awaited<ReturnType<PluginApi["create"]>>;
+} & ({ kind: "create"; input: CreateInput } | { kind: "update"; input: SaveInput });
 
 export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageId?: string }) {
   const [spaces, setSpaces] = useState<PluginSpaces | null>(null);
@@ -20,6 +28,8 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState(false);
   const [busy, setBusy] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [recovery, setRecovery] = useState<"uncertain" | "acknowledged" | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [conflict, setConflict] = useState(false);
@@ -27,7 +37,10 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
   const [navigation, setNavigation] = useState<Navigation | null>(null);
   const preview = useRef<HTMLElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
-  const pending = useRef<{ key: string; id: string } | null>(null);
+  const pending = useRef<PendingMutation | null>(null);
+  const inFlight = useRef<PendingMutation | null>(null);
+  const draftSession = useRef(0);
+  const draftValue = useRef("");
   const initialHandled = useRef<string | undefined>(undefined);
   const initializing = useRef(true);
   const loadedApi = useRef<PluginApi | null>(null);
@@ -39,25 +52,50 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
 
   function report(cause: unknown) {
     setError(cause instanceof Error ? cause.message : "NoteFlare is temporarily unavailable.");
-    if (cause instanceof PluginToolError && cause.code === "page_changed" && editing) setConflict(true);
+    if (
+      cause instanceof PluginToolError &&
+      editing &&
+      (cause.code === "page_changed" ||
+        (!creating && ["operation_receipt_unverifiable", "operation_id_reused"].includes(cause.code)))
+    )
+      setConflict(true);
   }
   const current = useCallback((token: number) => mounted.current && token === navigationToken.current, []);
+  const currentSession = useCallback((session: number) => mounted.current && session === draftSession.current, []);
   const nextToken = useCallback(() => ++navigationToken.current, []);
+  const nextSession = useCallback(() => ++draftSession.current, []);
+  function changeDraft(value: string) {
+    draftValue.current = value;
+    setDraft(value);
+  }
+  const abandonDraft = useCallback(() => {
+    nextSession();
+    pending.current = null;
+    inFlight.current = null;
+    setSaving(false);
+    setRecovery(null);
+  }, [nextSession]);
   const share = useCallback(
-    async (next: PluginDocument | null, selection = "", token = navigationToken.current) => {
-      if (!current(token)) return;
+    async (
+      next: PluginDocument | null,
+      selection = "",
+      token = navigationToken.current,
+      session = draftSession.current,
+    ) => {
+      if (!current(token) || !currentSession(session)) return;
       try {
         await api.context(next, selection);
       } catch {
-        if (current(token)) setNotice("Chat context could not be updated. You can still use the document tools.");
+        if (current(token) && currentSession(session))
+          setNotice("Chat context could not be updated. You can still use the document tools.");
       }
     },
-    [api, current],
+    [api, current, currentSession],
   );
   function acceptPage(next: PluginDocument, token: number) {
     if (!current(token)) return;
     setPage(next);
-    setDraft(next.markdown);
+    changeDraft(next.markdown);
     setCreating(false);
     setEditing(false);
     setConflict(false);
@@ -80,12 +118,16 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
   }
   function navigate(run: (token: number) => void | Promise<void>) {
     const token = nextToken();
-    if (dirty) {
+    const leave = () => {
+      abandonDraft();
+      return run(token);
+    };
+    if (dirty || pending.current) {
       setBusy(false);
-      setNavigation({ token, run: () => run(token) });
+      setNavigation({ token, run: leave });
     } else {
       setNavigation(null);
-      void run(token);
+      void leave();
     }
   }
   function keepEditing() {
@@ -118,7 +160,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
       setPage(null);
       setCreating(false);
       setEditing(false);
-      setDraft("");
+      changeDraft("");
       setTitle("");
       setConflict(false);
       setLatest(null);
@@ -133,8 +175,23 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
     loadedApi.current = null;
     initialHandled.current = undefined;
     const token = nextToken();
+    abandonDraft();
+    setPage(null);
+    changeDraft("");
+    setTitle("");
+    setCreating(false);
+    setEditing(false);
+    setConflict(false);
+    setLatest(null);
+    setNavigation(null);
+    setError("");
+    setNotice("");
     setSpaces(null);
+    setSpaceId("");
+    setParents([]);
     setListing(null);
+    setSearch(null);
+    setQuery("");
     setBusy(true);
     async function initialize() {
       try {
@@ -153,9 +210,12 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
     return () => {
       mounted.current = false;
       nextToken();
+      nextSession();
+      pending.current = null;
+      inFlight.current = null;
     };
     // Load spaces once; the navigation effect uses the latest host page after bootstrap.
-  }, [api, current, nextToken]);
+  }, [api, current, nextToken, nextSession, abandonDraft]);
 
   useEffect(() => {
     if (!spaces || loadedApi.current !== api) return;
@@ -208,18 +268,14 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
       if (current(token)) report(cause);
     });
   };
-  const operationId = (key: string) => {
-    if (pending.current?.key !== key) pending.current = { key, id: crypto.randomUUID() };
-    return pending.current.id;
-  };
-  function saveInput(operation_id: string): SaveInput | null {
+  function saveInput(operation_id: string, markdown = draft): SaveInput | null {
     return page
       ? {
           page_id: page.id,
           expected_revision: page.revision,
           expected_content_epoch: page.contentEpoch,
           operation_id,
-          command: { type: "replace_content", replace_content: { new_str: draft } },
+          command: { type: "replace_content", replace_content: { new_str: markdown } },
         }
       : null;
   }
@@ -235,53 +291,110 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
   const fits = !previewInput || requestFits(creating ? "create_page" : "update_page", previewInput);
 
   async function save(token = navigationToken.current): Promise<boolean> {
-    if (!current(token) || conflict || !fits) return false;
-    setBusy(true);
+    if (!current(token) || inFlight.current || conflict || (!pending.current && !fits)) return false;
+    if (!pending.current && !dirty) return true;
+    const session = pending.current?.session ?? draftSession.current;
+    let mutation = pending.current;
+    if (!mutation) {
+      const operationId = crypto.randomUUID();
+      const destination = { session, markdown: draftValue.current, spaceId, ...(parentId ? { parentId } : {}) };
+      if (creating) {
+        if (!title.trim() || !writable) return false;
+        mutation = {
+          ...destination,
+          kind: "create",
+          // create_page inserts a fresh page with the schema's initial content_epoch of 1.
+          expectedEpoch: 1,
+          input: {
+            space_id: spaceId,
+            ...(parentId ? { parent_id: parentId } : {}),
+            title: title.trim(),
+            markdown: draftValue.current,
+            operation_id: operationId,
+          },
+        };
+      } else {
+        const input = saveInput(operationId, draftValue.current);
+        if (!input || !page?.canEdit || page.truncated) return false;
+        mutation = { ...destination, kind: "update", expectedEpoch: input.expected_content_epoch, input };
+      }
+      pending.current = mutation;
+      setRecovery("uncertain");
+    }
+    inFlight.current = mutation;
+    setSaving(true);
     setError("");
     setNotice("");
     try {
-      const key = JSON.stringify(previewInput);
-      const id = operationId(key);
-      const input = saveInput(id);
-      let savedId: string;
-      if (creating) {
-        const create: CreateInput = {
-          space_id: spaceId,
-          ...(parentId ? { parent_id: parentId } : {}),
-          title: title.trim(),
-          markdown: draft,
-          operation_id: id,
-        };
-        savedId = (await api.create(create)).id;
-      } else if (input) {
-        savedId = (await api.save(input)).id;
-      } else return false;
-      // Fetch failures retain the operation ID: retrying a committed write returns its receipt.
-      if (!current(token)) return false;
-      const refreshed = await api.document(savedId);
-      if (!current(token)) return false;
-      acceptPage(refreshed, token);
-      setNotice("Document saved.");
-      if (spaceId) {
+      if (!mutation.acknowledgement) {
+        mutation.acknowledgement =
+          mutation.kind === "create" ? await api.create(mutation.input) : await api.save(mutation.input);
+        if (!currentSession(session)) return false;
+        setRecovery("acknowledged");
+      }
+      const refreshed = await api.document(mutation.acknowledgement.id);
+      if (!currentSession(session)) return false;
+      const confirmed =
+        refreshed.revision === mutation.acknowledgement.revision && refreshed.contentEpoch === mutation.expectedEpoch;
+      const newerDraft = draftValue.current !== mutation.markdown;
+      setPage(refreshed);
+      setCreating(false);
+      pending.current = null;
+      setRecovery(null);
+      if (!confirmed) {
+        setEditing(true);
+        setConflict(true);
+        setLatest(refreshed);
+        setNotice("The save completed, but the document changed again. Reconcile your preserved draft before saving.");
+        return false;
+      }
+      if (!newerDraft) changeDraft(refreshed.markdown);
+      setEditing(newerDraft);
+      setConflict(false);
+      setLatest(null);
+      setNotice(newerDraft ? "Previous save confirmed. Your newer changes are still unsaved." : "Document saved.");
+      void share(refreshed, "", navigationToken.current, session);
+      if (mutation.spaceId) {
         try {
-          const next = await api.pages(spaceId, parentId);
-          if (current(token)) setListing(next);
+          const next = await api.pages(mutation.spaceId, mutation.parentId);
+          if (currentSession(session)) setListing(next);
         } catch {
-          if (current(token)) setNotice("Document saved. Refresh navigation to see the updated list.");
+          if (currentSession(session))
+            setNotice(
+              newerDraft
+                ? "Previous save confirmed. Your newer changes are still unsaved. Refresh navigation to see the updated list."
+                : "Document saved. Refresh navigation to see the updated list.",
+            );
         }
       }
-      return true;
+      return currentSession(session) && draftValue.current === refreshed.markdown;
     } catch (cause) {
-      if (current(token)) report(cause);
+      if (currentSession(session)) {
+        // Access and page_create_unknown errors can follow a committed write, even when not retryable.
+        if (
+          !mutation.acknowledgement &&
+          cause instanceof PluginToolError &&
+          ["page_changed", "invalid_markdown", "request_too_large", "too_many_blocks", "document_limit"].includes(
+            cause.code,
+          )
+        ) {
+          pending.current = null;
+          setRecovery(null);
+        }
+        report(cause);
+      }
       return false;
     } finally {
-      if (current(token)) setBusy(false);
+      if (inFlight.current === mutation) {
+        inFlight.current = null;
+        setSaving(false);
+      }
     }
   }
   function newDocument() {
     navigate((token) => {
       setPage(null);
-      setDraft("");
+      changeDraft("");
       setTitle("");
       setCreating(true);
       setEditing(true);
@@ -326,7 +439,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
         </div>
       ) : null}
       {notice ? <output className="message">{notice}</output> : null}
-      {busy ? <output className="loading">Loading NoteFlare…</output> : null}
+      {busy || saving ? <output className="loading">Loading NoteFlare…</output> : null}
       <div className="workspace">
         <aside aria-label="Wiki navigation">
           <label htmlFor="space">Space</label>
@@ -467,7 +580,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                     id="title"
                     maxLength={PAGE_TITLE_MAX}
                     value={title}
-                    disabled={busy}
+                    disabled={busy || recovery !== null}
                     onChange={(event) => setTitle(event.target.value)}
                   />
                   <p>
@@ -484,7 +597,7 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                     value={draft}
                     disabled={busy}
                     spellCheck
-                    onChange={(event) => setDraft(event.target.value)}
+                    onChange={(event) => changeDraft(event.target.value)}
                     onSelect={(event) =>
                       shareSelection(draft.slice(event.currentTarget.selectionStart, event.currentTarget.selectionEnd))
                     }
@@ -494,11 +607,20 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                       type="button"
                       className="primary"
                       disabled={
-                        busy || conflict || !fits || (creating ? !title.trim() || !writable : !page?.canEdit || !dirty)
+                        busy ||
+                        saving ||
+                        conflict ||
+                        (!recovery &&
+                          (!fits ||
+                            (creating ? !title.trim() || !writable : !page?.canEdit || page.truncated || !dirty)))
                       }
                       onClick={() => void save()}
                     >
-                      Save
+                      {recovery === "acknowledged"
+                        ? "Refresh saved document"
+                        : recovery === "uncertain"
+                          ? "Retry previous save"
+                          : "Save"}
                     </button>
                     <button
                       type="button"
@@ -553,13 +675,14 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                           </details>
                           <button
                             type="button"
-                            disabled={busy || !latest.canEdit}
+                            disabled={busy || !latest.canEdit || latest.truncated}
                             onClick={() => {
                               setPage(latest);
                               setLatest(null);
                               setConflict(false);
                               setError("");
                               pending.current = null;
+                              setRecovery(null);
                             }}
                           >
                             I’ve reconciled my draft
@@ -574,9 +697,9 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
                 <div className="actions">
                   <button
                     type="button"
-                    disabled={busy || !page?.canEdit || page.truncated || !fits}
+                    disabled={busy || saving || !page?.canEdit || page.truncated || !fits}
                     onClick={() => {
-                      setDraft(page?.markdown ?? "");
+                      changeDraft(page?.markdown ?? "");
                       setEditing(true);
                     }}
                   >
@@ -610,10 +733,11 @@ export function PluginApp({ api, initialPageId }: { api: PluginApi; initialPageI
           <dialog ref={dialog} aria-labelledby="draft-dialog-title" className="dialog" onCancel={keepEditing}>
             <h2 id="draft-dialog-title">Keep your draft?</h2>
             <p>You have unsaved changes.</p>
+            {recovery ? <p>Discarding this draft cannot undo a save that has already been submitted.</p> : null}
             <div className="actions">
               <button
                 type="button"
-                disabled={busy || conflict || !fits || (creating && !title.trim())}
+                disabled={busy || saving || conflict || (!recovery && (!fits || (creating && !title.trim())))}
                 onClick={() => void runNavigation(false)}
               >
                 Save and continue
