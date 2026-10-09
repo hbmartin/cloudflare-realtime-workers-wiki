@@ -24,7 +24,13 @@ import { sourceRateLimitKey } from "./source-rate-limit";
 import type { Env } from "./env";
 import { protectedCommentBlockIds } from "./comments";
 import type { DocumentContentEnvelope, ProseMirrorJson } from "../shared/types";
-import { documentResultSchema, pagesResultSchema, spacesResultSchema, PLUGIN_UI_URI } from "../shared/plugin-contracts";
+import {
+  documentResultSchema,
+  pagesResultSchema,
+  spacesResultSchema,
+  PLUGIN_UI_URI,
+  pluginToolContracts,
+} from "../shared/plugin-contracts";
 
 const ORIGIN = "http://example.test";
 const RESOURCE = `${ORIGIN}/mcp`;
@@ -2199,6 +2205,59 @@ describe("MCP Markdown write gate", () => {
 });
 
 describe("ChatGPT plugin contracts", () => {
+  it("reads typed tables and diagrams through authenticated MCP with bounded, revision-aware continuation", async () => {
+    const cookie = await bootstrap();
+    const connection = await connect(cookie);
+    const create = async (kind: "table" | "diagram") => {
+      const response = await SELF.fetch(`${ORIGIN}/api/pages`, {
+        method: "POST",
+        headers: { cookie, origin: ORIGIN, "content-type": "application/json" },
+        body: JSON.stringify({ kind, title: `Plugin ${kind}`, spaceId: connection.page.spaceId }),
+      });
+      expect(response.status).toBe(201);
+      return (await response.json<{ page: { id: string } }>()).page.id;
+    };
+    const tableId = await create("table"),
+      diagramId = await create("diagram");
+    await env.DB.prepare("INSERT INTO table_columns VALUES('typed-column',?,'Count','number',100)").bind(tableId).run();
+    for (let index = 0; index < 55; index++)
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO table_rows VALUES(?,?,?,?,?,?)").bind(
+          `typed-row-${index}`,
+          tableId,
+          index,
+          connection.user.id,
+          1,
+          1,
+        ),
+        env.DB.prepare(
+          "INSERT INTO table_cells(row_id,column_id,number_value,updated_at) VALUES(?,'typed-column',?,1)",
+        ).bind(`typed-row-${index}`, index),
+      ]);
+    const first = pluginToolContracts.fetch_table.outputSchema.parse(
+      (await toolCall(connection.token, "fetch_table", { page_id: tableId })).result.structuredContent,
+    );
+    expect(first.complete).toBe(false);
+    expect(first.rows).toHaveLength(50);
+    expect(first.columns.some((column) => column.type === "number")).toBe(true);
+    const second = pluginToolContracts.fetch_table.outputSchema.parse(
+      (await toolCall(connection.token, "fetch_table", { page_id: tableId, cursor: first.nextCursor! })).result
+        .structuredContent,
+    );
+    expect(second.complete).toBe(true);
+    expect(second.rows).toHaveLength(5);
+    const diagram = pluginToolContracts.fetch_diagram.outputSchema.parse(
+      (await toolCall(connection.token, "fetch_diagram", { page_id: diagramId })).result.structuredContent,
+    );
+    expect(diagram).toMatchObject({ id: diagramId, complete: true, totalNodes: 0, totalEdges: 0 });
+    await env.DB.prepare("UPDATE table_state SET revision=revision+1 WHERE page_id=?").bind(tableId).run();
+    expect(
+      (await toolCall(connection.token, "fetch_table", { page_id: tableId, cursor: first.nextCursor! })).result,
+    ).toMatchObject({ isError: true, structuredContent: { error: { code: "source_changed" } } });
+    expect((await toolCall(connection.token, "fetch_diagram", { page_id: crypto.randomUUID() })).result.isError).toBe(
+      true,
+    );
+  });
   it("opens authorized documents and links other page kinds to NoteFlare", async () => {
     const connection = await connect(await bootstrap());
     const opened = await toolCall(connection.token, "open_noteflare", { page_id: connection.page.id });
@@ -2240,7 +2299,9 @@ describe("ChatGPT plugin contracts", () => {
     expect(result.tools?.map((tool) => tool.name).sort()).toEqual([
       "create_comment",
       "create_page",
+      "fetch_diagram",
       "fetch_page",
+      "fetch_table",
       "list_pages",
       "list_spaces",
       "open_noteflare",

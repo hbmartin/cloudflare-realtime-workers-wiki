@@ -2,6 +2,25 @@
   { "id": "search", "prompt": "Find notes about the launch checklist in NoteFlare.", "expected": ["search_pages"] },
   { "id": "read", "prompt": "Read the NoteFlare document with ID test-document.", "expected": ["fetch_page"] },
   {
+    "id": "read-table",
+    "prompt": "Read the typed rows and schema of NoteFlare table test-table.",
+    "expected": ["fetch_table"],
+    "arguments": { "page_id": "test-table" }
+  },
+  {
+    "id": "read-diagram",
+    "prompt": "Read labels and relationships from NoteFlare diagram test-diagram.",
+    "expected": ["fetch_diagram"],
+    "arguments": { "page_id": "test-diagram" }
+  },
+  {
+    "id": "continue-table",
+    "context": "fetch_table returned table test-table, filter urgent, complete false, nextCursor opaque-next-page. Continue with identical arguments.",
+    "prompt": "Read the remaining rows in that filtered table.",
+    "expected": ["fetch_table"],
+    "arguments": { "page_id": "test-table", "filter": "urgent", "cursor": "opaque-next-page" }
+  },
+  {
     "id": "discover-destination",
     "prompt": "Save a new note in NoteFlare. I have not chosen a space yet.",
     "expected": ["list_spaces"]

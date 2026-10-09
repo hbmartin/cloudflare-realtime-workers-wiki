@@ -190,6 +190,8 @@ describe("synthetic evaluation reporting", () => {
     const argumentsByTool = {
       search_pages: { query: "launch" },
       fetch_page: { page_id: "test-document" },
+      fetch_table: { page_id: "test-table", filter: "urgent", cursor: "opaque-next-page" },
+      fetch_diagram: { page_id: "test-diagram" },
       list_spaces: {},
       list_pages: { space_id: "test-space" },
       open_noteflare: {},

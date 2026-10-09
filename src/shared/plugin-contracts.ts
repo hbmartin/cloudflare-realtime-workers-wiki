@@ -99,7 +99,73 @@ const markdownCommandSchema = z.discriminatedUnion("type", [
 ]);
 
 const OPERATION_ID = /^[A-Za-z0-9:_-]{1,128}$/;
+const typedCells = z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]));
+const diagramLink = z.object({ id: z.string(), label: z.string() });
+const diagramEntity = z.discriminatedUnion("entity", [
+  z.object({
+    entity: z.literal("node"),
+    id: z.string(),
+    type: z.string(),
+    label: z.string(),
+    notes: z.string(),
+    parentId: z.string().nullable(),
+    references: z.array(diagramLink),
+    mentions: z.array(diagramLink),
+  }),
+  z.object({
+    entity: z.literal("edge"),
+    id: z.string(),
+    source: z.string(),
+    target: z.string(),
+    label: z.string(),
+    arrow: z.boolean(),
+  }),
+]);
+const snapshotIdentity = {
+  ...pageIdentity,
+  revision: z.number().int().nonnegative(),
+  contentEpoch: z.number().int().nonnegative(),
+  complete: z.boolean(),
+  nextCursor: z.string().nullable(),
+};
 export const pluginToolContracts = {
+  fetch_table: {
+    description:
+      "Read typed table schema and rows, with an optional text filter or column subset. Follow nextCursor with identical arguments until complete; restart if the revision changes. Select values are option IDs from the schema. Attachment bytes and editor leases are excluded. Tables are read-only through this tool.",
+    inputSchema: z.object({
+      page_id: z.string().regex(ID_PATTERN),
+      filter: z.string().max(200).optional(),
+      column_ids: z.array(z.string().regex(ID_PATTERN)).min(1).max(200).optional(),
+      cursor: z.string().max(2048).optional(),
+    }),
+    outputSchema: z.object({
+      ...snapshotIdentity,
+      filter: z.string(),
+      totalRows: z.number().int().nonnegative(),
+      columns: z.array(
+        z.object({
+          id: z.string(),
+          name: z.string(),
+          type: z.enum(["text", "number", "checkbox", "date", "select"]),
+          position: z.number(),
+          options: z.array(z.object({ id: z.string(), label: z.string(), position: z.number() })),
+        }),
+      ),
+      rows: z.array(z.object({ id: z.string(), position: z.number(), cells: typedCells })),
+    }),
+  },
+  fetch_diagram: {
+    description:
+      "Read diagram nodes and edges as text and relationships. Follow nextCursor with identical arguments until complete; restart if the revision, sequence, or epoch changes. References are metadata, not permission to fetch their targets. Image bytes are excluded. Diagrams are read-only through this tool.",
+    inputSchema: z.object({ page_id: z.string().regex(ID_PATTERN), cursor: z.string().max(2048).optional() }),
+    outputSchema: z.object({
+      ...snapshotIdentity,
+      sequence: z.number().int().nonnegative(),
+      totalNodes: z.number().int().nonnegative(),
+      totalEdges: z.number().int().nonnegative(),
+      items: z.array(diagramEntity),
+    }),
+  },
   search_pages: {
     description: "Find pages the connected member can read. Use the returned IDs to fetch documents or open NoteFlare.",
     inputSchema: z.object({ query: z.string().trim().min(1).max(200), cursor: z.string().max(512).optional() }),
@@ -107,7 +173,7 @@ export const pluginToolContracts = {
   },
   fetch_page: {
     description:
-      "Read a document as Markdown. Use its revision and contentEpoch when updating it; diagrams and tables open in NoteFlare.",
+      "Read a document as Markdown. Use its revision and contentEpoch when updating it. Use fetch_table or fetch_diagram for other page types.",
     inputSchema: z.object({ page_id: z.string().regex(ID_PATTERN) }),
     outputSchema: documentResultSchema,
   },

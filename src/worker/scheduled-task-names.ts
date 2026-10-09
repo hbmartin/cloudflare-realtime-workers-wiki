@@ -18,6 +18,7 @@ export const SCHEDULED_TASK_NAMES = [
   "oauth_security_records",
   "mcp_staged_pages",
   "table_search_values",
+  "ai_history",
 ] as const;
 
 export type ScheduledTaskName = (typeof SCHEDULED_TASK_NAMES)[number];
