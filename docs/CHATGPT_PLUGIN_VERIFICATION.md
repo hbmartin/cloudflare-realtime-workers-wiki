@@ -1,5 +1,35 @@
 # ChatGPT plugin verification — 8 October 2026
 
+## PR #234 expired-create and Markdown follow-up
+
+This follow-up fixes the two confirmed regressions from [PR #234](https://github.com/hbmartin/cloudflare-realtime-workers-wiki/pull/234), based on merged `main` commit `1f8b7e17ccf97f75d2ceccd89fd56d636eaca5b8`. The tested source commit is `d28fbd2dd1b0755f7925bf40ca3300013c2ba47a`. Its implementation fingerprint is `e780696e30079a0052c4db31de56d78401306f281d459a48b382587f9f367580`: SHA-256 of the compact, key-sorted JSON object mapping all 10 changed non-Markdown paths, relative to that base, to their file SHA-256 digests. Source and lockfile hashes remained unchanged through acceptance. The subsequent verification commit changes this document only.
+
+An unacknowledged create that receives `page_creation_expired` now releases the pending request while preserving the current title, Markdown, and destination. The title unlocks and ordinary Save returns. Regression tests cover the original exact-request retry, unchanged and edited drafts saved with fresh operation IDs, adoption of the created page for subsequent updates, and isolation of late responses from abandoned sessions. Acknowledged creates and update requests retain their existing recovery behavior; nonretryable errors are not broadly released. The server's expiration message and cleanup are unchanged.
+
+Only the direct Marked dependency is rolled back, from `18.1.0` to exact `16.4.2`. The lockfile was regenerated with pinned pnpm `11.18.0`, and the two parser/import compatibility changes were restored to their pre-PR implementations. All other dependency upgrades and the existing task-list regressions remain. New parsing, generated-mutation, and rendered-preview tests cover tight, loose, and nested task lists, checked and unchecked markers, literal and escaped brackets, and formatted labels. Real MCP create and update tests assert both stored Durable Object content and the subsequent `fetch_page` result for `- [x] First` followed by `- [ ] [x] = completed`.
+
+The two core expired-create cases failed before the recovery fix. All nine new parser, mutation, and preview cases reproduced the Marked 18 regression before passing with Marked 16; both new MCP cases also reproduced persisted corruption with Marked 18 and passed after the rollback. Existing import, escaped link/image label, inline-math, unsupported-content rejection, uncertain-error, and acknowledged-write coverage remains enabled. An independent subagent reviewed the combined changes after the separate implementation passes.
+
+Runtime: Node `v24.21.0`, pnpm `11.18.0`. These are local results, not a claim of a published CI run.
+
+| Check                                               | Result                                                                                           |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| Clean frozen-lockfile installation                  | Passed; application resolution from preview, importer, and write-parser paths is Marked `16.4.2` |
+| Complete check pipeline                             | Passed once on the finished source: `VITEST_MAX_WORKERS=1 pnpm check`                            |
+| Formatting, lint, middleware Semgrep and rule tests | Passed; zero findings and 10/10 policy tests                                                     |
+| All five TypeScript projects                        | Passed                                                                                           |
+| Full unit and component coverage                    | 1,716 passed, one existing skipped; 103 passed files and one skipped file; thresholds passed     |
+| Full Worker integration coverage                    | 1,614 passed across 22 files, including both new MCP persistence regressions; thresholds passed  |
+| Bundled plugin-host Chromium suite                  | Both tests passed on the tested source commit                                                    |
+| Production desktop and touch browser suite          | 25 passed in 51.6 seconds on the tested source commit                                            |
+| Dead-code analysis and generated Worker bindings    | Passed                                                                                           |
+| Production build and Worker dry run                 | Passed; `wrangler deploy --env production --dry-run` exited successfully                         |
+| Final scope and original-checkout verification      | Only Marked changed in dependencies; original local dependency edits preserved byte-for-byte     |
+
+Full unit coverage: 73.30% lines, 64.69% functions, 70.52% statements, and 66.30% branches. Full Worker coverage: 84.66% lines, 88.21% functions, 81.17% statements, and 74.34% branches. Unit coverage took 171.94 seconds; Worker coverage took 987.25 seconds. Every coverage and benchmark threshold is unchanged.
+
+No public tool schema, API interface, database migration, or receipt format changes. Existing documents are not rewritten; the rollback prevents future corruption. Deployment, plugin registration, paid evaluations, and installed ChatGPT acceptance were not performed. Broader receipt limitations, cross-space navigation, and persistent drafts remain separate work.
+
 ## PR #234 review fixes
 
 The corrections for [PR #234](https://github.com/hbmartin/cloudflare-realtime-workers-wiki/pull/234) are on source commit `5c9584f7722ce161984b286ae5407b8914a382bf`. They retain the upgraded dependencies. The implementation fingerprint is `87f1e35e7266042b5425dce95ea7caf5b342df5cc45b2c75429ddcee83d45b58`, using the same SHA-256 method described below for all 42 changed non-Markdown paths relative to `22593af2dab6aebc8cc092263deb377ca4fb5bb0`. The source commit and all hashes were verified again after the complete acceptance run and remained unchanged. The later verification commit changes this Markdown document only.
