@@ -269,6 +269,73 @@ describe("App error handling", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each(["preserve", "cancel", "page", "utility"])(
+    "handles an unconsumed writing launch while its page is pending: %s",
+    async (action) => {
+      const target = { ...page, id: "writing-target", title: "Writing target" };
+      const pending = deferred<{ page: Page }>();
+      mockShellApi();
+      const shellApi = vi.mocked(api).getMockImplementation()!;
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path.startsWith("/api/ai/conversations?"))
+          return {
+            conversations: [{ id: "conversation", pageId: target.id, title: "Saved writing", expiresAt: Date.now() }],
+            nextCursor: null,
+          };
+        if (path === `/api/pages/${target.id}`) return pending.promise;
+        return shellApi(path, init);
+      });
+      render(<App />);
+      fireEvent.click(await screen.findByRole("button", { name: "My writing" }));
+      fireEvent.click(await screen.findByRole("button", { name: "Saved writing" }));
+      const cancel = await screen.findByRole("button", { name: "Return to current page" });
+      if (action === "cancel") fireEvent.click(cancel);
+      if (action === "page")
+        await act(async () => window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: page.id })));
+      if (action === "utility") fireEvent.click(screen.getByRole("button", { name: "My writing" }));
+      await act(async () => pending.resolve({ page: target }));
+      if (action !== "preserve")
+        act(() => {
+          dispatchWorkspaceEvent({ type: "pages-upserted", pages: [target] });
+          window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: target.id }));
+        });
+      await waitFor(() => {
+        const props = mocks.editorRender.mock.calls.at(-1)?.[0] as EditorPageProps | undefined;
+        expect(props?.page.id).toBe(target.id);
+        expect(props?.writingLaunchRequest?.conversationId).toBe(action === "preserve" ? "conversation" : undefined);
+      });
+    },
+  );
+
+  it("clears an unconsumed writing launch when page-tree changes abandon its selected target", async () => {
+    const target = { ...page, id: "writing-target", title: "Writing target" };
+    mockShellApi({ pages: [page, target] });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path.startsWith("/api/ai/conversations?"))
+        return {
+          conversations: [{ id: "conversation", pageId: target.id, title: "Saved writing", expiresAt: Date.now() }],
+          nextCursor: null,
+        };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "My writing" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Saved writing" }));
+    await waitFor(() =>
+      expect(mocks.editorRender.mock.calls.at(-1)?.[0].writingLaunchRequest?.conversationId).toBe("conversation"),
+    );
+    act(() => dispatchWorkspaceEvent({ type: "pages-removed", pageIds: [target.id], permanently: false }));
+    await waitFor(() => expect(mocks.editorRender.mock.calls.at(-1)?.[0].page.id).toBe(page.id));
+    act(() => dispatchWorkspaceEvent({ type: "pages-upserted", pages: [{ ...target, revision: 2 }], restored: true }));
+    await act(async () => window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: target.id })));
+    await waitFor(() => {
+      const props = mocks.editorRender.mock.calls.at(-1)?.[0] as EditorPageProps | undefined;
+      expect(props?.page.id).toBe(target.id);
+      expect(props?.writingLaunchRequest).toBeUndefined();
+    });
+  });
+
   it("keeps a legacy cleanup warning visible while moving it to the account hash", async () => {
     const accountKey = "user\0workspace";
     const rawKey = `notes:offline-purge-warning:${accountKey}`;

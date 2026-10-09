@@ -376,6 +376,10 @@ export function EditorPage({
   const [writingOpen, setWritingOpen] = useState(false);
   const [pendingWritingLaunch, setPendingWritingLaunch] = useState<WritingLaunchRequest | undefined>();
   const handledWritingLaunch = useRef<string | undefined>(undefined);
+  const writingLaunchDelivered = useCallback(
+    (id: string) => setPendingWritingLaunch((current) => (current?.id === id ? undefined : current)),
+    [],
+  );
   useEffect(() => {
     if (!writingLaunchRequest || handledWritingLaunch.current === writingLaunchRequest.id) return;
     handledWritingLaunch.current = writingLaunchRequest.id;
@@ -1259,6 +1263,7 @@ export function EditorPage({
               contentEpoch={page.contentEpoch}
               writingOpen={writingOpen}
               writingLaunchRequest={pendingWritingLaunch}
+              onWritingLaunchDelivered={writingLaunchDelivered}
               onWritingOpen={() => {
                 setWritingOpen(true);
                 setCommentsOpen(false);
@@ -1460,6 +1465,7 @@ function CollaborativeEditor({
   contentEpoch,
   writingOpen,
   writingLaunchRequest,
+  onWritingLaunchDelivered,
   onWritingOpen,
   onWritingClose,
 }: {
@@ -1476,6 +1482,7 @@ function CollaborativeEditor({
   contentEpoch: number;
   writingOpen: boolean;
   writingLaunchRequest?: WritingLaunchRequest;
+  onWritingLaunchDelivered: (id: string) => void;
   onWritingOpen: () => void;
   onWritingClose: () => void;
 }) {
@@ -1525,9 +1532,12 @@ function CollaborativeEditor({
     writingBusy.current = busy;
   }, []);
   useEffect(() => {
-    // eslint-disable-next-line react/set-state-in-effect -- Deliver the page-scoped one-shot launch to the retained panel instance.
-    if (writingLaunchRequest) setPanelLaunch(writingLaunchRequest);
-  }, [writingLaunchRequest]);
+    if (writingLaunchRequest) {
+      // eslint-disable-next-line react/set-state-in-effect -- Retain the launch before acknowledging delivery to the parent.
+      setPanelLaunch(writingLaunchRequest);
+      onWritingLaunchDelivered(writingLaunchRequest.id);
+    }
+  }, [writingLaunchRequest, onWritingLaunchDelivered]);
   const writingReady = useCallback(
     () => navigator.onLine && bundle.provider.synced && !bundle.hasUnsyncedChanges,
     [bundle],

@@ -7,6 +7,7 @@ import type { ClientMemberContext } from "../shared/types";
 import { ApiClientError } from "./api";
 import { createCollaboration, OfflineStorageTimeoutError } from "./collaboration";
 import { EditorPage } from "./EditorPage";
+import type { WritingLaunchRequest } from "./writing-target";
 
 const mocks = vi.hoisted(() => {
   const handlers = new Map<string, (value: unknown) => void>();
@@ -33,6 +34,7 @@ const mocks = vi.hoisted(() => {
     lateReady: Promise.resolve() as Promise<void>,
     slashItems: null as null | ((query: string) => Promise<Array<{ title: string; onItemClick: () => void }>>),
     unsynced: false,
+    writingPanel: vi.fn(),
   };
 });
 
@@ -106,7 +108,21 @@ vi.mock("@blocknote/react", () => ({
   FormattingToolbarController: () => null,
   FormattingToolbar: () => null,
   getFormattingToolbarItems: () => [],
-  useCreateBlockNote: () => ({ insertInlineContent: vi.fn() }),
+  useCreateBlockNote: () => ({
+    insertInlineContent: vi.fn(),
+    prosemirrorState: { doc: {}, selection: { from: 0, to: 0 } },
+  }),
+}));
+
+vi.mock("./writing-target", async (original) => ({
+  ...(await original<typeof import("./writing-target")>()),
+  captureWritingTarget: () => ({ kind: "page", epoch: 1, blocks: [], fromOffset: 0, toOffset: 0, text: "" }),
+}));
+vi.mock("./WritingPanel", () => ({
+  WritingPanel: (props: { launchRequest?: WritingLaunchRequest }) => {
+    mocks.writingPanel(props);
+    return <div data-testid="writing-panel" />;
+  },
 }));
 
 vi.mock("./BacklinksPanel", () => ({ BacklinksPanel: () => null }));
@@ -170,6 +186,7 @@ describe("EditorPage close reconciliation", () => {
     mocks.lateReady = Promise.resolve();
     mocks.slashItems = null;
     mocks.unsynced = false;
+    mocks.writingPanel.mockClear();
     Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
     localStorage.clear();
   });
@@ -177,6 +194,43 @@ describe("EditorPage close reconciliation", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("retains launches through initialization, acknowledges delivery, and does not replay after a child remount", async () => {
+    let initialized!: () => void;
+    mocks.ready = new Promise<void>((resolve) => {
+      initialized = resolve;
+    });
+    const consumed = vi.fn();
+    const first = { id: "first", pageId: page.id, conversationId: "conversation-one" };
+    const props = {
+      page,
+      member,
+      onPageChanged: vi.fn(),
+      onPageUnavailable: vi.fn(),
+      onAccessDenied: vi.fn(),
+      onSelectPage: vi.fn(),
+      backlinksRevision: 0,
+      writingLaunchRequest: first,
+      onWritingLaunchConsumed: consumed,
+    };
+    const view = render(<EditorPage {...props} />);
+    await act(async () => Promise.resolve());
+    expect(consumed).toHaveBeenCalledWith("first");
+    expect(mocks.writingPanel).not.toHaveBeenCalled();
+    await act(async () => initialized());
+    expect(mocks.writingPanel.mock.calls.at(-1)?.[0].launchRequest).toEqual(first);
+    mocks.writingPanel.mockClear();
+    mocks.ready = Promise.resolve();
+    await act(async () => view.rerender(<EditorPage {...props} onPageChanged={vi.fn()} />));
+    expect(createCollaboration).toHaveBeenCalledTimes(2);
+    expect(mocks.writingPanel).toHaveBeenCalled();
+    expect(mocks.writingPanel.mock.calls.at(-1)?.[0].launchRequest).toBeUndefined();
+    expect(consumed).toHaveBeenCalledOnce();
+    const second = { ...first, id: "second", conversationId: "conversation-two" };
+    await act(async () => view.rerender(<EditorPage {...props} writingLaunchRequest={second} />));
+    expect(mocks.writingPanel.mock.calls.at(-1)?.[0].launchRequest).toEqual(second);
+    expect(consumed).toHaveBeenLastCalledWith("second");
   });
 
   it("keeps the page mounted when local sign-out blocks a new document store", async () => {
