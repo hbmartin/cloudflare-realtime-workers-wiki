@@ -13,6 +13,32 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe("funding-specific model catalogs", () => {
+  it("accepts null optional ChatGPT metadata alongside valid and hidden entries", async () => {
+    fetcher.mockResolvedValue(
+      Response.json({
+        models: [
+          { slug: "null-metadata", visibility: null, context_window: null },
+          { slug: "known-model", visibility: "list", context_window: 32000 },
+          { slug: "hidden-model", visibility: "hidden", context_window: null },
+        ],
+      }),
+    );
+    expect(await providerModels(workspace, "credential", "chatgpt")).toEqual([
+      { id: "null-metadata", maxCharacters: 250000, contextTokens: undefined },
+      { id: "known-model", maxCharacters: 32000, contextTokens: 32000 },
+    ]);
+  });
+  it.each([
+    { slug: "" },
+    { slug: 42 },
+    { slug: "model", visibility: 42 },
+    { slug: "model", context_window: "32000" },
+    { slug: "model", context_window: 0 },
+    { slug: "model", context_window: -1 },
+  ])("still rejects invalid ChatGPT metadata %j", async (model) => {
+    fetcher.mockResolvedValue(Response.json({ models: [{ slug: "valid" }, model] }));
+    await expect(providerModels(workspace, "credential", "chatgpt")).rejects.toMatchObject({ status: 502 });
+  });
   it("preserves the documented ChatGPT models[].slug contract and visibility", async () => {
     fetcher.mockResolvedValue(
       Response.json({

@@ -62,7 +62,7 @@ export function projectionLeafText(node: ProseMirrorJson): string {
     return stringAttr(node, "entityId") && label && (type === "page" || type === "user") ? `${label} ` : "";
   }
   if (node.type === "dateMention") return `${dateMentionText(node)} `;
-  return node.type === "hardBreak" ? "\n" : "";
+  return node.type === "hardBreak" ? "\n" : " ";
 }
 
 export function collectLinkedDiagramIds(

@@ -11,8 +11,8 @@ const chatgptCatalog = z.object({
   models: z.array(
     z.object({
       slug: z.string().min(1),
-      visibility: z.string().optional(),
-      context_window: z.number().positive().optional(),
+      visibility: z.string().nullish(),
+      context_window: z.number().positive().nullish(),
     }),
   ),
 });
@@ -74,7 +74,7 @@ async function fetchModels(token: string, funding: AiFunding): Promise<ProviderM
         .map((item) => ({
           id: item.slug,
           maxCharacters: Math.min(AI_MAX_CHARACTERS, item.context_window ?? AI_MAX_CHARACTERS),
-          contextTokens: item.context_window,
+          contextTokens: item.context_window ?? undefined,
         }));
   } else {
     const parsed = apiCatalog.safeParse(data);

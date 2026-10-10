@@ -1,6 +1,41 @@
 # AI writing implementation verification
 
-This reliability update is prepared for review on `feat/ai-writing`, starting at commit `d67ae40` (the existing AI writing implementation). It addresses comments 1–9 and 11–14, fixes action labels from 15, and adds funding-specific model contract coverage for 10. AES-GCM consolidation remains deferred. No additional database migration is included.
+This recovery follow-up is prepared for review on `feat/ai-writing`, starting at commit `47eea3d`. It implements the AI writing reliability and recovery plan while retaining the existing launch-delivery fix. No additional database migration or production deployment is included.
+
+## Recovery follow-up: October 10, 2026
+
+Focused validation passed 130 unit tests across six files and 41 AI Worker integration tests. All five TypeScript projects and lint passed. Tests use synthetic documents and mocked provider endpoints; they do not spend API credits or establish hosted ChatGPT eligibility.
+
+The panel regressions cover restored draft output, sources, message identity, and application targets surviving focus, hide/reveal, and foreground refresh. Newer messages, including those returned by the immediate post-failure history read, changed or missing saved drafts, explicit opening, discard, new generation, and access denial invalidate preservation; a fresh panel opens the latest empty failed message. Authenticated saved openings do not re-gate while monitoring is pending. Failed access gates provide manual, five-second automatic, and idle new-conversation recovery, and focus requests coalesce with pending polls while still refreshing saved history.
+
+Model regressions distinguish pending lookup from failed or unavailable lookup and reject stale responses after funding/attempt changes. Catalog tests accept null optional metadata alongside valid entries while still rejecting malformed identifiers, wrong types, and nonpositive context windows. Selection tests match projection whitespace around inline math, adjacent atoms, and hard breaks and reject blank or atom-only selected sources without whole-page fallback.
+
+Worker regressions hold final authorization across interval ticks and a transient retry ladder and observe at most one active authorization check. They distinguish cancellation, deadline expiry, other failure, and deleted-message races between final verification and persistence, preserve terminal database states and partial text, and verify zero expiration UPDATEs for idle or unexpired conversations. Existing immediate abandoned-generation recovery tests remain enabled.
+
+`pnpm check` passed. The final panel refinement was followed by another focused run, full unit coverage run, format/lint/type checks, dead-code analysis, and client/Worker dry-run builds. Final results:
+
+| Check                                                                | Result                                                    |
+| -------------------------------------------------------------------- | --------------------------------------------------------- |
+| Format, lint, all five TypeScript projects                           | Passed                                                    |
+| Middleware policy scan and regression fixtures                       | 0 findings; 10/10 fixtures passed                         |
+| Full unit coverage suite                                             | 1,831 tests passed; 1 existing skip; 73.90% line coverage |
+| Full Worker coverage suite                                           | 1,668 tests passed across 24 files; 84.77% line coverage  |
+| Dead-code/type analysis and generated Cloudflare bindings            | Passed                                                    |
+| Client, MCP App, offline shell, and production Worker dry-run builds | Passed                                                    |
+
+The earlier browser matrix is historical evidence; it was not rerun for this follow-up.
+
+Repeatable focused commands:
+
+```sh
+pnpm exec vitest run src/client/WritingPanel.test.tsx src/client/writing-target.test.ts src/shared/ai.test.ts src/shared/ai-writing.test.ts src/shared/document-projection.test.ts src/worker/ai-models.test.ts
+pnpm test:worker src/worker/ai.integration.test.ts
+pnpm check
+```
+
+## Earlier implementation baseline
+
+The evidence below was recorded for the earlier reliability update starting at `d67ae40`. That update addressed comments 1–9 and 11–14, fixed action labels from 15, and added funding-specific model contract coverage for 10. AES-GCM consolidation remains deferred.
 
 ## Automated evidence
 
@@ -20,7 +55,7 @@ Local checks use synthetic content and mocked inference/token endpoints. They do
 
 The expanded browser matrix covers closing/reopening a pending generation, repeated Writing launches, `/ai` while busy, retained instructions, quota guards for Regenerate, and navigation without replayed conversation opens. It retains application/Undo, stale-target refusal, insertion, selection launches, private history, accessibility, responsive page panels, and the MCP App host/create/update/retry flows.
 
-Worker regressions cover discovery and inference credential rejection, actual session failure, refresh failure with 424, quota refunds/counting, immediate stale recovery during read/open/access/follow-up, concurrent follow-ups, cancellation/expiry completion races, saved running cancellation, membership/session/source revocation, and transient checks that withhold deltas. Model unit tests preserve ChatGPT `models[].slug`, reject the API shape for that funding, and exercise funding/workspace/credential isolation, concurrent deduplication, TTL expiry, bounded eviction, invalidation, and uncached failures.
+Worker regressions cover discovery and inference credential rejection, actual session failure, refresh failure with 424, quota refunds/counting, immediate stale recovery during read/open/access/follow-up, concurrent follow-ups, cancellation/expiry completion races, saved running cancellation, membership/session/source revocation, and transient checks that withhold deltas. Model unit tests preserve ChatGPT `models[].slug`, reject the API shape for that funding, and exercise funding/workspace/credential isolation, concurrent discovery, TTL expiry, bounded eviction, invalidation, and uncached failures.
 
 Parser and target tests cover 250,000-character ASCII and multibyte prose, supplementary Unicode, the UTF-8 byte boundary, formatted output beyond 4,096 delimiters, total/per-block budgets, nested container/depth boundaries, unchanged general Markdown limits, mention/date and atom-only selections, protected replacement, and changed/restored targets. Panel tests cover provider failures before and after stream start, retained result/application identity, funding switching, operation guards, remote running work, access gating and expiry, and hidden/background behavior.
 

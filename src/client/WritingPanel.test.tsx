@@ -138,7 +138,313 @@ function savedConversation(output: string) {
     },
   };
 }
+async function restoredPanel() {
+  const view = panel();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled());
+  fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+  await screen.findByRole("heading", { name: "Improved writing" });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled());
+  const original = mocks.api.getMockImplementation()!;
+  const saved = savedConversation("# Improved writing\n\nClear **result**.");
+  saved.conversation.messages.push({
+    ...saved.conversation.messages[0]!,
+    id: "failed-follow-up",
+    status: "failed",
+    output: "",
+  });
+  mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+    path === `/api/ai/conversations/${saved.conversation.id}` ||
+    path === `/api/ai/conversations/${saved.conversation.id}/open`
+      ? Promise.resolve(saved)
+      : original(path, options),
+  );
+  mocks.stream.mockImplementation(
+    async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+      emit({
+        type: "start",
+        conversationId: saved.conversation.id,
+        messageId: "failed-follow-up",
+        sources: [source],
+        changedPageIds: [],
+        canApply: true,
+        quota: status.quota,
+      });
+      emit({ type: "error", status: 503, code: "ai_provider_rejected", message: "Empty follow-up failed" });
+    },
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+  await screen.findByText("Empty follow-up failed");
+  const preview = () => view.container.querySelector('.writing-panel > [aria-label="Writing result"]');
+  expect(preview()).toHaveTextContent("Improved writing");
+  return { ...view, saved, original, preview };
+}
 describe("writing UI", () => {
+  it.each(["focus", "reveal", "foreground"])(
+    "preserves a restored draft and its application identity after %s",
+    async (boundary) => {
+      const view = await restoredPanel();
+      await act(async () => {
+        if (boundary === "focus") fireEvent(window, new Event("focus"));
+        else if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible={false} />);
+        else {
+          vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+          fireEvent(document, new Event("visibilitychange"));
+        }
+      });
+      if (boundary !== "focus")
+        await act(async () => {
+          if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible />);
+          else {
+            vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+            fireEvent(document, new Event("visibilitychange"));
+          }
+        });
+      expect(view.preview()).toHaveTextContent("Improved writing");
+      expect(screen.getByText("Conversation (2 requests)")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith("# Improved writing\n\nClear **result**.");
+      fireEvent.click(screen.getByRole("button", { name: "Replace" }));
+      await waitFor(() =>
+        expect(view.apply).toHaveBeenCalledWith(
+          target,
+          "# Improved writing\n\nClear **result**.",
+          "replace",
+          1,
+          new Set(),
+        ),
+      );
+      expect(mocks.api).toHaveBeenCalledWith("/api/ai/results/message/apply-check", expect.anything());
+    },
+  );
+  it.each(["newer", "changed", "missing", "explicit", "discard", "denial"])(
+    "invalidates restored-draft preservation on %s",
+    async (reason) => {
+      const view = await restoredPanel();
+      if (reason === "newer")
+        view.saved.conversation.messages.push({
+          ...view.saved.conversation.messages[0]!,
+          id: "newer",
+          output: "Newer server draft",
+        });
+      if (reason === "changed") view.saved.conversation.messages[0]!.output = "Changed saved draft";
+      if (reason === "missing") view.saved.conversation.messages.shift();
+      if (reason === "denial") {
+        const original = mocks.api.getMockImplementation()!;
+        mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+          path.endsWith("/access")
+            ? Promise.resolve({ locked: true, activeGeneration: null })
+            : original(path, options),
+        );
+      }
+      if (reason === "discard") fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+      await act(async () => {
+        if (reason === "explicit")
+          view.rerender(
+            <WritingPanel
+              {...view.props}
+              launchRequest={{ id: "explicit", pageId: "doc", conversationId: view.saved.conversation.id }}
+            />,
+          );
+        else fireEvent(window, new Event("focus"));
+      });
+      expect(view.preview()?.textContent ?? null).toBe(reason === "newer" ? "Newer server draft" : null);
+      const replace = screen.queryByRole<HTMLButtonElement>("button", { name: "Replace" });
+      expect(replace === null || replace.disabled).toBe(true);
+      expect(view.apply).not.toHaveBeenCalled();
+    },
+  );
+  it("replaces a restored draft when a new generation succeeds", async () => {
+    const view = await restoredPanel();
+    mocks.stream.mockImplementation(
+      async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+        emit({
+          type: "start",
+          conversationId: view.saved.conversation.id,
+          messageId: "new-generation",
+          sources: [source],
+          changedPageIds: [],
+          canApply: true,
+          quota: status.quota,
+        });
+        emit({ type: "delta", text: "New generated draft" });
+        emit({ type: "complete" });
+      },
+    );
+    view.saved.conversation.messages.push({
+      ...view.saved.conversation.messages[0]!,
+      id: "new-generation",
+      output: "New generated draft",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" }));
+    await waitFor(() => expect(view.preview()).toHaveTextContent("New generated draft"));
+    await act(async () => fireEvent(window, new Event("focus")));
+    expect(view.preview()).toHaveTextContent("New generated draft");
+  });
+  it("invalidates a restored draft when the immediate post-failure history read returns a newer message", async () => {
+    const view = await restoredPanel();
+    view.saved.conversation.messages.push({
+      ...view.saved.conversation.messages[0]!,
+      id: "newer",
+      output: "Newer server draft",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" }));
+    await waitFor(() => expect(view.preview()).toHaveTextContent("Newer server draft"));
+    expect(screen.getByRole("button", { name: "Replace" })).toBeDisabled();
+    expect(view.apply).not.toHaveBeenCalled();
+  });
+  it("opens the latest failed message in a fresh panel rather than restoring an earlier draft", async () => {
+    const view = await restoredPanel();
+    view.unmount();
+    const fresh = render(
+      <WritingPanel
+        {...view.props}
+        launchRequest={{ id: "fresh", pageId: "doc", conversationId: view.saved.conversation.id }}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText(/Saved result opened/)).toBeVisible());
+    expect(fresh.container.querySelector('.writing-panel > [aria-label="Writing result"]')).toBeNull();
+  });
+  it("does not re-gate an authenticated saved opening while the monitoring read is pending", async () => {
+    const original = mocks.api.getMockImplementation()!;
+    const access = deferred<unknown>();
+    mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+      path.endsWith("/open")
+        ? Promise.resolve(savedConversation("Saved draft"))
+        : path.endsWith("/access")
+          ? access.promise
+          : original(path, options),
+    );
+    const view = panel();
+    view.rerender(
+      <WritingPanel
+        {...view.props}
+        launchRequest={{ id: "saved", pageId: "doc", conversationId: "11111111-1111-4111-8111-111111111111" }}
+      />,
+    );
+    await waitFor(() =>
+      expect(view.container.querySelector('.writing-panel > [aria-label="Writing result"]')).toHaveTextContent(
+        "Saved draft",
+      ),
+    );
+    expect(screen.queryByText("Checking conversation access…")).toBeNull();
+    await act(async () => access.resolve({ locked: false, activeGeneration: null }));
+  });
+  it.each(["manual", "automatic", "new conversation"])(
+    "offers %s recovery from an unverified access gate",
+    async (recovery) => {
+      panel();
+      await waitFor(() => expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled());
+      vi.useFakeTimers();
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate" })));
+      expect(screen.getByRole("heading", { name: "Improved writing" })).toBeVisible();
+      const original = mocks.api.getMockImplementation()!;
+      let fail = true,
+        accesses = 0;
+      const pending = deferred<unknown>();
+      mocks.api.mockImplementation((path: string, options?: RequestInit) => {
+        if (path.endsWith("/access")) {
+          accesses++;
+          return fail ? Promise.reject(new TypeError("Network unavailable")) : pending.promise;
+        }
+        if (path === "/api/ai/conversations/11111111-1111-4111-8111-111111111111")
+          return Promise.resolve(savedConversation("Recovered draft"));
+        return original(path, options);
+      });
+      await act(async () => fireEvent(window, new Event("focus")));
+      expect(screen.getByText("Conversation access is unverified.")).toBeVisible();
+      expect(screen.queryByText("Checking conversation access…")).toBeNull();
+      expect(screen.getByRole("button", { name: "New conversation" })).toBeEnabled();
+      expect(screen.getByRole("button", { name: "Retry conversation access" })).toBeEnabled();
+      expect(screen.queryByLabelText("Writing result")).toBeNull();
+      let pendingRetryDisabled: boolean | undefined;
+      if (recovery === "new conversation") {
+        fireEvent.click(screen.getByRole("button", { name: "New conversation" }));
+      } else {
+        fail = false;
+        if (recovery === "manual") {
+          fireEvent.click(screen.getByRole("button", { name: "Retry conversation access" }));
+          fireEvent.click(screen.getByRole("button", { name: "Retry conversation access" }));
+        } else await act(async () => vi.advanceTimersByTimeAsync(5000));
+        pendingRetryDisabled = screen.getByRole<HTMLButtonElement>("button", {
+          name: "Retry conversation access",
+        }).disabled;
+        await act(async () => pending.resolve({ locked: false, activeGeneration: null }));
+      }
+      expect(pendingRetryDisabled).toBe(recovery === "new conversation" ? undefined : true);
+      expect(accesses).toBe(recovery === "new conversation" ? 1 : 2);
+      expect(screen.queryByText("Conversation access is unverified.")).toBeNull();
+      expect(
+        screen.getByRole("button", { name: recovery === "new conversation" ? "Generate" : "Generate follow-up" }),
+      ).toBeEnabled();
+      expect(screen.queryAllByLabelText("Writing result")[0]?.textContent ?? null).toBe(
+        recovery === "new conversation" ? null : "Recovered draft",
+      );
+      expect(screen.queryByRole("button", { name: "Retry conversation access" })).toBeNull();
+    },
+  );
+  it("coalesces focus with an in-flight poll and refreshes the conversation after verification", async () => {
+    const original = mocks.api.getMockImplementation()!;
+    const pending = deferred<unknown>();
+    let accesses = 0;
+    mocks.api.mockImplementation((path: string, options?: RequestInit) => {
+      if (path.endsWith("/access")) {
+        accesses++;
+        return pending.promise;
+      }
+      if (path === "/api/ai/conversations/11111111-1111-4111-8111-111111111111")
+        return Promise.resolve(savedConversation("Refreshed draft"));
+      return original(path, options);
+    });
+    panel();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+    await screen.findByRole("heading", { name: "Improved writing" });
+    const before = mocks.api.mock.calls.filter(
+      ([path]) => path === "/api/ai/conversations/11111111-1111-4111-8111-111111111111",
+    ).length;
+    fireEvent(window, new Event("focus"));
+    fireEvent(window, new Event("focus"));
+    expect(accesses).toBe(1);
+    await act(async () => pending.resolve({ locked: false, activeGeneration: null }));
+    expect(screen.getAllByLabelText("Writing result")[0]).toHaveTextContent("Refreshed draft");
+    expect(
+      mocks.api.mock.calls.filter(([path]) => path === "/api/ai/conversations/11111111-1111-4111-8111-111111111111"),
+    ).toHaveLength(before + 1);
+  });
+  it("shows model loading instead of retry until an unavailable lookup completes", async () => {
+    const original = mocks.api.getMockImplementation()!;
+    const pending = deferred<{ fast: boolean; best: boolean }>();
+    mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+      path.startsWith("/api/ai/models") ? pending.promise : original(path, options),
+    );
+    panel();
+    expect(await screen.findByText("Checking model access…")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Retry model access" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
+    await act(async () => pending.resolve({ fast: false, best: false }));
+    expect(screen.queryByText("Checking model access…")).toBeNull();
+    expect(screen.getByRole("button", { name: "Retry model access" })).toBeEnabled();
+  });
+  it("rejects a blank initial selection instead of dispatching the whole page", async () => {
+    const view = panel();
+    view.unmount();
+    render(
+      <WritingPanel
+        {...view.props}
+        initialTarget={{
+          ...target,
+          kind: "selection",
+          text: " \n ",
+          blocks: [{ id: "selected", fingerprint: "unchanged" }],
+        }}
+      />,
+    );
+    await waitFor(() => expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Generate" }));
+    expect(await screen.findByText("Select readable document text.")).toBeVisible();
+    expect(mocks.stream).not.toHaveBeenCalled();
+  });
   it.each(["deadline", "reopen", "foreground", "online", "focus"])(
     "refreshes an exhausted quota at its %s boundary without switching funding",
     async (boundary) => {
@@ -533,11 +839,14 @@ describe("writing UI", () => {
       }
       return original(path, options);
     });
-    panel();
+    const view = panel();
     await waitFor(() => expect(lookups).toBe(1));
     expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Retry model access" }));
-    fireEvent.click(screen.getByRole("button", { name: "Retry model access" }));
+    expect(screen.queryByRole("button", { name: "Retry model access" })).toBeNull();
+    expect(screen.getByText("Checking model access…")).toBeVisible();
+    view.rerender(<WritingPanel {...view.props} visible={false} />);
+    view.rerender(<WritingPanel {...view.props} visible />);
     await screen.findByText("Model access could not be checked.");
     await act(async () => stale.resolve({ fast: true, best: false }));
     expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
@@ -668,7 +977,7 @@ describe("writing UI", () => {
         <WritingPanel
           pageId="doc"
           initialTarget={target}
-          conversationId="11111111-1111-4111-8111-111111111111"
+          launchRequest={{ id: "locked", pageId: "doc", conversationId: "11111111-1111-4111-8111-111111111111" }}
           onCapture={() => target}
           onApply={vi.fn()}
           onClose={vi.fn()}
@@ -714,6 +1023,18 @@ describe("writing UI", () => {
     fireEvent.click(screen.getByRole("button", { name: "Generate" }));
     await screen.findByRole("heading", { name: "Improved writing" });
     await waitFor(() => expect(screen.getByRole("button", { name: "Regenerate" })).toBeEnabled());
+    const original = mocks.api.getMockImplementation()!;
+    const saved = savedConversation("# Improved writing\n\nClear **result**.");
+    saved.conversation.messages.push({
+      ...saved.conversation.messages[0]!,
+      id: "rejected",
+      output: "",
+      status: "failed",
+      sources: [],
+    });
+    mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+      path === `/api/ai/conversations/${saved.conversation.id}` ? Promise.resolve(saved) : original(path, options),
+    );
     mocks.stream.mockImplementationOnce(
       async (_input: AiGenerate, _signal: AbortSignal, onEvent: (event: AiStreamEvent) => void) => {
         onEvent({
@@ -731,7 +1052,7 @@ describe("writing UI", () => {
     fireEvent.click(screen.getByRole("button", { name: "Regenerate" }));
     await screen.findByText("Provider credential rejected");
     await waitFor(() => expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled());
-    expect(screen.getByRole("heading", { name: "Improved writing" })).toBeVisible();
+    expect(screen.getAllByRole("heading", { name: "Improved writing" })[0]).toBeVisible();
     expect(screen.getByLabelText("Workspace API")).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: "Replace" }));
     await waitFor(() =>
@@ -867,10 +1188,16 @@ describe("writing UI", () => {
       finish();
     });
     expect(parser).not.toHaveBeenCalled();
+    const original = mocks.api.getMockImplementation()!;
+    mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+      path === "/api/ai/conversations/11111111-1111-4111-8111-111111111111"
+        ? Promise.resolve(savedConversation("Hidden work"))
+        : original(path, options),
+    );
     await act(async () => view.rerender(<WritingPanel {...view.props} subscribeReadiness={subscribe} visible />));
-    expect(screen.getByLabelText("Writing instruction")).toHaveValue("Retained instruction");
-    expect(screen.getByLabelText("Writing result")).toHaveTextContent("Hidden work");
-    fireEvent.change(screen.getByLabelText("Writing instruction"), { target: { value: "Another instruction" } });
+    expect(screen.getByLabelText("Follow-up instruction")).toHaveValue("Retained instruction");
+    expect(screen.getAllByLabelText("Writing result")[0]).toHaveTextContent("Hidden work");
+    fireEvent.change(screen.getByLabelText("Follow-up instruction"), { target: { value: "Another instruction" } });
     expect(subscribe).toHaveBeenCalledTimes(2);
     expect(unsubscribe).toHaveBeenCalledOnce();
     expect(
@@ -1001,7 +1328,7 @@ describe("writing UI", () => {
     expect(screen.queryByText(/conversation is locked/)).toBeNull();
     expect(screen.getByRole("button", { name: "New conversation" })).toBeEnabled();
   });
-  it("does not reparse unchanged history or poll access in a background browser document", async () => {
+  it("does not reparse history on instruction edits or poll access in a background browser document", async () => {
     const original = mocks.api.getMockImplementation()!;
     const savedMessage = {
       id: "message",
@@ -1037,7 +1364,8 @@ describe("writing UI", () => {
     hidden.mockReturnValue(false);
     await act(async () => document.dispatchEvent(new Event("visibilitychange")));
     expect(mocks.api.mock.calls.filter(([path]) => String(path).endsWith("/access")).length).toBeGreaterThan(1);
-    expect(parser.mock.calls.filter(([text]) => text === "Historical output")).toHaveLength(2);
+    // Foreground verification now reloads the saved latest result as well as remounting history.
+    expect(parser.mock.calls.filter(([text]) => text === "Historical output")).toHaveLength(3);
   });
   it("keeps provider model controls owner-only and never exposes an API credential field", async () => {
     render(<WritingSettings owner={false} />);

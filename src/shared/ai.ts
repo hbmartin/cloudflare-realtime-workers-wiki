@@ -27,7 +27,11 @@ const aiSourceSchema = z.object({
     z.object({
       kind: z.literal("selection"),
       blockIds: z.array(id).min(1).max(1000),
-      text: z.string().min(1).max(AI_MAX_CHARACTERS),
+      text: z
+        .string()
+        .min(1)
+        .max(AI_MAX_CHARACTERS)
+        .refine((text) => !!text.trim(), "Select readable document text."),
       contentEpoch: z.number().int().nonnegative(),
     }),
     z.object({

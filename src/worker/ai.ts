@@ -160,10 +160,17 @@ async function conversationLocked(env: Env, member: MemberContext, id: string) {
   return !!row?.locked;
 }
 async function expireGenerations(env: Env, member: MemberContext, id: string) {
+  const cutoff = Date.now() - AI_GENERATION_DEADLINE_MS;
+  const expired = await env.DB.prepare(
+    "SELECT 1 FROM ai_messages WHERE status='running' AND created_at<=? AND conversation_id IN (SELECT id FROM ai_conversations WHERE id=? AND workspace_id=? AND user_id=?) LIMIT 1",
+  )
+    .bind(cutoff, id, member.workspace.id, member.user.id)
+    .first();
+  if (!expired) return;
   await env.DB.prepare(
     "UPDATE ai_messages SET status='failed' WHERE status='running' AND created_at<=? AND conversation_id IN (SELECT id FROM ai_conversations WHERE id=? AND workspace_id=? AND user_id=?)",
   )
-    .bind(Date.now() - AI_GENERATION_DEADLINE_MS, id, member.workspace.id, member.user.id)
+    .bind(cutoff, id, member.workspace.id, member.user.id)
     .run();
 }
 function conversationJson(row: ConversationRow, locked: boolean): AiConversation {
@@ -670,22 +677,37 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
     ]);
     let accessCheck: Promise<boolean> | null = null,
       accessError: HttpError | undefined;
+    const stopGeneration = (row: { status: string | null; created_at: number | null } | null) => {
+      cancelled = row?.status === "cancelled";
+      const expired =
+        typeof row?.created_at === "number" && row.created_at <= Date.now() - AI_GENERATION_DEADLINE_MS && !cancelled;
+      accessError = new HttpError(
+        409,
+        expired ? "ai_generation_expired" : "ai_stream_failed",
+        expired
+          ? "Generation expired. Partial text can be copied. Retry explicitly."
+          : "Generation stopped before completion. Partial text can be copied. Retry explicitly.",
+      );
+      upstreamAbort.abort();
+      return false;
+    };
     const checkAccess = async () => {
       // Identity was authenticated once at dispatch. Revalidate the live session,
       // protection and grants without rebuilding Better Auth on every tick.
       await requireSecurity(env, member.user.id, member.session.id);
       const row = await env.DB.prepare(
-        `SELECT m.status,wm.user_id member_id,${conversationLockSql("c.workspace_id", "c.user_id", "c.id", "wm.role")} locked FROM (SELECT ? workspace_id,? user_id) actor LEFT JOIN workspace_members wm ON wm.workspace_id=actor.workspace_id AND wm.user_id=actor.user_id LEFT JOIN ai_conversations c ON c.id=? AND c.workspace_id=actor.workspace_id AND c.user_id=actor.user_id LEFT JOIN ai_messages m ON m.id=? AND m.conversation_id=c.id`,
+        `SELECT m.status,m.created_at,wm.user_id member_id,${conversationLockSql("c.workspace_id", "c.user_id", "c.id", "wm.role")} locked FROM (SELECT ? workspace_id,? user_id) actor LEFT JOIN workspace_members wm ON wm.workspace_id=actor.workspace_id AND wm.user_id=actor.user_id LEFT JOIN ai_conversations c ON c.id=? AND c.workspace_id=actor.workspace_id AND c.user_id=actor.user_id LEFT JOIN ai_messages m ON m.id=? AND m.conversation_id=c.id`,
       )
         .bind(member.workspace.id, member.user.id, conversationId, input.operationId)
-        .first<{ status: string | null; member_id: string | null; locked: number }>();
+        .first<{ status: string | null; created_at: number | null; member_id: string | null; locked: number }>();
       if (row && (!row.member_id || row.locked))
         throw new HttpError(403, "conversation_locked", "A referenced page or workspace is no longer accessible.");
-      if (!row || row.status !== "running") {
-        cancelled = true;
-        upstreamAbort.abort();
-        return false;
-      }
+      if (
+        !row ||
+        row.status !== "running" ||
+        (row.created_at !== null && row.created_at <= Date.now() - AI_GENERATION_DEADLINE_MS)
+      )
+        return stopGeneration(row);
       return true;
     };
     const verifyAccess = async () => {
@@ -715,13 +737,17 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
       }
       return false;
     };
-    const poll = setInterval(() => {
-      if (accessCheck || combinedSignal.aborted) return;
+    const startAccessCheck = () => {
+      if (accessCheck) return accessCheck;
       const task = verifyAccess();
       accessCheck = task;
       void task.finally(() => {
         if (accessCheck === task) accessCheck = null;
       });
+      return task;
+    };
+    const poll = setInterval(() => {
+      if (!combinedSignal.aborted) void startAccessCheck();
     }, 1000);
     const waitForAccessCheck = async () => {
       const pending = accessCheck;
@@ -787,15 +813,18 @@ export async function generateAi(request: Request, env: Env, context: Pick<Execu
           // Check the cumulative access union and membership again immediately
           // before releasing the complete result. Deletion/cancellation wins.
           if (!(await waitForAccessCheck())) throw new Error("Access check stopped generation.");
-          if (!(await verifyAccess())) throw new Error("Access check stopped generation.");
+          if (!(await startAccessCheck())) throw new Error("Access check stopped generation.");
           const saved = await env.DB.prepare(
             "UPDATE ai_messages SET output=?,status='complete' WHERE id=? AND status='running' AND created_at>?",
           )
             .bind(output, input.operationId, Date.now() - AI_GENERATION_DEADLINE_MS)
             .run();
           if (!saved.meta.changes) {
-            cancelled = true;
-            throw new Error("Generation cancelled.");
+            const row = await env.DB.prepare("SELECT status,created_at FROM ai_messages WHERE id=?")
+              .bind(input.operationId)
+              .first<{ status: string; created_at: number }>();
+            stopGeneration(row);
+            throw new Error("Generation stopped.");
           }
           completed = true;
           send({ type: "complete" });

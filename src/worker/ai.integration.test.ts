@@ -162,6 +162,25 @@ async function anotherOwner() {
     .bind(member.workspace.id)
     .run();
 }
+function interceptAiStatement(
+  prefix: string,
+  method: "first" | "run",
+  handle: (execute: () => Promise<unknown>) => Promise<unknown>,
+) {
+  const original = env.DB.prepare.bind(env.DB);
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+    new Proxy(statement, {
+      get(target, property) {
+        if (property === "bind") return (...values: unknown[]) => wrap(target.bind(...values));
+        if (property === method) return () => handle(() => (method === "first" ? target.first() : target.run()));
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  vi.spyOn(env.DB, "prepare").mockImplementation((sql: string) =>
+    sql.startsWith(prefix) ? wrap(original(sql)) : original(sql),
+  );
+}
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
@@ -304,6 +323,43 @@ describe("AI writing dispatch and quota", () => {
     expect(providerCalls).toHaveLength(0);
     expect((await (await call("/api/ai/status")).json<AiStatus>()).quota.remaining).toBe(20);
   });
+  it("accepts captured separators around math and hard breaks while rejecting blank selected sources", async () => {
+    const room = env.DOCUMENT.getByName(`${page.id}~${page.contentEpoch}`);
+    await runInDurableObject(room, async (instance) => {
+      const object = instance as unknown as { document: Y.Doc; compact(): Promise<void> };
+      const group = object.document.getXmlFragment("document-store").get(0) as Y.XmlElement;
+      const paragraph = (group.get(0) as Y.XmlElement).get(0) as Y.XmlElement;
+      const math = new Y.XmlElement("inlineMath"),
+        anotherMath = new Y.XmlElement("inlineMath");
+      math.setAttribute("formula", "x");
+      anotherMath.setAttribute("formula", "y");
+      object.document.transact(() => {
+        paragraph.delete(0, paragraph.length);
+        paragraph.insert(0, [
+          new Y.XmlText("A"),
+          math,
+          anotherMath,
+          new Y.XmlText("B"),
+          new Y.XmlElement("hardBreak"),
+          new Y.XmlText("C"),
+        ]);
+      });
+      await object.compact();
+    });
+    const scope = {
+      kind: "selection" as const,
+      blockIds: ["selected"],
+      contentEpoch: page.contentEpoch,
+      text: "A  B\nC",
+    };
+    expect((await readAiSource(env, member, { pageId: page.id, scope })).text).toBe(scope.text);
+    for (const text of ["", " \n\t "])
+      expect(
+        (await call("/api/ai/generate", "POST", input({ sources: [{ pageId: page.id, scope: { ...scope, text } }] })))
+          .status,
+      ).toBe(422);
+    expect(providerCalls).toHaveLength(0);
+  });
   it("cancels the upstream stream, preserves partial history, and counts the started request once", async () => {
     vi.stubGlobal(
       "fetch",
@@ -420,9 +476,21 @@ describe("AI writing dispatch and quota", () => {
     }
     live.send({ type: "response.completed", response: { status: "completed" } });
     await waitOnExecutionContext(live.context);
-    const event = new TextDecoder().decode((await live.reader.read()).value);
-    expect(event).toContain('"type":"error"');
-    expect(event).not.toContain('"type":"complete"');
+    const event = JSON.parse(
+      new TextDecoder()
+        .decode((await live.reader.read()).value)
+        .slice(6)
+        .trim(),
+    ) as AiStreamEvent;
+    expect(event).toMatchObject({
+      type: "error",
+      status: 409,
+      code: kind === "cancelled" ? "ai_stream_failed" : "ai_generation_expired",
+      message:
+        kind === "cancelled"
+          ? "Generation cancelled. Partial text can be copied."
+          : "Generation expired. Partial text can be copied. Retry explicitly.",
+    });
     expect(
       await env.DB.prepare("SELECT status,output FROM ai_messages WHERE id=?").bind(live.value.operationId).first(),
     ).toEqual({ status: kind === "cancelled" ? "cancelled" : "failed", output: "Partial saved text" });
@@ -442,6 +510,113 @@ describe("AI writing dispatch and quota", () => {
     expect(queries.filter((sql) => sql.trimStart().startsWith("SELECT"))).toHaveLength(2);
     expect(queries.some((sql) => sql.startsWith("SELECT m.status"))).toBe(true);
     await live.reader.cancel();
+  });
+  it.each(["waiting", "retrying"])("serializes final authorization with polling while %s", async (kind) => {
+    const live = await liveGeneration();
+    let release!: () => void, started!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const checking = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let checks = 0,
+      active = 0,
+      maximum = 0;
+    interceptAiStatement("SELECT m.status", "first", async (execute) => {
+      checks++;
+      if (kind === "retrying" && checks === 1) throw new Error("Transient D1 failure");
+      active++;
+      maximum = Math.max(maximum, active);
+      started();
+      try {
+        await held;
+        return await execute();
+      } finally {
+        active--;
+      }
+    });
+    live.send({ type: "response.completed", response: { status: "completed" } });
+    await checking;
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      expect(checks).toBe(kind === "retrying" ? 2 : 1);
+      expect(maximum).toBe(1);
+    } finally {
+      release();
+    }
+    await waitOnExecutionContext(live.context);
+    expect(new TextDecoder().decode((await live.reader.read()).value)).toContain('"type":"complete"');
+    await live.reader.cancel();
+  });
+  it.each(["expired", "cancelled", "failed", "deleted"])(
+    "classifies a %s race between final authorization and saving completion",
+    async (kind) => {
+      const live = await liveGeneration();
+      live.send({ type: "response.output_text.delta", delta: "Partial saved text" });
+      await live.reader.read();
+      const original = env.DB.prepare.bind(env.DB);
+      interceptAiStatement("UPDATE ai_messages SET output=?,status='complete'", "run", async (execute) => {
+        if (kind === "deleted") await original("DELETE FROM ai_messages WHERE id=?").bind(live.value.operationId).run();
+        else
+          await original("UPDATE ai_messages SET status=?,created_at=? WHERE id=?")
+            .bind(
+              kind === "expired" ? "failed" : kind,
+              kind === "expired" ? Date.now() - AI_GENERATION_DEADLINE_MS - 1 : Date.now(),
+              live.value.operationId,
+            )
+            .run();
+        return execute();
+      });
+      live.send({ type: "response.completed", response: { status: "completed" } });
+      await waitOnExecutionContext(live.context);
+      const event = JSON.parse(
+        new TextDecoder()
+          .decode((await live.reader.read()).value)
+          .slice(6)
+          .trim(),
+      ) as Extract<AiStreamEvent, { type: "error" }>;
+      expect(event).toMatchObject({
+        type: "error",
+        status: 409,
+        code: kind === "expired" ? "ai_generation_expired" : "ai_stream_failed",
+      });
+      expect(event.message).toContain(
+        kind === "expired"
+          ? "Generation expired."
+          : kind === "cancelled"
+            ? "Generation cancelled."
+            : "Generation stopped before completion.",
+      );
+      expect(
+        await original("SELECT status,output FROM ai_messages WHERE id=?").bind(live.value.operationId).first(),
+      ).toEqual(
+        kind === "deleted" ? null : { status: kind === "expired" ? "failed" : kind, output: "Partial saved text" },
+      );
+      await live.reader.cancel();
+    },
+  );
+  it.each(["idle", "unexpired"])("avoids expiration UPDATEs on reads of an %s conversation", async (kind) => {
+    const value = input(),
+      first = await generate(value);
+    const start = first.events[0] as Extract<AiStreamEvent, { type: "start" }>;
+    if (kind === "unexpired")
+      await env.DB.prepare("UPDATE ai_messages SET status='running',created_at=? WHERE id=?")
+        .bind(Date.now(), value.operationId)
+        .run();
+    const original = env.DB.prepare.bind(env.DB),
+      writes: string[] = [];
+    vi.spyOn(env.DB, "prepare").mockImplementation((sql: string) => {
+      if (sql.startsWith("UPDATE ai_messages SET status='failed'")) writes.push(sql);
+      return original(sql);
+    });
+    for (const [suffix, method] of [
+      ["", "GET"],
+      ["/access", "GET"],
+      ["/open", "POST"],
+    ])
+      expect((await call(`/api/ai/conversations/${start.conversationId}${suffix}`, method)).status).toBe(200);
+    expect(writes).toHaveLength(0);
   });
   it.each([1, 3])("withholds deltas during access failures and %i attempts", async (failures) => {
     const live = await liveGeneration();
