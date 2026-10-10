@@ -82,6 +82,23 @@ describe("writing requests", () => {
   });
 });
 describe("SSE framing", () => {
+  it("retains multiple complete events and an unfinished frame from the same chunk", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(
+          new TextEncoder().encode('data: {"type":"delta"}\n\ndata: {"type":"complete"}\n\ndata: {"type":"er'),
+        );
+        controller.enqueue(new TextEncoder().encode('ror"}\n\n'));
+        controller.close();
+      },
+    });
+    const frames = readSse(stream);
+    expect(JSON.parse((await frames.next()).value!)).toEqual({ type: "delta" });
+    expect(JSON.parse((await frames.next()).value!)).toEqual({ type: "complete" });
+    expect(JSON.parse((await frames.next()).value!)).toEqual({ type: "error" });
+    expect((await frames.next()).done).toBe(true);
+  });
+
   it("handles fragmented Unicode, CRLF, comments, and multiline data", async () => {
     const bytes = new TextEncoder().encode(': keepalive\r\ndata: {"text":"é"}\r\n\r\ndata: first\ndata: second\n\n');
     const stream = new ReadableStream<Uint8Array>({

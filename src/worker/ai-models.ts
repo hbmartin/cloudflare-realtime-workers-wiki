@@ -3,8 +3,7 @@ import { AI_MAX_CHARACTERS, type AiFunding } from "../shared/ai";
 import { HttpError, sha256 } from "./http";
 
 type ProviderModel = { id: string; maxCharacters: number; contextTokens: number | undefined };
-const catalogCache = new Map<string, { expiresAt: number; models: ProviderModel[] }>();
-let invalidation = 0;
+const catalogCache = new Map<string, { expiresAt: number; models?: ProviderModel[] }>();
 const TTL = 60_000;
 const apiCatalog = z.object({ data: z.array(z.object({ id: z.string().min(1) })) });
 const chatgptCatalog = z.object({
@@ -21,24 +20,25 @@ async function cacheKey(workspaceId: string, token: string, funding: AiFunding) 
 }
 export async function invalidateProviderModels(workspaceId: string, token: string, funding: AiFunding) {
   const key = await cacheKey(workspaceId, token, funding);
-  invalidation++;
   catalogCache.delete(key);
 }
 export async function providerModels(workspaceId: string, token: string, funding: AiFunding) {
   const key = await cacheKey(workspaceId, token, funding);
-  const cached = catalogCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return cached.models;
-  catalogCache.delete(key);
-  const revision = invalidation;
+  const now = Date.now();
+  for (const [id, entry] of catalogCache) if (entry.models && entry.expiresAt <= now) catalogCache.delete(id);
+  let entry = catalogCache.get(key);
+  if (entry?.models) return entry.models;
+  if (!entry) {
+    if (catalogCache.size >= 128) catalogCache.delete(catalogCache.keys().next().value!);
+    entry = { expiresAt: 0 };
+    catalogCache.set(key, entry);
+  }
   // Fetches belong to the calling Worker request. Share only their parsed results.
   const models = await fetchModels(token, funding);
-  if (revision === invalidation) {
-    const now = Date.now();
-    for (const [id, entry] of catalogCache) if (entry.expiresAt <= now) catalogCache.delete(id);
-    if (!catalogCache.has(key)) {
-      if (catalogCache.size >= 128) catalogCache.delete(catalogCache.keys().next().value!);
-      catalogCache.set(key, { expiresAt: now + TTL, models });
-    }
+  // Eviction and invalidation retire the object, even if this key is recreated.
+  if (catalogCache.get(key) === entry && (!entry.models || entry.expiresAt <= Date.now())) {
+    entry.expiresAt = Date.now() + TTL;
+    entry.models = models;
   }
   return models;
 }

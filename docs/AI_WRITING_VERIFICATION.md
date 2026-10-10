@@ -1,8 +1,43 @@
 # AI writing implementation verification
 
-This recovery follow-up is prepared for review on `feat/ai-writing`, starting at commit `47eea3d`. It implements the AI writing reliability and recovery plan while retaining the existing launch-delivery fix. No additional database migration or production deployment is included.
+This review follow-up is prepared on `codex/ai-writing-review-followup`, starting from updated `main` at `9d71760`, which contains merged PR #238. It implements the writing recovery, access monitoring, quota timing, cache invalidation, linked-diagram projection, and selected display/SSE cleanup plan. No database migration, dependency, or production deployment is included.
 
-## Recovery follow-up: October 10, 2026
+## Review follow-up: October 10, 2026
+
+Focused validation passed 168 unit tests across six files, all 42 AI Worker integration tests, and the Chromium writing browser suite. Tests use synthetic documents and mocked provider endpoints.
+
+Panel regressions cover old locked/not-found monitors overlapping a newer opening, superseded and failed openings, request-owned pending cleanup across generation and monitor replacement, and access denial aborting a generation despite content-revision changes. Background history reload failures remain gated until a successful retry. History search, loaded pages, cursor, and component identity survive temporary verification; denial clears retained history and redundant alerts, with authentication feedback preserved for 401.
+
+Recovered drafts retain output, sources, message identity, and application targets after pre-start retry failure and empty remote cancellation. Existing checks retain fresh-opening behavior and invalidation after newer messages, changed/deleted saved drafts, explicit opening, discard, local cancellation, and access loss. The existing Apply-denial and zero-expiration-UPDATE regressions remain enabled.
+
+Quota regressions cover clocks ahead and behind the server, later local-clock changes, a database read spanning server midnight, suspension and resumption, funding switches, legacy Workers, failed focus refreshes, unchanged and changing overdue responses, overlapping refreshes, and the 5/15/60/300-second retry ladder. Cache tests cover cross-key and same-key invalidation, concurrent successful/failed lookups, and eviction/recreation while an older fetch is unfinished. Selection tests span linked diagrams with explicit, default, empty, and missing attributes. SSE checks cover split and combined frames; incremental Worker assertions retain one parser iterator per response and close it after use.
+
+`pnpm check` passed on the final implementation, including format/lint, middleware policy checks, all five TypeScript projects, both coverage suites, dead-code/type analysis, generated Cloudflare bindings, and client/MCP App/offline/Worker dry-run builds.
+
+| Check                                                                | Result                                                    |
+| -------------------------------------------------------------------- | --------------------------------------------------------- |
+| Focused unit suites                                                  | 168 tests passed across six files                         |
+| AI Worker integration suite                                          | 42 tests passed                                           |
+| Chromium writing browser suite                                       | 1 test passed                                             |
+| Format, lint, all five TypeScript projects                           | Passed                                                    |
+| Middleware policy scan and regression fixtures                       | 0 findings; 10/10 fixtures passed                         |
+| Full unit coverage suite                                             | 1,869 tests passed; 1 existing skip; 74.18% line coverage |
+| Full Worker coverage suite                                           | 1,669 tests passed across 24 files; 84.77% line coverage  |
+| Dead-code/type analysis and generated Cloudflare bindings            | Passed                                                    |
+| Client, MCP App, offline shell, and production Worker dry-run builds | Passed                                                    |
+
+Repeatable commands:
+
+```sh
+pnpm exec vitest run src/client/WritingPanel.test.tsx src/client/writing-target.test.ts src/shared/ai.test.ts src/shared/ai-writing.test.ts src/shared/document-projection.test.ts src/worker/ai-models.test.ts
+pnpm test:worker src/worker/ai.integration.test.ts
+pnpm exec playwright test tests/e2e/writing.spec.ts --project=chromium
+pnpm check
+```
+
+## Earlier recovery follow-up: October 10, 2026
+
+The following evidence was recorded on `feat/ai-writing`, starting at `47eea3d`, before this review follow-up.
 
 Focused validation passed 130 unit tests across six files and 41 AI Worker integration tests. All five TypeScript projects and lint passed. Tests use synthetic documents and mocked provider endpoints; they do not spend API credits or establish hosted ChatGPT eligibility.
 

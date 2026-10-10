@@ -22,7 +22,7 @@ import { WritingHistory } from "./WritingHistory";
 
 type RestoredDraft = {
   conversationId: string;
-  failedMessageId: string;
+  terminalMessageId: string;
   messageId: string;
   output: string;
   complete: boolean;
@@ -33,8 +33,8 @@ function matchesRestoredDraft(conversation: AiConversation, restored: RestoredDr
   const latest = conversation.messages?.at(-1);
   const saved = conversation.messages?.find((message) => message.id === restored.messageId);
   return (
-    latest?.id === restored.failedMessageId &&
-    latest.status === "failed" &&
+    latest?.id === restored.terminalMessageId &&
+    (latest.status === "failed" || latest.status === "cancelled") &&
     !latest.output &&
     saved?.output === restored.output &&
     (saved.status === "complete") === restored.complete &&
@@ -150,7 +150,13 @@ export function WritingPanel({
     visibleRef = useRef(visible),
     handledLaunch = useRef<string | undefined>(undefined),
     loadRevision = useRef(0),
-    statusRequest = useRef<Promise<void> | null>(null),
+    statusRequest = useRef<Promise<AiStatus> | null>(null),
+    quotaSample = useRef<{ quota: AiStatus["quota"]; receivedAt: number } | null>(null),
+    quotaWasActive = useRef<boolean | null>(null),
+    quotaSchedule = useRef({ retry: 0, retryAt: 0, request: null as Promise<void> | null }),
+    accessContext = useRef<{ id?: string }>({}),
+    opening = useRef<{ owner: symbol; touch: boolean } | null>(null),
+    accessOwner = useRef<symbol | null>(null),
     accessGate = useRef({ visible, foreground, refresh: false }),
     retryAccess = useRef<(() => void) | null>(null),
     restoredDraft = useRef<RestoredDraft | null>(null),
@@ -176,6 +182,36 @@ export function WritingPanel({
     if (displayTimer.current !== null) clearTimeout(displayTimer.current);
     displayTimer.current = null;
     if (mounted.current) setResult(outputBuffer.current);
+  }, []);
+  const showLatest = useCallback(
+    (latest: AiMessage | undefined) => {
+      latestMessageId.current = latest?.id ?? "";
+      outputBuffer.current = latest?.output ?? "";
+      flushResult();
+      setResultState(latest?.status === "complete" ? "complete" : latest?.output ? "partial" : "empty");
+      setMessageId(latest?.id ?? "");
+      setResultSources(latest?.sources ?? []);
+    },
+    [flushResult],
+  );
+  const finishAccess = useCallback((owner: symbol) => {
+    if (accessOwner.current !== owner) return;
+    accessOwner.current = null;
+    if (mounted.current) setAccessPending(false);
+  }, []);
+  const recordQuota = useCallback((quota: AiStatus["quota"]) => {
+    quotaSample.current = { quota, receivedAt: performance.now() };
+    if (quota.resetsAt > (quota.checkedAt ?? Date.now())) {
+      quotaSchedule.current.retry = 0;
+      quotaSchedule.current.retryAt = 0;
+    }
+  }, []);
+  const quotaDelay = useCallback(() => {
+    const sample = quotaSample.current;
+    if (!sample) return 0;
+    return sample.quota.checkedAt === undefined
+      ? sample.quota.resetsAt - Date.now()
+      : sample.quota.resetsAt - sample.quota.checkedAt - (performance.now() - sample.receivedAt);
   }, []);
   useLayoutEffect(() => {
     visibleRef.current = visible;
@@ -232,46 +268,74 @@ export function WritingPanel({
     const request = api<AiStatus>("/api/ai/status")
       .then((value) => {
         if (mounted.current) {
+          recordQuota(value.quota);
           setStatus(value);
           setFunding(
             (current) => current ?? value.preference ?? (value.connected && value.chatgptConfigured ? "chatgpt" : null),
           );
         }
+        return value;
       })
       .finally(() => {
         if (statusRequest.current === request) statusRequest.current = null;
       });
     statusRequest.current = request;
     return request;
-  }, []);
+  }, [recordQuota]);
   const quotaResetsAt = status?.quota.resetsAt;
   useEffect(() => {
-    if (!visible || !foreground || !online || quotaResetsAt === undefined) return undefined;
+    if (quotaResetsAt === undefined) return undefined;
+    const active = visible && foreground && online && funding === "api";
+    const resumed = quotaWasActive.current === false && active;
+    quotaWasActive.current = active;
+    if (!active) return undefined;
     let disposed = false;
     let inFlight = false;
     let timer: ReturnType<typeof setTimeout>;
-    const check = async () => {
+    const check = async (force = false) => {
       if (disposed || inFlight) return;
       clearTimeout(timer);
-      const delay = quotaResetsAt - Date.now();
-      if (delay > 0) {
+      const delay = quotaSchedule.current.retryAt ? quotaSchedule.current.retryAt - performance.now() : quotaDelay();
+      if (!force && delay > 0) {
         timer = setTimeout(() => void check(), delay);
         return;
       }
       inFlight = true;
-      await refreshStatus().catch(() => undefined);
+      const schedule = quotaSchedule.current;
+      if (!schedule.request) {
+        schedule.request = refreshStatus()
+          .catch(() => undefined)
+          .then((value) => {
+            if (value && quotaDelay() > 0) {
+              schedule.retry = 0;
+              schedule.retryAt = 0;
+            } else {
+              const retries = [5000, 15_000, 60_000, 300_000];
+              schedule.retryAt = performance.now() + retries[Math.min(schedule.retry++, retries.length - 1)]!;
+            }
+          })
+          .finally(() => {
+            schedule.request = null;
+          });
+      }
+      await schedule.request;
       inFlight = false;
-      if (!disposed) timer = setTimeout(() => void check(), 5000);
+      if (!disposed) {
+        timer = setTimeout(
+          () => void check(),
+          Math.max(0, schedule.retryAt ? schedule.retryAt - performance.now() : quotaDelay()),
+        );
+      }
     };
-    void check();
-    const focus = () => void check();
+    void check(resumed);
+    const focus = () => void check(true);
     window.addEventListener("focus", focus);
     return () => {
       disposed = true;
       clearTimeout(timer);
       window.removeEventListener("focus", focus);
     };
-  }, [visible, foreground, online, quotaResetsAt, refreshStatus]);
+  }, [visible, foreground, online, funding, quotaResetsAt, refreshStatus, quotaDelay]);
   useEffect(() => {
     mounted.current = true;
     void refreshStatus().catch((cause) => setError(apiErrorMessage(cause, "Writing is unavailable.")));
@@ -284,6 +348,9 @@ export function WritingPanel({
       mounted.current = false;
       // eslint-disable-next-line react-hooks/exhaustive-deps -- Invalidate whichever conversation reads are pending at disposal.
       loadRevision.current++;
+      accessContext.current = {};
+      opening.current = null;
+      accessOwner.current = null;
       if (displayTimer.current !== null) clearTimeout(displayTimer.current);
       controller.current?.abort();
       const disposedOperation = activeId.current;
@@ -308,6 +375,10 @@ export function WritingPanel({
   }, [ready, visible]);
   const clearPrivateContent = useCallback(() => {
     loadRevision.current++;
+    accessContext.current = { id: accessContext.current.id };
+    opening.current = null;
+    accessOwner.current = null;
+    setAccessError("");
     controller.current?.abort();
     historyHidden.current = true;
     restoredDraft.current = null;
@@ -332,6 +403,7 @@ export function WritingPanel({
       if (!(cause instanceof ApiClientError)) return false;
       if (cause.status === 401) {
         clearPrivateContent();
+        setAccessError(apiErrorMessage(cause, "Sign in again to check conversation access."));
         return true;
       }
       if (cause.code === "conversation_not_found") {
@@ -351,9 +423,13 @@ export function WritingPanel({
     async (id: string, touch = true, preserveTarget = false) => {
       if (operation.current || (touch && remoteId.current)) {
         if (touch) setNotice("Finish or cancel the current operation before changing its source.");
-        return;
+        return false;
       }
       const revision = ++loadRevision.current;
+      const owner = Symbol("open");
+      accessContext.current = { id: accessContext.current.id };
+      opening.current = { owner, touch };
+      accessOwner.current = owner;
       if (touch) restoredDraft.current = null;
       setCheckingAccess(true);
       setAccessPending(true);
@@ -363,9 +439,10 @@ export function WritingPanel({
           `/api/ai/conversations/${id}${touch ? "/open" : ""}`,
           touch ? { method: "POST" } : undefined,
         );
-        if (!mounted.current || revision !== loadRevision.current) return;
+        if (!mounted.current || revision !== loadRevision.current) return false;
         setLocked(conversation.locked);
         setUnavailable(false);
+        accessContext.current = { id: conversation.id };
         setThreadId(conversation.id);
         if (touch) {
           setHistoryOpen(false);
@@ -378,7 +455,7 @@ export function WritingPanel({
         }
         if (conversation.locked) {
           clearPrivateContent();
-          return;
+          return false;
         }
         if (!touch) setAccessError("");
         const latest = conversation.messages?.at(-1);
@@ -390,15 +467,9 @@ export function WritingPanel({
           setResultTarget(null);
         }
         historyHidden.current = false;
-        latestMessageId.current = latest?.id ?? "";
         setMessages(conversation.messages ?? []);
-        if (!keepDraft) {
-          outputBuffer.current = latest?.output ?? "";
-          flushResult();
-          setResultState(latest?.status === "complete" ? "complete" : latest?.output ? "partial" : "empty");
-          setMessageId(latest?.id ?? "");
-          setResultSources(latest?.sources ?? []);
-        }
+        if (keepDraft) latestMessageId.current = latest?.id ?? "";
+        else showLatest(latest);
         const active =
           latest?.status === "running"
             ? {
@@ -415,21 +486,23 @@ export function WritingPanel({
               ? "A saved generation is still running. Cancel it or wait for completion."
               : "Saved result opened. Choose a current insertion location to use it, or generate again from the latest sources.",
           );
+        setCheckingAccess(false);
+        return true;
       } catch (cause) {
         if (mounted.current && revision === loadRevision.current) {
-          accessFailure(cause);
+          const denied = accessFailure(cause);
           if (touch) setError(apiErrorMessage(cause, "The conversation could not be opened."));
-          else
+          else if (!denied)
             setAccessError(apiErrorMessage(cause, "Conversation access could not be checked. Retrying automatically."));
+          if (touch) setCheckingAccess(false);
         }
+        return false;
       } finally {
-        if (mounted.current && revision === loadRevision.current) {
-          setCheckingAccess(false);
-          setAccessPending(false);
-        }
+        if (opening.current?.owner === owner) opening.current = null;
+        finishAccess(owner);
       }
     },
-    [pageId, clearPrivateContent, flushResult, accessFailure],
+    [pageId, clearPrivateContent, showLatest, accessFailure, finishAccess],
   );
   useEffect(() => {
     const id = launchRequest?.id;
@@ -455,25 +528,27 @@ export function WritingPanel({
     const abort = new AbortController();
     let inFlight = false,
       refreshRequested = false;
+    let requestOwner: symbol | null = null;
     const check = async (refresh = false) => {
-      if (abort.signal.aborted) return;
+      if (abort.signal.aborted || opening.current || accessContext.current.id !== threadId) return;
       if (refresh) {
         refreshRequested = true;
         setCheckingAccess(true);
       }
       if (inFlight || abort.signal.aborted) return;
       inFlight = true;
-      const revision = loadRevision.current;
+      const context = accessContext.current;
+      const owner = Symbol("monitor");
+      requestOwner = owner;
+      accessOwner.current = owner;
       setAccessPending(true);
       try {
         const value = await api<AiConversationAccess>(`/api/ai/conversations/${threadId}/access`, {
           signal: abort.signal,
         });
-        if (abort.signal.aborted || revision !== loadRevision.current) return;
+        if (abort.signal.aborted || context !== accessContext.current || opening.current) return;
         setAccessError("");
         const shouldRefresh = refreshRequested;
-        refreshRequested = false;
-        accessGate.current.refresh = false;
         if (value.locked) {
           setLocked(true);
           clearPrivateContent();
@@ -488,20 +563,24 @@ export function WritingPanel({
               !operation.current &&
               (shouldRefresh || historyHidden.current || (wasRemote && !value.activeGeneration))
             ) {
-              await open(threadId, false, true);
+              if (await open(threadId, false, true)) {
+                refreshRequested = false;
+                accessGate.current.refresh = false;
+              }
               return;
             }
           }
         }
-        if (!abort.signal.aborted && revision === loadRevision.current) setCheckingAccess(false);
+        if (!abort.signal.aborted && context === accessContext.current) setCheckingAccess(false);
       } catch (cause) {
-        if (!abort.signal.aborted && revision === loadRevision.current) {
-          if (accessFailure(cause)) setCheckingAccess(false);
-          setAccessError(apiErrorMessage(cause, "Conversation access could not be checked. Retrying automatically."));
+        if (!abort.signal.aborted && context === accessContext.current) {
+          if (!accessFailure(cause))
+            setAccessError(apiErrorMessage(cause, "Conversation access could not be checked. Retrying automatically."));
         }
       } finally {
         inFlight = false;
-        if (!abort.signal.aborted && revision === loadRevision.current) setAccessPending(false);
+        finishAccess(owner);
+        if (requestOwner === owner) requestOwner = null;
       }
     };
     const retry = () => void check(true);
@@ -515,8 +594,18 @@ export function WritingPanel({
       if (retryAccess.current === retry) retryAccess.current = null;
       clearInterval(timer);
       window.removeEventListener("focus", focus);
+      if (requestOwner) finishAccess(requestOwner);
+      // A hidden reload must not release content after a newer reveal check.
+      if (opening.current && !opening.current.touch && accessContext.current.id === threadId) {
+        const owner = opening.current.owner;
+        opening.current = null;
+        accessContext.current = { id: threadId };
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- Retire the current reload when its monitor is disposed.
+        loadRevision.current++;
+        finishAccess(owner);
+      }
     };
-  }, [threadId, visible, foreground, open, clearPrivateContent, accessFailure]);
+  }, [threadId, visible, foreground, open, clearPrivateContent, accessFailure, finishAccess]);
   function captureSelection() {
     if (operation.current || remoteId.current) return;
     const current = onCapture();
@@ -584,6 +673,8 @@ export function WritingPanel({
       requestTarget: target,
       messageId,
       sources: resultSources,
+      restored: restoredDraft.current,
+      latestMessageId: latestMessageId.current,
     };
     restoredDraft.current = null;
     const nextTarget = target?.kind === "page" || !target ? onCapture("page") : target;
@@ -611,10 +702,12 @@ export function WritingPanel({
         if (event.type === "start") {
           started = true;
           savedThread = event.conversationId;
+          if (accessContext.current.id !== event.conversationId) accessContext.current = { id: event.conversationId };
           setThreadId(event.conversationId);
           setMessageId(event.messageId);
           latestMessageId.current = event.messageId;
           setResultSources(event.sources);
+          recordQuota(event.quota);
           setStatus((current) => (current ? { ...current, quota: event.quota } : null));
           if (event.changedPageIds.length) setNotice("Some sources changed. This result uses their latest contents.");
         } else if (event.type === "delta") {
@@ -659,13 +752,16 @@ export function WritingPanel({
           if (started && savedThread && previous.messageId && previous.result) {
             restoredDraft.current = {
               conversationId: savedThread,
-              failedMessageId: latestMessageId.current,
+              terminalMessageId: latestMessageId.current,
               messageId: previous.messageId,
               output: previous.result,
               complete: previous.state === "complete",
               sources: previous.sources,
             };
-          } else latestMessageId.current = previous.messageId;
+          } else {
+            restoredDraft.current = previous.restored;
+            latestMessageId.current = previous.latestMessageId;
+          }
           setResultSources(previous.sources);
         } else if (!terminal) {
           setResultState(outputBuffer.current ? "partial" : "empty");
@@ -685,12 +781,7 @@ export function WritingPanel({
                 if (restoredDraft.current && !matchesRestoredDraft(conversation, restoredDraft.current)) {
                   restoredDraft.current = null;
                   const latest = conversation.messages?.at(-1);
-                  latestMessageId.current = latest?.id ?? "";
-                  outputBuffer.current = latest?.output ?? "";
-                  flushResult();
-                  setResultState(latest?.status === "complete" ? "complete" : latest?.output ? "partial" : "empty");
-                  setMessageId(latest?.id ?? "");
-                  setResultSources(latest?.sources ?? []);
+                  showLatest(latest);
                   setTarget(null);
                   setResultTarget(null);
                 }
@@ -1027,6 +1118,9 @@ export function WritingPanel({
           onClick={() => {
             if (operation.current || remoteId.current || (checkingAccess && (!accessError || accessPending))) return;
             loadRevision.current++;
+            accessContext.current = {};
+            opening.current = null;
+            accessOwner.current = null;
             restoredDraft.current = null;
             accessGate.current.refresh = false;
             setCheckingAccess(false);
@@ -1057,8 +1151,10 @@ export function WritingPanel({
           Document writing history
         </button>
       </div>
-      {historyOpen && !checkingAccess && !locked && !unavailable && (
-        <WritingHistory pageId={pageId} onOpen={(conversation) => void open(conversation.id)} />
+      {historyOpen && !locked && !unavailable && (
+        <div hidden={checkingAccess}>
+          <WritingHistory pageId={pageId} onOpen={(conversation) => void open(conversation.id)} />
+        </div>
       )}
     </aside>
   );

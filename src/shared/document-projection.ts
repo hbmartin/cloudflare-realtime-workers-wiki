@@ -62,6 +62,8 @@ export function projectionLeafText(node: ProseMirrorJson): string {
     return stringAttr(node, "entityId") && label && (type === "page" || type === "user") ? `${label} ` : "";
   }
   if (node.type === "dateMention") return `${dateMentionText(node)} `;
+  if (node.type === "linkedDiagram")
+    return stringAttr(node, "pageId") ? `${stringAttr(node, "title") ?? "Linked whiteboard"} ` : "";
   return node.type === "hardBreak" ? "\n" : " ";
 }
 
@@ -527,11 +529,9 @@ export function projectDocument(root: ProseMirrorJson): DocumentProjection {
 
     if (node.type === "linkedDiagram") {
       const entityId = stringAttr(node, "pageId");
-      const label = stringAttr(node, "title") ?? "Linked whiteboard";
       if (entityId) {
         if (!pageOffsets.has(entityId)) pageOffsets.set(entityId, textLength);
-        append(label);
-        append(" ");
+        append(projectionLeafText(node));
       }
     }
 

@@ -19,6 +19,7 @@ import type {
   AiStreamEvent,
 } from "../shared/ai";
 import { AI_GENERATION_DEADLINE_MS, AI_RETENTION_MS } from "../shared/ai";
+import { readSse } from "../shared/sse";
 import type { Page } from "../shared/types";
 import { diagramNodeMap, diagramRoots } from "../shared/diagram";
 import type { Env, MemberContext } from "./env";
@@ -104,6 +105,20 @@ async function documentText(value: string, blockId = "selected") {
     await object.compact();
   });
 }
+function eventReader(body: ReadableStream<Uint8Array>) {
+  const frames = readSse(body);
+  return {
+    async read<T extends AiStreamEvent["type"]>(type?: T): Promise<Extract<AiStreamEvent, { type: T }>> {
+      for (;;) {
+        const frame = await frames.next();
+        if (frame.done) throw new Error(`Stream ended before ${type ?? "an event"}.`);
+        const event = JSON.parse(frame.value) as AiStreamEvent;
+        if (!type || event.type === type) return event as Extract<AiStreamEvent, { type: T }>;
+      }
+    },
+    cancel: () => frames.return(undefined),
+  };
+}
 async function liveGeneration() {
   let upstream!: ReadableStreamDefaultController<Uint8Array>, ready!: () => void;
   const started = new Promise<void>((resolve) => {
@@ -138,13 +153,8 @@ async function liveGeneration() {
   const value = input(),
     context = createExecutionContext();
   const response = await worker.fetch(request("/api/ai/generate", "POST", value), bindings(), context),
-    reader = response.body!.getReader();
-  const start = JSON.parse(
-    new TextDecoder()
-      .decode((await reader.read()).value)
-      .slice(6)
-      .trim(),
-  ) as Extract<AiStreamEvent, { type: "start" }>;
+    reader = eventReader(response.body!);
+  const start = await reader.read("start");
   await started;
   return {
     value,
@@ -254,6 +264,10 @@ describe("AI writing dispatch and quota", () => {
     const status = await (await call("/api/ai/status")).json<AiStatus>();
     expect(status.quota.remaining).toBe(19);
     expect(status.quota.resetsAt % 86400000).toBe(0);
+    expect(status.quota.checkedAt).toBeTypeOf("number");
+    expect(status.quota.resetsAt - status.quota.checkedAt!).toBeGreaterThan(0);
+    expect(status.quota.resetsAt - status.quota.checkedAt!).toBeLessThanOrEqual(86400000);
+    expect(start.quota.checkedAt).toBeTypeOf("number");
     expect(JSON.stringify(status)).not.toContain("operator-private-test-key");
   });
   it("keeps translation parameters in follow-ups and retains idempotency after deletion", async () => {
@@ -271,6 +285,21 @@ describe("AI writing dispatch and quota", () => {
     expect(replay.text).toContain("ai_operation_deleted");
     expect(providerCalls).toHaveLength(2);
     expect((await (await call("/api/ai/status")).json<AiStatus>()).quota.remaining).toBe(18);
+  });
+  it("uses one quota clock sample when its database read spans server midnight", async () => {
+    await generate();
+    const midnight = (Math.floor(Date.now() / 86400000) + 1) * 86400000;
+    const clock = vi.spyOn(Date, "now");
+    interceptAiStatement("SELECT", "first", async (execute) => {
+      const result = await execute();
+      if (result && typeof result === "object") {
+        if ("settings_json" in result) clock.mockReturnValue(midnight - 1);
+        if ("used" in result) clock.mockReturnValue(midnight + 1);
+      }
+      return result;
+    });
+    const result = await (await call("/api/ai/status")).json<AiStatus>();
+    expect(result.quota).toEqual({ remaining: 19, limit: 20, checkedAt: midnight - 1, resetsAt: midnight });
   });
   it("counts one request under concurrent duplicate dispatch, and atomically enforces the daily quota", async () => {
     const value = input();
@@ -387,13 +416,13 @@ describe("AI writing dispatch and quota", () => {
     const value = input(),
       context = createExecutionContext();
     const response = await worker.fetch(request("/api/ai/generate", "POST", value), bindings(), context);
-    const reader = response.body!.getReader();
-    await reader.read();
-    const delta = await reader.read();
-    expect(new TextDecoder().decode(delta.value)).toContain("Partial cancelled draft");
+    const reader = eventReader(response.body!);
+    await reader.read("start");
+    const delta = await reader.read("delta");
+    expect(delta.text).toBe("Partial cancelled draft");
     expect((await call(`/api/ai/generations/${value.operationId}/cancel`, "POST", {})).status).toBe(200);
     await waitOnExecutionContext(context);
-    expect(new TextDecoder().decode((await reader.read()).value)).toContain("Generation cancelled");
+    expect(await reader.read("error")).toMatchObject({ message: "Generation cancelled. Partial text can be copied." });
     await reader.cancel();
     expect(
       await env.DB.prepare("SELECT output,status FROM ai_messages WHERE id=?").bind(value.operationId).first(),
@@ -426,17 +455,12 @@ describe("AI writing dispatch and quota", () => {
     );
     const context = createExecutionContext();
     const response = await worker.fetch(request("/api/ai/generate", "POST", input()), bindings(), context);
-    const reader = response.body!.getReader();
-    const start = JSON.parse(
-      new TextDecoder()
-        .decode((await reader.read()).value)
-        .slice(6)
-        .trim(),
-    ) as Extract<AiStreamEvent, { type: "start" }>;
-    await reader.read();
+    const reader = eventReader(response.body!);
+    const start = await reader.read("start");
+    await reader.read("delta");
     await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(page.id).run();
     await waitOnExecutionContext(context);
-    expect(new TextDecoder().decode((await reader.read()).value)).toContain("conversation_locked");
+    expect(await reader.read("error")).toMatchObject({ code: "conversation_locked" });
     await reader.cancel();
     const saved = await (
       await call(`/api/ai/conversations/${start.conversationId}`)
@@ -454,19 +478,14 @@ describe("AI writing dispatch and quota", () => {
         .run();
     } else await env.DB.prepare("DELETE FROM session WHERE id=?").bind(member.session.id).run();
     await waitOnExecutionContext(live.context);
-    const event = JSON.parse(
-      new TextDecoder()
-        .decode((await live.reader.read()).value)
-        .slice(6)
-        .trim(),
-    );
+    const event = await live.reader.read("error");
     expect(event).toMatchObject({ type: "error", status: kind === "session" ? 401 : 403 });
     await live.reader.cancel();
   });
   it.each(["cancelled", "expired"])("prevents a late completion after the request is %s", async (kind) => {
     const live = await liveGeneration();
     live.send({ type: "response.output_text.delta", delta: "Partial saved text" });
-    await live.reader.read();
+    await live.reader.read("delta");
     if (kind === "cancelled") await call(`/api/ai/generations/${live.value.operationId}/cancel`, "POST");
     else {
       await env.DB.prepare("UPDATE ai_messages SET created_at=? WHERE id=?")
@@ -476,12 +495,7 @@ describe("AI writing dispatch and quota", () => {
     }
     live.send({ type: "response.completed", response: { status: "completed" } });
     await waitOnExecutionContext(live.context);
-    const event = JSON.parse(
-      new TextDecoder()
-        .decode((await live.reader.read()).value)
-        .slice(6)
-        .trim(),
-    ) as AiStreamEvent;
+    const event = await live.reader.read("error");
     expect(event).toMatchObject({
       type: "error",
       status: 409,
@@ -506,7 +520,7 @@ describe("AI writing dispatch and quota", () => {
     });
     live.send({ type: "response.completed", response: { status: "completed" } });
     await waitOnExecutionContext(live.context);
-    expect(new TextDecoder().decode((await live.reader.read()).value)).toContain('"type":"complete"');
+    expect(await live.reader.read("complete")).toEqual({ type: "complete" });
     expect(queries.filter((sql) => sql.trimStart().startsWith("SELECT"))).toHaveLength(2);
     expect(queries.some((sql) => sql.startsWith("SELECT m.status"))).toBe(true);
     await live.reader.cancel();
@@ -546,7 +560,7 @@ describe("AI writing dispatch and quota", () => {
       release();
     }
     await waitOnExecutionContext(live.context);
-    expect(new TextDecoder().decode((await live.reader.read()).value)).toContain('"type":"complete"');
+    expect(await live.reader.read("complete")).toEqual({ type: "complete" });
     await live.reader.cancel();
   });
   it.each(["expired", "cancelled", "failed", "deleted"])(
@@ -554,7 +568,7 @@ describe("AI writing dispatch and quota", () => {
     async (kind) => {
       const live = await liveGeneration();
       live.send({ type: "response.output_text.delta", delta: "Partial saved text" });
-      await live.reader.read();
+      await live.reader.read("delta");
       const original = env.DB.prepare.bind(env.DB);
       interceptAiStatement("UPDATE ai_messages SET output=?,status='complete'", "run", async (execute) => {
         if (kind === "deleted") await original("DELETE FROM ai_messages WHERE id=?").bind(live.value.operationId).run();
@@ -570,12 +584,7 @@ describe("AI writing dispatch and quota", () => {
       });
       live.send({ type: "response.completed", response: { status: "completed" } });
       await waitOnExecutionContext(live.context);
-      const event = JSON.parse(
-        new TextDecoder()
-          .decode((await live.reader.read()).value)
-          .slice(6)
-          .trim(),
-      ) as Extract<AiStreamEvent, { type: "error" }>;
+      const event = await live.reader.read("error");
       expect(event).toMatchObject({
         type: "error",
         status: 409,
@@ -642,14 +651,20 @@ describe("AI writing dispatch and quota", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(released).toBe(false);
-    const event = new TextDecoder().decode((await next).value);
-    expect(event).toContain(failures === 1 ? '"type":"delta"' : "ai_access_unavailable");
+    const event = await next;
+    expect(event).toMatchObject(
+      failures === 1
+        ? { type: "delta", text: "Withheld private text" }
+        : { type: "error", code: "ai_access_unavailable" },
+    );
     expect(attempts).toBe(failures === 1 ? 2 : 3);
-    expect(event.includes("Withheld private text")).toBe(failures === 1);
+    expect(event.type === "delta").toBe(failures === 1);
     if (failures === 1) live.send({ type: "response.completed", response: { status: "completed" } });
     await waitOnExecutionContext(live.context);
-    const terminal = failures === 1 ? new TextDecoder().decode((await live.reader.read()).value) : event;
-    expect(terminal).toContain(failures === 1 ? '"type":"complete"' : "ai_access_unavailable");
+    const terminal = failures === 1 ? await live.reader.read("complete") : event;
+    expect(terminal).toMatchObject(
+      failures === 1 ? { type: "complete" } : { type: "error", code: "ai_access_unavailable" },
+    );
     await live.reader.cancel();
   });
   it("lets effective viewers generate and copy, while refusing application and owner settings", async () => {

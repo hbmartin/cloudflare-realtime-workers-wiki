@@ -9,8 +9,13 @@ const schema = new Schema({
   nodes: {
     doc: { content: "blockGroup" },
     blockGroup: { content: "blockContainer+" },
-    blockContainer: { content: "paragraph blockGroup?", attrs: { id: { default: null } } },
-    paragraph: { content: "inline*" },
+    blockContainer: { content: "blockContent blockGroup?", attrs: { id: { default: null } } },
+    paragraph: { group: "blockContent", content: "inline*" },
+    linkedDiagram: {
+      group: "blockContent",
+      atom: true,
+      attrs: { pageId: { default: null }, title: { default: null } },
+    },
     text: { group: "inline" },
     mention: {
       inline: true,
@@ -33,6 +38,27 @@ const document = () =>
     schema.node("blockGroup", null, [block("one", "Before target after"), block("two", "Second paragraph")]),
   );
 describe("writing application", () => {
+  it.each([
+    [{ pageId: "map", title: "Architecture" }, "Before Architecture After"],
+    [{ pageId: "map" }, "Before Linked whiteboard After"],
+    [{ pageId: "map", title: "" }, "Before After"],
+    [{ title: "Unlinked" }, "Before After"],
+  ])("matches projection for a selection spanning linked diagram %j", (attrs, expected) => {
+    const doc = schema.node(
+      "doc",
+      null,
+      schema.node("blockGroup", null, [
+        block("before", "Before"),
+        schema.node("blockContainer", { id: "diagram" }, schema.node("linkedDiagram", attrs)),
+        block("after", "After"),
+      ]),
+    );
+    const captured = captureWritingTarget(doc, 0, doc.content.size, 1);
+    expect(captured.text.replace(/\s+/g, " ").trim()).toBe(expected);
+    expect(projectDocument(doc.toJSON()).plainText).toBe(expected);
+    expect(targetSource(captured, "doc").scope.kind).toBe("selection");
+  });
+
   it("matches projected separators around math, adjacent atoms, and hard breaks without widening empty selections", () => {
     const doc = schema.node(
       "doc",

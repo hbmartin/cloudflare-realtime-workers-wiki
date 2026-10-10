@@ -120,7 +120,7 @@ export type AiStatus = {
   connected: boolean;
   accountLabel: string | null;
   preference: AiFunding | null;
-  quota: { remaining: number; limit: number; resetsAt: number };
+  quota: { remaining: number; limit: number; resetsAt: number; checkedAt?: number };
 };
 export type AiConversationAccess = {
   locked: boolean;
