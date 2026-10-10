@@ -3,6 +3,7 @@ import { Schema } from "prosemirror-model";
 import { EditorState } from "prosemirror-state";
 import { applyWriting, captureWritingTarget, targetSource, writingTargetState } from "./writing-target";
 import { projectDocument } from "../shared/document-projection";
+import { aiGenerateSchema } from "../shared/ai";
 
 const schema = new Schema({
   nodes: {
@@ -18,6 +19,8 @@ const schema = new Schema({
       attrs: { label: { default: "Alice" }, entityId: { default: "alice" }, entityType: { default: "user" } },
     },
     dateMention: { inline: true, group: "inline", atom: true, attrs: { value: { default: "2026-10-09" } } },
+    inlineMath: { inline: true, group: "inline", atom: true, attrs: { formula: { default: "x" } } },
+    hardBreak: { inline: true, group: "inline" },
   },
   marks: { bold: {}, link: { attrs: { href: {} } } },
 });
@@ -30,6 +33,50 @@ const document = () =>
     schema.node("blockGroup", null, [block("one", "Before target after"), block("two", "Second paragraph")]),
   );
 describe("writing application", () => {
+  it("matches projected separators around math, adjacent atoms, and hard breaks without widening empty selections", () => {
+    const doc = schema.node(
+      "doc",
+      null,
+      schema.node(
+        "blockGroup",
+        null,
+        schema.node(
+          "blockContainer",
+          { id: "atoms" },
+          schema.node("paragraph", null, [
+            schema.text("A"),
+            schema.node("inlineMath"),
+            schema.node("inlineMath"),
+            schema.text("B"),
+            schema.node("hardBreak"),
+            schema.text("C"),
+          ]),
+        ),
+      ),
+    );
+    const selected = captureWritingTarget(doc, 3, 9, 1);
+    expect(selected.text).toBe("A  B\nC");
+    expect(projectDocument(doc.toJSON()).plainText).toBe(selected.text.replace(/\s+/g, " "));
+    for (const [from, to] of [
+      [4, 5],
+      [4, 6],
+    ]) {
+      const atomOnly = captureWritingTarget(doc, from!, to!, 1);
+      const source = targetSource(atomOnly, "doc");
+      expect(source.scope.kind).toBe("selection");
+      expect(
+        aiGenerateSchema.safeParse({
+          operationId: "9bf905db-67a6-4e02-a7fd-850ee98eae24",
+          pageId: "doc",
+          action: "rewrite",
+          prompt: "",
+          funding: "api",
+          sources: [source],
+        }).success,
+      ).toBe(false);
+    }
+    expect(targetSource({ ...selected, text: "" }, "doc").scope.kind).toBe("selection");
+  });
   it("captures mentions and dates with the same text and separators as server projection", () => {
     const doc = schema.node(
       "doc",

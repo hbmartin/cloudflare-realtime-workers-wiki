@@ -1,4 +1,3 @@
-/* oxlint-disable react/set-state-in-effect -- This panel synchronizes external launches, visibility access checks, and provider availability; each requires updating retained state. */
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   AI_ACTIONS,
@@ -20,6 +19,28 @@ import { targetSource, WritingTargetError, type WritingTarget, type WritingLaunc
 import { WritingPreview, useWritingMarkdown } from "./WritingPreview";
 import { WritingSources } from "./WritingSources";
 import { WritingHistory } from "./WritingHistory";
+
+type RestoredDraft = {
+  conversationId: string;
+  failedMessageId: string;
+  messageId: string;
+  output: string;
+  complete: boolean;
+  sources: AiMessage["sources"];
+};
+function matchesRestoredDraft(conversation: AiConversation, restored: RestoredDraft | null) {
+  if (!restored || restored.conversationId !== conversation.id) return false;
+  const latest = conversation.messages?.at(-1);
+  const saved = conversation.messages?.find((message) => message.id === restored.messageId);
+  return (
+    latest?.id === restored.failedMessageId &&
+    latest.status === "failed" &&
+    !latest.output &&
+    saved?.output === restored.output &&
+    (saved.status === "complete") === restored.complete &&
+    JSON.stringify(saved.sources) === JSON.stringify(restored.sources)
+  );
+}
 
 const HistoryMessage = memo(
   function HistoryMessage({ message }: { message: AiMessage }) {
@@ -61,7 +82,6 @@ const HistoryMessage = memo(
 export function WritingPanel({
   pageId,
   initialTarget,
-  conversationId,
   launchRequest,
   visible = true,
   onBusyChange,
@@ -74,7 +94,6 @@ export function WritingPanel({
 }: {
   pageId: string;
   initialTarget: WritingTarget;
-  conversationId?: string;
   launchRequest?: WritingLaunchRequest;
   visible?: boolean;
   onBusyChange?: (busy: boolean) => void;
@@ -108,6 +127,8 @@ export function WritingPanel({
   const [resultTarget, setResultTarget] = useState<WritingTarget | null>(null),
     [target, setTarget] = useState<WritingTarget | null>(initialTarget),
     [error, setError] = useState(""),
+    [accessError, setAccessError] = useState(""),
+    [modelError, setModelError] = useState(""),
     [notice, setNotice] = useState(""),
     [historyOpen, setHistoryOpen] = useState(false),
     [locked, setLocked] = useState(false),
@@ -116,6 +137,8 @@ export function WritingPanel({
     [online, setOnline] = useState(navigator.onLine),
     [foreground, setForeground] = useState(!document.hidden),
     [checkingAccess, setCheckingAccess] = useState(false),
+    [accessPending, setAccessPending] = useState(false),
+    [modelPending, setModelPending] = useState(false),
     [remoteGeneration, setRemoteGeneration] = useState<AiConversationAccess["activeGeneration"]>(null);
   const controller = useRef<AbortController | null>(null),
     activeId = useRef<string | null>(null),
@@ -127,6 +150,10 @@ export function WritingPanel({
     visibleRef = useRef(visible),
     handledLaunch = useRef<string | undefined>(undefined),
     loadRevision = useRef(0),
+    statusRequest = useRef<Promise<void> | null>(null),
+    accessGate = useRef({ visible, foreground, refresh: false }),
+    retryAccess = useRef<(() => void) | null>(null),
+    restoredDraft = useRef<RestoredDraft | null>(null),
     historyHidden = useRef(false),
     latestMessageId = useRef("");
   const [availability, setAvailability] = useState<{
@@ -157,33 +184,37 @@ export function WritingPanel({
       clearTimeout(displayTimer.current);
       displayTimer.current = null;
     }
-    if (visible && foreground && threadId) setCheckingAccess(true);
+    const previous = accessGate.current;
+    const refresh = !!(visible && foreground && threadId && (!previous.visible || !previous.foreground));
+    if (refresh) setCheckingAccess(true);
+    accessGate.current = { visible, foreground, refresh: previous.refresh || refresh };
   }, [visible, foreground, threadId, flushResult]);
   useEffect(() => {
     if (!visible) return undefined;
     const update = () => setSynced(ready());
     update();
-    const unsubscribe = subscribeReadiness?.(update);
-    window.addEventListener("online", update);
-    window.addEventListener("offline", update);
-    return () => {
-      unsubscribe?.();
-      window.removeEventListener("online", update);
-      window.removeEventListener("offline", update);
-    };
+    return subscribeReadiness?.(update);
   }, [ready, subscribeReadiness, visible]);
   const configuredFast = funding ? status?.settings.models[funding].fast.id : "";
   const configuredBest = funding ? status?.settings.models[funding].best.id : "";
   useEffect(() => {
     if (!visible || !funding || (!configuredFast && !configuredBest)) return undefined;
     const abort = new AbortController();
+    setModelPending(true);
     setAvailability(null);
+    setModelError("");
     void api<{ fast: boolean; best: boolean }>(`/api/ai/models?funding=${funding}`, { signal: abort.signal })
       .then((value) => {
-        if (!abort.signal.aborted) setAvailability({ ...value, funding, attempt: modelCheck });
+        if (!abort.signal.aborted) {
+          setAvailability({ ...value, funding, attempt: modelCheck });
+          setModelError("");
+        }
       })
       .catch((cause) => {
-        if (!abort.signal.aborted) setError(apiErrorMessage(cause, "Model access could not be checked."));
+        if (!abort.signal.aborted) setModelError(apiErrorMessage(cause, "Model access could not be checked."));
+      })
+      .finally(() => {
+        if (!abort.signal.aborted) setModelPending(false);
       });
     return () => abort.abort();
   }, [visible, funding, configuredFast, configuredBest, modelCheck]);
@@ -196,15 +227,51 @@ export function WritingPanel({
       setError(apiErrorMessage(cause, "Funding is selected for this request but could not be remembered.")),
     );
   }
-  const refreshStatus = useCallback(async () => {
-    const value = await api<AiStatus>("/api/ai/status");
-    if (mounted.current) {
-      setStatus(value);
-      setFunding(
-        (current) => current ?? value.preference ?? (value.connected && value.chatgptConfigured ? "chatgpt" : null),
-      );
-    }
+  const refreshStatus = useCallback(() => {
+    if (statusRequest.current) return statusRequest.current;
+    const request = api<AiStatus>("/api/ai/status")
+      .then((value) => {
+        if (mounted.current) {
+          setStatus(value);
+          setFunding(
+            (current) => current ?? value.preference ?? (value.connected && value.chatgptConfigured ? "chatgpt" : null),
+          );
+        }
+      })
+      .finally(() => {
+        if (statusRequest.current === request) statusRequest.current = null;
+      });
+    statusRequest.current = request;
+    return request;
   }, []);
+  const quotaResetsAt = status?.quota.resetsAt;
+  useEffect(() => {
+    if (!visible || !foreground || !online || quotaResetsAt === undefined) return undefined;
+    let disposed = false;
+    let inFlight = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const check = async () => {
+      if (disposed || inFlight) return;
+      clearTimeout(timer);
+      const delay = quotaResetsAt - Date.now();
+      if (delay > 0) {
+        timer = setTimeout(() => void check(), delay);
+        return;
+      }
+      inFlight = true;
+      await refreshStatus().catch(() => undefined);
+      inFlight = false;
+      if (!disposed) timer = setTimeout(() => void check(), 5000);
+    };
+    void check();
+    const focus = () => void check();
+    window.addEventListener("focus", focus);
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+      window.removeEventListener("focus", focus);
+    };
+  }, [visible, foreground, online, quotaResetsAt, refreshStatus]);
   useEffect(() => {
     mounted.current = true;
     void refreshStatus().catch((cause) => setError(apiErrorMessage(cause, "Writing is unavailable.")));
@@ -215,6 +282,8 @@ export function WritingPanel({
       .catch(() => undefined);
     return () => {
       mounted.current = false;
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- Invalidate whichever conversation reads are pending at disposal.
+      loadRevision.current++;
       if (displayTimer.current !== null) clearTimeout(displayTimer.current);
       controller.current?.abort();
       const disposedOperation = activeId.current;
@@ -223,7 +292,10 @@ export function WritingPanel({
     };
   }, [refreshStatus]);
   useEffect(() => {
-    const update = () => setOnline(navigator.onLine),
+    const update = () => {
+        setOnline(navigator.onLine);
+        if (visible) setSynced(ready());
+      },
       visibility = () => setForeground(!document.hidden);
     window.addEventListener("online", update);
     window.addEventListener("offline", update);
@@ -233,12 +305,23 @@ export function WritingPanel({
       window.removeEventListener("offline", update);
       document.removeEventListener("visibilitychange", visibility);
     };
-  }, []);
+  }, [ready, visible]);
   const clearPrivateContent = useCallback(() => {
+    loadRevision.current++;
+    controller.current?.abort();
     historyHidden.current = true;
+    restoredDraft.current = null;
     outputBuffer.current = "";
     setResult("");
     setMessages([]);
+    setHistoryOpen(false);
+    setResultSources([]);
+    setResultTarget(null);
+    setMessageId("");
+    latestMessageId.current = "";
+    setResultState("empty");
+    setCheckingAccess(false);
+    setAccessPending(false);
     remoteId.current = null;
     setRemoteGeneration(null);
     if (displayTimer.current !== null) clearTimeout(displayTimer.current);
@@ -271,7 +354,10 @@ export function WritingPanel({
         return;
       }
       const revision = ++loadRevision.current;
+      if (touch) restoredDraft.current = null;
       setCheckingAccess(true);
+      setAccessPending(true);
+      setAccessError("");
       try {
         const { conversation } = await api<{ conversation: AiConversation }>(
           `/api/ai/conversations/${id}${touch ? "/open" : ""}`,
@@ -292,22 +378,27 @@ export function WritingPanel({
         }
         if (conversation.locked) {
           clearPrivateContent();
-          setResultState("empty");
           return;
         }
+        if (!touch) setAccessError("");
         const latest = conversation.messages?.at(-1);
-        if (preserveTarget && latest?.id !== latestMessageId.current) {
+        const restored = restoredDraft.current;
+        const keepDraft = preserveTarget && matchesRestoredDraft(conversation, restored);
+        if (!keepDraft) restoredDraft.current = null;
+        if (preserveTarget && (latest?.id !== latestMessageId.current || (restored && !keepDraft))) {
           setTarget(null);
           setResultTarget(null);
         }
         historyHidden.current = false;
         latestMessageId.current = latest?.id ?? "";
         setMessages(conversation.messages ?? []);
-        outputBuffer.current = latest?.output ?? "";
-        flushResult();
-        setResultState(latest?.status === "complete" ? "complete" : latest?.output ? "partial" : "empty");
-        setMessageId(latest?.id ?? "");
-        setResultSources(latest?.sources ?? []);
+        if (!keepDraft) {
+          outputBuffer.current = latest?.output ?? "";
+          flushResult();
+          setResultState(latest?.status === "complete" ? "complete" : latest?.output ? "partial" : "empty");
+          setMessageId(latest?.id ?? "");
+          setResultSources(latest?.sources ?? []);
+        }
         const active =
           latest?.status === "running"
             ? {
@@ -327,23 +418,28 @@ export function WritingPanel({
       } catch (cause) {
         if (mounted.current && revision === loadRevision.current) {
           accessFailure(cause);
-          setError(apiErrorMessage(cause, "The conversation could not be opened."));
+          if (touch) setError(apiErrorMessage(cause, "The conversation could not be opened."));
+          else
+            setAccessError(apiErrorMessage(cause, "Conversation access could not be checked. Retrying automatically."));
         }
       } finally {
-        if (mounted.current && revision === loadRevision.current) setCheckingAccess(false);
+        if (mounted.current && revision === loadRevision.current) {
+          setCheckingAccess(false);
+          setAccessPending(false);
+        }
       }
     },
     [pageId, clearPrivateContent, flushResult, accessFailure],
   );
   useEffect(() => {
-    const id = launchRequest?.id ?? (conversationId ? `initial:${conversationId}` : undefined);
+    const id = launchRequest?.id;
     if (!id || handledLaunch.current === id) return;
     handledLaunch.current = id;
     if (operation.current || remoteId.current) {
       setNotice("Finish or cancel the current operation before changing its source.");
       return;
     }
-    const savedId = launchRequest?.conversationId ?? conversationId;
+    const savedId = launchRequest?.conversationId;
     if (savedId) {
       void open(savedId);
       return;
@@ -353,19 +449,31 @@ export function WritingPanel({
       setTarget(next);
       setSources((items) => items.map((source) => (source.pageId === pageId ? targetSource(next, pageId) : source)));
     }
-  }, [launchRequest, conversationId, open, pageId]);
+  }, [launchRequest, open, pageId]);
   useEffect(() => {
     if (!threadId || !visible || !foreground) return undefined;
     const abort = new AbortController();
-    let inFlight = false;
+    let inFlight = false,
+      refreshRequested = false;
     const check = async (refresh = false) => {
+      if (abort.signal.aborted) return;
+      if (refresh) {
+        refreshRequested = true;
+        setCheckingAccess(true);
+      }
       if (inFlight || abort.signal.aborted) return;
       inFlight = true;
+      const revision = loadRevision.current;
+      setAccessPending(true);
       try {
         const value = await api<AiConversationAccess>(`/api/ai/conversations/${threadId}/access`, {
           signal: abort.signal,
         });
-        if (abort.signal.aborted) return;
+        if (abort.signal.aborted || revision !== loadRevision.current) return;
+        setAccessError("");
+        const shouldRefresh = refreshRequested;
+        refreshRequested = false;
+        accessGate.current.refresh = false;
         if (value.locked) {
           setLocked(true);
           clearPrivateContent();
@@ -376,26 +484,35 @@ export function WritingPanel({
           if (!controller.current) {
             remoteId.current = value.activeGeneration?.messageId ?? null;
             setRemoteGeneration(value.activeGeneration ?? null);
-            if (refresh || historyHidden.current || (wasRemote && !value.activeGeneration))
+            if (
+              !operation.current &&
+              (shouldRefresh || historyHidden.current || (wasRemote && !value.activeGeneration))
+            ) {
               await open(threadId, false, true);
+              return;
+            }
           }
         }
-        if (!abort.signal.aborted) setCheckingAccess(false);
+        if (!abort.signal.aborted && revision === loadRevision.current) setCheckingAccess(false);
       } catch (cause) {
-        if (!abort.signal.aborted) {
+        if (!abort.signal.aborted && revision === loadRevision.current) {
           if (accessFailure(cause)) setCheckingAccess(false);
-          setError(apiErrorMessage(cause, "Conversation access could not be checked. Reopen Writing to retry."));
+          setAccessError(apiErrorMessage(cause, "Conversation access could not be checked. Retrying automatically."));
         }
       } finally {
         inFlight = false;
+        if (!abort.signal.aborted && revision === loadRevision.current) setAccessPending(false);
       }
     };
-    void check();
+    const retry = () => void check(true);
+    retryAccess.current = retry;
+    void check(accessGate.current.refresh);
     const timer = setInterval(() => void check(), 5000),
       focus = () => void check(true);
     window.addEventListener("focus", focus);
     return () => {
       abort.abort();
+      if (retryAccess.current === retry) retryAccess.current = null;
       clearInterval(timer);
       window.removeEventListener("focus", focus);
     };
@@ -403,7 +520,7 @@ export function WritingPanel({
   function captureSelection() {
     if (operation.current || remoteId.current) return;
     const current = onCapture();
-    if (current.kind !== "selection" || !current.text) {
+    if (current.kind !== "selection" || !current.text.trim()) {
       setError("Select text in the document first.");
       return;
     }
@@ -417,6 +534,11 @@ export function WritingPanel({
     availability?.funding === funding &&
     availability.attempt === modelCheck &&
     !!availability[quality];
+  const modelLoading =
+    !!funding &&
+    !!(configuredFast || configuredBest) &&
+    !modelError &&
+    (modelPending || !availability || availability.funding !== funding || availability.attempt !== modelCheck);
   const validInstruction =
     !(["draft", "custom"].includes(action) && !prompt.trim()) &&
     !(action === "translate" && !targetLanguage.trim()) &&
@@ -463,8 +585,10 @@ export function WritingPanel({
       messageId,
       sources: resultSources,
     };
+    restoredDraft.current = null;
     const nextTarget = target?.kind === "page" || !target ? onCapture("page") : target;
     const abort = new AbortController();
+    const revision = ++loadRevision.current;
     operation.current = "generate";
     onBusyChange?.(true);
     controller.current = abort;
@@ -483,7 +607,7 @@ export function WritingPanel({
       savedThread = threadId;
     try {
       await streamWriting(input.data, abort.signal, (event) => {
-        if (!mounted.current) return;
+        if (!mounted.current || revision !== loadRevision.current || abort.signal.aborted) return;
         if (event.type === "start") {
           started = true;
           savedThread = event.conversationId;
@@ -516,22 +640,32 @@ export function WritingPanel({
         }
       });
     } catch (cause) {
-      denied = accessFailure(cause) ?? false;
-      if (mounted.current && !abort.signal.aborted)
+      if (mounted.current && revision === loadRevision.current && !abort.signal.aborted) {
+        denied = accessFailure(cause);
         setError(apiErrorMessage(cause, "Generation failed. Retry explicitly."));
+      }
     } finally {
       activeId.current = null;
       controller.current = null;
       operation.current = null;
       onBusyChange?.(!!remoteId.current);
-      if (mounted.current) {
+      if (mounted.current && revision === loadRevision.current) {
         if ((!started || (terminalFailure && !outputBuffer.current)) && !denied && !abort.signal.aborted) {
           outputBuffer.current = previous.result;
           setResultState(previous.state);
           setResultTarget(previous.target);
           setTarget(previous.requestTarget);
           setMessageId(previous.messageId);
-          latestMessageId.current = previous.messageId;
+          if (started && savedThread && previous.messageId && previous.result) {
+            restoredDraft.current = {
+              conversationId: savedThread,
+              failedMessageId: latestMessageId.current,
+              messageId: previous.messageId,
+              output: previous.result,
+              complete: previous.state === "complete",
+              sources: previous.sources,
+            };
+          } else latestMessageId.current = previous.messageId;
           setResultSources(previous.sources);
         } else if (!terminal) {
           setResultState(outputBuffer.current ? "partial" : "empty");
@@ -539,7 +673,6 @@ export function WritingPanel({
         }
         flushResult();
         void refreshStatus().catch(() => undefined);
-        const revision = loadRevision.current;
         if (savedThread && !abort.signal.aborted)
           void api<{ conversation: AiConversation }>(`/api/ai/conversations/${savedThread}`)
             .then(({ conversation }) => {
@@ -547,9 +680,25 @@ export function WritingPanel({
               if (conversation.locked) {
                 setLocked(true);
                 clearPrivateContent();
-              } else setMessages(conversation.messages ?? []);
+              } else {
+                setMessages(conversation.messages ?? []);
+                if (restoredDraft.current && !matchesRestoredDraft(conversation, restoredDraft.current)) {
+                  restoredDraft.current = null;
+                  const latest = conversation.messages?.at(-1);
+                  latestMessageId.current = latest?.id ?? "";
+                  outputBuffer.current = latest?.output ?? "";
+                  flushResult();
+                  setResultState(latest?.status === "complete" ? "complete" : latest?.output ? "partial" : "empty");
+                  setMessageId(latest?.id ?? "");
+                  setResultSources(latest?.sources ?? []);
+                  setTarget(null);
+                  setResultTarget(null);
+                }
+              }
             })
-            .catch(() => undefined);
+            .catch((cause) => {
+              if (mounted.current && revision === loadRevision.current) accessFailure(cause);
+            });
       }
     }
   }
@@ -582,6 +731,7 @@ export function WritingPanel({
     )
       return;
     operation.current = "apply";
+    const revision = loadRevision.current;
     setApplying(true);
     onBusyChange?.(true);
     setError("");
@@ -590,17 +740,19 @@ export function WritingPanel({
         `/api/ai/results/${messageId}/apply-check`,
         { method: "POST", body: json({}) },
       );
-      if (!mounted.current) return;
+      if (!mounted.current || revision !== loadRevision.current) return;
       onApply(target, outputBuffer.current, mode, check.contentEpoch, new Set(check.protectedBlockIds));
       setNotice(`Result ${mode === "insert" ? "inserted" : "applied"}. Use the document's Undo to reverse it.`);
       setTarget(null);
     } catch (cause) {
-      accessFailure(cause);
-      setError(
-        cause instanceof WritingTargetError
-          ? cause.message
-          : apiErrorMessage(cause, "The result could not be applied."),
-      );
+      if (mounted.current && revision === loadRevision.current) {
+        accessFailure(cause);
+        setError(
+          cause instanceof WritingTargetError
+            ? cause.message
+            : apiErrorMessage(cause, "The result could not be applied."),
+        );
+      }
     } finally {
       operation.current = null;
       setApplying(false);
@@ -623,15 +775,30 @@ export function WritingPanel({
       <p className="muted">Private writing workspace. Review results before applying them.</p>
       {!online && <output aria-live="polite">Writing and history need a network connection.</output>}
       {online && !synced && <output aria-live="polite">Waiting for the document to finish syncing…</output>}
-      {error && (
-        <p className="form-error" role="alert">
-          {error}
-        </p>
+      {(
+        [
+          ["operation", error],
+          ["access", accessError],
+          ["model", modelError],
+        ] as const
+      ).map(([kind, message]) =>
+        message ? (
+          <p key={kind} className="form-error" role="alert">
+            {message}
+          </p>
+        ) : null,
       )}
       {notice && <output aria-live="polite">{notice}</output>}
+      {accessError && threadId && !locked && !unavailable && (
+        <button disabled={accessPending} onClick={() => retryAccess.current?.()}>
+          Retry conversation access
+        </button>
+      )}
       {running && <button onClick={() => void cancel()}>Cancel generation</button>}
       {checkingAccess ? (
-        <output aria-live="polite">Checking conversation access…</output>
+        <output aria-live="polite">
+          {accessError && !accessPending ? "Conversation access is unverified." : "Checking conversation access…"}
+        </output>
       ) : unavailable ? (
         <p>This conversation was deleted or expired. Start a new conversation.</p>
       ) : locked ? (
@@ -666,11 +833,22 @@ export function WritingPanel({
                 {new Date(status.quota.resetsAt).toLocaleString()}.
               </p>
             )}
-            {funding && !availability && (
-              <button type="button" disabled={busy} onClick={() => setModelCheck((value) => value + 1)}>
-                Retry model access
-              </button>
-            )}
+            {modelLoading && <output aria-live="polite">Checking model access…</output>}
+            {funding &&
+              !modelLoading &&
+              (modelError || (!!status?.settings.models[funding][quality].id && !modeAvailable)) && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    setAvailability(null);
+                    setModelError("");
+                    setModelCheck((value) => value + 1);
+                  }}
+                >
+                  Retry model access
+                </button>
+              )}
             <p className="muted">Funding never switches automatically. Connect ChatGPT in Settings.</p>
           </fieldset>
           <label>
@@ -810,6 +988,7 @@ export function WritingPanel({
                   disabled={busy}
                   onClick={() => {
                     if (operation.current || remoteId.current) return;
+                    restoredDraft.current = null;
                     outputBuffer.current = "";
                     setResult("");
                     setResultState("empty");
@@ -844,10 +1023,14 @@ export function WritingPanel({
       )}
       <div className="writing-actions">
         <button
-          disabled={busy || checkingAccess}
+          disabled={busy || (checkingAccess && (!accessError || accessPending))}
           onClick={() => {
-            if (operation.current || remoteId.current || checkingAccess) return;
+            if (operation.current || remoteId.current || (checkingAccess && (!accessError || accessPending))) return;
             loadRevision.current++;
+            restoredDraft.current = null;
+            accessGate.current.refresh = false;
+            setCheckingAccess(false);
+            setAccessPending(false);
             historyHidden.current = false;
             latestMessageId.current = "";
             remoteId.current = null;
@@ -865,6 +1048,7 @@ export function WritingPanel({
             setSources([targetSource(current, pageId)]);
             setNotice("");
             setError("");
+            setAccessError("");
           }}
         >
           New conversation
@@ -873,7 +1057,9 @@ export function WritingPanel({
           Document writing history
         </button>
       </div>
-      {historyOpen && <WritingHistory pageId={pageId} onOpen={(conversation) => void open(conversation.id)} />}
+      {historyOpen && !checkingAccess && !locked && !unavailable && (
+        <WritingHistory pageId={pageId} onOpen={(conversation) => void open(conversation.id)} />
+      )}
     </aside>
   );
 }

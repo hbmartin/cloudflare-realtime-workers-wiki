@@ -52,7 +52,7 @@ export function targetSource(target: WritingTarget, pageId: string): AiSource {
   return {
     pageId,
     scope:
-      target.kind === "selection" && target.text
+      target.kind === "selection"
         ? {
             kind: "selection",
             blockIds: target.blocks.map((block) => block.id),

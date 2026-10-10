@@ -12,6 +12,24 @@ const valid = {
   sources: [{ pageId: "doc", scope: { kind: "page" } }],
 };
 describe("writing requests", () => {
+  it.each(["", " ", "\n\t"])("rejects a blank selection %j", (text) => {
+    expect(
+      aiGenerateSchema.safeParse({
+        ...valid,
+        sources: [
+          {
+            pageId: "doc",
+            scope: {
+              kind: "selection",
+              blockIds: ["selected"],
+              contentEpoch: 1,
+              text,
+            },
+          },
+        ],
+      }).success,
+    ).toBe(false);
+  });
   it("supports each agreed preset and defaults to Fast", () => {
     for (const action of Object.keys(AI_ACTIONS)) {
       const result = aiGenerateSchema.parse({

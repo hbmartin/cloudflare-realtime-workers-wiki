@@ -1611,6 +1611,12 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   });
   const [unreadMentions, setUnreadMentions] = useState(0);
   const [writingLaunch, setWritingLaunch] = useState<WritingLaunchRequest | null>(null);
+  useEffect(() => {
+    if (writingLaunch && (view !== "pages" || writingLaunch.pageId !== (pendingSelectionId ?? selectedId))) {
+      // eslint-disable-next-line react/set-state-in-effect -- Discard launches whose navigation was abandoned or removed by a tree update.
+      setWritingLaunch(null);
+    }
+  }, [writingLaunch, view, pendingSelectionId, selectedId]);
   const consumeWritingLaunch = useCallback(
     (id: string) => setWritingLaunch((current) => (current?.id === id ? null : current)),
     [],
@@ -1988,6 +1994,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const navigateToPage = useCallback(
     (pageId: string, knownPage?: Page) => {
+      setWritingLaunch((current) => (current?.pageId === pageId ? current : null));
       startupNavigation.current!.lookupPending = false;
       const page = knownPage ?? pages.find((candidate) => candidate.id === pageId);
       if (page) {
@@ -3556,6 +3563,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   // so navigating without closing it strands the reader behind the thing they
   // just opened. Selecting a page already closes it; these do the same.
   function showTrash() {
+    setWritingLaunch(null);
     cancelPendingSelection();
     closeSidebar(true);
     refreshTrash();
@@ -3565,6 +3573,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     next: "search" | "home" | "tasks" | "mentions" | "templates" | "settings" | "activity" | "writing",
   ) {
     cancelPendingSelection();
+    setWritingLaunch(null);
     if (next === "templates") void loadOrganization();
     setView(next);
     closeSidebar(true);
@@ -3604,6 +3613,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   function cancelPendingSelection() {
     cancelPageAccessRequest();
     if (!pendingSelectionId) return;
+    setWritingLaunch((current) => (current?.pageId === pendingSelectionId ? null : current));
     startupNavigation.current!.lookupPending = false;
     dispatchPageAction({ type: "clear-pending-selection", pageId: pendingSelectionId });
   }
