@@ -1,6 +1,22 @@
 # AI writing implementation verification
 
-This review follow-up is prepared on `codex/ai-writing-review-followup`, starting from updated `main` at `9d71760`, which contains merged PR #238. It implements the writing recovery, access monitoring, quota timing, cache invalidation, linked-diagram projection, and selected display/SSE cleanup plan. No database migration, dependency, or production deployment is included.
+This review follow-up is prepared on `codex/ai-writing-refresh-quota`, following merged PR #239 at `main` commit `0611005`. It implements the panel refresh, discard/recovery, authentication alert, paginated history, quota ordering, and catalog cache cleanup fixes below. No database migration, dependency, or production deployment is included.
+
+## Additional race fixes: October 11, 2026
+
+Remote-generation completion now latches the pending saved-history refresh before its first reload, retaining the gate and retrying on ordinary five-second polls until it succeeds. Provider catalog entries count pending independent fetches and remove an empty placeholder only when its last lookup finishes, preserving concurrent successful fills and recreated entries. Both status responses and stream starts reject older timestamped quota samples, retain the newer allowance and monotonic reset anchor, and accept unrelated status fields. Equal timestamps and comparisons involving a missing timestamp preserve arrival-order compatibility.
+
+Focused panel, history, and provider catalog suites passed **156 tests**, including **10 new regressions**. They cover repeated remote-completion reload failures and stopping retries after success; failed placeholders consuming cache capacity; failure after invalidation/recreation; delayed status responses during and after generation; a delayed older stream start; reset timing after an obsolete response; unrelated status field updates; and equal/missing quota timestamps. Existing concurrent success/failure, invalidation, eviction, discard, history, and clock-skew checks remain enabled.
+
+The Chromium writing scenario passed. `pnpm check` passed: format/lint, all five TypeScript projects, middleware policy checks (zero findings and 10/10 fixtures), code analysis, generated Cloudflare bindings, and client/MCP App/offline/Worker dry-run builds. Full unit coverage passed **1,910 tests** with one existing skip and **74.26% line coverage**; full Worker coverage passed **1,669 tests across 24 files** with **84.76% line coverage**. Tests use synthetic documents and mocked provider endpoints.
+
+Repeatable commands:
+
+```sh
+pnpm exec vitest run src/client/WritingPanel.test.tsx src/client/WritingHistory.test.tsx src/worker/ai-models.test.ts
+pnpm exec playwright test tests/e2e/writing.spec.ts --project=chromium
+pnpm check
+```
 
 ## Comment fixes: October 11, 2026
 

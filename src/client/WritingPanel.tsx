@@ -202,11 +202,15 @@ export function WritingPanel({
     if (mounted.current) setAccessPending(false);
   }, []);
   const recordQuota = useCallback((quota: AiStatus["quota"]) => {
+    const current = quotaSample.current?.quota;
+    if (current?.checkedAt !== undefined && quota.checkedAt !== undefined && quota.checkedAt < current.checkedAt)
+      return current;
     quotaSample.current = { quota, receivedAt: performance.now() };
     if (quota.resetsAt > (quota.checkedAt ?? Date.now())) {
       quotaSchedule.current.retry = 0;
       quotaSchedule.current.retryAt = 0;
     }
+    return quota;
   }, []);
   const quotaDelay = useCallback(() => {
     const sample = quotaSample.current;
@@ -270,8 +274,7 @@ export function WritingPanel({
     const request = api<AiStatus>("/api/ai/status")
       .then((value) => {
         if (mounted.current) {
-          recordQuota(value.quota);
-          setStatus(value);
+          setStatus({ ...value, quota: recordQuota(value.quota) });
           setFunding(
             (current) => current ?? value.preference ?? (value.connected && value.chatgptConfigured ? "chatgpt" : null),
           );
@@ -579,6 +582,8 @@ export function WritingPanel({
               !operation.current &&
               (shouldRefresh || historyHidden.current || (wasRemote && !value.activeGeneration))
             ) {
+              refreshRequested = true;
+              accessGate.current.refresh = true;
               if (await open(threadId, false, true)) {
                 refreshRequested = false;
                 accessGate.current.refresh = false;
@@ -724,8 +729,8 @@ export function WritingPanel({
           setMessageId(event.messageId);
           latestMessageId.current = event.messageId;
           setResultSources(event.sources);
-          recordQuota(event.quota);
-          setStatus((current) => (current ? { ...current, quota: event.quota } : null));
+          const quota = recordQuota(event.quota);
+          setStatus((current) => (current ? { ...current, quota } : null));
           if (event.changedPageIds.length) setNotice("Some sources changed. This result uses their latest contents.");
         } else if (event.type === "delta") {
           outputBuffer.current += event.text;

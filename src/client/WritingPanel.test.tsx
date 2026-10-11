@@ -662,6 +662,64 @@ describe("writing UI", () => {
     expect(view.preview()).toHaveTextContent("Improved writing");
     expect(reads).toBe(2);
   });
+  it("retries remote-completion reload failures on ordinary polls until saved output is refreshed", async () => {
+    vi.useFakeTimers();
+    const original = mocks.api.getMockImplementation()!;
+    const saved = savedConversation("Saved partial"),
+      path = `/api/ai/conversations/${saved.conversation.id}`;
+    let active = true,
+      reads = 0;
+    mocks.api.mockImplementation(async (url: string, options?: RequestInit) => {
+      if (url === `${path}/access`)
+        return {
+          locked: false,
+          activeGeneration: active ? { messageId: "message", createdAt: 1, deadlineAt: 330001 } : null,
+        };
+      if (url === path || url === `${path}/open`) {
+        if (url === path && ++reads <= 2) throw new TypeError("History unavailable");
+        return {
+          conversation: {
+            ...saved.conversation,
+            messages: [
+              {
+                ...saved.conversation.messages[0],
+                status: active ? "running" : "complete",
+                output: active ? "Saved partial" : "Completed remotely",
+              },
+            ],
+          },
+        };
+      }
+      return original(url, options);
+    });
+    let view!: ReturnType<typeof panel>;
+    await act(async () => {
+      view = panel();
+    });
+    await act(async () =>
+      view.rerender(
+        <WritingPanel
+          {...view.props}
+          launchRequest={{ id: "remote", pageId: "doc", conversationId: saved.conversation.id }}
+        />,
+      ),
+    );
+    const preview = () => view.container.querySelector('.writing-panel > [aria-label="Writing result"]');
+    expect(preview()).toHaveTextContent("Saved partial");
+    active = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await act(async () => vi.advanceTimersByTimeAsync(5000));
+      expect(reads).toBe(attempt);
+      expect(screen.getByText("Conversation access is unverified.")).toBeVisible();
+      expect(preview()).toBeNull();
+    }
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(reads).toBe(3);
+    expect(preview()).toHaveTextContent("Completed remotely");
+    expect(screen.queryByRole("alert")).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(reads).toBe(3);
+  });
   it.each(["locked", "missing"])("honors an in-flight %s denial across generation", async (failure) => {
     const view = await restoredPanel();
     vi.useFakeTimers();
@@ -808,6 +866,151 @@ describe("writing UI", () => {
     await act(async () => vi.advanceTimersByTimeAsync(1));
     expect(reads).toBe(2);
     expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled();
+  });
+  it.each(["active", "completed"])(
+    "keeps newer stream quota when an earlier status refresh resolves after generation is %s",
+    async (phase) => {
+      vi.useFakeTimers();
+      const original = mocks.api.getMockImplementation()!,
+        now = Date.now(),
+        older = deferred<AiStatus>(),
+        done = deferred<void>();
+      let reads = 0;
+      mocks.api.mockImplementation((path: string, options?: RequestInit) => {
+        if (path !== "/api/ai/status") return original(path, options);
+        if (++reads === 2) return older.promise;
+        return Promise.resolve({
+          ...status,
+          preference: "api",
+          quota: {
+            ...status.quota,
+            remaining: reads === 1 ? 1 : 20,
+            checkedAt: Date.now(),
+            resetsAt: reads === 1 ? now + 1000 : Date.now() + 86400000,
+          },
+        });
+      });
+      mocks.stream.mockImplementationOnce(
+        async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+          emit({
+            type: "start",
+            conversationId: "11111111-1111-4111-8111-111111111111",
+            messageId: "last-allowed",
+            sources: [source],
+            changedPageIds: [],
+            canApply: true,
+            quota: { ...status.quota, remaining: 0, checkedAt: Date.now(), resetsAt: now + 1000 },
+          });
+          emit({ type: "delta", text: "Last allowed result" });
+          await done.promise;
+          emit({ type: "complete" });
+        },
+      );
+      await act(async () => panel());
+      await act(async () => fireEvent(window, new Event("focus")));
+      await act(async () => vi.advanceTimersByTimeAsync(200));
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate" })));
+      if (phase === "completed") await act(async () => done.resolve());
+      await act(async () => vi.advanceTimersByTimeAsync(400));
+      await act(async () =>
+        older.resolve({
+          ...status,
+          connected: false,
+          quota: { ...status.quota, remaining: 1, checkedAt: now, resetsAt: now + 1000 },
+        }),
+      );
+      expect(screen.getByText(/^0 of 20 API requests remaining/)).toBeVisible();
+      expect(screen.getByRole("radio", { name: "ChatGPT plan" })).toBeDisabled();
+      expect(
+        screen.getByRole("button", { name: phase === "completed" ? "Generate" : "Cancel generation" }),
+      ).toHaveProperty("disabled", phase === "completed");
+      expect(reads).toBe(2);
+      await act(async () => vi.advanceTimersByTimeAsync(399));
+      expect(reads).toBe(2);
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(reads).toBe(3);
+      expect(screen.getByText(/^20 of 20 API requests remaining/)).toBeVisible();
+      await act(async () => done.resolve());
+    },
+  );
+  it("keeps a newer status quota when an older generation start arrives later", async () => {
+    const original = mocks.api.getMockImplementation()!,
+      now = Date.now(),
+      start = deferred<void>(),
+      done = deferred<void>();
+    let reads = 0;
+    mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+      path === "/api/ai/status"
+        ? Promise.resolve({
+            ...status,
+            preference: "api",
+            quota: {
+              ...status.quota,
+              remaining: ++reads === 1 ? 1 : 0,
+              checkedAt: now + reads * 1000,
+              resetsAt: now + 86400000,
+            },
+          })
+        : original(path, options),
+    );
+    mocks.stream.mockImplementationOnce(
+      async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+        await start.promise;
+        emit({
+          type: "start",
+          conversationId: "11111111-1111-4111-8111-111111111111",
+          messageId: "late-start",
+          sources: [source],
+          changedPageIds: [],
+          canApply: true,
+          quota: { ...status.quota, remaining: 1, checkedAt: now + 1500, resetsAt: now + 86400000 },
+        });
+        await done.promise;
+        emit({ type: "complete" });
+      },
+    );
+    const view = panel();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled());
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate" })));
+    await act(async () => fireEvent(window, new Event("focus")));
+    await act(async () => start.resolve());
+    expect(screen.getByText(/^0 of 20 API requests remaining/)).toBeVisible();
+    await act(async () => done.resolve());
+    expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
+    view.unmount();
+  });
+  it.each([
+    { existing: 1000, incoming: 1000 },
+    { existing: 1000, incoming: undefined },
+    { existing: undefined, incoming: 1000 },
+    { existing: undefined, incoming: undefined },
+  ])("accepts equal or legacy quota timestamps $existing → $incoming", async ({ existing, incoming }) => {
+    vi.useFakeTimers();
+    const original = mocks.api.getMockImplementation()!,
+      now = Date.now();
+    let reads = 0;
+    mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+      path === "/api/ai/status"
+        ? Promise.resolve({
+            ...status,
+            preference: "api",
+            quota: {
+              ...status.quota,
+              remaining: ++reads === 1 ? 1 : 0,
+              checkedAt:
+                (reads === 1 ? existing : incoming) === undefined
+                  ? undefined
+                  : now + (reads === 1 ? existing! : incoming!),
+              resetsAt: now + 86400000,
+            },
+          })
+        : original(path, options),
+    );
+    await act(async () => panel());
+    await act(async () => fireEvent(window, new Event("focus")));
+    expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
+    expect(screen.getByText(/^0 of 20 API requests remaining/)).toBeVisible();
+    expect(reads).toBe(2);
   });
   it.each(["legacy", "server", "changing-legacy", "changing-server", "failure"])(
     "backs off unchanged overdue %s quota responses and resets after recovery",

@@ -78,6 +78,34 @@ describe("funding-specific model catalogs", () => {
     expect(await providerModels(workspace, "credential", "api")).toMatchObject([{ id: "successful" }]);
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
+  it("removes failed placeholders so they cannot evict a useful catalog", async () => {
+    await providerModels(workspace, "healthy", "api");
+    fetcher.mockResolvedValue(new Response("Unavailable", { status: 503 }));
+    for (let index = 0; index < 128; index++)
+      await expect(providerModels(`${workspace}-failed-${index}`, "credential", "api")).rejects.toMatchObject({
+        status: 503,
+      });
+    fetcher.mockResolvedValue(Response.json({ data: [{ id: "unexpected-refetch" }] }));
+    expect(await providerModels(workspace, "healthy", "api")).toMatchObject([{ id: "api-model" }]);
+    expect(fetcher).toHaveBeenCalledTimes(129);
+  });
+  it("does not remove a recreated entry when an invalidated lookup fails", async () => {
+    let fail!: (cause: Error) => void;
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise<Response>((_resolve, reject) => {
+          fail = reject;
+        }),
+    );
+    const old = providerModels(workspace, "credential", "api").catch((cause: unknown) => cause);
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    await invalidateProviderModels(workspace, "credential", "api");
+    await providerModels(workspace, "credential", "api");
+    fail(new Error("Old lookup failed"));
+    expect(await old).toMatchObject({ status: 503 });
+    expect(await providerModels(workspace, "credential", "api")).toMatchObject([{ id: "api-model" }]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
   it("bounds unfinished entries and rejects a retired fill after eviction and recreation", async () => {
     const finishes: ((response: Response) => void)[] = [];
     fetcher.mockImplementation(() => new Promise<Response>((resolve) => finishes.push(resolve)));
