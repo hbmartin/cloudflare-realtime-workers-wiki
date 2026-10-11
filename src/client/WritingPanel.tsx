@@ -33,6 +33,7 @@ type HistoryRefresh = {
   token: symbol;
   mode: "passive" | "local";
 };
+type DiscardedResult = { conversationId: string; latestMessageId: string };
 function matchesRestoredDraft(conversation: AiConversation, restored: RestoredDraft | null) {
   if (!restored || restored.conversationId !== conversation.id) return false;
   const latest = conversation.messages?.at(-1);
@@ -44,6 +45,11 @@ function matchesRestoredDraft(conversation: AiConversation, restored: RestoredDr
     saved?.output === restored.output &&
     (saved.status === "complete") === restored.complete &&
     JSON.stringify(saved.sources) === JSON.stringify(restored.sources)
+  );
+}
+function matchesDiscardedResult(conversation: AiConversation, discarded: DiscardedResult | null) {
+  return (
+    discarded?.conversationId === conversation.id && discarded.latestMessageId === conversation.messages?.at(-1)?.id
   );
 }
 
@@ -156,8 +162,8 @@ export function WritingPanel({
     visibleRef = useRef(visible),
     handledLaunch = useRef<string | undefined>(undefined),
     loadRevision = useRef(0),
-    statusRequest = useRef<{ reservation: number; promise: Promise<AiStatus> } | null>(null),
-    quotaReservation = useRef(0),
+    statusRequest = useRef<{ epoch: number; promise: Promise<AiStatus> } | null>(null),
+    quotaEpoch = useRef(0),
     quotaSample = useRef<{ quota: AiStatus["quota"]; receivedAt: number } | null>(null),
     quotaWasActive = useRef<boolean | null>(null),
     quotaSchedule = useRef({ retry: 0, retryAt: 0, request: null as Promise<void> | null }),
@@ -169,7 +175,7 @@ export function WritingPanel({
     historyRead = useRef<{ revision: number } | null>(null),
     retryAccess = useRef<(() => void) | null>(null),
     restoredDraft = useRef<RestoredDraft | null>(null),
-    discardedResult = useRef<{ conversationId: string; latestMessageId: string } | null>(null),
+    discardedResult = useRef<DiscardedResult | null>(null),
     historyHidden = useRef(false),
     latestMessageId = useRef("");
   const [availability, setAvailability] = useState<{
@@ -227,7 +233,9 @@ export function WritingPanel({
       ? sample.quota.resetsAt - Date.now()
       : sample.quota.resetsAt - sample.quota.checkedAt - (performance.now() - sample.receivedAt);
   }, []);
-  const requestHistoryRefresh = useCallback((conversationId: string, mode: HistoryRefresh["mode"]) => {
+  const requestHistoryRefresh = useCallback((conversationId: string, mode: HistoryRefresh["mode"], fresh = false) => {
+    const pending = pendingHistory.current;
+    if (!fresh && pending?.conversationId === conversationId) return pending;
     const refresh = { conversationId, token: Symbol("history refresh"), mode };
     pendingHistory.current = refresh;
     return refresh;
@@ -286,7 +294,7 @@ export function WritingPanel({
     function requestStatus(): Promise<AiStatus> {
       const pending = statusRequest.current;
       if (pending) {
-        if (pending.reservation === quotaReservation.current) return pending.promise;
+        if (pending.epoch === quotaEpoch.current) return pending.promise;
         // A terminal refresh must observe any reservation/refund that the older request predates.
         return pending.promise.then(
           (value) => (mounted.current ? requestStatus() : value),
@@ -296,14 +304,12 @@ export function WritingPanel({
           },
         );
       }
-      const reservation = quotaReservation.current;
+      const epoch = quotaEpoch.current;
       const request = api<AiStatus>("/api/ai/status")
         .then((value) => {
           if (mounted.current) {
             const quota =
-              reservation === quotaReservation.current
-                ? recordQuota(value.quota)
-                : (quotaSample.current?.quota ?? value.quota);
+              epoch === quotaEpoch.current ? recordQuota(value.quota) : (quotaSample.current?.quota ?? value.quota);
             setStatus({ ...value, quota });
             setFunding(
               (current) =>
@@ -315,7 +321,7 @@ export function WritingPanel({
         .finally(() => {
           if (statusRequest.current?.promise === request) statusRequest.current = null;
         });
-      statusRequest.current = { reservation, promise: request };
+      statusRequest.current = { epoch, promise: request };
       return request;
     },
     [recordQuota],
@@ -494,7 +500,7 @@ export function WritingPanel({
         const discarded = discardedResult.current;
         if (
           (restoredDraft.current && !matchesRestoredDraft(conversation, restoredDraft.current)) ||
-          (discarded && (discarded.conversationId !== conversation.id || discarded.latestMessageId !== latest?.id))
+          (discarded && !matchesDiscardedResult(conversation, discarded))
         ) {
           restoredDraft.current = null;
           discardedResult.current = null;
@@ -517,7 +523,7 @@ export function WritingPanel({
         if (touch) setNotice("Finish or cancel the current operation before changing its source.");
         return false;
       }
-      const pending = touch ? null : (refresh ?? requestHistoryRefresh(id, "passive"));
+      const pending = touch ? null : (refresh ?? requestHistoryRefresh(id, "passive", true));
       const revision = ++loadRevision.current;
       const owner = Symbol("open");
       historyRead.current = null;
@@ -564,8 +570,7 @@ export function WritingPanel({
         const restored = restoredDraft.current;
         const keepDraft = preserveTarget && matchesRestoredDraft(conversation, restored);
         const discarded = discardedResult.current;
-        const keepDiscard =
-          preserveTarget && discarded?.conversationId === conversation.id && discarded.latestMessageId === latest?.id;
+        const keepDiscard = preserveTarget && matchesDiscardedResult(conversation, discarded);
         if (!keepDraft) restoredDraft.current = null;
         if (!keepDiscard) discardedResult.current = null;
         if (preserveTarget && (latest?.id !== latestMessageId.current || (restored && !keepDraft))) {
@@ -593,7 +598,7 @@ export function WritingPanel({
               : "Saved result opened. Choose a current insertion location to use it, or generate again from the latest sources.",
           );
         setCheckingAccess(false);
-        if (pendingHistory.current?.token === pending?.token) pendingHistory.current = null;
+        if (pending && pendingHistory.current?.token === pending.token) pendingHistory.current = null;
         if (!touch) setHistoryRefreshVersion((version) => version + 1);
         return true;
       } catch (cause) {
@@ -623,8 +628,7 @@ export function WritingPanel({
       !refresh ||
       refresh.conversationId !== accessContext.current.id ||
       operation.current ||
-      opening.current ||
-      historyRead.current?.revision === loadRevision.current
+      opening.current
     )
       return;
     if (refresh.mode === "local") await syncLocalHistory(refresh);
@@ -660,7 +664,8 @@ export function WritingPanel({
         accessGate.current.verify = true;
         setCheckingAccess(true);
         if (operation.current === "generate") requestHistoryRefresh(threadId, "local");
-        else if (!operation.current) requestHistoryRefresh(threadId, "passive");
+        else if (!operation.current || operation.current === "apply")
+          requestHistoryRefresh(threadId, "passive", operation.current === "apply");
       }
       if (inFlight || abort.signal.aborted) return;
       inFlight = true;
@@ -688,8 +693,8 @@ export function WritingPanel({
             setHistoryRefreshVersion((version) => version + 1);
           }
           if (!controller.current) {
-            if ((wasRemote && !value.activeGeneration) || historyHidden.current)
-              requestHistoryRefresh(threadId, "passive");
+            const completedRemote = wasRemote && !value.activeGeneration;
+            if (completedRemote || historyHidden.current) requestHistoryRefresh(threadId, "passive", completedRemote);
             remoteId.current = value.activeGeneration?.messageId ?? null;
             setRemoteGeneration(value.activeGeneration ?? null);
           }
@@ -842,7 +847,7 @@ export function WritingPanel({
         if (!mounted.current || revision !== loadRevision.current || abort.signal.aborted) return;
         if (event.type === "start") {
           started = true;
-          quotaReservation.current++;
+          quotaEpoch.current++;
           discardedResult.current = null;
           savedThread = event.conversationId;
           if (accessContext.current.id !== event.conversationId) accessContext.current = { id: event.conversationId };
@@ -903,8 +908,10 @@ export function WritingPanel({
           if (abort.signal.aborted) setNotice("Generation cancelled. Partial text can be copied.");
         }
         flushResult();
+        quotaEpoch.current++;
         void refreshStatus().catch(() => undefined);
-        if (savedThread && !abort.signal.aborted) void syncLocalHistory(requestHistoryRefresh(savedThread, "local"));
+        if (savedThread && !abort.signal.aborted)
+          void syncLocalHistory(requestHistoryRefresh(savedThread, "local", true));
       }
     }
   }

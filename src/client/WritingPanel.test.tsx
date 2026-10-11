@@ -406,78 +406,75 @@ describe("writing UI", () => {
     ["generate", "apply"].flatMap((operation) =>
       ["focus", "reveal", "foreground"].map((boundary) => ({ operation, boundary })),
     ),
-  )(
-    "consumes $boundary verification during $operation without a deferred result reload",
-    async ({ operation, boundary }) => {
-      const view = await completedPanel();
-      vi.useFakeTimers();
-      await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
-      await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
-      const original = mocks.api.getMockImplementation()!;
-      const done = deferred<{ contentEpoch: number; protectedBlockIds: string[] }>();
-      let reads = 0,
-        emit!: (event: AiStreamEvent) => void;
-      mocks.api.mockImplementation((path: string, options?: RequestInit) => {
-        if (path === `/api/ai/conversations/${view.saved.conversation.id}`) reads++;
-        return path.endsWith("apply-check") ? done.promise : original(path, options);
-      });
-      mocks.stream.mockImplementationOnce(
-        async (_input: AiGenerate, _signal: AbortSignal, onEvent: (event: AiStreamEvent) => void) => {
-          emit = onEvent;
-          emit({
-            type: "start",
-            conversationId: view.saved.conversation.id,
-            messageId: "busy",
-            sources: [source],
-            changedPageIds: [],
-            canApply: true,
-            quota: status.quota,
-          });
-          emit({ type: "delta", text: "Busy result" });
-          await done.promise;
-        },
-      );
-      await act(async () =>
-        fireEvent.click(
-          screen.getByRole("button", { name: operation === "generate" ? "Generate follow-up" : "Replace" }),
-        ),
-      );
+  )("defers $boundary history verification until $operation finishes", async ({ operation, boundary }) => {
+    const view = await completedPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    const done = deferred<{ contentEpoch: number; protectedBlockIds: string[] }>();
+    let reads = 0,
+      emit!: (event: AiStreamEvent) => void;
+    mocks.api.mockImplementation((path: string, options?: RequestInit) => {
+      if (path === `/api/ai/conversations/${view.saved.conversation.id}`) reads++;
+      return path.endsWith("apply-check") ? done.promise : original(path, options);
+    });
+    mocks.stream.mockImplementationOnce(
+      async (_input: AiGenerate, _signal: AbortSignal, onEvent: (event: AiStreamEvent) => void) => {
+        emit = onEvent;
+        emit({
+          type: "start",
+          conversationId: view.saved.conversation.id,
+          messageId: "busy",
+          sources: [source],
+          changedPageIds: [],
+          canApply: true,
+          quota: status.quota,
+        });
+        emit({ type: "delta", text: "Busy result" });
+        await done.promise;
+      },
+    );
+    await act(async () =>
+      fireEvent.click(
+        screen.getByRole("button", { name: operation === "generate" ? "Generate follow-up" : "Replace" }),
+      ),
+    );
+    await act(async () => {
+      if (boundary === "focus") fireEvent(window, new Event("focus"));
+      else if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible={false} />);
+      else {
+        vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+        fireEvent(document, new Event("visibilitychange"));
+      }
+    });
+    if (boundary !== "focus")
       await act(async () => {
-        if (boundary === "focus") fireEvent(window, new Event("focus"));
-        else if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible={false} />);
+        if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible />);
         else {
-          vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+          vi.spyOn(document, "hidden", "get").mockReturnValue(false);
           fireEvent(document, new Event("visibilitychange"));
         }
       });
-      if (boundary !== "focus")
-        await act(async () => {
-          if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible />);
-          else {
-            vi.spyOn(document, "hidden", "get").mockReturnValue(false);
-            fireEvent(document, new Event("visibilitychange"));
-          }
+    expect(screen.queryByText("Checking conversation access…")).toBeNull();
+    expect(reads).toBe(0);
+    await act(async () => {
+      if (operation === "generate") {
+        view.saved.conversation.messages.push({
+          ...view.saved.conversation.messages[0]!,
+          id: "busy",
+          output: "Busy result",
         });
-      expect(screen.queryByText("Checking conversation access…")).toBeNull();
-      expect(reads).toBe(0);
-      await act(async () => {
-        if (operation === "generate") {
-          view.saved.conversation.messages.push({
-            ...view.saved.conversation.messages[0]!,
-            id: "busy",
-            output: "Busy result",
-          });
-          emit({ type: "complete" });
-        }
-        done.resolve({ contentEpoch: 1, protectedBlockIds: [] });
-      });
-      expect(reads).toBe(operation === "generate" ? 1 : 0);
-      fireEvent.click(screen.getByRole("button", { name: "Discard" }));
-      await act(async () => vi.advanceTimersByTimeAsync(10000));
-      expect(reads).toBe(operation === "generate" ? 1 : 0);
-      expect(view.preview()).toBeNull();
-    },
-  );
+        emit({ type: "complete" });
+      }
+      done.resolve({ contentEpoch: 1, protectedBlockIds: [] });
+    });
+    expect(reads).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(reads).toBe(1);
+    expect(view.preview()).toBeNull();
+  });
   it.each(["locked", "missing"])(
     "ignores an old %s access response while a newer opening owns the gate",
     async (failure) => {
@@ -2705,7 +2702,370 @@ describe("writing synchronization races", () => {
   );
 });
 
+describe("writing terminal quota refresh", () => {
+  it.each(["refund", "complete"].flatMap((terminal) => ["success", "failure"].map((sample) => ({ terminal, sample }))))(
+    "rechecks quota after $terminal when a post-reservation sample ends with $sample",
+    async ({ terminal, sample }) => {
+      vi.useFakeTimers();
+      const original = mocks.api.getMockImplementation()!,
+        now = Date.now();
+      const older = deferred<AiStatus>(),
+        fresh = deferred<AiStatus>(),
+        done = deferred<void>();
+      const available: AiStatus = {
+        ...status,
+        preference: "api",
+        quota: { ...status.quota, remaining: 1, checkedAt: now, resetsAt: now + 86400000 },
+      };
+      let reads = 0;
+      mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+        if (url !== "/api/ai/status") return original(url, options);
+        reads++;
+        if (reads === 1) return Promise.resolve(available);
+        return reads === 2 ? older.promise : fresh.promise;
+      });
+      mocks.stream.mockImplementationOnce(
+        async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+          emit({
+            type: "start",
+            conversationId: "11111111-1111-4111-8111-111111111111",
+            messageId: "last-request",
+            sources: [source],
+            changedPageIds: [],
+            canApply: true,
+            quota: { ...available.quota, remaining: 0 },
+          });
+          emit({ type: "delta", text: "Last allowed result" });
+          await done.promise;
+          emit(
+            terminal === "refund"
+              ? { type: "error", status: 429, code: "ai_provider_rejected", message: "Request refunded" }
+              : { type: "complete" },
+          );
+        },
+      );
+      await act(async () => panel());
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate" })));
+      await act(async () => {
+        fireEvent(window, new Event("focus"));
+        fireEvent(window, new Event("focus"));
+      });
+      expect(reads).toBe(2);
+      await act(async () => done.resolve());
+      if (sample === "failure") await act(async () => older.reject(new TypeError("Status failed")));
+      else
+        await act(async () =>
+          older.resolve({
+            ...available,
+            connected: false,
+            quota: { ...available.quota, remaining: terminal === "refund" ? 0 : 1, checkedAt: now + 1000 },
+          }),
+        );
+      expect(reads).toBe(3);
+      expect(screen.getByText(/^0 of 20 API requests remaining/)).toBeVisible();
+      expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
+      expect(screen.getByRole("radio", { name: "ChatGPT plan" })).toHaveProperty("disabled", sample === "success");
+      await act(async () => {
+        fireEvent(window, new Event("focus"));
+        fireEvent(window, new Event("focus"));
+      });
+      expect(reads).toBe(3);
+      await act(async () =>
+        fresh.resolve({
+          ...available,
+          quota: { ...available.quota, remaining: terminal === "refund" ? 1 : 0, checkedAt: now + 2000 },
+        }),
+      );
+      expect(screen.getByRole("button", { name: "Generate" })).toHaveProperty("disabled", terminal !== "refund");
+      expect(
+        screen.getByText(new RegExp(`^${terminal === "refund" ? 1 : 0} of 20 API requests remaining`)),
+      ).toBeVisible();
+      expect(screen.getByRole("radio", { name: "Workspace API" })).toBeChecked();
+      await act(async () => vi.advanceTimersByTimeAsync(10000));
+      expect(reads).toBe(3);
+    },
+  );
+});
+
+describe("writing refresh ownership", () => {
+  it.each(["equal", "greater", "legacy", "failure"])(
+    "fences a mid-generation pre-refund status with %s timestamp/outcome",
+    async (ordering) => {
+      vi.useFakeTimers();
+      const original = mocks.api.getMockImplementation()!;
+      const now = Date.now();
+      const available: AiStatus = {
+        ...status,
+        preference: "api",
+        quota: { ...status.quota, remaining: 1, checkedAt: now, resetsAt: now + 86400000 },
+      };
+      const older = deferred<AiStatus>(),
+        fresh = deferred<AiStatus>(),
+        done = deferred<void>();
+      let reads = 0;
+      mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+        if (url !== "/api/ai/status") return original(url, options);
+        reads++;
+        if (reads === 1) return Promise.resolve(available);
+        return reads === 2 ? older.promise : fresh.promise;
+      });
+      mocks.stream.mockImplementationOnce(
+        async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+          emit({
+            type: "start",
+            conversationId: "11111111-1111-4111-8111-111111111111",
+            messageId: "last-request",
+            sources: [source],
+            changedPageIds: [],
+            canApply: true,
+            quota: { ...available.quota, remaining: 0, checkedAt: now + 500 },
+          });
+          await done.promise;
+          emit({ type: "error", status: 429, code: "ai_provider_rejected", message: "Request refunded" });
+        },
+      );
+      await act(async () => panel());
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate" })));
+      await act(async () => fireEvent(window, new Event("focus")));
+      expect(reads).toBe(2);
+      await act(async () => done.resolve());
+      if (ordering === "failure") await act(async () => older.reject(new TypeError("Status failed")));
+      else
+        await act(async () =>
+          older.resolve({
+            ...available,
+            quota: {
+              ...available.quota,
+              remaining: 0,
+              checkedAt: ordering === "legacy" ? undefined : now + (ordering === "greater" ? 1000 : 500),
+            },
+          }),
+        );
+      expect(reads).toBe(3);
+      expect(screen.getByText(/^0 of 20 API requests remaining/)).toBeVisible();
+      expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
+      await act(async () => fresh.resolve({ ...available, quota: { ...available.quota, checkedAt: now + 2000 } }));
+      expect(screen.getByText(/^1 of 20 API requests remaining/)).toBeVisible();
+      expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled();
+      expect(reads).toBe(3);
+    },
+  );
+
+  it.each([
+    { boundary: "focus", first: "access" },
+    { boundary: "focus", first: "history" },
+    { boundary: "reveal", first: "access" },
+    { boundary: "reveal", first: "history" },
+    { boundary: "foreground", first: "access" },
+    { boundary: "foreground", first: "history" },
+  ])("reuses a terminal history read across $boundary when $first finishes first", async ({ boundary, first }) => {
+    const view = await completedPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    const history = deferred<ReturnType<typeof savedConversation>>(),
+      access = deferred<unknown>();
+    const saved = savedConversation("# Improved writing\n\nClear **result**.");
+    saved.conversation.messages.push({ ...saved.conversation.messages[0]!, id: "second" });
+    let reads = 0,
+      accessReads = 0;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === `/api/ai/conversations/${view.saved.conversation.id}`) {
+        reads++;
+        return history.promise;
+      }
+      if (url.endsWith("/access")) {
+        accessReads++;
+        return access.promise;
+      }
+      return original(url, options);
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    expect(reads).toBe(1);
+    if (boundary === "focus")
+      await act(async () => {
+        fireEvent(window, new Event("focus"));
+        fireEvent(window, new Event("focus"));
+      });
+    else if (boundary === "reveal") {
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    } else {
+      const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+      await act(async () => fireEvent(document, new Event("visibilitychange")));
+      hidden.mockReturnValue(false);
+      await act(async () => fireEvent(document, new Event("visibilitychange")));
+    }
+    expect(accessReads).toBe(1);
+    expect(screen.getByText("Checking conversation access…")).toBeVisible();
+    expect(view.preview()).toBeNull();
+    if (first === "history") await act(async () => history.resolve(saved));
+    expect(screen.getByText("Checking conversation access…")).toBeVisible();
+    expect(view.preview()).toBeNull();
+    await act(async () => access.resolve({ locked: false, activeGeneration: null }));
+    expect(screen.queryByText("Checking conversation access…")).toBeNull();
+    expect(view.preview()).toHaveTextContent("Improved writing");
+    expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled();
+    if (first === "access") await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(accessReads).toBe(first === "access" ? 2 : 1);
+    expect(reads).toBe(1);
+    await act(async () => history.resolve(saved));
+    expect(screen.getByText("Conversation (2 requests)")).toBeVisible();
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(reads).toBe(1);
+  });
+
+  it("supersedes a slow local read immediately when a remote generation completes", async () => {
+    const view = await completedPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    const local = deferred<ReturnType<typeof savedConversation>>(),
+      fresh = deferred<ReturnType<typeof savedConversation>>();
+    let active = true,
+      reads = 0;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === `/api/ai/conversations/${view.saved.conversation.id}`)
+        return ++reads === 1 ? local.promise : fresh.promise;
+      if (url.endsWith("/access"))
+        return Promise.resolve({
+          locked: false,
+          activeGeneration: active ? { messageId: "remote", createdAt: 1, deadlineAt: 330001 } : null,
+        });
+      return original(url, options);
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(reads).toBe(1);
+    active = false;
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(reads).toBe(2);
+    expect(screen.getByText("Checking conversation access…")).toBeVisible();
+    await act(async () => local.resolve(savedConversation("Obsolete local history")));
+    expect(screen.queryByText("Obsolete local history")).toBeNull();
+    expect(screen.getByText("Checking conversation access…")).toBeVisible();
+    const saved = savedConversation("Remote result");
+    saved.conversation.messages[0]!.id = "remote";
+    await act(async () => fresh.resolve(saved));
+    expect(view.preview()).toHaveTextContent("Remote result");
+    expect(screen.queryByText("Checking conversation access…")).toBeNull();
+    expect(screen.getByRole("button", { name: "Replace" })).toBeDisabled();
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(reads).toBe(2);
+  });
+});
+
 describe("writing history during apply", () => {
+  it.each(["before", "after"])(
+    "supersedes local history that settles %s an apply with a queued passive refresh",
+    async (timing) => {
+      const view = await completedPanel();
+      vi.useFakeTimers();
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+      const original = mocks.api.getMockImplementation()!;
+      const local = deferred<ReturnType<typeof savedConversation>>(),
+        applied = deferred<{ contentEpoch: number; protectedBlockIds: string[] }>();
+      const saved = savedConversation("New server result");
+      saved.conversation.messages[0]!.id = "remote-follow-up";
+      let reads = 0;
+      mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+        if (url.endsWith("apply-check")) return applied.promise;
+        if (url === `/api/ai/conversations/${view.saved.conversation.id}`)
+          return ++reads === 1 ? local.promise : Promise.resolve(saved);
+        return original(url, options);
+      });
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+      expect(reads).toBe(1);
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Replace" })));
+      await act(async () => fireEvent(window, new Event("focus")));
+      if (timing === "before") await act(async () => local.resolve(savedConversation("Obsolete local history")));
+      expect(view.preview()).toHaveTextContent("Improved writing");
+      expect(reads).toBe(1);
+      await act(async () => applied.resolve({ contentEpoch: 1, protectedBlockIds: [] }));
+      expect(view.apply).toHaveBeenCalledWith(
+        target,
+        "# Improved writing\n\nClear **result**.",
+        "replace",
+        1,
+        new Set(),
+      );
+      await act(async () => local.resolve(savedConversation("Obsolete local history")));
+      expect(reads).toBe(2);
+      expect(view.preview()).toHaveTextContent("New server result");
+      expect(screen.queryByText("Obsolete local history")).toBeNull();
+      await act(async () => vi.advanceTimersByTimeAsync(10000));
+      expect(reads).toBe(2);
+    },
+  );
+
+  it.each(
+    ["focus", "reveal", "foreground", "hidden"].flatMap((boundary) =>
+      ["success", "failure"].map((outcome) => ({ boundary, outcome })),
+    ),
+  )("refreshes saved history after $boundary during apply ends with $outcome", async ({ boundary, outcome }) => {
+    const view = await completedPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    const applied = deferred<{ contentEpoch: number; protectedBlockIds: string[] }>();
+    let reads = 0;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+      if (url.endsWith("apply-check")) return applied.promise;
+      if (url === `/api/ai/conversations/${view.saved.conversation.id}`) reads++;
+      return original(url, options);
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Replace" })));
+    view.saved.conversation.messages.push({
+      ...view.saved.conversation.messages[0]!,
+      id: "remote-follow-up",
+      output: "# Remote follow-up",
+    });
+    await act(async () => {
+      if (boundary === "focus" || boundary === "hidden") fireEvent(window, new Event("focus"));
+      else if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible={false} />);
+      else {
+        vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+        fireEvent(document, new Event("visibilitychange"));
+      }
+    });
+    if (boundary === "reveal" || boundary === "foreground")
+      await act(async () => {
+        if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible />);
+        else {
+          vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+          fireEvent(document, new Event("visibilitychange"));
+        }
+      });
+    expect(reads).toBe(0);
+    expect(view.apply).not.toHaveBeenCalled();
+    expect(view.preview()).toHaveTextContent("Improved writing");
+    if (boundary === "hidden") await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () =>
+      outcome === "success"
+        ? applied.resolve({ contentEpoch: 1, protectedBlockIds: [] })
+        : applied.reject(new TypeError("Application unavailable")),
+    );
+    expect(view.apply.mock.calls).toEqual(
+      outcome === "success" ? [[target, "# Improved writing\n\nClear **result**.", "replace", 1, new Set()]] : [],
+    );
+    expect(reads).toBe(boundary === "hidden" ? 0 : 1);
+    if (boundary === "hidden") {
+      await act(async () => vi.advanceTimersByTimeAsync(10000));
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    }
+    expect(reads).toBe(1);
+    expect(view.preview()).toHaveTextContent("Remote follow-up");
+    expect(screen.queryByRole("alert")?.textContent ?? null).toBe(
+      outcome === "failure" ? "The result could not be applied." : null,
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(reads).toBe(1);
+  });
+
   it("defers an override-changing saved result until an in-flight apply finishes", async () => {
     const view = await restoredPanel();
     vi.useFakeTimers();

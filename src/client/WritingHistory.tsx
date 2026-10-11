@@ -2,6 +2,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import type { AiConversation } from "../shared/ai";
 import { api, apiErrorMessage } from "./api";
 
+const HISTORY_DELETED_EVENT = "notes:writing-history-deleted";
+
 export function WritingHistory({
   pageId,
   onOpen,
@@ -13,7 +15,10 @@ export function WritingHistory({
 }) {
   const [query, setQuery] = useState("");
   const [deleting, setDeleting] = useState(false),
-    [deletionError, setDeletionError] = useState("");
+    [deletionState, setDeletionState] = useState({ pageId, query, revision: 0, error: "" });
+  if (deletionState.pageId !== pageId || deletionState.query !== query)
+    setDeletionState({ pageId, query, revision: deletionState.revision + 1, error: "" });
+  const deletionError = deletionState.pageId === pageId && deletionState.query === query ? deletionState.error : "";
   const [history, setHistory] = useState({
     pageId,
     query,
@@ -26,14 +31,17 @@ export function WritingHistory({
   const sameScope = history.pageId === pageId && history.query === query;
   const items = sameScope ? history.items : [],
     cursor = sameScope ? history.cursor : null,
-    error = deletionError || (sameScope ? history.error : ""),
+    error = sameScope ? history.error : "",
     loading = deleting || history.loading || !sameScope || history.refreshVersion !== refreshVersion;
   const pagination = useRef({ pageId, query, pages: 1 }),
     request = useRef<AbortController | null>(null),
+    reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null),
     deletion = useRef(false),
     mounted = useRef(true);
   const load = useCallback(
     async (appendCursor?: string) => {
+      if (reloadTimer.current !== null) clearTimeout(reloadTimer.current);
+      reloadTimer.current = null;
       request.current?.abort();
       const controller = new AbortController();
       request.current = controller;
@@ -106,28 +114,38 @@ export function WritingHistory({
   }, [load]);
   useEffect(() => {
     mounted.current = true;
+    const refresh = () => void latestLoad.current();
+    window.addEventListener(HISTORY_DELETED_EVENT, refresh);
     return () => {
       mounted.current = false;
+      window.removeEventListener(HISTORY_DELETED_EVENT, refresh);
     };
   }, []);
   useEffect(() => {
-    const timer = setTimeout(() => void load(), 200);
+    reloadTimer.current = setTimeout(() => void load(), 200);
     return () => {
-      clearTimeout(timer);
+      if (reloadTimer.current !== null) clearTimeout(reloadTimer.current);
+      reloadTimer.current = null;
       request.current?.abort();
       request.current = null;
     };
   }, [load]);
   async function remove(id?: string) {
     if (loading || request.current || deletion.current) return;
+    const revision = deletionState.revision;
     deletion.current = true;
     setDeleting(true);
-    setDeletionError("");
+    setDeletionState((current) => ({ ...current, error: "" }));
     try {
       await api(`/api/ai/conversations${id ? `/${id}` : ""}`, { method: "DELETE" });
-      if (mounted.current) await latestLoad.current();
+      window.dispatchEvent(new Event(HISTORY_DELETED_EVENT));
     } catch (cause) {
-      if (mounted.current) setDeletionError(apiErrorMessage(cause, "History could not be deleted."));
+      if (mounted.current)
+        setDeletionState((current) =>
+          current.revision === revision
+            ? { ...current, error: apiErrorMessage(cause, "History could not be deleted.") }
+            : current,
+        );
     } finally {
       deletion.current = false;
       if (mounted.current) setDeleting(false);
@@ -144,6 +162,17 @@ export function WritingHistory({
         Search your conversations
         <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} />
       </label>
+      {deletionError && (
+        <div role="alert" className="form-error">
+          {deletionError}
+          <button
+            aria-label="Dismiss deletion error"
+            onClick={() => setDeletionState((current) => ({ ...current, error: "" }))}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       {error && (
         <p role="alert" className="form-error">
           {error}
