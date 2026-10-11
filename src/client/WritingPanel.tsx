@@ -131,6 +131,7 @@ export function WritingPanel({
     [modelError, setModelError] = useState(""),
     [notice, setNotice] = useState(""),
     [historyOpen, setHistoryOpen] = useState(false),
+    [historyRefreshVersion, setHistoryRefreshVersion] = useState(0),
     [locked, setLocked] = useState(false),
     [unavailable, setUnavailable] = useState(false),
     [applying, setApplying] = useState(false),
@@ -160,6 +161,7 @@ export function WritingPanel({
     accessGate = useRef({ visible, foreground, refresh: false }),
     retryAccess = useRef<(() => void) | null>(null),
     restoredDraft = useRef<RestoredDraft | null>(null),
+    discardedResult = useRef<{ conversationId: string; latestMessageId: string } | null>(null),
     historyHidden = useRef(false),
     latestMessageId = useRef("");
   const [availability, setAvailability] = useState<{
@@ -200,11 +202,15 @@ export function WritingPanel({
     if (mounted.current) setAccessPending(false);
   }, []);
   const recordQuota = useCallback((quota: AiStatus["quota"]) => {
+    const current = quotaSample.current?.quota;
+    if (current?.checkedAt !== undefined && quota.checkedAt !== undefined && quota.checkedAt < current.checkedAt)
+      return current;
     quotaSample.current = { quota, receivedAt: performance.now() };
     if (quota.resetsAt > (quota.checkedAt ?? Date.now())) {
       quotaSchedule.current.retry = 0;
       quotaSchedule.current.retryAt = 0;
     }
+    return quota;
   }, []);
   const quotaDelay = useCallback(() => {
     const sample = quotaSample.current;
@@ -268,8 +274,7 @@ export function WritingPanel({
     const request = api<AiStatus>("/api/ai/status")
       .then((value) => {
         if (mounted.current) {
-          recordQuota(value.quota);
-          setStatus(value);
+          setStatus({ ...value, quota: recordQuota(value.quota) });
           setFunding(
             (current) => current ?? value.preference ?? (value.connected && value.chatgptConfigured ? "chatgpt" : null),
           );
@@ -382,6 +387,7 @@ export function WritingPanel({
     controller.current?.abort();
     historyHidden.current = true;
     restoredDraft.current = null;
+    discardedResult.current = null;
     outputBuffer.current = "";
     setResult("");
     setMessages([]);
@@ -430,7 +436,10 @@ export function WritingPanel({
       accessContext.current = { id: accessContext.current.id };
       opening.current = { owner, touch };
       accessOwner.current = owner;
-      if (touch) restoredDraft.current = null;
+      if (touch) {
+        restoredDraft.current = null;
+        discardedResult.current = null;
+      }
       setCheckingAccess(true);
       setAccessPending(true);
       setAccessError("");
@@ -461,14 +470,18 @@ export function WritingPanel({
         const latest = conversation.messages?.at(-1);
         const restored = restoredDraft.current;
         const keepDraft = preserveTarget && matchesRestoredDraft(conversation, restored);
+        const discarded = discardedResult.current;
+        const keepDiscard =
+          preserveTarget && discarded?.conversationId === conversation.id && discarded.latestMessageId === latest?.id;
         if (!keepDraft) restoredDraft.current = null;
+        if (!keepDiscard) discardedResult.current = null;
         if (preserveTarget && (latest?.id !== latestMessageId.current || (restored && !keepDraft))) {
           setTarget(null);
           setResultTarget(null);
         }
         historyHidden.current = false;
         setMessages(conversation.messages ?? []);
-        if (keepDraft) latestMessageId.current = latest?.id ?? "";
+        if (keepDraft || keepDiscard) latestMessageId.current = latest?.id ?? "";
         else showLatest(latest);
         const active =
           latest?.status === "running"
@@ -487,12 +500,13 @@ export function WritingPanel({
               : "Saved result opened. Choose a current insertion location to use it, or generate again from the latest sources.",
           );
         setCheckingAccess(false);
+        if (!touch) setHistoryRefreshVersion((version) => version + 1);
         return true;
       } catch (cause) {
         if (mounted.current && revision === loadRevision.current) {
           const denied = accessFailure(cause);
-          if (touch) setError(apiErrorMessage(cause, "The conversation could not be opened."));
-          else if (!denied)
+          if (touch && !denied) setError(apiErrorMessage(cause, "The conversation could not be opened."));
+          else if (!touch && !denied)
             setAccessError(apiErrorMessage(cause, "Conversation access could not be checked. Retrying automatically."));
           if (touch) setCheckingAccess(false);
         }
@@ -556,6 +570,11 @@ export function WritingPanel({
           const wasRemote = !!remoteId.current;
           setLocked(false);
           setUnavailable(false);
+          if (shouldRefresh && (controller.current || operation.current)) {
+            refreshRequested = false;
+            accessGate.current.refresh = false;
+            setHistoryRefreshVersion((version) => version + 1);
+          }
           if (!controller.current) {
             remoteId.current = value.activeGeneration?.messageId ?? null;
             setRemoteGeneration(value.activeGeneration ?? null);
@@ -563,6 +582,8 @@ export function WritingPanel({
               !operation.current &&
               (shouldRefresh || historyHidden.current || (wasRemote && !value.activeGeneration))
             ) {
+              refreshRequested = true;
+              accessGate.current.refresh = true;
               if (await open(threadId, false, true)) {
                 refreshRequested = false;
                 accessGate.current.refresh = false;
@@ -701,14 +722,15 @@ export function WritingPanel({
         if (!mounted.current || revision !== loadRevision.current || abort.signal.aborted) return;
         if (event.type === "start") {
           started = true;
+          discardedResult.current = null;
           savedThread = event.conversationId;
           if (accessContext.current.id !== event.conversationId) accessContext.current = { id: event.conversationId };
           setThreadId(event.conversationId);
           setMessageId(event.messageId);
           latestMessageId.current = event.messageId;
           setResultSources(event.sources);
-          recordQuota(event.quota);
-          setStatus((current) => (current ? { ...current, quota: event.quota } : null));
+          const quota = recordQuota(event.quota);
+          setStatus((current) => (current ? { ...current, quota } : null));
           if (event.changedPageIds.length) setNotice("Some sources changed. This result uses their latest contents.");
         } else if (event.type === "delta") {
           outputBuffer.current += event.text;
@@ -719,23 +741,15 @@ export function WritingPanel({
           setResultState(event.type === "complete" ? "complete" : "partial");
           if (event.type === "error") {
             terminalFailure = true;
-            setError(event.message);
-            if (event.status === 401) {
-              denied = true;
-              clearPrivateContent();
-            }
-            if (event.code === "conversation_locked") {
-              denied = true;
-              setLocked(true);
-              clearPrivateContent();
-            }
+            denied = accessFailure(new ApiClientError(event.status ?? 500, event.code, event.message));
+            if (!denied) setError(event.message);
           }
         }
       });
     } catch (cause) {
       if (mounted.current && revision === loadRevision.current && !abort.signal.aborted) {
         denied = accessFailure(cause);
-        setError(apiErrorMessage(cause, "Generation failed. Retry explicitly."));
+        if (!denied) setError(apiErrorMessage(cause, "Generation failed. Retry explicitly."));
       }
     } finally {
       activeId.current = null;
@@ -758,7 +772,7 @@ export function WritingPanel({
               complete: previous.state === "complete",
               sources: previous.sources,
             };
-          } else {
+          } else if (!started) {
             restoredDraft.current = previous.restored;
             latestMessageId.current = previous.latestMessageId;
           }
@@ -778,9 +792,16 @@ export function WritingPanel({
                 clearPrivateContent();
               } else {
                 setMessages(conversation.messages ?? []);
-                if (restoredDraft.current && !matchesRestoredDraft(conversation, restoredDraft.current)) {
+                setHistoryRefreshVersion((version) => version + 1);
+                const latest = conversation.messages?.at(-1);
+                const discarded = discardedResult.current;
+                if (
+                  (restoredDraft.current && !matchesRestoredDraft(conversation, restoredDraft.current)) ||
+                  (discarded &&
+                    (discarded.conversationId !== conversation.id || discarded.latestMessageId !== latest?.id))
+                ) {
                   restoredDraft.current = null;
-                  const latest = conversation.messages?.at(-1);
+                  discardedResult.current = null;
                   showLatest(latest);
                   setTarget(null);
                   setResultTarget(null);
@@ -837,12 +858,12 @@ export function WritingPanel({
       setTarget(null);
     } catch (cause) {
       if (mounted.current && revision === loadRevision.current) {
-        accessFailure(cause);
-        setError(
-          cause instanceof WritingTargetError
-            ? cause.message
-            : apiErrorMessage(cause, "The result could not be applied."),
-        );
+        if (!accessFailure(cause))
+          setError(
+            cause instanceof WritingTargetError
+              ? cause.message
+              : apiErrorMessage(cause, "The result could not be applied."),
+          );
       }
     } finally {
       operation.current = null;
@@ -1080,6 +1101,9 @@ export function WritingPanel({
                   onClick={() => {
                     if (operation.current || remoteId.current) return;
                     restoredDraft.current = null;
+                    discardedResult.current = threadId
+                      ? { conversationId: threadId, latestMessageId: latestMessageId.current }
+                      : null;
                     outputBuffer.current = "";
                     setResult("");
                     setResultState("empty");
@@ -1122,6 +1146,7 @@ export function WritingPanel({
             opening.current = null;
             accessOwner.current = null;
             restoredDraft.current = null;
+            discardedResult.current = null;
             accessGate.current.refresh = false;
             setCheckingAccess(false);
             setAccessPending(false);
@@ -1153,7 +1178,11 @@ export function WritingPanel({
       </div>
       {historyOpen && !locked && !unavailable && (
         <div hidden={checkingAccess}>
-          <WritingHistory pageId={pageId} onOpen={(conversation) => void open(conversation.id)} />
+          <WritingHistory
+            pageId={pageId}
+            refreshVersion={historyRefreshVersion}
+            onOpen={(conversation) => void open(conversation.id)}
+          />
         </div>
       )}
     </aside>

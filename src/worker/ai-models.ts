@@ -3,7 +3,7 @@ import { AI_MAX_CHARACTERS, type AiFunding } from "../shared/ai";
 import { HttpError, sha256 } from "./http";
 
 type ProviderModel = { id: string; maxCharacters: number; contextTokens: number | undefined };
-const catalogCache = new Map<string, { expiresAt: number; models?: ProviderModel[] }>();
+const catalogCache = new Map<string, { expiresAt: number; pending: number; models?: ProviderModel[] }>();
 const TTL = 60_000;
 const apiCatalog = z.object({ data: z.array(z.object({ id: z.string().min(1) })) });
 const chatgptCatalog = z.object({
@@ -30,17 +30,23 @@ export async function providerModels(workspaceId: string, token: string, funding
   if (entry?.models) return entry.models;
   if (!entry) {
     if (catalogCache.size >= 128) catalogCache.delete(catalogCache.keys().next().value!);
-    entry = { expiresAt: 0 };
+    entry = { expiresAt: 0, pending: 0 };
     catalogCache.set(key, entry);
   }
   // Fetches belong to the calling Worker request. Share only their parsed results.
-  const models = await fetchModels(token, funding);
-  // Eviction and invalidation retire the object, even if this key is recreated.
-  if (catalogCache.get(key) === entry && (!entry.models || entry.expiresAt <= Date.now())) {
-    entry.expiresAt = Date.now() + TTL;
-    entry.models = models;
+  entry.pending++;
+  try {
+    const models = await fetchModels(token, funding);
+    // Eviction and invalidation retire the object, even if this key is recreated.
+    if (catalogCache.get(key) === entry && (!entry.models || entry.expiresAt <= Date.now())) {
+      entry.expiresAt = Date.now() + TTL;
+      entry.models = models;
+    }
+    return models;
+  } finally {
+    entry.pending--;
+    if (catalogCache.get(key) === entry && !entry.pending && !entry.models) catalogCache.delete(key);
   }
-  return models;
 }
 async function fetchModels(token: string, funding: AiFunding): Promise<ProviderModel[]> {
   let response: Response;

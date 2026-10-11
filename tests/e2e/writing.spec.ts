@@ -153,6 +153,19 @@ test("writing streams into a read-only preview, applies with undo, preserves con
   await expect(editor).toContainText("Original writing source.");
   await page.getByRole("button", { name: "Page actions", exact: true }).click();
   await page.locator(".action-menu-portal").getByRole("button", { name: "Writing", exact: true }).click();
+  await writing.getByRole("button", { name: "Discard", exact: true }).click();
+  await Promise.all([
+    page.waitForResponse((response) => new URL(response.url()).pathname === `/api/ai/conversations/${saved!.id}`),
+    page.evaluate(() => window.dispatchEvent(new Event("focus"))),
+  ]);
+  await expect(writing.getByText("Checking conversation access…", { exact: true })).not.toBeVisible();
+  await expect(writing.locator(':scope > [aria-label="Writing result"]')).toHaveCount(0);
+  await expect(writing.getByRole("button", { name: "Copy", exact: true })).toHaveCount(0);
+  await writing.getByRole("button", { name: "Close writing" }).click();
+  await page.getByRole("button", { name: "Page actions", exact: true }).click();
+  await page.locator(".action-menu-portal").getByRole("button", { name: "Writing", exact: true }).click();
+  await expect(writing.getByRole("button", { name: "Document writing history", exact: true })).toBeEnabled();
+  await expect(writing.locator(':scope > [aria-label="Writing result"]')).toHaveCount(0);
   await writing.getByRole("button", { name: "New conversation", exact: true }).click();
   await expect
     .poll(async () => JSON.stringify(await (await page.request.get(`/api/pages/${document.id}/content`)).json()))
