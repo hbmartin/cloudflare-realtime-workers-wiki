@@ -12,10 +12,12 @@ function item(id: string, title = id, locked = false): AiConversation {
 }
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((complete) => {
+  let reject!: (cause: unknown) => void;
+  const promise = new Promise<T>((complete, fail) => {
     resolve = complete;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 async function settle() {
   await act(async () => vi.advanceTimersByTimeAsync(200));
@@ -180,5 +182,125 @@ describe("writing history refresh", () => {
     expect(new URL(String(mocks.api.mock.calls[4]![0]), "https://example.test").searchParams.get("pageId")).toBe(
       "other",
     );
+  });
+});
+
+describe("writing history deletion", () => {
+  it.each(["refresh", "query", "document"])(
+    "reconciles a late deletion with the current list after %s",
+    async (boundary) => {
+      const deleted = deferred<{ ok: boolean }>();
+      const obsolete = deferred<HistoryPage>();
+      let committed = false,
+        reads = 0;
+      mocks.api.mockImplementation((_path: string, options?: RequestInit) => {
+        if (options?.method === "DELETE") return deleted.promise;
+        reads++;
+        if (reads === 2) return obsolete.promise;
+        return Promise.resolve({
+          conversations: committed ? [item("retained")] : [item("to-delete"), item("retained")],
+          nextCursor: null,
+        });
+      });
+      const onOpen = vi.fn();
+      const view = render(<WritingHistory pageId="doc" onOpen={onOpen} />);
+      await settle();
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Delete to-delete" })));
+      expect(mocks.api.mock.calls[1]![1]).toEqual({ method: "DELETE" });
+      expect(screen.getByRole("button", { name: "Delete retained" })).toBeDisabled();
+      if (boundary === "query") fireEvent.change(screen.getByRole("searchbox"), { target: { value: "new query" } });
+      else
+        view.rerender(
+          <WritingHistory pageId={boundary === "document" ? "other" : "doc"} onOpen={onOpen} refreshVersion={1} />,
+        );
+      await settle();
+      const obsoleteSignal = (mocks.api.mock.calls[2]![1] as RequestInit).signal!;
+      committed = true;
+      await act(async () => deleted.resolve({ ok: true }));
+      expect(obsoleteSignal.aborted).toBe(true);
+      const current = new URL(String(mocks.api.mock.calls.at(-1)![0]), "https://example.test");
+      expect(current.searchParams.get("q")).toBe(boundary === "query" ? "new query" : "");
+      expect(current.searchParams.get("pageId")).toBe(boundary === "document" ? "other" : "doc");
+      await act(async () => obsolete.resolve({ conversations: [item("to-delete")], nextCursor: null }));
+      expect(screen.queryByRole("button", { name: "to-delete" })).toBeNull();
+      expect(screen.getByRole("button", { name: "retained" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "Delete retained" })).toBeEnabled();
+      expect(screen.queryByText("Loading conversations…")).toBeNull();
+      expect(reads).toBe(3);
+    },
+  );
+
+  it("retains loaded depth and blocks pagination and repeat deletes until deletion settles", async () => {
+    const deleted = deferred<{ ok: boolean }>();
+    let committed = false;
+    mocks.api.mockImplementation(async (path: string, options?: RequestInit) => {
+      if (options?.method === "DELETE") return deleted.promise;
+      const cursor = new URL(path, "https://example.test").searchParams.get("cursor");
+      return {
+        conversations: committed ? [item(cursor ? "second" : "first")] : [item(cursor ? "second" : "to-delete")],
+        nextCursor: cursor ? "third" : "second",
+      };
+    });
+    render(<WritingHistory onOpen={vi.fn()} />);
+    await settle();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Load more conversations" })));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Delete to-delete" })));
+    expect(screen.getByRole("button", { name: "Load more conversations" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Delete second" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Delete second" }));
+    fireEvent.click(screen.getByRole("button", { name: "Load more conversations" }));
+    expect(mocks.api).toHaveBeenCalledTimes(3);
+    committed = true;
+    await act(async () => deleted.resolve({ ok: true }));
+    expect(screen.getByRole("button", { name: "first" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "second" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Load more conversations" })).toBeEnabled();
+    expect(mocks.api).toHaveBeenCalledTimes(5);
+  });
+
+  it("keeps deletion failure visible through concurrent and subsequent list reads", async () => {
+    const deleted = deferred<{ ok: boolean }>();
+    const refreshed = deferred<HistoryPage>();
+    let reads = 0;
+    mocks.api.mockImplementation((_path: string, options?: RequestInit) => {
+      if (options?.method === "DELETE") return deleted.promise;
+      return ++reads === 2
+        ? refreshed.promise
+        : Promise.resolve({ conversations: [item("retained")], nextCursor: null });
+    });
+    const onOpen = vi.fn();
+    const view = render(<WritingHistory onOpen={onOpen} />);
+    await settle();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Delete retained" })));
+    view.rerender(<WritingHistory onOpen={onOpen} refreshVersion={1} />);
+    await settle();
+    await act(async () => deleted.reject(new TypeError("Deletion failed")));
+    await act(async () => refreshed.resolve({ conversations: [item("retained")], nextCursor: null }));
+    expect(screen.getByRole("alert")).toHaveTextContent("History could not be deleted.");
+    view.rerender(<WritingHistory onOpen={onOpen} refreshVersion={2} />);
+    await settle();
+    expect(screen.getByRole("alert")).toHaveTextContent("History could not be deleted.");
+    mocks.api.mockResolvedValue({ conversations: [], nextCursor: null });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Delete retained" })));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByText("No conversations found.")).toBeVisible();
+  });
+
+  it.each(["success", "failure"])("does not reload after an unmounted deletion settles with %s", async (outcome) => {
+    const deleted = deferred<{ ok: boolean }>();
+    mocks.api.mockImplementation((_path: string, options?: RequestInit) =>
+      options?.method === "DELETE"
+        ? deleted.promise
+        : Promise.resolve({ conversations: [item("to-delete")], nextCursor: null }),
+    );
+    const view = render(<WritingHistory onOpen={vi.fn()} />);
+    await settle();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Delete to-delete" })));
+    view.unmount();
+    await act(async () =>
+      outcome === "success" ? deleted.resolve({ ok: true }) : deleted.reject(new TypeError("Deletion failed")),
+    );
+    expect(mocks.api).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

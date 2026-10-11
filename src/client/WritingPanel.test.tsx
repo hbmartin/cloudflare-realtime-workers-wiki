@@ -874,11 +874,13 @@ describe("writing UI", () => {
       const original = mocks.api.getMockImplementation()!,
         now = Date.now(),
         older = deferred<AiStatus>(),
+        fresh = deferred<AiStatus>(),
         done = deferred<void>();
       let reads = 0;
       mocks.api.mockImplementation((path: string, options?: RequestInit) => {
         if (path !== "/api/ai/status") return original(path, options);
         if (++reads === 2) return older.promise;
+        if (reads === 3) return fresh.promise;
         return Promise.resolve({
           ...status,
           preference: "api",
@@ -924,11 +926,17 @@ describe("writing UI", () => {
       expect(
         screen.getByRole("button", { name: phase === "completed" ? "Generate" : "Cancel generation" }),
       ).toHaveProperty("disabled", phase === "completed");
-      expect(reads).toBe(2);
+      expect(reads).toBe(phase === "completed" ? 3 : 2);
       await act(async () => vi.advanceTimersByTimeAsync(399));
-      expect(reads).toBe(2);
+      expect(reads).toBe(phase === "completed" ? 3 : 2);
       await act(async () => vi.advanceTimersByTimeAsync(1));
       expect(reads).toBe(3);
+      await act(async () =>
+        fresh.resolve({
+          ...status,
+          quota: { ...status.quota, remaining: 20, checkedAt: Date.now(), resetsAt: Date.now() + 86400000 },
+        }),
+      );
       expect(screen.getByText(/^20 of 20 API requests remaining/)).toBeVisible();
       await act(async () => done.resolve());
     },
@@ -2343,5 +2351,390 @@ describe("writing UI", () => {
     expect(await screen.findByText("Connected: member@example.test")).toBeVisible();
     expect(screen.queryByText("Workspace writing controls")).toBeNull();
     expect(screen.queryByLabelText(/key/i)).toBeNull();
+  });
+});
+
+describe("writing synchronization races", () => {
+  it.each(["visible", "hidden"])(
+    "retains remote completion during apply and retries its history read while %s",
+    async (visibility) => {
+      const view = await completedPanel();
+      vi.useFakeTimers();
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+      const original = mocks.api.getMockImplementation()!;
+      const done = deferred<{ contentEpoch: number; protectedBlockIds: string[] }>();
+      const path = `/api/ai/conversations/${view.saved.conversation.id}`;
+      let active = true,
+        reads = 0;
+      mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+        if (url.endsWith("apply-check")) return done.promise;
+        if (url === `${path}/access`)
+          return Promise.resolve({
+            locked: false,
+            activeGeneration: active ? { messageId: "remote-follow-up", createdAt: 1, deadlineAt: 330001 } : null,
+          });
+        if (url === path && ++reads === 1) return Promise.reject(new TypeError("History unavailable"));
+        return original(url, options);
+      });
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Replace" })));
+      await act(async () => vi.advanceTimersByTimeAsync(5000));
+      active = false;
+      view.saved.conversation.messages.push({
+        ...view.saved.conversation.messages[0]!,
+        id: "remote-follow-up",
+        output: "Remote follow-up completed",
+      });
+      await act(async () => vi.advanceTimersByTimeAsync(5000));
+      expect(reads).toBe(0);
+      if (visibility === "hidden")
+        await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+      await act(async () => done.resolve({ contentEpoch: 1, protectedBlockIds: [] }));
+      expect(view.apply).toHaveBeenCalledTimes(1);
+      if (visibility === "hidden") await act(async () => vi.advanceTimersByTimeAsync(15000));
+      expect(reads).toBe(visibility === "hidden" ? 0 : 1);
+      if (visibility === "hidden") {
+        await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+      }
+      expect(reads).toBe(1);
+      expect(screen.getByText("Conversation access is unverified.")).toBeVisible();
+      await act(async () => vi.advanceTimersByTimeAsync(5000));
+      expect(reads).toBe(2);
+      expect(view.preview()).toHaveTextContent("Remote follow-up completed");
+      expect(screen.queryByRole("alert")).toBeNull();
+      await act(async () => vi.advanceTimersByTimeAsync(10000));
+      expect(reads).toBe(2);
+    },
+  );
+
+  it.each(["success", "failure"])(
+    "retires an old passive reload after a conversation switch even on late %s",
+    async (outcome) => {
+      const view = await completedPanel();
+      vi.useFakeTimers();
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+      const original = mocks.api.getMockImplementation()!;
+      const stale = deferred<ReturnType<typeof savedConversation>>();
+      const fresh = deferred<ReturnType<typeof savedConversation>>();
+      const next = savedConversation("New conversation output");
+      next.conversation.id = "new-conversation";
+      let extraReads = 0;
+      mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+        if (url === `/api/ai/conversations/${view.saved.conversation.id}`) return stale.promise;
+        if (url === "/api/ai/conversations/new-conversation/open") return Promise.resolve(next);
+        if (url === "/api/ai/conversations/new-conversation/access")
+          return Promise.resolve({ locked: false, activeGeneration: null });
+        if (url === "/api/ai/conversations/new-conversation") {
+          extraReads++;
+          return fresh.promise;
+        }
+        return original(url, options);
+      });
+      await act(async () => fireEvent(window, new Event("focus")));
+      await act(async () =>
+        view.rerender(
+          <WritingPanel
+            {...view.props}
+            launchRequest={{ id: "switch", pageId: "doc", conversationId: "new-conversation" }}
+          />,
+        ),
+      );
+      expect(extraReads).toBe(0);
+      expect(view.preview()).toHaveTextContent("New conversation output");
+      expect(screen.queryByText("Checking conversation access…")).toBeNull();
+      await act(async () => fireEvent(window, new Event("focus")));
+      expect(extraReads).toBe(1);
+      await act(async () =>
+        outcome === "success" ? stale.resolve(view.saved) : stale.reject(new TypeError("Old history failed")),
+      );
+      expect(screen.getByText("Checking conversation access…")).toBeVisible();
+      expect(view.preview()).toBeNull();
+      await act(async () => fresh.resolve(next));
+      expect(view.preview()).toHaveTextContent("New conversation output");
+      expect(screen.queryByRole("alert")).toBeNull();
+      await act(async () => vi.advanceTimersByTimeAsync(10000));
+      expect(extraReads).toBe(1);
+    },
+  );
+
+  it.each(["discard", "restored"])(
+    "preserves a %s override through failed explicit open and focus/reveal",
+    async (override) => {
+      const view = override === "restored" ? await restoredPanel() : await completedPanel();
+      const original = mocks.api.getMockImplementation()!;
+      if (override === "discard") fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+      mocks.api.mockImplementation((url: string, options?: RequestInit) =>
+        url.endsWith("/open") ? Promise.reject(new TypeError("Open failed")) : original(url, options),
+      );
+      const props = {
+        ...view.props,
+        launchRequest: { id: "failed-switch", pageId: "doc", conversationId: "other-conversation" },
+      };
+      await act(async () => view.rerender(<WritingPanel {...props} />));
+      expect(screen.getByRole("alert")).toHaveTextContent("The conversation could not be opened.");
+      await act(async () => fireEvent(window, new Event("focus")));
+      await act(async () => view.rerender(<WritingPanel {...props} visible={false} />));
+      await act(async () => view.rerender(<WritingPanel {...props} visible />));
+      expect(view.preview()?.textContent ?? "").toMatch(override === "discard" ? /^$/ : /Improved writing/);
+      const replace = screen.queryByRole<HTMLButtonElement>("button", { name: "Replace" });
+      expect(replace === null || replace.disabled).toBe(override === "discard");
+      if (replace) await act(async () => fireEvent.click(replace));
+      expect(view.apply.mock.calls).toEqual(
+        override === "discard" ? [] : [[target, "# Improved writing\n\nClear **result**.", "replace", 1, new Set()]],
+      );
+      expect(mocks.api.mock.calls.some(([url]) => url === "/api/ai/results/message/apply-check")).toBe(
+        override === "restored",
+      );
+    },
+  );
+
+  it.each(["complete", "empty-failure"])(
+    "retries terminal history failures without blocking a %s live result",
+    async (outcome) => {
+      const view = await completedPanel();
+      vi.useFakeTimers();
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+      const original = mocks.api.getMockImplementation()!;
+      const done = deferred<void>();
+      let reads = 0;
+      mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+        if (url === `/api/ai/conversations/${view.saved.conversation.id}` && ++reads <= 2)
+          return Promise.reject(new TypeError("History timed out"));
+        return original(url, options);
+      });
+      mocks.stream.mockImplementationOnce(
+        async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+          emit({
+            type: "start",
+            conversationId: view.saved.conversation.id,
+            messageId: "follow-up",
+            sources: [source],
+            changedPageIds: [],
+            canApply: true,
+            quota: status.quota,
+          });
+          if (outcome === "complete") emit({ type: "delta", text: "Successful live follow-up" });
+          await done.promise;
+          if (outcome === "complete") emit({ type: "complete" });
+          else emit({ type: "error", status: 503, code: "ai_provider_rejected", message: "Empty follow-up failed" });
+        },
+      );
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+      await act(async () => fireEvent(window, new Event("focus")));
+      expect(reads).toBe(0);
+      view.saved.conversation.messages.push({
+        ...view.saved.conversation.messages[0]!,
+        id: "follow-up",
+        output: outcome === "complete" ? "Successful live follow-up" : "",
+        status: outcome === "complete" ? "complete" : "failed",
+      });
+      await act(async () => done.resolve());
+      const expected = outcome === "complete" ? "Successful live follow-up" : "Improved writing";
+      expect(view.preview()).toHaveTextContent(expected);
+      expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled();
+      expect(screen.queryByText("Checking conversation access…")).toBeNull();
+      expect(reads).toBe(1);
+      await act(async () => vi.advanceTimersByTimeAsync(5000));
+      expect(reads).toBe(2);
+      expect(view.preview()).toHaveTextContent(expected);
+      expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled();
+      await act(async () => vi.advanceTimersByTimeAsync(5000));
+      expect(reads).toBe(3);
+      expect(screen.getByText("Conversation (2 requests)")).toBeVisible();
+      expect(view.preview()).toHaveTextContent(expected);
+      expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled();
+      fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+      await act(async () => vi.advanceTimersByTimeAsync(10000));
+      expect(reads).toBe(3);
+      expect(view.preview()).toBeNull();
+    },
+  );
+
+  it("keeps access polling and rejects a late history response after denial during a slow terminal read", async () => {
+    const view = await completedPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    const history = deferred<ReturnType<typeof savedConversation>>();
+    let reads = 0,
+      accessReads = 0,
+      denied = false;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === `/api/ai/conversations/${view.saved.conversation.id}`) {
+        reads++;
+        return history.promise;
+      }
+      if (url.endsWith("/access")) {
+        accessReads++;
+        return Promise.resolve({ locked: denied, activeGeneration: null });
+      }
+      return original(url, options);
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    await act(async () => vi.advanceTimersByTimeAsync(15000));
+    expect(reads).toBe(1);
+    expect(accessReads).toBe(3);
+    expect(view.preview()).toHaveTextContent("Improved writing");
+    expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled();
+    denied = true;
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(view.preview()).toBeNull();
+    await act(async () => history.resolve(savedConversation("Private obsolete history")));
+    expect(screen.queryByText("Private obsolete history")).toBeNull();
+    expect(screen.getByText(/conversation is locked/)).toBeVisible();
+  });
+
+  it("preserves pending local history across a failed explicit open and ignores the superseded read", async () => {
+    const view = await completedPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    const stale = deferred<ReturnType<typeof savedConversation>>();
+    let reads = 0;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+      if (url.endsWith("/other/open")) return Promise.reject(new TypeError("Open failed"));
+      if (url === `/api/ai/conversations/${view.saved.conversation.id}` && ++reads === 1) return stale.promise;
+      return original(url, options);
+    });
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    await act(async () =>
+      view.rerender(
+        <WritingPanel {...view.props} launchRequest={{ id: "failed-open", pageId: "doc", conversationId: "other" }} />,
+      ),
+    );
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(reads).toBe(2);
+    expect(view.preview()).toHaveTextContent("Improved writing");
+    await act(async () => stale.resolve(savedConversation("Obsolete history")));
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(reads).toBe(2);
+    expect(screen.queryByText("Obsolete history")).toBeNull();
+  });
+
+  it("retains failed terminal synchronization while hidden and resumes it on reveal", async () => {
+    const view = await completedPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    let reads = 0;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) =>
+      url === `/api/ai/conversations/${view.saved.conversation.id}` && ++reads === 1
+        ? Promise.reject(new TypeError("History unavailable"))
+        : original(url, options),
+    );
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => vi.advanceTimersByTimeAsync(15000));
+    expect(reads).toBe(1);
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    expect(reads).toBe(2);
+    expect(view.preview()).toHaveTextContent("Improved writing");
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(reads).toBe(2);
+  });
+
+  it.each(["equal", "greater", "legacy", "failure"])(
+    "fences a pre-reservation status with %s timestamp/outcome and fetches a fresh refund sample",
+    async (ordering) => {
+      vi.useFakeTimers();
+      const original = mocks.api.getMockImplementation()!,
+        now = Date.now();
+      const older = deferred<AiStatus>(),
+        fresh = deferred<AiStatus>(),
+        done = deferred<void>();
+      let reads = 0;
+      const available: AiStatus = {
+        ...status,
+        preference: "api",
+        quota: { ...status.quota, remaining: 1, checkedAt: now, resetsAt: now + 86400000 },
+      };
+      mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+        if (url !== "/api/ai/status") return original(url, options);
+        reads++;
+        if (reads === 1) return Promise.resolve(available);
+        return reads === 2 ? older.promise : fresh.promise;
+      });
+      mocks.stream.mockImplementationOnce(
+        async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+          emit({
+            type: "start",
+            conversationId: "11111111-1111-4111-8111-111111111111",
+            messageId: "last-request",
+            sources: [source],
+            changedPageIds: [],
+            canApply: true,
+            quota: { ...available.quota, remaining: 0 },
+          });
+          emit({ type: "delta", text: "Last allowed result" });
+          await done.promise;
+          emit({ type: "error", status: 429, code: "ai_provider_rejected", message: "Request refunded" });
+        },
+      );
+      await act(async () => panel());
+      await act(async () => fireEvent(window, new Event("focus")));
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate" })));
+      await act(async () => fireEvent(window, new Event("focus")));
+      await act(async () => done.resolve());
+      if (ordering === "failure") await act(async () => older.reject(new TypeError("Status failed")));
+      else
+        await act(async () =>
+          older.resolve({
+            ...available,
+            connected: false,
+            quota: {
+              ...available.quota,
+              checkedAt: ordering === "legacy" ? undefined : now + (ordering === "greater" ? 1000 : 0),
+            },
+          }),
+        );
+      expect(reads).toBe(3);
+      expect(screen.getByText(/^0 of 20 API requests remaining/)).toBeVisible();
+      expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
+      expect(screen.getByRole("radio", { name: "ChatGPT plan" })).toHaveProperty("disabled", ordering !== "failure");
+      await act(async () => fresh.resolve({ ...available, quota: { ...available.quota, checkedAt: now + 2000 } }));
+      expect(reads).toBe(3);
+      expect(screen.getByText(/^1 of 20 API requests remaining/)).toBeVisible();
+      expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled();
+      expect(screen.getByRole("radio", { name: "Workspace API" })).toBeChecked();
+    },
+  );
+});
+
+describe("writing history during apply", () => {
+  it("defers an override-changing saved result until an in-flight apply finishes", async () => {
+    const view = await restoredPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    const history = deferred<ReturnType<typeof savedConversation>>();
+    const applied = deferred<{ contentEpoch: number; protectedBlockIds: string[] }>();
+    const saved = savedConversation("New server result");
+    let reads = 0;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+      if (url.endsWith("apply-check")) return applied.promise;
+      if (url === `/api/ai/conversations/${view.saved.conversation.id}`)
+        return ++reads === 1 ? history.promise : Promise.resolve(saved);
+      return original(url, options);
+    });
+    // A pre-start failure preserves the recovered draft and schedules a saved-history read.
+    mocks.stream.mockRejectedValueOnce(new TypeError("Dispatch failed"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Replace" })));
+    await act(async () => history.resolve(saved));
+    expect(reads).toBe(1);
+    expect(view.preview()).toHaveTextContent("Improved writing");
+    expect(view.preview()).not.toHaveTextContent("New server result");
+    await act(async () => applied.resolve({ contentEpoch: 1, protectedBlockIds: [] }));
+    expect(view.apply).toHaveBeenCalledWith(target, "# Improved writing\n\nClear **result**.", "replace", 1, new Set());
+    expect(reads).toBe(2);
+    expect(view.preview()).toHaveTextContent("New server result");
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(reads).toBe(2);
   });
 });

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { AiConversation } from "../shared/ai";
 import { api, apiErrorMessage } from "./api";
 
@@ -12,6 +12,8 @@ export function WritingHistory({
   refreshVersion?: number;
 }) {
   const [query, setQuery] = useState("");
+  const [deleting, setDeleting] = useState(false),
+    [deletionError, setDeletionError] = useState("");
   const [history, setHistory] = useState({
     pageId,
     query,
@@ -24,10 +26,12 @@ export function WritingHistory({
   const sameScope = history.pageId === pageId && history.query === query;
   const items = sameScope ? history.items : [],
     cursor = sameScope ? history.cursor : null,
-    error = sameScope ? history.error : "",
-    loading = history.loading || !sameScope || history.refreshVersion !== refreshVersion;
+    error = deletionError || (sameScope ? history.error : ""),
+    loading = deleting || history.loading || !sameScope || history.refreshVersion !== refreshVersion;
   const pagination = useRef({ pageId, query, pages: 1 }),
-    request = useRef<AbortController | null>(null);
+    request = useRef<AbortController | null>(null),
+    deletion = useRef(false),
+    mounted = useRef(true);
   const load = useCallback(
     async (appendCursor?: string) => {
       request.current?.abort();
@@ -35,15 +39,18 @@ export function WritingHistory({
       request.current = controller;
       if (pagination.current.pageId !== pageId || pagination.current.query !== query)
         pagination.current = { pageId, query, pages: 1 };
-      setHistory((current) => ({
-        pageId,
-        query,
-        refreshVersion,
-        items: current.pageId === pageId && current.query === query ? current.items : [],
-        cursor: current.pageId === pageId && current.query === query ? current.cursor : null,
-        error: "",
-        loading: true,
-      }));
+      setHistory((current) => {
+        const keepScope = current.pageId === pageId && current.query === query;
+        return {
+          pageId,
+          query,
+          refreshVersion,
+          items: keepScope ? current.items : [],
+          cursor: keepScope ? current.cursor : null,
+          error: "",
+          loading: true,
+        };
+      });
       try {
         const refreshedItems: AiConversation[] = [];
         let nextCursor = appendCursor ?? null,
@@ -93,6 +100,16 @@ export function WritingHistory({
     },
     [pageId, query, refreshVersion],
   );
+  const latestLoad = useRef(load);
+  useLayoutEffect(() => {
+    latestLoad.current = load;
+  }, [load]);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   useEffect(() => {
     const timer = setTimeout(() => void load(), 200);
     return () => {
@@ -102,22 +119,18 @@ export function WritingHistory({
     };
   }, [load]);
   async function remove(id?: string) {
-    if (loading || request.current) return;
-    const controller = new AbortController();
-    request.current = controller;
-    setHistory((current) => ({ ...current, loading: true }));
+    if (loading || request.current || deletion.current) return;
+    deletion.current = true;
+    setDeleting(true);
+    setDeletionError("");
     try {
-      await api(`/api/ai/conversations${id ? `/${id}` : ""}`, { method: "DELETE", signal: controller.signal });
-      if (controller.signal.aborted) return;
-      await load();
+      await api(`/api/ai/conversations${id ? `/${id}` : ""}`, { method: "DELETE" });
+      if (mounted.current) await latestLoad.current();
     } catch (cause) {
-      if (!controller.signal.aborted)
-        setHistory((current) => ({ ...current, error: apiErrorMessage(cause, "History could not be deleted.") }));
+      if (mounted.current) setDeletionError(apiErrorMessage(cause, "History could not be deleted."));
     } finally {
-      if (request.current === controller) {
-        request.current = null;
-        setHistory((current) => ({ ...current, loading: false }));
-      }
+      deletion.current = false;
+      if (mounted.current) setDeleting(false);
     }
   }
   function more() {
