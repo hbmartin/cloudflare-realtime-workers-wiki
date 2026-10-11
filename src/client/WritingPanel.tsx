@@ -28,6 +28,11 @@ type RestoredDraft = {
   complete: boolean;
   sources: AiMessage["sources"];
 };
+type HistoryRefresh = {
+  conversationId: string;
+  token: symbol;
+  mode: "passive" | "local";
+};
 function matchesRestoredDraft(conversation: AiConversation, restored: RestoredDraft | null) {
   if (!restored || restored.conversationId !== conversation.id) return false;
   const latest = conversation.messages?.at(-1);
@@ -151,14 +156,17 @@ export function WritingPanel({
     visibleRef = useRef(visible),
     handledLaunch = useRef<string | undefined>(undefined),
     loadRevision = useRef(0),
-    statusRequest = useRef<Promise<AiStatus> | null>(null),
+    statusRequest = useRef<{ reservation: number; promise: Promise<AiStatus> } | null>(null),
+    quotaReservation = useRef(0),
     quotaSample = useRef<{ quota: AiStatus["quota"]; receivedAt: number } | null>(null),
     quotaWasActive = useRef<boolean | null>(null),
     quotaSchedule = useRef({ retry: 0, retryAt: 0, request: null as Promise<void> | null }),
     accessContext = useRef<{ id?: string }>({}),
     opening = useRef<{ owner: symbol; touch: boolean } | null>(null),
     accessOwner = useRef<symbol | null>(null),
-    accessGate = useRef({ visible, foreground, refresh: false }),
+    accessGate = useRef({ visible, foreground, verify: false }),
+    pendingHistory = useRef<HistoryRefresh | null>(null),
+    historyRead = useRef<{ revision: number } | null>(null),
     retryAccess = useRef<(() => void) | null>(null),
     restoredDraft = useRef<RestoredDraft | null>(null),
     discardedResult = useRef<{ conversationId: string; latestMessageId: string } | null>(null),
@@ -219,6 +227,11 @@ export function WritingPanel({
       ? sample.quota.resetsAt - Date.now()
       : sample.quota.resetsAt - sample.quota.checkedAt - (performance.now() - sample.receivedAt);
   }, []);
+  const requestHistoryRefresh = useCallback((conversationId: string, mode: HistoryRefresh["mode"]) => {
+    const refresh = { conversationId, token: Symbol("history refresh"), mode };
+    pendingHistory.current = refresh;
+    return refresh;
+  }, []);
   useLayoutEffect(() => {
     visibleRef.current = visible;
     if (visible) flushResult();
@@ -229,7 +242,7 @@ export function WritingPanel({
     const previous = accessGate.current;
     const refresh = !!(visible && foreground && threadId && (!previous.visible || !previous.foreground));
     if (refresh) setCheckingAccess(true);
-    accessGate.current = { visible, foreground, refresh: previous.refresh || refresh };
+    accessGate.current = { visible, foreground, verify: previous.verify || refresh };
   }, [visible, foreground, threadId, flushResult]);
   useEffect(() => {
     if (!visible) return undefined;
@@ -269,24 +282,44 @@ export function WritingPanel({
       setError(apiErrorMessage(cause, "Funding is selected for this request but could not be remembered.")),
     );
   }
-  const refreshStatus = useCallback(() => {
-    if (statusRequest.current) return statusRequest.current;
-    const request = api<AiStatus>("/api/ai/status")
-      .then((value) => {
-        if (mounted.current) {
-          setStatus({ ...value, quota: recordQuota(value.quota) });
-          setFunding(
-            (current) => current ?? value.preference ?? (value.connected && value.chatgptConfigured ? "chatgpt" : null),
-          );
-        }
-        return value;
-      })
-      .finally(() => {
-        if (statusRequest.current === request) statusRequest.current = null;
-      });
-    statusRequest.current = request;
-    return request;
-  }, [recordQuota]);
+  const refreshStatus = useCallback(
+    function requestStatus(): Promise<AiStatus> {
+      const pending = statusRequest.current;
+      if (pending) {
+        if (pending.reservation === quotaReservation.current) return pending.promise;
+        // A terminal refresh must observe any reservation/refund that the older request predates.
+        return pending.promise.then(
+          (value) => (mounted.current ? requestStatus() : value),
+          (cause: unknown) => {
+            if (!mounted.current) throw cause;
+            return requestStatus();
+          },
+        );
+      }
+      const reservation = quotaReservation.current;
+      const request = api<AiStatus>("/api/ai/status")
+        .then((value) => {
+          if (mounted.current) {
+            const quota =
+              reservation === quotaReservation.current
+                ? recordQuota(value.quota)
+                : (quotaSample.current?.quota ?? value.quota);
+            setStatus({ ...value, quota });
+            setFunding(
+              (current) =>
+                current ?? value.preference ?? (value.connected && value.chatgptConfigured ? "chatgpt" : null),
+            );
+          }
+          return value;
+        })
+        .finally(() => {
+          if (statusRequest.current?.promise === request) statusRequest.current = null;
+        });
+      statusRequest.current = { reservation, promise: request };
+      return request;
+    },
+    [recordQuota],
+  );
   const quotaResetsAt = status?.quota.resetsAt;
   useEffect(() => {
     if (quotaResetsAt === undefined) return undefined;
@@ -356,6 +389,8 @@ export function WritingPanel({
       accessContext.current = {};
       opening.current = null;
       accessOwner.current = null;
+      pendingHistory.current = null;
+      historyRead.current = null;
       if (displayTimer.current !== null) clearTimeout(displayTimer.current);
       controller.current?.abort();
       const disposedOperation = activeId.current;
@@ -383,6 +418,9 @@ export function WritingPanel({
     accessContext.current = { id: accessContext.current.id };
     opening.current = null;
     accessOwner.current = null;
+    pendingHistory.current = null;
+    historyRead.current = null;
+    accessGate.current.verify = false;
     setAccessError("");
     controller.current?.abort();
     historyHidden.current = true;
@@ -425,21 +463,67 @@ export function WritingPanel({
     },
     [clearPrivateContent],
   );
+  const syncLocalHistory = useCallback(
+    async (refresh: HistoryRefresh) => {
+      if (
+        operation.current ||
+        opening.current ||
+        accessContext.current.id !== refresh.conversationId ||
+        pendingHistory.current?.token !== refresh.token ||
+        historyRead.current?.revision === loadRevision.current
+      )
+        return;
+      const read = { revision: loadRevision.current };
+      historyRead.current = read;
+      const current = () =>
+        mounted.current && read.revision === loadRevision.current && pendingHistory.current?.token === refresh.token;
+      try {
+        const { conversation } = await api<{ conversation: AiConversation }>(
+          `/api/ai/conversations/${refresh.conversationId}`,
+        );
+        if (!current()) return;
+        if (conversation.locked) {
+          setLocked(true);
+          clearPrivateContent();
+          return;
+        }
+        if (operation.current) return;
+        setMessages(conversation.messages ?? []);
+        setHistoryRefreshVersion((version) => version + 1);
+        const latest = conversation.messages?.at(-1);
+        const discarded = discardedResult.current;
+        if (
+          (restoredDraft.current && !matchesRestoredDraft(conversation, restoredDraft.current)) ||
+          (discarded && (discarded.conversationId !== conversation.id || discarded.latestMessageId !== latest?.id))
+        ) {
+          restoredDraft.current = null;
+          discardedResult.current = null;
+          showLatest(latest);
+          setTarget(null);
+          setResultTarget(null);
+        }
+        pendingHistory.current = null;
+      } catch (cause) {
+        if (current()) accessFailure(cause);
+      } finally {
+        if (historyRead.current === read) historyRead.current = null;
+      }
+    },
+    [accessFailure, clearPrivateContent, showLatest],
+  );
   const open = useCallback(
-    async (id: string, touch = true, preserveTarget = false) => {
+    async (id: string, touch = true, preserveTarget = false, refresh?: HistoryRefresh) => {
       if (operation.current || (touch && remoteId.current)) {
         if (touch) setNotice("Finish or cancel the current operation before changing its source.");
         return false;
       }
+      const pending = touch ? null : (refresh ?? requestHistoryRefresh(id, "passive"));
       const revision = ++loadRevision.current;
       const owner = Symbol("open");
+      historyRead.current = null;
       accessContext.current = { id: accessContext.current.id };
       opening.current = { owner, touch };
       accessOwner.current = owner;
-      if (touch) {
-        restoredDraft.current = null;
-        discardedResult.current = null;
-      }
       setCheckingAccess(true);
       setAccessPending(true);
       setAccessError("");
@@ -448,12 +532,21 @@ export function WritingPanel({
           `/api/ai/conversations/${id}${touch ? "/open" : ""}`,
           touch ? { method: "POST" } : undefined,
         );
-        if (!mounted.current || revision !== loadRevision.current) return false;
+        if (
+          !mounted.current ||
+          revision !== loadRevision.current ||
+          (pending && pendingHistory.current?.token !== pending.token)
+        )
+          return false;
         setLocked(conversation.locked);
         setUnavailable(false);
         accessContext.current = { id: conversation.id };
         setThreadId(conversation.id);
         if (touch) {
+          restoredDraft.current = null;
+          discardedResult.current = null;
+          pendingHistory.current = null;
+          accessGate.current.verify = false;
           setHistoryOpen(false);
           setError("");
         }
@@ -500,10 +593,15 @@ export function WritingPanel({
               : "Saved result opened. Choose a current insertion location to use it, or generate again from the latest sources.",
           );
         setCheckingAccess(false);
+        if (pendingHistory.current?.token === pending?.token) pendingHistory.current = null;
         if (!touch) setHistoryRefreshVersion((version) => version + 1);
         return true;
       } catch (cause) {
-        if (mounted.current && revision === loadRevision.current) {
+        if (
+          mounted.current &&
+          revision === loadRevision.current &&
+          (!pending || pendingHistory.current?.token === pending.token)
+        ) {
           const denied = accessFailure(cause);
           if (touch && !denied) setError(apiErrorMessage(cause, "The conversation could not be opened."));
           else if (!touch && !denied)
@@ -516,8 +614,22 @@ export function WritingPanel({
         finishAccess(owner);
       }
     },
-    [pageId, clearPrivateContent, showLatest, accessFailure, finishAccess],
+    [pageId, clearPrivateContent, showLatest, accessFailure, finishAccess, requestHistoryRefresh],
   );
+  const drainHistory = useCallback(async () => {
+    const refresh = pendingHistory.current;
+    if (
+      !mounted.current ||
+      !refresh ||
+      refresh.conversationId !== accessContext.current.id ||
+      operation.current ||
+      opening.current ||
+      historyRead.current?.revision === loadRevision.current
+    )
+      return;
+    if (refresh.mode === "local") await syncLocalHistory(refresh);
+    else await open(refresh.conversationId, false, true, refresh);
+  }, [open, syncLocalHistory]);
   useEffect(() => {
     const id = launchRequest?.id;
     if (!id || handledLaunch.current === id) return;
@@ -540,14 +652,15 @@ export function WritingPanel({
   useEffect(() => {
     if (!threadId || !visible || !foreground) return undefined;
     const abort = new AbortController();
-    let inFlight = false,
-      refreshRequested = false;
+    let inFlight = false;
     let requestOwner: symbol | null = null;
     const check = async (refresh = false) => {
       if (abort.signal.aborted || opening.current || accessContext.current.id !== threadId) return;
       if (refresh) {
-        refreshRequested = true;
+        accessGate.current.verify = true;
         setCheckingAccess(true);
+        if (operation.current === "generate") requestHistoryRefresh(threadId, "local");
+        else if (!operation.current) requestHistoryRefresh(threadId, "passive");
       }
       if (inFlight || abort.signal.aborted) return;
       inFlight = true;
@@ -562,7 +675,8 @@ export function WritingPanel({
         });
         if (abort.signal.aborted || context !== accessContext.current || opening.current) return;
         setAccessError("");
-        const shouldRefresh = refreshRequested;
+        const shouldRefresh = accessGate.current.verify;
+        accessGate.current.verify = false;
         if (value.locked) {
           setLocked(true);
           clearPrivateContent();
@@ -571,25 +685,21 @@ export function WritingPanel({
           setLocked(false);
           setUnavailable(false);
           if (shouldRefresh && (controller.current || operation.current)) {
-            refreshRequested = false;
-            accessGate.current.refresh = false;
             setHistoryRefreshVersion((version) => version + 1);
           }
           if (!controller.current) {
+            if ((wasRemote && !value.activeGeneration) || historyHidden.current)
+              requestHistoryRefresh(threadId, "passive");
             remoteId.current = value.activeGeneration?.messageId ?? null;
             setRemoteGeneration(value.activeGeneration ?? null);
-            if (
-              !operation.current &&
-              (shouldRefresh || historyHidden.current || (wasRemote && !value.activeGeneration))
-            ) {
-              refreshRequested = true;
-              accessGate.current.refresh = true;
-              if (await open(threadId, false, true)) {
-                refreshRequested = false;
-                accessGate.current.refresh = false;
-              }
+          }
+          if (!operation.current && pendingHistory.current?.conversationId === threadId) {
+            if (pendingHistory.current.mode === "passive") {
+              await drainHistory();
               return;
             }
+            // Keep access polling independent of a slow, non-gating saved-history read.
+            void drainHistory();
           }
         }
         if (!abort.signal.aborted && context === accessContext.current) setCheckingAccess(false);
@@ -606,7 +716,7 @@ export function WritingPanel({
     };
     const retry = () => void check(true);
     retryAccess.current = retry;
-    void check(accessGate.current.refresh);
+    void check(accessGate.current.verify);
     const timer = setInterval(() => void check(), 5000),
       focus = () => void check(true);
     window.addEventListener("focus", focus);
@@ -626,7 +736,16 @@ export function WritingPanel({
         finishAccess(owner);
       }
     };
-  }, [threadId, visible, foreground, open, clearPrivateContent, accessFailure, finishAccess]);
+  }, [
+    threadId,
+    visible,
+    foreground,
+    drainHistory,
+    requestHistoryRefresh,
+    clearPrivateContent,
+    accessFailure,
+    finishAccess,
+  ]);
   function captureSelection() {
     if (operation.current || remoteId.current) return;
     const current = onCapture();
@@ -701,6 +820,7 @@ export function WritingPanel({
     const nextTarget = target?.kind === "page" || !target ? onCapture("page") : target;
     const abort = new AbortController();
     const revision = ++loadRevision.current;
+    historyRead.current = null;
     operation.current = "generate";
     onBusyChange?.(true);
     controller.current = abort;
@@ -722,6 +842,7 @@ export function WritingPanel({
         if (!mounted.current || revision !== loadRevision.current || abort.signal.aborted) return;
         if (event.type === "start") {
           started = true;
+          quotaReservation.current++;
           discardedResult.current = null;
           savedThread = event.conversationId;
           if (accessContext.current.id !== event.conversationId) accessContext.current = { id: event.conversationId };
@@ -783,34 +904,7 @@ export function WritingPanel({
         }
         flushResult();
         void refreshStatus().catch(() => undefined);
-        if (savedThread && !abort.signal.aborted)
-          void api<{ conversation: AiConversation }>(`/api/ai/conversations/${savedThread}`)
-            .then(({ conversation }) => {
-              if (!mounted.current || revision !== loadRevision.current) return;
-              if (conversation.locked) {
-                setLocked(true);
-                clearPrivateContent();
-              } else {
-                setMessages(conversation.messages ?? []);
-                setHistoryRefreshVersion((version) => version + 1);
-                const latest = conversation.messages?.at(-1);
-                const discarded = discardedResult.current;
-                if (
-                  (restoredDraft.current && !matchesRestoredDraft(conversation, restoredDraft.current)) ||
-                  (discarded &&
-                    (discarded.conversationId !== conversation.id || discarded.latestMessageId !== latest?.id))
-                ) {
-                  restoredDraft.current = null;
-                  discardedResult.current = null;
-                  showLatest(latest);
-                  setTarget(null);
-                  setResultTarget(null);
-                }
-              }
-            })
-            .catch((cause) => {
-              if (mounted.current && revision === loadRevision.current) accessFailure(cause);
-            });
+        if (savedThread && !abort.signal.aborted) void syncLocalHistory(requestHistoryRefresh(savedThread, "local"));
       }
     }
   }
@@ -867,8 +961,12 @@ export function WritingPanel({
       }
     } finally {
       operation.current = null;
-      setApplying(false);
-      onBusyChange?.(!!remoteId.current);
+      if (mounted.current) {
+        setApplying(false);
+        onBusyChange?.(!!remoteId.current);
+        if (revision === loadRevision.current && accessGate.current.visible && accessGate.current.foreground)
+          void drainHistory();
+      }
     }
   }
   const currentScope = sources.find((source) => source.pageId === pageId)?.scope;
@@ -1147,7 +1245,9 @@ export function WritingPanel({
             accessOwner.current = null;
             restoredDraft.current = null;
             discardedResult.current = null;
-            accessGate.current.refresh = false;
+            accessGate.current.verify = false;
+            pendingHistory.current = null;
+            historyRead.current = null;
             setCheckingAccess(false);
             setAccessPending(false);
             historyHidden.current = false;
