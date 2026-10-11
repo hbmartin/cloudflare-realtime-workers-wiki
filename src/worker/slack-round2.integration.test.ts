@@ -4022,6 +4022,29 @@ describe("review follow-up permissions and recovery", () => {
     expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(0);
   });
 
+  it("delivers personal comparison sections without escaping their text twice", async () => {
+    await page();
+    await env.DB.prepare(
+      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation,authorization_started_at,verification_method,verified_at,better_auth_account_id,migration_state) VALUES('installation','owner','U123',1,1,0,1,'slack_openid',1,'owner-slack','verified')",
+    ).run();
+    const sections = [
+      "Your daily NoteFlare digest:",
+      "Before: &lt;script&gt;\nAfter: safe\nhttps://notes.test/?page=page&compareFrom=first&compareTo=last".replaceAll(
+        "&compare",
+        "&amp;compare",
+      ),
+    ];
+    await sendPersonalSlackNotification(runtime(), "owner", "workspace", sections.join("\n\n"), "page", {
+      escaped: true,
+      sections,
+    });
+    const post = calls.find((call) => call.method === "chat.postMessage")!;
+    expect(post.body.blocks).toEqual(
+      sections.map((text) => ({ type: "section", text: { type: "mrkdwn", verbatim: true, text } })),
+    );
+    expect(post.body.text).not.toContain("&amp;lt;");
+  });
+
   it("keeps rate-limit backoff on repeated unmute of an active mapping", async () => {
     const m = await mapping("immediate");
     await page();
@@ -7839,4 +7862,53 @@ describe("bounded verified Slack recovery", () => {
     expect((await env.DB.prepare("SELECT * FROM slack_channel_events ORDER BY id").all()).results).toEqual(before);
     expect(calls).toEqual([]);
   });
+});
+
+it.each([false, true])("freezes channel comparison coverage, including legacy inputs (%s)", async (legacy) => {
+  const m = await mapping();
+  await page();
+  const r = await receipt(m.id);
+  const projection = (sequence: number, text: string) =>
+    JSON.stringify({
+      schemaVersion: 1,
+      pageId: "page",
+      contentEpoch: 1,
+      sequence,
+      document: {
+        type: "doc",
+        content: [
+          {
+            type: "blockGroup",
+            content: [
+              {
+                type: "blockContainer",
+                attrs: { id: "stable" },
+                content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+              },
+            ],
+          },
+        ],
+      },
+    });
+  await env.BUCKET.put("comparison-old", projection(0, "Old <message>"));
+  await env.BUCKET.put("comparison-after", projection(1, "New"));
+  await env.DB.prepare(
+    `INSERT INTO page_change_checkpoints(id,page_id,workspace_id,content_epoch,sequence,before_key,before_epoch,before_sequence,after_key,actor_id,created_at) VALUES('page:1:1','page','workspace',1,1,'comparison-old',1,0,'comparison-after','owner',?)`,
+  )
+    .bind(r.window_end - 10)
+    .run();
+  await event(m.id, "page", r.window_end - 10, "page_edit", `page_edit:page:1:1:${m.id}`);
+  if (legacy) await event(m.id, "page", r.window_end - 20, "page_edit", "legacy-edit-without-checkpoint");
+  await deliverDigest(runtime(), r.id);
+  const message = await env.DB.prepare("SELECT comparison_refs_json FROM slack_digest_messages WHERE receipt_id=?")
+    .bind(r.id)
+    .first<{ comparison_refs_json: string }>();
+  expect(JSON.parse(message!.comparison_refs_json)).toEqual({
+    page: legacy ? { first: "", last: "" } : { first: "page:1:1", last: "page:1:1" },
+  });
+  const posted = JSON.stringify(calls.find((call) => call.method === "chat.postMessage")!.body);
+  expect(posted.includes("Comparison unavailable")).toBe(legacy);
+  expect(posted.includes("Before: Old &lt;message&gt;")).toBe(!legacy);
+  expect(posted.includes("After: New")).toBe(!legacy);
+  expect(posted.includes("compareFrom=page%3A1%3A1")).toBe(!legacy);
 });

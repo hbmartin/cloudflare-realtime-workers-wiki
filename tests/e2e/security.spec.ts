@@ -1,12 +1,14 @@
 import { expect, test } from "@playwright/test";
 import { createOTP } from "@better-auth/utils/otp";
 import { base32 } from "@better-auth/utils/base32";
-import { signInOwner } from "./security-helpers";
+import { signInOwner, openNavigation } from "./security-helpers";
 
 test("passkey enrollment, passwordless sign-in, replay rejection, and mandatory user verification", async ({
   page,
   browser,
+  browserName,
 }) => {
+  test.skip(browserName !== "chromium", "Virtual authenticator emulation requires Chromium CDP.");
   test.setTimeout(60_000);
   await signInOwner(page);
   const invitation = await page.request.post("/api/invites", { data: { role: "viewer" } });
@@ -48,6 +50,7 @@ test("passkey enrollment, passwordless sign-in, replay rejection, and mandatory 
   await guest.getByLabel("I saved my recovery codes").check();
   await guest.getByRole("button", { name: "Continue", exact: true }).click();
   await expect(guest.getByRole("heading", { name: "Home", exact: true })).toBeVisible();
+  await openNavigation(guest);
   await guest.getByRole("button", { name: "Sign out", exact: true }).click();
   const assertion = guest.waitForRequest((request) => request.url().endsWith("/passkey/verify-authentication"));
   await guest.getByRole("button", { name: "Sign in with a passkey" }).click();
@@ -62,6 +65,7 @@ test("passkey enrollment, passwordless sign-in, replay rejection, and mandatory 
     data: captured.postDataJSON(),
   });
   expect(wrongAccount.status()).toBe(403);
+  await openNavigation(guest);
   await guest.getByRole("button", { name: "Sign out", exact: true }).click();
   for (const invalidPart of ["origin", "rpId"]) {
     await context.route("**/api/auth/passkey/verify-authentication", async (route) => {

@@ -87,12 +87,11 @@ not only task lists.
 ### Round 2 candidates awaiting selection
 
 These open [IDEAS](../IDEAS.md) items are small or medium, have no dependency on Tracks A and B, and close visible
-gaps. None has a plan yet. Pick the ones to plan as Phases 11 and later:
+gaps. None has a plan yet. Pick the ones to plan as Phases 12 and later:
 
 | Candidate                                      | IDEAS | Why now                                                                                                                 |
 | ---------------------------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------- |
 | Comment reactions                              | #12   | The client still throws `Comment reactions are not enabled.`, and the thread store already models `reactions`           |
-| Copy link to block and deep-link highlight     | #17   | Comment anchors already exist; this pairs with MCP and `/v1` block IDs                                                  |
 | Workspace export and scheduled R2 backups      | #41   | Completes `docs/BACKUP_AND_RECOVERY.md`; per-page export and Workflows already exist                                    |
 | Audit log                                      | #31   | Table stakes for a self-hosted org. OAuth/MCP grants and Slack actions now add actors worth auditing                    |
 | Trash at scale                                 | #34   | Trash offers single-item restore only                                                                                   |
@@ -135,3 +134,9 @@ Historical: this is the baseline the Round 1 plans were written against. Each it
 - `/v1` pinned `2026-03-11` and had no page Markdown routes (Phase 5).
 - Tables were D1-authoritative with five property types and a 60-second lease. This remains true and is Phase 7's
   starting point.
+
+## Document ideas — Phase 11
+
+The approved [document ideas plan](11-document-ideas.md) implements IDEAS #17, #65, and #62 in that release order.
+All three controls are initially off in production. They are implemented in the local checkout; no merged, deployed,
+or shipped status is claimed here. Verification/freshness and workspace export/backups are excluded.

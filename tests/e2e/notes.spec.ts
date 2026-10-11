@@ -45,7 +45,7 @@ function treeLink(page: Page, title: string) {
 
 async function createPage(page: Page, kind: "Document" | "Table" | "Diagram" | "Task List") {
   await openSidebar(page);
-  await page.getByRole("button", { name: /^New page in / }).click();
+  await page.getByRole("button", { name: /^New page in / }).press("Enter");
   await page.getByRole("button", { name: kind, exact: true }).click();
 }
 
@@ -75,9 +75,9 @@ async function acceptInvite(context: BrowserContext, inviteURL: string, role: "e
   await page.getByLabel("Password").fill("password123");
   await page.getByRole("button", { name: "Accept invite" }).click();
   await completeEnrollment(page);
-  await expect(page.getByRole("button", { name: "Home", exact: true })).toBeAttached();
+  await expect(page.getByRole("button", { name: "Home", exact: true, includeHidden: true })).toBeAttached();
   await openSidebar(page);
-  await page.getByRole("treeitem").first().click();
+  await page.getByRole("treeitem").first().press("Enter");
   await expect(page.getByLabel("Page title")).toBeVisible();
   return page;
 }
@@ -119,6 +119,7 @@ test("creates and edits a realtime diagram", async ({ page }) => {
 
 test("opens the Activities tray with keyboard-safe focus and an accessible recent state", async ({ page }) => {
   await signIn(page);
+  await openSidebar(page);
   const trigger = page.getByRole("button", { name: "Imports & exports" });
   await trigger.click();
   const tray = page.getByRole("dialog", { name: "Imports & exports" });
@@ -144,7 +145,9 @@ test("organizes pages with spaces, favorites, pins, and tags", async ({ page }, 
   await expect(switcher).toBeEnabled();
   await expect(switcher).toHaveValue(/.+/);
 
-  await page.getByRole("button", { name: "Favorite" }).click();
+  const favorite = page.getByRole("button", { name: "Favorite", exact: true });
+  if (!(await favorite.isVisible())) await page.getByRole("button", { name: "Page actions", exact: true }).click();
+  await favorite.click();
   await page.getByRole("button", { name: "Page actions", exact: true }).click();
   await page.getByRole("button", { name: "Pin in this space", exact: true }).click();
   await page.getByRole("button", { name: "Page actions", exact: true }).click();
@@ -343,6 +346,7 @@ test("exports and imports Markdown through resumable jobs", async ({ page }) => 
   await expect(exportJob.getByRole("link", { name: "Download" })).toBeVisible();
   await page.keyboard.press("Escape");
 
+  await openSidebar(page);
   await page.getByRole("button", { name: "Import notes", exact: true }).click();
   const importDialog = page.getByRole("dialog", { name: "Import notes" });
   await importDialog.locator('input[type="file"]').setInputFiles({
@@ -369,6 +373,7 @@ test("refreshes an old import preview and imports only after a second confirmati
   const importTitle = `refresh-preview-${Date.now()}`;
   test.skip(Boolean(process.env.NOTES_E2E_BASE_URL), "Requires the isolated local D1 test database.");
   await signIn(page);
+  await openSidebar(page);
   await page.getByRole("button", { name: "Import notes", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Import notes" });
   await dialog.locator('input[type="file"]').setInputFiles({
@@ -485,11 +490,6 @@ test("enforces viewer UI permissions and table edit leases", async ({ browser, p
   } finally {
     await viewerContext.close();
   }
-
-  // "+ Table" is hidden below the 1000px breakpoint, so the lease half of this
-  // scenario has no mobile entry point. The viewer assertions above still run
-  // everywhere; skipping here keeps viewerContext.close() above it.
-  test.skip(testInfo.project.name === "mobile-chromium", "+ Table is hidden at mobile widths");
 
   const editorURL = await createInvite(page, "editor");
   const editorContext = await browser.newContext();

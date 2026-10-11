@@ -1,9 +1,10 @@
 import { expect, test } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { signInOwner } from "./security-helpers";
+import { signInOwner, openNavigation } from "./security-helpers";
 
 test("task values stay consistent across table, board, My Tasks, and locked retries", async ({ page, browser }) => {
   await signInOwner(page);
+  await openNavigation(page);
   await page.getByRole("button", { name: /^New page in / }).click();
   await page.getByRole("button", { name: "Task List", exact: true }).click();
   await expect(page.getByLabel("Page title")).toHaveValue("Untitled tasks");
@@ -29,6 +30,7 @@ test("task values stay consistent across table, board, My Tasks, and locked retr
   try {
     const second = await other.newPage();
     await signInOwner(second);
+    await openNavigation(second);
     await second.getByRole("button", { name: "My Tasks", exact: true }).click();
     await expect(second.getByLabel(`Due date for ${taskTitle}`)).toHaveValue("2026-10-01");
     await second.getByLabel(`Status for ${taskTitle}`).selectOption("done");
@@ -75,6 +77,7 @@ test("finds nested pages by keyboard, creates a child, and resumes after reload"
   await page.getByRole("combobox", { name: "Find a page" }).fill(`Nested 2 ${stamp}`);
   await page.getByRole("combobox", { name: "Find a page" }).press("Enter");
   await expect(page.getByLabel("Page title")).toHaveValue(`Nested 2 ${stamp}`);
+  await openNavigation(page);
   await page.getByRole("button", { name: `Add child to Nested 2 ${stamp}`, exact: true }).click();
   await page.getByRole("button", { name: "Document", exact: true }).click();
   await expect(page.getByLabel("Page title")).toHaveValue("Untitled");
@@ -85,6 +88,7 @@ test("finds nested pages by keyboard, creates a child, and resumes after reload"
   await page.reload();
   await expect(page.getByLabel("Page title")).toHaveValue(`Child ${stamp}`);
   await expect(page.locator(".bn-editor")).toContainText("A useful nested document.");
+  await openNavigation(page);
   await page.getByRole("button", { name: "Home", exact: true }).click();
   await expect(page.getByRole("main").getByRole("button", { name: `Child ${stamp}`, exact: true })).toBeVisible();
 });

@@ -131,9 +131,9 @@ function edgeFromMap(id: string, value: Y.Map<unknown>): DiagramEdge | null {
   };
 }
 
-export function diagramRoots(document: Y.Doc) {
+export function diagramRoots(document: Y.Doc, initialize = true) {
   const meta = document.getMap<unknown>(DIAGRAM_META_ROOT);
-  if (!meta.has("schemaVersion")) meta.set("schemaVersion", DIAGRAM_SCHEMA_VERSION);
+  if (initialize && !meta.has("schemaVersion")) meta.set("schemaVersion", DIAGRAM_SCHEMA_VERSION);
   return {
     meta,
     nodes: document.getMap<Y.Map<unknown>>(DIAGRAM_NODES_ROOT),
@@ -144,8 +144,9 @@ export function diagramRoots(document: Y.Doc) {
 export function diagramFromYDoc(
   document: Y.Doc,
   identity: { pageId: string; contentEpoch: number; sequence?: number },
+  initialize = true,
 ): DiagramContentEnvelope {
-  const { nodes: nodeMap, edges: edgeMap } = diagramRoots(document);
+  const { nodes: nodeMap, edges: edgeMap } = diagramRoots(document, initialize);
   const nodes = [...nodeMap.entries()]
     .filter((entry): entry is [string, Y.Map<unknown>] => entry[1] instanceof Y.Map)
     .map(([id, value]) => nodeFromMap(id, value))

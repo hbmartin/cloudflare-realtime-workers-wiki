@@ -2,6 +2,8 @@ import { renderToString } from "katex";
 import { createReactBlockSpec, createReactInlineContentSpec } from "@blocknote/react";
 import {
   createContext,
+  lazy,
+  Suspense,
   useContext,
   useEffect,
   useId,
@@ -16,6 +18,11 @@ import { resolveEmbed } from "../shared/embed-providers";
 import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import type { Page, SearchTitleSuggestion } from "../shared/types";
 import "katex/dist/katex.min.css";
+
+import { DiagramEmbedContext } from "./diagram-embed-context";
+const LiveDiagramEmbed = lazy(() =>
+  import("./LiveDiagramEmbed").then((module) => ({ default: module.LiveDiagramEmbed })),
+);
 
 const CALLOUT_TONES = ["info", "success", "warning", "danger"] as const;
 export const EmbedFeatureContext = createContext(false);
@@ -630,6 +637,7 @@ export function LinkedDiagramView({
   title: string;
   update?: (page: Pick<Page, "id" | "title">) => void;
 }) {
+  const liveAccount = useContext(DiagramEmbedContext);
   const [choosing, setChoosing] = useState(!pageId && Boolean(update));
   const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<SearchTitleSuggestion[]>([]);
@@ -760,12 +768,18 @@ export function LinkedDiagramView({
 
   return (
     <figure className="editor-linked-diagram" contentEditable={false}>
-      <a href={`/?page=${encodeURIComponent(pageId)}`}>
-        <img src={`/api/pages/${encodeURIComponent(pageId)}/diagram-thumbnail.svg`} alt="" loading="lazy" />
-        <figcaption>
-          <span aria-hidden="true">◇</span> {title || "Linked whiteboard"}
-        </figcaption>
-      </a>
+      {liveAccount ? (
+        <Suspense fallback={<p>Loading diagram…</p>}>
+          <LiveDiagramEmbed key={pageId} account={liveAccount} pageId={pageId} title={title} />
+        </Suspense>
+      ) : (
+        <a href={`/?page=${encodeURIComponent(pageId)}`}>
+          <img src={`/api/pages/${encodeURIComponent(pageId)}/diagram-thumbnail.svg`} alt="" loading="lazy" />
+          <figcaption>
+            <span aria-hidden="true">◇</span> {title || "Linked whiteboard"}
+          </figcaption>
+        </a>
+      )}
       {update && (
         <button type="button" onClick={() => setChoosing(true)}>
           Change

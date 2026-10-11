@@ -2019,6 +2019,15 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     }
   }, [cancelPageAccessRequest, pendingSelectionId]);
 
+  useEffect(() => {
+    const navigate = () => {
+      const id = new URL(window.location.href).searchParams.get("page");
+      if (id && id !== selectedIdRef.current) navigateToPage(id);
+    };
+    window.addEventListener("popstate", navigate);
+    return () => window.removeEventListener("popstate", navigate);
+  }, [navigateToPage, selectedIdRef]);
+
   const recordPageUpserts = useCallback((incoming: Page[]) => {
     pendingPageEvents.current.recordUpserts(incoming);
   }, []);
@@ -2893,7 +2902,10 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const signal = workspaceAbortController.current.signal;
     const bundle = createWorkspaceEvents(
       member.workspace.id,
-      (event) => handleWorkspaceEventRef.current(event),
+      (event) => {
+        window.dispatchEvent(new CustomEvent("notes:workspace-event", { detail: event }));
+        handleWorkspaceEventRef.current(event);
+      },
       () => {
         void loadPages().catch((error) => {
           if (signal.aborted) return;
@@ -3098,6 +3110,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
     const pageId = pendingSelectionId ?? resolvedSelectedId;
     if (view === "pages") url.searchParams.delete("view");
     else url.searchParams.set("view", view);
+    if (url.searchParams.get("page") !== pageId) {
+      if (url.hash.startsWith("#block=")) url.hash = "";
+      url.searchParams.delete("compareFrom");
+      url.searchParams.delete("compareTo");
+    }
     if (pageId) url.searchParams.set("page", pageId);
     else url.searchParams.delete("page");
     if (url.href !== window.location.href) history.replaceState(null, "", url);
@@ -4224,6 +4241,18 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                   </button>
                 )}
                 <ActionMenu label="Page actions">
+                  {!activeSelected.isTemplate && (
+                    <button
+                      className="mobile-favorite-action"
+                      aria-label="Favorite"
+                      aria-pressed={favorites.some((page) => page.id === activeSelected.id)}
+                      disabled={pendingOrganizationAction === `favorite:${activeSelected.id}`}
+                      data-close-menu
+                      onClick={() => void toggleFavorite(activeSelected)}
+                    >
+                      Favorite
+                    </button>
+                  )}
                   {activeSelected.kind === "document" && (
                     <button
                       data-close-menu

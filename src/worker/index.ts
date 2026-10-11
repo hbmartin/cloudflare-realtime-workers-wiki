@@ -1,3 +1,4 @@
+import { readComparison, pruneDocumentChanges } from "./document-changes";
 import { buildTableRowQuery, tableRowBinds, stableTableSnapshot, collectRowCells } from "./table-read";
 import { processDueSlackFileCleanup, slackFileCleanupHealth } from "./slack-file-cleanup";
 import { disconnectSlackIdentity } from "./slack-identity";
@@ -1518,6 +1519,9 @@ app.get("/api/me", async (c) => {
     features: {
       expandedEmbeds: c.env.EXPANDED_EMBEDS_ENABLED === "true",
       offlineEditing: c.env.OFFLINE_EDITING_ENABLED === "true",
+      blockLinks: c.env.BLOCK_LINKS_ENABLED === "true",
+      liveDiagramEmbeds: c.env.LIVE_DIAGRAM_EMBEDS_ENABLED === "true",
+      diffDigests: c.env.DIFF_DIGESTS_ENABLED === "true",
       workspaceActivity: c.env.WORKSPACE_ACTIVITY_ENABLED === "true",
     },
   };
@@ -4848,6 +4852,18 @@ app.get("/api/pages/:id/preview", async (c) => {
   return c.json({ preview: { page: pageJson(row), excerpt: (row.plain_text ?? "").slice(0, 280) } });
 });
 
+app.get("/api/pages/:id/comparison", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  if (c.env.DIFF_DIGESTS_ENABLED !== "true" || page.kind !== "document")
+    throw new HttpError(404, "comparison_disabled", "Document comparisons are not enabled.");
+  const first = text(c.req.query("first"), "first", 200);
+  const last = text(c.req.query("last"), "last", 200);
+  const diff = await readComparison(c.env, page.id, first, last);
+  await pageForMember(c.env, await requireMember(c.req.raw, c.env), page.id);
+  return c.json({ comparison: { first, last, diff } });
+});
+
 app.get("/api/pages/:id/verification", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const row = await pageForMember(c.env, member, c.req.param("id"));
@@ -6754,7 +6770,10 @@ async function handlePartyRequest(request: Request, env: Env) {
       if ((page.kind !== "document" && page.kind !== "diagram") || page.content_epoch !== ids.epoch) {
         throw new HttpError(409, "stale_epoch", "Reload this page to connect to its current document version.");
       }
-      connectionRole = page.effective_role ?? member.role;
+      connectionRole =
+        page.kind === "diagram" && url.searchParams.get("mode") === "read"
+          ? "viewer"
+          : (page.effective_role ?? member.role);
     } else {
       if (!ID_PATTERN.test(candidate) || candidate !== member.workspace.id) throw roomNotFound();
       room = candidate;
@@ -7073,6 +7092,7 @@ export default {
         slack_redrive: () => runSlackMaintenance(env),
         job_artifacts: () => expireJobArtifacts(env),
         notification_digests: () => sendDueNotificationDigests(env),
+        document_changes: () => pruneDocumentChanges(env),
         date_reminders: () => processDueDateReminders(env),
         slack_digests: async () => {
           await dueRound2Digests(env);

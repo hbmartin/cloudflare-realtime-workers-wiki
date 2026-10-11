@@ -1,5 +1,9 @@
 # Product ideas backlog
 
+Items 17, 62, and 65 were implemented locally on 11 October 2026; release evidence is tracked in
+[Phase 11](roadmap/11-document-ideas.md). Verification/freshness (#60) and workspace export/backups (#41)
+remain outside this increment.
+
 Written on 25 September 2026 against a checkout with 34 migrations. Each item's status was last audited on
 **1 October 2026** against `main` at `2ef1450` (migrations through `0065`). Item numbers are stable; cite them as
 `IDEAS #n`.
@@ -17,6 +21,7 @@ code that has since changed, the status note takes precedence.
 | Planned    | 2, 3, 4 (subset), 9 → roadmap Phases 7–8                                                              |
 | Partial    | 1, 3, 10, 14, 18, 19, 20, 23, 26, 27, 38                                                              |
 | Unverified | 22 (BlockNote defaults only)                                                                          |
+| Local      | 17 block links · 62 document diff digests · 65 whole-diagram embeds (not shipped)                     |
 | Open       | Everything else                                                                                       |
 
 Done and partial items came mostly from roadmap Round 1 (#201–#210). The [roadmap README](roadmap/README.md#round-2)
@@ -57,7 +62,7 @@ Each stage is independently shippable and each one is visible to users.
 14. **Page display options (S).** _Status: Partial — full width shipped (migration `0047`). Small text and the page-info popover are open, and `updated_by` is still unused in the UI._ Full-width, small text, and a page-info popover (created by / last edited by / word count / contributors). `updated_by` already exists in schema and is unused in the UI.
 15. **Toggle headings (S).** _Status: Done — provided by BlockNote's default heading spec and slash menu, and probably already present when this was written. Notion import maps `is_toggleable`._ BlockNote supports them; they're a Notion staple for long wiki pages.
 16. **Date mentions and reminders (M).** _Status: Done — #203: `dateMention` tokens, private reminders, and migrations `0057`–`0060`._ No `reminder` exists anywhere. `@tomorrow 9am` inline, backed by a `reminders` table and the existing `*/15` cron + `DELIVERY_QUEUE` + notification preferences. Almost all the plumbing is already built and unused for this.
-17. **Copy link to block + deep-link highlight (S).** _Status: Open — no `#block=` deep links._ Anchoring already exists for comments; reuse the anchor to build `?page=X#block=Y` with a flash highlight on arrival.
+17. **Copy link to block + deep-link highlight (S).** _Status: Implemented locally — private block actions and deep-link highlighting; production flag off, deployed verification pending. See Phase 11._ Anchoring already exists for comments; reuse the anchor to build `?page=X#block=Y` with a flash highlight on arrival.
 18. **Wider embed allowlist (S).** _Status: Partial — #201 added Loom, Google Docs/Sheets/Slides/Drive, Miro, Spotify, and CodePen behind `EXPANDED_EMBEDS_ENABLED` (off in production). Google Maps, Excalidraw, and a generic oEmbed fallback are open._ `allowedEmbedUrl` permits only YouTube, Vimeo, and Figma. Add Loom, Google Docs/Sheets/Slides/Drive, Google Maps, CodePen, Excalidraw, Miro, Spotify, and a generic oEmbed fallback. You already have unfurl infrastructure for Slack — point it inward.
 19. **Smart paste (S).** _Status: Partial — #201 offers Link, Preview card, or Embed when a URL is pasted, with server-fetched cached previews. Smart table and Markdown paste rely on BlockNote defaults._ Paste a URL alone on a line → bookmark block with a server-fetched OG card (reuse the unfurl fetcher, cache in D1). Paste a table → table block. Paste Markdown → parsed blocks.
 20. **Code block polish (S).** _Status: Partial — #201 added Shiki highlighting, a language picker, and a copy button. A wrap toggle is open._ `editorOptions` in `EditorPage.tsx` passes no `codeBlock` config, so there's no highlighter or language picker. Add Shiki lazily, plus a copy button and a wrap toggle.
@@ -124,10 +129,10 @@ These use the architecture as an _advantage_ rather than apologizing for it.
 59. **Automations.** _Status: Open._ "When Status → Done: post to Slack, set Completed date, create a page from template." You already have Queues, Workflows, Slack OAuth, and webhooks — what's missing is a rules table and an evaluator. This is the highest ratio of user-visible power to new infrastructure in the whole list.
 60. **Wiki verification and freshness.** _Status: Open._ Owner + "verified until" date, a badge that decays, auto-unverify on substantive edit, and a stale-page sweep on the cron that's already load-bearing. This is what makes a wiki trustworthy rather than a junk drawer, and Notion charges enterprise money for it.
 61. **Template variables and recurring templates.** _Status: Open._ `{{date}}`, `{{me}}`, `{{parent.title}}`; plus "create a Weekly Sync page every Monday at 9am" driven by the existing cron. Add in-page template buttons.
-62. **The diff digest.** _Status: Open — digests are still roll-ups. See also Slack Milestone 4._ Your weekly email today is a notification roll-up. Make it a _rendered block diff_ of what actually changed in a space — `block-diff.ts` exists and is currently used only for version comparison.
+62. **The diff digest.** _Status: Implemented locally — exact document comparisons in existing daily email and Slack digests, with retained projections and frozen retries; production flag off. See Phase 11._ Your weekly email today is a notification roll-up. Make it a _rendered block diff_ of what actually changed in a space — `block-diff.ts` exists and is currently used only for version comparison.
 63. **Save a Slack thread to the wiki.** _Status: Done — #202: **Save to Notes** and **New page from thread** publish through the verified import workflow._ You have a Slack app with OAuth, slash commands, and access-filtered unfurls. A message action that turns a thread into a page (or a row) closes the loop from chat to knowledge, which is where most wikis die.
 64. **Voice notes → transcript → page** _Status: Open._ via Workers AI Whisper, with the audio kept as an R2 attachment and the transcript as blocks. Meeting notes without a meeting bot.
-65. **Live diagram viewports inside documents.** _Status: Open — `linkedDiagram` is still a picker plus a link._ `linkedDiagram` is a link today; make it a live, synced region of the diagram rendered inline. Two Yjs rooms on one screen is a genuinely novel document experience and you already run both.
+65. **Live diagram viewports inside documents.** _Status: Implemented locally — whole-diagram live embeds with local pan/zoom; production flag off. See Phase 11._ `linkedDiagram` is a link today; make it a live, synced region of the diagram rendered inline. Two Yjs rooms on one screen is a genuinely novel document experience and you already run both.
 66. **Per-page cost and latency HUD.** _Status: Open._ You write to Analytics Engine already. Show operators which pages are hot, which DOs are expensive, which documents approach the 16 MiB warning. A self-hosted app that honestly reports its own unit economics is a distinctive stance — and it makes the accepted limits feel like transparency rather than excuses.
 67. **Semantic "related pages"** _Status: Open._ in the existing `BacklinksPanel`, from the embeddings in #49 — the backlinks panel is currently empty for most pages, which makes it feel broken.
 68. **End-to-end encrypted private spaces.** _Status: Open._ The DO stores only ciphertext Yjs updates; search index lives client-side. It breaks server search and export, so it must be scoped to spaces that opt in — but "the server literally cannot read my private space" is a claim no hosted competitor can make, and self-hosting is exactly the audience that wants it.

@@ -43,6 +43,9 @@ export interface AppBindings {
   EXPANDED_EMBEDS_ENABLED?: "true" | "false";
   NOTION_MARKDOWN_WRITES_ENABLED?: "true" | "false";
   OFFLINE_EDITING_ENABLED?: "true" | "false";
+  BLOCK_LINKS_ENABLED?: "true" | "false";
+  LIVE_DIAGRAM_EMBEDS_ENABLED?: "true" | "false";
+  DIFF_DIGESTS_ENABLED?: "true" | "false";
   WORKSPACE_ACTIVITY_ENABLED?: "true" | "false";
   SLACK_CHANNEL_VALIDATION_ENABLED?: "true" | "false";
   SLACK_SHARE_REFRESH_ENABLED?: "true" | "false";
@@ -62,6 +65,9 @@ declare global {
       | "EXPANDED_EMBEDS_ENABLED"
       | "NOTION_MARKDOWN_WRITES_ENABLED"
       | "OFFLINE_EDITING_ENABLED"
+      | "BLOCK_LINKS_ENABLED"
+      | "LIVE_DIAGRAM_EMBEDS_ENABLED"
+      | "DIFF_DIGESTS_ENABLED"
       | "WORKSPACE_ACTIVITY_ENABLED"
       | "SLACK_CHANNEL_VALIDATION_ENABLED"
       | "SLACK_SHARE_REFRESH_ENABLED"

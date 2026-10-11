@@ -278,11 +278,13 @@ export function createNetworkCollaboration(
   pageId: string,
   epoch: number,
   onStatus: (status: "offline" | "connecting" | "connected") => void,
+  readOnly = false,
 ): NetworkCollaborationBundle {
   const doc = new Y.Doc();
   const provider = new YProvider(window.location.host, `${pageId}~${epoch}`, doc, {
     party: "document",
     connect: false,
+    params: readOnly ? { mode: "read" } : {},
   });
   const durability = new CollaborationDurability();
   let destroyed = false;
@@ -352,7 +354,7 @@ export function createNetworkCollaboration(
     }
   };
   const handleUpdate = (_update: Uint8Array, origin: unknown) => {
-    if (origin === provider) return;
+    if (readOnly || origin === provider) return;
     durability.markChanged();
     barrier.schedule();
   };
