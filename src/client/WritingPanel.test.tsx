@@ -92,12 +92,12 @@ afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
-function panel(editable = true, ready = true) {
+function panel(editable = true, ready = true, initialTarget = target) {
   const apply = vi.fn(),
     capture = vi.fn(() => target);
   const props = {
     pageId: "doc",
-    initialTarget: target,
+    initialTarget,
     onCapture: capture,
     onApply: apply,
     onClose: vi.fn(),
@@ -178,7 +178,306 @@ async function restoredPanel() {
   expect(preview()).toHaveTextContent("Improved writing");
   return { ...view, saved, original, preview };
 }
+async function completedPanel() {
+  const original = mocks.api.getMockImplementation()!;
+  const saved = savedConversation("# Improved writing\n\nClear **result**.");
+  mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+    path === `/api/ai/conversations/${saved.conversation.id}` || path.endsWith("/open")
+      ? Promise.resolve(saved)
+      : original(path, options),
+  );
+  const view = panel();
+  await waitFor(() => expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled());
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate" })));
+  const preview = () => view.container.querySelector('.writing-panel > [aria-label="Writing result"]');
+  expect(preview()).toHaveTextContent("Improved writing");
+  return { ...view, saved, preview };
+}
 describe("writing UI", () => {
+  it.each(["generation", "opening", "application", "stream"])(
+    "reports one authentication alert for a failed %s",
+    async (kind) => {
+      const view = await completedPanel();
+      const original = mocks.api.getMockImplementation()!;
+      const failure = new ApiClientError(401, "challenge_required", "Sign in required");
+      mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+        (kind === "opening" && path.endsWith("/open")) || (kind === "application" && path.endsWith("apply-check"))
+          ? Promise.reject(failure)
+          : original(path, options),
+      );
+      if (kind === "generation") mocks.stream.mockRejectedValueOnce(failure);
+      if (kind === "stream")
+        mocks.stream.mockImplementationOnce(
+          async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+            emit({
+              type: "start",
+              conversationId: view.saved.conversation.id,
+              messageId: "revoked-stream",
+              sources: [source],
+              changedPageIds: [],
+              canApply: true,
+              quota: status.quota,
+            });
+            emit({ type: "error", status: 401, code: "challenge_required", message: "Sign in required" });
+          },
+        );
+      await act(async () => {
+        if (kind === "opening")
+          view.rerender(
+            <WritingPanel
+              {...view.props}
+              launchRequest={{ id: "denied", pageId: "doc", conversationId: view.saved.conversation.id }}
+            />,
+          );
+        else
+          fireEvent.click(
+            screen.getByRole("button", { name: kind === "application" ? "Replace" : "Generate follow-up" }),
+          );
+      });
+      expect(screen.getAllByRole("alert")).toHaveLength(1);
+      expect(screen.getByRole("alert")).toHaveTextContent("Sign in required");
+      expect(view.preview()).toBeNull();
+      expect(view.apply).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["focus", "reveal", "foreground"])(
+    "preserves a discarded result through %s and polling",
+    async (boundary) => {
+      const view = await completedPanel();
+      vi.useFakeTimers();
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+      fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+      await act(async () => {
+        if (boundary === "focus") fireEvent(window, new Event("focus"));
+        else if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible={false} />);
+        else {
+          vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+          fireEvent(document, new Event("visibilitychange"));
+        }
+      });
+      if (boundary !== "focus")
+        await act(async () => {
+          if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible />);
+          else {
+            vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+            fireEvent(document, new Event("visibilitychange"));
+          }
+        });
+      await act(async () => vi.advanceTimersByTimeAsync(10000));
+      expect(view.preview()).toBeNull();
+      expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+      expect(screen.getByText("Conversation (1 requests)")).toBeVisible();
+    },
+  );
+
+  it.each(["newer", "explicit", "fresh", "missing", "denial"])(
+    "ends discard preservation after %s",
+    async (boundary) => {
+      const view = await completedPanel();
+      fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+      if (boundary === "newer")
+        view.saved.conversation.messages.push({
+          ...view.saved.conversation.messages[0]!,
+          id: "newer",
+          output: "New server result",
+        });
+      if (boundary === "missing") view.saved.conversation.messages = [];
+      if (boundary === "denial") {
+        const original = mocks.api.getMockImplementation()!;
+        let denied = true;
+        mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+          path.endsWith("/access")
+            ? Promise.resolve({ locked: denied, activeGeneration: null })
+            : original(path, options),
+        );
+        await act(async () => fireEvent(window, new Event("focus")));
+        denied = false;
+      }
+      let preview = view.preview;
+      if (boundary === "fresh") {
+        view.unmount();
+        const fresh = render(
+          <WritingPanel
+            {...view.props}
+            launchRequest={{ id: "fresh", pageId: "doc", conversationId: view.saved.conversation.id }}
+          />,
+        );
+        preview = () => fresh.container.querySelector('.writing-panel > [aria-label="Writing result"]');
+      } else {
+        await act(async () => {
+          if (boundary === "explicit")
+            view.rerender(
+              <WritingPanel
+                {...view.props}
+                launchRequest={{ id: "opened", pageId: "doc", conversationId: view.saved.conversation.id }}
+              />,
+            );
+          else fireEvent(window, new Event("focus"));
+        });
+      }
+      const expected = boundary === "missing" ? /^$/ : boundary === "newer" ? /New server result/ : /Improved writing/;
+      await waitFor(() => expect(preview()?.textContent ?? "").toMatch(expected));
+      if (boundary === "missing") {
+        view.saved.conversation.messages = savedConversation("Recreated saved result").conversation.messages;
+        await act(async () => fireEvent(window, new Event("focus")));
+      }
+      expect(preview()?.textContent ?? "").toMatch(boundary === "missing" ? /Recreated saved result/ : expected);
+    },
+  );
+
+  it("preserves discard after a pre-start failure and releases it on the next stream start", async () => {
+    const view = await completedPanel();
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+    mocks.stream.mockRejectedValueOnce(new Error("Dispatch failed"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    await act(async () => fireEvent(window, new Event("focus")));
+    expect(view.preview()).toBeNull();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    expect(view.preview()).toHaveTextContent("Improved writing");
+    await act(async () => fireEvent(window, new Event("focus")));
+    expect(view.preview()).toHaveTextContent("Improved writing");
+  });
+
+  it.each(["focus", "reveal", "foreground"])(
+    "keeps selection identity after an empty started failure and %s",
+    async (boundary) => {
+      const initialTarget: WritingTarget = {
+        ...target,
+        kind: "selection",
+        text: "Selected words",
+        blocks: [{ id: "block", fingerprint: "saved" }],
+      };
+      const original = mocks.api.getMockImplementation()!;
+      const saved = savedConversation("");
+      saved.conversation.messages[0]!.status = "failed";
+      mocks.api.mockImplementation((path: string, options?: RequestInit) =>
+        path === `/api/ai/conversations/${saved.conversation.id}` ? Promise.resolve(saved) : original(path, options),
+      );
+      mocks.stream.mockImplementationOnce(
+        async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+          emit({
+            type: "start",
+            conversationId: saved.conversation.id,
+            messageId: "message",
+            sources: [source],
+            changedPageIds: [],
+            canApply: true,
+            quota: status.quota,
+          });
+          emit({ type: "error", status: 503, code: "ai_provider_rejected", message: "Empty first failure" });
+        },
+      );
+      const view = panel(true, true, initialTarget);
+      await waitFor(() => expect(screen.getByRole("button", { name: "Generate" })).toBeEnabled());
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate" })));
+      await act(async () => {
+        if (boundary === "focus") fireEvent(window, new Event("focus"));
+        else if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible={false} />);
+        else {
+          vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+          fireEvent(document, new Event("visibilitychange"));
+        }
+      });
+      if (boundary !== "focus")
+        await act(async () => {
+          if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible />);
+          else {
+            vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+            fireEvent(document, new Event("visibilitychange"));
+          }
+        });
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+      expect(view.capture).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled();
+      await act(async () => fireEvent.click(screen.getByRole("button", { name: "Replace" })));
+      expect(view.apply).toHaveBeenCalledWith(
+        initialTarget,
+        "# Improved writing\n\nClear **result**.",
+        "replace",
+        1,
+        new Set(),
+      );
+    },
+  );
+
+  it.each(
+    ["generate", "apply"].flatMap((operation) =>
+      ["focus", "reveal", "foreground"].map((boundary) => ({ operation, boundary })),
+    ),
+  )(
+    "consumes $boundary verification during $operation without a deferred result reload",
+    async ({ operation, boundary }) => {
+      const view = await completedPanel();
+      vi.useFakeTimers();
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+      await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+      const original = mocks.api.getMockImplementation()!;
+      const done = deferred<{ contentEpoch: number; protectedBlockIds: string[] }>();
+      let reads = 0,
+        emit!: (event: AiStreamEvent) => void;
+      mocks.api.mockImplementation((path: string, options?: RequestInit) => {
+        if (path === `/api/ai/conversations/${view.saved.conversation.id}`) reads++;
+        return path.endsWith("apply-check") ? done.promise : original(path, options);
+      });
+      mocks.stream.mockImplementationOnce(
+        async (_input: AiGenerate, _signal: AbortSignal, onEvent: (event: AiStreamEvent) => void) => {
+          emit = onEvent;
+          emit({
+            type: "start",
+            conversationId: view.saved.conversation.id,
+            messageId: "busy",
+            sources: [source],
+            changedPageIds: [],
+            canApply: true,
+            quota: status.quota,
+          });
+          emit({ type: "delta", text: "Busy result" });
+          await done.promise;
+        },
+      );
+      await act(async () =>
+        fireEvent.click(
+          screen.getByRole("button", { name: operation === "generate" ? "Generate follow-up" : "Replace" }),
+        ),
+      );
+      await act(async () => {
+        if (boundary === "focus") fireEvent(window, new Event("focus"));
+        else if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible={false} />);
+        else {
+          vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+          fireEvent(document, new Event("visibilitychange"));
+        }
+      });
+      if (boundary !== "focus")
+        await act(async () => {
+          if (boundary === "reveal") view.rerender(<WritingPanel {...view.props} visible />);
+          else {
+            vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+            fireEvent(document, new Event("visibilitychange"));
+          }
+        });
+      expect(screen.queryByText("Checking conversation access…")).toBeNull();
+      expect(reads).toBe(0);
+      await act(async () => {
+        if (operation === "generate") {
+          view.saved.conversation.messages.push({
+            ...view.saved.conversation.messages[0]!,
+            id: "busy",
+            output: "Busy result",
+          });
+          emit({ type: "complete" });
+        }
+        done.resolve({ contentEpoch: 1, protectedBlockIds: [] });
+      });
+      expect(reads).toBe(operation === "generate" ? 1 : 0);
+      fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+      await act(async () => vi.advanceTimersByTimeAsync(10000));
+      expect(reads).toBe(operation === "generate" ? 1 : 0);
+      expect(view.preview()).toBeNull();
+    },
+  );
   it.each(["locked", "missing"])(
     "ignores an old %s access response while a newer opening owns the gate",
     async (failure) => {
@@ -440,7 +739,7 @@ describe("writing UI", () => {
       code === 401,
     );
   });
-  it("retains history search, loaded pages and cursor across a focus check", async () => {
+  it("retains history search and loaded depth while revalidating after a focus check", async () => {
     const view = await restoredPanel();
     const original = mocks.api.getMockImplementation()!;
     const access = deferred<unknown>();
@@ -473,9 +772,9 @@ describe("writing UI", () => {
     expect(screen.getByRole("searchbox")).toBe(search);
     expect(search).toHaveValue("retained search");
     expect(screen.getByRole("button", { name: "History second" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "Load more conversations" })).toBeEnabled();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Load more conversations" })).toBeEnabled());
     expect(mocks.api.mock.calls.filter(([path]) => String(path).startsWith("/api/ai/conversations?")).length).toBe(
-      reads,
+      reads + 2,
     );
   });
   it.each([-600000, 600000])("uses server reset timing with client skew %i and a later clock change", async (skew) => {

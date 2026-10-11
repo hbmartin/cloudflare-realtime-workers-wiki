@@ -1,70 +1,127 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { AiConversation } from "../shared/ai";
 import { api, apiErrorMessage } from "./api";
 
 export function WritingHistory({
   pageId,
   onOpen,
+  refreshVersion = 0,
 }: {
   pageId?: string;
   onOpen: (conversation: AiConversation) => void;
+  refreshVersion?: number;
 }) {
-  const [query, setQuery] = useState(""),
-    [items, setItems] = useState<AiConversation[]>([]),
-    [error, setError] = useState(""),
-    [loading, setLoading] = useState(false);
-  const [cursor, setCursor] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [history, setHistory] = useState({
+    pageId,
+    query,
+    refreshVersion,
+    items: [] as AiConversation[],
+    cursor: null as string | null,
+    error: "",
+    loading: true,
+  });
+  const sameScope = history.pageId === pageId && history.query === query;
+  const items = sameScope ? history.items : [],
+    cursor = sameScope ? history.cursor : null,
+    error = sameScope ? history.error : "",
+    loading = history.loading || !sameScope || history.refreshVersion !== refreshVersion;
+  const pagination = useRef({ pageId, query, pages: 1 }),
+    request = useRef<AbortController | null>(null);
   const load = useCallback(
-    async (signal?: AbortSignal) => {
-      setLoading(true);
+    async (appendCursor?: string) => {
+      request.current?.abort();
+      const controller = new AbortController();
+      request.current = controller;
+      if (pagination.current.pageId !== pageId || pagination.current.query !== query)
+        pagination.current = { pageId, query, pages: 1 };
+      setHistory((current) => ({
+        pageId,
+        query,
+        refreshVersion,
+        items: current.pageId === pageId && current.query === query ? current.items : [],
+        cursor: current.pageId === pageId && current.query === query ? current.cursor : null,
+        error: "",
+        loading: true,
+      }));
       try {
-        const params = new URLSearchParams({ q: query, ...(pageId ? { pageId } : {}) });
-        const result = await api<{ conversations: AiConversation[]; nextCursor: string | null }>(
-          `/api/ai/conversations?${params}`,
-          { signal },
-        );
-        setItems(result.conversations);
-        setCursor(result.nextCursor);
-        setError("");
+        const refreshedItems: AiConversation[] = [];
+        let nextCursor = appendCursor ?? null,
+          pages = 0;
+        const depth = appendCursor ? 1 : pagination.current.pages;
+        do {
+          const params = new URLSearchParams({
+            q: query,
+            ...(pageId ? { pageId } : {}),
+            ...(nextCursor ? { cursor: nextCursor } : {}),
+          });
+          const result = await api<{ conversations: AiConversation[]; nextCursor: string | null }>(
+            `/api/ai/conversations?${params}`,
+            { signal: controller.signal },
+          );
+          if (controller.signal.aborted) return;
+          refreshedItems.push(...result.conversations);
+          nextCursor = result.nextCursor;
+          pages++;
+        } while (nextCursor && pages < depth);
+        setHistory((current) => ({
+          ...current,
+          items: [
+            ...new Map(
+              (appendCursor ? [...current.items, ...refreshedItems] : refreshedItems).map((item) => [item.id, item]),
+            ).values(),
+          ],
+          cursor: nextCursor,
+          error: "",
+        }));
+        pagination.current.pages = appendCursor ? pagination.current.pages + pages : pages;
       } catch (cause) {
-        if (!signal?.aborted) setError(apiErrorMessage(cause, "History needs a network connection."));
+        if (!controller.signal.aborted)
+          setHistory((current) => ({
+            ...current,
+            error: apiErrorMessage(
+              cause,
+              appendCursor ? "More conversations could not be loaded." : "History needs a network connection.",
+            ),
+          }));
       } finally {
-        if (!signal?.aborted) setLoading(false);
+        if (request.current === controller) {
+          request.current = null;
+          setHistory((current) => ({ ...current, loading: false }));
+        }
       }
     },
-    [pageId, query],
+    [pageId, query, refreshVersion],
   );
   useEffect(() => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => void load(controller.signal), 200);
+    const timer = setTimeout(() => void load(), 200);
     return () => {
       clearTimeout(timer);
-      controller.abort();
+      request.current?.abort();
+      request.current = null;
     };
   }, [load]);
   async function remove(id?: string) {
+    if (loading || request.current) return;
+    const controller = new AbortController();
+    request.current = controller;
+    setHistory((current) => ({ ...current, loading: true }));
     try {
-      await api(`/api/ai/conversations${id ? `/${id}` : ""}`, { method: "DELETE" });
+      await api(`/api/ai/conversations${id ? `/${id}` : ""}`, { method: "DELETE", signal: controller.signal });
+      if (controller.signal.aborted) return;
       await load();
     } catch (cause) {
-      setError(apiErrorMessage(cause, "History could not be deleted."));
+      if (!controller.signal.aborted)
+        setHistory((current) => ({ ...current, error: apiErrorMessage(cause, "History could not be deleted.") }));
+    } finally {
+      if (request.current === controller) {
+        request.current = null;
+        setHistory((current) => ({ ...current, loading: false }));
+      }
     }
   }
-  async function more() {
-    if (!cursor) return;
-    setLoading(true);
-    try {
-      const params = new URLSearchParams({ q: query, cursor, ...(pageId ? { pageId } : {}) });
-      const result = await api<{ conversations: AiConversation[]; nextCursor: string | null }>(
-        `/api/ai/conversations?${params}`,
-      );
-      setItems((current) => [...current, ...result.conversations]);
-      setCursor(result.nextCursor);
-    } catch (cause) {
-      setError(apiErrorMessage(cause, "More conversations could not be loaded."));
-    } finally {
-      setLoading(false);
-    }
+  function more() {
+    if (cursor && !loading && !request.current) void load(cursor);
   }
   return (
     <section className="writing-history" aria-label="Private writing history">
@@ -89,21 +146,21 @@ export function WritingHistory({
             </button>
             {item.locked && <span> Access to a source is unavailable.</span>}
             <small>Expires {new Date(item.expiresAt).toLocaleDateString()}</small>
-            <button aria-label={`Delete ${item.title}`} onClick={() => void remove(item.id)}>
+            <button disabled={loading} aria-label={`Delete ${item.title}`} onClick={() => void remove(item.id)}>
               Delete
             </button>
           </li>
         ))}
       </ul>
       {cursor && (
-        <button disabled={loading} onClick={() => void more()}>
+        <button disabled={loading} onClick={more}>
           Load more conversations
         </button>
       )}
       {!pageId && (
         <button
           className="text-danger"
-          disabled={!items.length}
+          disabled={loading || !items.length}
           onClick={() => {
             if (confirm("Delete all your writing conversations?")) void remove();
           }}

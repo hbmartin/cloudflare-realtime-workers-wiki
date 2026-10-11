@@ -2,6 +2,24 @@
 
 This review follow-up is prepared on `codex/ai-writing-review-followup`, starting from updated `main` at `9d71760`, which contains merged PR #238. It implements the writing recovery, access monitoring, quota timing, cache invalidation, linked-diagram projection, and selected display/SSE cleanup plan. No database migration, dependency, or production deployment is included.
 
+## Comment fixes: October 11, 2026
+
+This follow-up fixes the four panel/history review issues without changing quota refresh behavior, server APIs, dependencies, or the database. Successful access verification during a local generation or application consumes its focus/reveal refresh rather than deferring a result reload. Discard records the latest saved message identity locally and survives passive refreshes of that message. An empty failure after stream start retains its new saved identity and selection target; pre-start failure preserves existing recovery and discard state. Classified opening, generation, application, and terminal stream authentication failures use one access alert.
+
+History revalidation preserves the search element and loaded depth, follows fresh cursors from the first page, deduplicates IDs, and commits the list/cursor together after all requested pages succeed. Tests cover changed titles, deletions, locks, shrinking result sets, a failure on a later page, pagination reset for search/document changes, and obsolete full-refresh/Load more responses after replacement or disposal. Confirmed access loss still clears private history.
+
+The two focused panel/history suites passed **120 tests**, including **31 new regressions**. The Chromium writing scenario passed with added assertions that discard survives focus verification and panel reopen; its existing apply/undo, conflict, private history, and accessibility checks remain enabled. The full unit coverage suite passed **1,900 tests** with one existing skip and **74.25% line coverage**. Tests use synthetic documents and mocked provider endpoints.
+
+`pnpm check` passed on the final implementation: format/lint, all five TypeScript projects, middleware policy checks (zero findings and 10/10 fixtures), both coverage suites, dead-code/type analysis, generated Cloudflare bindings, and client/MCP App/offline/Worker dry-run builds. Worker coverage passed **1,669 tests across 24 files** with **84.77% line coverage**.
+
+Repeatable commands:
+
+```sh
+pnpm exec vitest run src/client/WritingPanel.test.tsx src/client/WritingHistory.test.tsx
+pnpm exec playwright test tests/e2e/writing.spec.ts --project=chromium
+pnpm check
+```
+
 ## Review follow-up: October 10, 2026
 
 Focused validation passed 168 unit tests across six files, all 42 AI Worker integration tests, and the Chromium writing browser suite. Tests use synthetic documents and mocked provider endpoints.
