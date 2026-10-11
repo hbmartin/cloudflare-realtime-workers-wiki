@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import type { AiConversation } from "../shared/ai";
 import { api, apiErrorMessage } from "./api";
 
 const HISTORY_DELETED_EVENT = "notes:writing-history-deleted";
+type HistoryDeleted = { kind: "single"; id: string; pageId: string } | { kind: "all" };
 
 export function WritingHistory({
   pageId,
@@ -18,7 +19,7 @@ export function WritingHistory({
     [deletionState, setDeletionState] = useState({ pageId, query, revision: 0, error: "" });
   if (deletionState.pageId !== pageId || deletionState.query !== query)
     setDeletionState({ pageId, query, revision: deletionState.revision + 1, error: "" });
-  const deletionError = deletionState.pageId === pageId && deletionState.query === query ? deletionState.error : "";
+  const deletionError = deletionState.error;
   const [history, setHistory] = useState({
     pageId,
     query,
@@ -33,7 +34,7 @@ export function WritingHistory({
     cursor = sameScope ? history.cursor : null,
     error = sameScope ? history.error : "",
     loading = deleting || history.loading || !sameScope || history.refreshVersion !== refreshVersion;
-  const pagination = useRef({ pageId, query, pages: 1 }),
+  const pagination = useRef({ pageId, query, pages: 1, requestedPages: 1 }),
     request = useRef<AbortController | null>(null),
     reloadTimer = useRef<ReturnType<typeof setTimeout> | null>(null),
     deletion = useRef(false),
@@ -45,8 +46,7 @@ export function WritingHistory({
       request.current?.abort();
       const controller = new AbortController();
       request.current = controller;
-      if (pagination.current.pageId !== pageId || pagination.current.query !== query)
-        pagination.current = { pageId, query, pages: 1 };
+      if (appendCursor) pagination.current.requestedPages = pagination.current.pages + 1;
       setHistory((current) => {
         const keepScope = current.pageId === pageId && current.query === query;
         return {
@@ -63,7 +63,7 @@ export function WritingHistory({
         const refreshedItems: AiConversation[] = [];
         let nextCursor = appendCursor ?? null,
           pages = 0;
-        const depth = appendCursor ? 1 : pagination.current.pages;
+        const depth = appendCursor ? 1 : pagination.current.requestedPages;
         do {
           const params = new URLSearchParams({
             q: query,
@@ -90,8 +90,10 @@ export function WritingHistory({
           error: "",
         }));
         pagination.current.pages = appendCursor ? pagination.current.pages + pages : pages;
+        pagination.current.requestedPages = pagination.current.pages;
       } catch (cause) {
-        if (!controller.signal.aborted)
+        if (!controller.signal.aborted) {
+          if (appendCursor) pagination.current.requestedPages = pagination.current.pages;
           setHistory((current) => ({
             ...current,
             error: apiErrorMessage(
@@ -99,6 +101,7 @@ export function WritingHistory({
               appendCursor ? "More conversations could not be loaded." : "History needs a network connection.",
             ),
           }));
+        }
       } finally {
         if (request.current === controller) {
           request.current = null;
@@ -108,37 +111,37 @@ export function WritingHistory({
     },
     [pageId, query, refreshVersion],
   );
-  const latestLoad = useRef(load);
   useLayoutEffect(() => {
-    latestLoad.current = load;
-  }, [load]);
-  useEffect(() => {
     mounted.current = true;
-    const refresh = () => void latestLoad.current();
+    if (pagination.current.pageId !== pageId || pagination.current.query !== query)
+      pagination.current = { pageId, query, pages: 1, requestedPages: 1 };
+    const refresh = (event: Event) => {
+      const { detail } = event as CustomEvent<HistoryDeleted>;
+      if (!pageId || detail.kind === "all" || detail.pageId === pageId) void load();
+    };
     window.addEventListener(HISTORY_DELETED_EVENT, refresh);
+    reloadTimer.current = setTimeout(() => void load(), 200);
     return () => {
       mounted.current = false;
       window.removeEventListener(HISTORY_DELETED_EVENT, refresh);
-    };
-  }, []);
-  useEffect(() => {
-    reloadTimer.current = setTimeout(() => void load(), 200);
-    return () => {
       if (reloadTimer.current !== null) clearTimeout(reloadTimer.current);
       reloadTimer.current = null;
       request.current?.abort();
       request.current = null;
     };
-  }, [load]);
-  async function remove(id?: string) {
+  }, [load, pageId, query]);
+  async function remove(conversation?: AiConversation) {
     if (loading || request.current || deletion.current) return;
     const revision = deletionState.revision;
+    const detail: HistoryDeleted = conversation
+      ? { kind: "single", id: conversation.id, pageId: conversation.pageId }
+      : { kind: "all" };
     deletion.current = true;
     setDeleting(true);
     setDeletionState((current) => ({ ...current, error: "" }));
     try {
-      await api(`/api/ai/conversations${id ? `/${id}` : ""}`, { method: "DELETE" });
-      window.dispatchEvent(new Event(HISTORY_DELETED_EVENT));
+      await api(`/api/ai/conversations${conversation ? `/${conversation.id}` : ""}`, { method: "DELETE" });
+      window.dispatchEvent(new CustomEvent<HistoryDeleted>(HISTORY_DELETED_EVENT, { detail }));
     } catch (cause) {
       if (mounted.current)
         setDeletionState((current) =>
@@ -188,7 +191,7 @@ export function WritingHistory({
             </button>
             {item.locked && <span> Access to a source is unavailable.</span>}
             <small>Expires {new Date(item.expiresAt).toLocaleDateString()}</small>
-            <button disabled={loading} aria-label={`Delete ${item.title}`} onClick={() => void remove(item.id)}>
+            <button disabled={loading} aria-label={`Delete ${item.title}`} onClick={() => void remove(item)}>
               Delete
             </button>
           </li>

@@ -30,6 +30,7 @@ type RestoredDraft = {
 };
 type HistoryRefresh = {
   conversationId: string;
+  revision: number;
   token: symbol;
   mode: "passive" | "local";
 };
@@ -233,10 +234,21 @@ export function WritingPanel({
       ? sample.quota.resetsAt - Date.now()
       : sample.quota.resetsAt - sample.quota.checkedAt - (performance.now() - sample.receivedAt);
   }, []);
-  const requestHistoryRefresh = useCallback((conversationId: string, mode: HistoryRefresh["mode"], fresh = false) => {
+  const requestHistoryRefresh = useCallback((conversationId: string, mode: HistoryRefresh["mode"]) => {
     const pending = pendingHistory.current;
-    if (!fresh && pending?.conversationId === conversationId) return pending;
-    const refresh = { conversationId, token: Symbol("history refresh"), mode };
+    const revision = loadRevision.current;
+    if (
+      pending?.conversationId === conversationId &&
+      pending.revision === revision &&
+      (pending.mode === mode || pending.mode === "passive")
+    )
+      return pending;
+    const refresh = {
+      conversationId,
+      revision,
+      token: Symbol("history refresh"),
+      mode: pending?.conversationId === conversationId && pending.mode === "passive" ? pending.mode : mode,
+    };
     pendingHistory.current = refresh;
     return refresh;
   }, []);
@@ -523,7 +535,7 @@ export function WritingPanel({
         if (touch) setNotice("Finish or cancel the current operation before changing its source.");
         return false;
       }
-      const pending = touch ? null : (refresh ?? requestHistoryRefresh(id, "passive", true));
+      const pending = touch ? null : (refresh ?? requestHistoryRefresh(id, "passive"));
       const revision = ++loadRevision.current;
       const owner = Symbol("open");
       historyRead.current = null;
@@ -632,7 +644,8 @@ export function WritingPanel({
     )
       return;
     if (refresh.mode === "local") await syncLocalHistory(refresh);
-    else await open(refresh.conversationId, false, true, refresh);
+    else if (accessGate.current.visible && accessGate.current.foreground && !accessGate.current.verify)
+      await open(refresh.conversationId, false, true, refresh);
   }, [open, syncLocalHistory]);
   useEffect(() => {
     const id = launchRequest?.id;
@@ -664,8 +677,7 @@ export function WritingPanel({
         accessGate.current.verify = true;
         setCheckingAccess(true);
         if (operation.current === "generate") requestHistoryRefresh(threadId, "local");
-        else if (!operation.current || operation.current === "apply")
-          requestHistoryRefresh(threadId, "passive", operation.current === "apply");
+        else if (!operation.current || operation.current === "apply") requestHistoryRefresh(threadId, "passive");
       }
       if (inFlight || abort.signal.aborted) return;
       inFlight = true;
@@ -694,7 +706,7 @@ export function WritingPanel({
           }
           if (!controller.current) {
             const completedRemote = wasRemote && !value.activeGeneration;
-            if (completedRemote || historyHidden.current) requestHistoryRefresh(threadId, "passive", completedRemote);
+            if (completedRemote || historyHidden.current) requestHistoryRefresh(threadId, "passive");
             remoteId.current = value.activeGeneration?.messageId ?? null;
             setRemoteGeneration(value.activeGeneration ?? null);
           }
@@ -910,8 +922,10 @@ export function WritingPanel({
         flushResult();
         quotaEpoch.current++;
         void refreshStatus().catch(() => undefined);
-        if (savedThread && !abort.signal.aborted)
-          void syncLocalHistory(requestHistoryRefresh(savedThread, "local", true));
+        if (savedThread && !abort.signal.aborted) {
+          requestHistoryRefresh(savedThread, "local");
+          void drainHistory();
+        }
       }
     }
   }

@@ -2858,31 +2858,55 @@ describe("writing refresh ownership", () => {
     { boundary: "reveal", first: "history" },
     { boundary: "foreground", first: "access" },
     { boundary: "foreground", first: "history" },
-  ])("reuses a terminal history read across $boundary when $first finishes first", async ({ boundary, first }) => {
+  ])("upgrades terminal history across $boundary when $first finishes first", async ({ boundary, first }) => {
     const view = await completedPanel();
     vi.useFakeTimers();
     await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
     await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
     const original = mocks.api.getMockImplementation()!;
     const history = deferred<ReturnType<typeof savedConversation>>(),
+      fresh = deferred<ReturnType<typeof savedConversation>>(),
       access = deferred<unknown>();
-    const saved = savedConversation("# Improved writing\n\nClear **result**.");
-    saved.conversation.messages.push({ ...saved.conversation.messages[0]!, id: "second" });
+    const local = savedConversation("# Improved writing\n\nClear **result**.");
+    local.conversation.messages.push({ ...local.conversation.messages[0]!, id: "local", output: "Local follow-up" });
+    const saved = {
+      conversation: {
+        ...local.conversation,
+        messages: [
+          ...local.conversation.messages,
+          { ...local.conversation.messages[0]!, id: "remote", output: "Remote follow-up" },
+        ],
+      },
+    };
     let reads = 0,
       accessReads = 0;
     mocks.api.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === `/api/ai/conversations/${view.saved.conversation.id}`) {
-        reads++;
-        return history.promise;
-      }
+      if (url === `/api/ai/conversations/${view.saved.conversation.id}`)
+        return ++reads === 1 ? history.promise : fresh.promise;
       if (url.endsWith("/access")) {
         accessReads++;
         return access.promise;
       }
       return original(url, options);
     });
+    mocks.stream.mockImplementationOnce(
+      async (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+        emit({
+          type: "start",
+          conversationId: view.saved.conversation.id,
+          messageId: "local",
+          sources: [source],
+          changedPageIds: [],
+          canApply: true,
+          quota: status.quota,
+        });
+        emit({ type: "delta", text: "Local follow-up" });
+        emit({ type: "complete" });
+      },
+    );
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
     expect(reads).toBe(1);
+    expect(view.preview()).toHaveTextContent("Local follow-up");
     if (boundary === "focus")
       await act(async () => {
         fireEvent(window, new Event("focus"));
@@ -2898,22 +2922,138 @@ describe("writing refresh ownership", () => {
       await act(async () => fireEvent(document, new Event("visibilitychange")));
     }
     expect(accessReads).toBe(1);
+    expect(reads).toBe(1);
     expect(screen.getByText("Checking conversation access…")).toBeVisible();
     expect(view.preview()).toBeNull();
-    if (first === "history") await act(async () => history.resolve(saved));
-    expect(screen.getByText("Checking conversation access…")).toBeVisible();
+    if (first === "history") await act(async () => history.resolve(local));
     expect(view.preview()).toBeNull();
     await act(async () => access.resolve({ locked: false, activeGeneration: null }));
+    expect(reads).toBe(2);
+    expect(screen.getByText("Checking conversation access…")).toBeVisible();
+    await act(async () => {
+      fireEvent(window, new Event("focus"));
+      fireEvent(window, new Event("focus"));
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(reads).toBe(2);
+    expect(accessReads).toBe(1);
+    await act(async () => fresh.resolve(saved));
     expect(screen.queryByText("Checking conversation access…")).toBeNull();
-    expect(view.preview()).toHaveTextContent("Improved writing");
-    expect(screen.getByRole("button", { name: "Replace" })).toBeEnabled();
-    if (first === "access") await act(async () => vi.advanceTimersByTimeAsync(5000));
-    expect(accessReads).toBe(first === "access" ? 2 : 1);
-    expect(reads).toBe(1);
-    await act(async () => history.resolve(saved));
-    expect(screen.getByText("Conversation (2 requests)")).toBeVisible();
+    expect(view.preview()).toHaveTextContent("Remote follow-up");
+    expect(screen.getByRole("button", { name: "Replace" })).toBeDisabled();
+    await act(async () => history.resolve(local));
+    expect(screen.getByText("Conversation (3 requests)")).toBeVisible();
+    expect(view.preview()).toHaveTextContent("Remote follow-up");
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(reads).toBe(2);
+  });
+
+  it("restores hidden content on the first poll after delayed stream cleanup", async () => {
+    const view = await completedPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    const stream = deferred<void>();
+    const recovered = savedConversation("Recovered server result");
+    recovered.conversation.messages[0]!.id = "recovered";
+    let locked = true,
+      reads = 0;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === `/api/ai/conversations/${view.saved.conversation.id}`) {
+        reads++;
+        return Promise.resolve(recovered);
+      }
+      if (url.endsWith("/access")) return Promise.resolve({ locked, activeGeneration: null });
+      return original(url, options);
+    });
+    mocks.stream.mockImplementationOnce(
+      (_input: AiGenerate, _signal: AbortSignal, emit: (event: AiStreamEvent) => void) => {
+        emit({
+          type: "start",
+          conversationId: view.saved.conversation.id,
+          messageId: "running",
+          sources: [source],
+          changedPageIds: [],
+          canApply: true,
+          quota: status.quota,
+        });
+        return stream.promise;
+      },
+    );
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    await act(async () => fireEvent(window, new Event("focus")));
+    expect(view.preview()).toBeNull();
+    expect((mocks.stream.mock.calls.at(-1)![1] as AbortSignal).aborted).toBe(true);
+    locked = false;
+    await act(async () => fireEvent(window, new Event("focus")));
+    expect(reads).toBe(0);
+    await act(async () => stream.resolve());
     await act(async () => vi.advanceTimersByTimeAsync(5000));
     expect(reads).toBe(1);
+    expect(view.preview()).toHaveTextContent("Recovered server result");
+    expect(screen.getByRole("button", { name: "Replace" })).toBeDisabled();
+    await act(async () => vi.advanceTimersByTimeAsync(5000));
+    expect(reads).toBe(1);
+  });
+
+  it("rejects a local read from before a new generation and synchronizes its terminal history", async () => {
+    const view = await completedPanel();
+    const original = mocks.api.getMockImplementation()!;
+    const stale = deferred<ReturnType<typeof savedConversation>>(),
+      terminal = deferred<ReturnType<typeof savedConversation>>();
+    let reads = 0;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) =>
+      url === `/api/ai/conversations/${view.saved.conversation.id}`
+        ? ++reads === 1
+          ? stale.promise
+          : terminal.promise
+        : original(url, options),
+    );
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    expect(reads).toBe(2);
+    const saved = savedConversation("# Improved writing\n\nClear **result**.");
+    saved.conversation.messages.push({
+      ...saved.conversation.messages[0]!,
+      id: "terminal",
+      output: "Saved terminal history",
+    });
+    await act(async () => terminal.resolve(saved));
+    await act(async () => stale.resolve(savedConversation("Obsolete generation history")));
+    expect(screen.getByText("Conversation (2 requests)")).toBeVisible();
+    expect(screen.queryByText("Obsolete generation history")).toBeNull();
+    expect(view.preview()).toHaveTextContent("Improved writing");
+  });
+
+  it("retains passive refresh intent across a failed open and a new generation", async () => {
+    const view = await completedPanel();
+    vi.useFakeTimers();
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible={false} />));
+    await act(async () => view.rerender(<WritingPanel {...view.props} visible />));
+    const original = mocks.api.getMockImplementation()!;
+    const saved = savedConversation("Latest server result");
+    saved.conversation.messages[0]!.id = "remote";
+    let reads = 0;
+    mocks.api.mockImplementation((url: string, options?: RequestInit) => {
+      if (url.endsWith("/other/open")) return Promise.reject(new TypeError("Open failed"));
+      if (url === `/api/ai/conversations/${view.saved.conversation.id}`)
+        return ++reads === 1 ? Promise.reject(new TypeError("Passive read failed")) : Promise.resolve(saved);
+      return original(url, options);
+    });
+    await act(async () => fireEvent(window, new Event("focus")));
+    expect(reads).toBe(1);
+    await act(async () =>
+      view.rerender(
+        <WritingPanel {...view.props} launchRequest={{ id: "failed-open", pageId: "doc", conversationId: "other" }} />,
+      ),
+    );
+    expect(screen.getByRole("button", { name: "Generate follow-up" })).toBeEnabled();
+    mocks.stream.mockRejectedValueOnce(new TypeError("Dispatch failed"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Generate follow-up" })));
+    expect(reads).toBe(2);
+    expect(view.preview()).toHaveTextContent("Latest server result");
+    expect(screen.getByRole("button", { name: "Replace" })).toBeDisabled();
   });
 
   it("supersedes a slow local read immediately when a remote generation completes", async () => {
