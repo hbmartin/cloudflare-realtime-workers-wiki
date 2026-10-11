@@ -96,7 +96,8 @@ async function aiSettings(env: Env, member: MemberContext) {
   return row ? aiSettingsSchema.parse(JSON.parse(row.settings_json)) : DEFAULT_SETTINGS;
 }
 async function quota(env: Env, member: MemberContext, settings: AiSettings): Promise<AiStatus["quota"]> {
-  const day = Math.floor(Date.now() / DAY);
+  const checkedAt = Date.now(),
+    day = Math.floor(checkedAt / DAY);
   const row = await env.DB.prepare(
     "SELECT COUNT(*) used FROM ai_requests WHERE workspace_id=? AND user_id=? AND day=? AND funding='api' AND counted=1",
   )
@@ -106,6 +107,7 @@ async function quota(env: Env, member: MemberContext, settings: AiSettings): Pro
     remaining: Math.max(0, settings.dailyQuota - (row?.used ?? 0)),
     limit: settings.dailyQuota,
     resetsAt: (day + 1) * DAY,
+    checkedAt,
   };
 }
 export async function aiStatusResponse(request: Request, env: Env) {

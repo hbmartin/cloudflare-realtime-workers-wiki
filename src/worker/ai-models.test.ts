@@ -13,6 +13,92 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe("funding-specific model catalogs", () => {
+  it.each(["workspace", "funding", "credential"])(
+    "keeps an in-flight cache fill after another %s key is invalidated",
+    async (key) => {
+      let finish!: (response: Response) => void;
+      fetcher.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const lookup = providerModels(workspace, "credential", "api");
+      await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+      await invalidateProviderModels(
+        key === "workspace" ? `${workspace}-other` : workspace,
+        key === "credential" ? "other" : "credential",
+        key === "funding" ? "chatgpt" : "api",
+      );
+      finish(Response.json({ data: [{ id: "retained" }] }));
+      await lookup;
+      expect(await providerModels(workspace, "credential", "api")).toMatchObject([{ id: "retained" }]);
+      expect(fetcher).toHaveBeenCalledOnce();
+    },
+  );
+  it("does not revive an invalidated entry when its key is recreated before the old fetch finishes", async () => {
+    let finish!: (response: Response) => void;
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const old = providerModels(workspace, "credential", "api");
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    await invalidateProviderModels(workspace, "credential", "api");
+    await providerModels(workspace, "credential", "api");
+    finish(Response.json({ data: [{ id: "obsolete" }] }));
+    expect(await old).toMatchObject([{ id: "obsolete" }]);
+    expect(await providerModels(workspace, "credential", "api")).toMatchObject([{ id: "api-model" }]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+  it("keeps a concurrent success cacheable when the other request fails first", async () => {
+    let fail!: (cause: Error) => void, finish!: (response: Response) => void;
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise<Response>((_resolve, reject) => {
+          fail = reject;
+        }),
+    );
+    fetcher.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const failed = providerModels(workspace, "credential", "api").catch((cause: unknown) => cause);
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    const successful = providerModels(workspace, "credential", "api");
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+    fail(new Error("First request ended"));
+    expect(await failed).toMatchObject({ status: 503 });
+    finish(Response.json({ data: [{ id: "successful" }] }));
+    await successful;
+    expect(await providerModels(workspace, "credential", "api")).toMatchObject([{ id: "successful" }]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+  it("bounds unfinished entries and rejects a retired fill after eviction and recreation", async () => {
+    const finishes: ((response: Response) => void)[] = [];
+    fetcher.mockImplementation(() => new Promise<Response>((resolve) => finishes.push(resolve)));
+    const first = providerModels(workspace, "credential", "api");
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    const others = Array.from({ length: 128 }, (_, index) =>
+      providerModels(`${workspace}-${index}`, "credential", "api"),
+    );
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(129));
+    const recreated = providerModels(workspace, "credential", "api");
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(130));
+    finishes[129]!(Response.json({ data: [{ id: "current" }] }));
+    await recreated;
+    finishes[0]!(Response.json({ data: [{ id: "retired" }] }));
+    await first;
+    finishes.slice(1, 129).forEach((finish) => finish(Response.json({ data: [{ id: "other" }] })));
+    await Promise.all(others);
+    expect(await providerModels(workspace, "credential", "api")).toMatchObject([{ id: "current" }]);
+    expect(fetcher).toHaveBeenCalledTimes(130);
+  });
+
   it("accepts null optional ChatGPT metadata alongside valid and hidden entries", async () => {
     fetcher.mockResolvedValue(
       Response.json({
