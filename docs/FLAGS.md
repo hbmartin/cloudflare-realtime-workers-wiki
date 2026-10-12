@@ -3,7 +3,7 @@
 Every switch that turns behavior on or off. For other variables, secrets, and limits, see
 [Configuration](CONFIGURATION.md).
 
-Portable defaults are prepared against the concurrent deployment implementation. Its [native release gate](evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate) remains pending; the named production defaults below still describe the existing installation.
+Portable defaults are integrated on `main`. The [native release gate](evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate) remains pending; the named production defaults below still describe the existing installation.
 
 ## Environment flags
 
@@ -26,12 +26,6 @@ flag; any other value or an unset variable disables it.
 
 The five editor flags above also default to `true` for a new portable installation. The table's
 Legacy production column describes the existing named legacy environment. Portable redeployment reads saved
-Worker variables so existing feature settings are retained; adjust those in Cloudflare's dashboard
-for an existing portable installation. Local development keeps Notion Markdown enabled, while new
-portable installations keep it disabled. Owner settings below are unchanged.
-
-The five editor flags above also default to `true` for a new portable installation. The table's
-Production column describes the existing named legacy environment. Portable redeployment reads saved
 Worker variables so existing feature settings are retained; adjust those in Cloudflare's dashboard
 for an existing portable installation. Local development keeps Notion Markdown enabled, while new
 portable installations keep it disabled. Owner settings below are unchanged.

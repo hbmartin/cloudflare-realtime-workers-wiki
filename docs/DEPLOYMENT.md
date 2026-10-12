@@ -11,7 +11,7 @@ identifiers. These deployment names are compatibility details; the product prese
 
 ## Browser deployment
 
-The portable deployment implementation is integrated on `main`. The native GitHub authorization and five editor-flow acceptance checks remain pending; the README deploy button stays disabled. See [deployment evidence](evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate).
+The portable deployment implementation is integrated on `main`. The native GitHub authorization and five editor-flow acceptance checks remain pending; the README deploy button is available as a preview. See [deployment evidence](evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate).
 
 For a new installation, use Cloudflare's native
 [Deploy to Cloudflare flow](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
@@ -80,8 +80,9 @@ unchanged; follow the upgrade procedures in [Upgrading](UPGRADING.md) before ret
 
 ### Native-button release checklist
 
-Publish the README deploy button only after testing a disposable deployment with Cloudflare's default
-authorization and package-manager launcher. Verify owner creation, MFA, collaborative editing,
+The README button is available as a preview. Complete this checklist before removing the preview
+status: test a disposable deployment with Cloudflare's default authorization and package-manager
+launcher. Verify owner creation, MFA, collaborative editing,
 attachment upload, export, and each of the five enabled editor features. Then remove the setup key,
 create content, change a feature setting, and redeploy. Confirm the resource bindings, origin, secret
 names, owner, content, and saved feature settings persist. Validate the existing GitHub Actions

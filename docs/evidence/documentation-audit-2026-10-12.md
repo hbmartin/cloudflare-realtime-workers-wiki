@@ -45,3 +45,9 @@ Validated in the isolated documentation checkout on 12 October 2026:
 - Fresh local schema initialization and account-protection enrollment exercised with the browser harness. Upgrade ranges and commands reviewed against the migration runner, SQL filenames, and deployment workflow; production migrations and feature activation were not executed.
 
 Live gates in the capability table remain unresolved unless their independent deployed acceptance evidence is recorded. Human review remains responsible for configuration descriptions and product-contract accuracy; the checker enforces coverage and navigation.
+
+## Rebase and preview button update
+
+The documentation branch was rebased onto `3736dcc`, which includes portable deployment commit `2ae66e2`. The dependency described above is now integrated. The verification record is retained only under `docs/evidence/`, migration safeguards remain in Upgrading, and the documentation check is added alongside the existing portable deployment commands. The README deploy button is available as a preview at the owner’s request; native authorization and editor-flow acceptance remain pending.
+
+Rebase validation passed: documentation links/discovery/configuration coverage, all 102 focused documentation-checker/deployment/migration tests, repository formatting and lint, and rendered README inspection. The active button redirects to Cloudflare’s deployment form and its badge returns HTTP 200. Application source, migration SQL, deployment helpers, and production release workflow match the rebased `main`; full application suites and live native deployment were not rerun for this documentation update.

@@ -45,3 +45,7 @@ Then test the native button with Cloudflare's default authorization, verify the 
 for the five enabled features, and repeat the content/setup-key-removal redeployment test. The local
 OAuth deployment verifies application behavior but does not establish that the native build token has
 all required permissions. Uncomment the README button only after those checks pass.
+
+## Preview button availability
+
+On October 12, 2026, the README deploy button was enabled as a preview at the owner’s request after the portable deployment implementation landed on `main`. The README and deployment guide retain the pending native authorization and editor-flow verification status. This change does not establish completion of the remaining release gate above.

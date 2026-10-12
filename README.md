@@ -44,14 +44,11 @@ The client supports Chrome/Edge 116+, Firefox 124+, and Safari 17.4+ on macOS/iO
 
 Workers Paid is the supported production target. As checked on 12 October 2026, its account minimum is **US$5/month**. A small idle installation staying within included allowances may remain near that baseline; this is not a measured or guaranteed total. Storage, compute, requests, optional browser/PDF usage, and AI provider usage can add charges. See [Cloudflare pricing](https://developers.cloudflare.com/workers/platform/pricing/).
 
-The prepared portable browser flow lets Cloudflare provision resources and generate internal secrets from one private setup key. Its native GitHub authorization and editor-flow acceptance gate is still pending, so the deploy button remains disabled; see [verification evidence](docs/evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate). New portable defaults enable five editor features; existing named production settings are preserved. The manual installation path remains available.
+Use the button below to start Cloudflare’s browser deployment flow. Cloudflare provisions resources and generates internal secrets from one private setup key. New portable defaults enable five editor features; existing named production settings are preserved. See [browser deployment and updates](docs/DEPLOYMENT.md#browser-deployment) for setup, custom domains, and redeployment.
 
-<!-- Release gate: uncomment this button only after a disposable native-button
-deployment and redeployment pass the live checklist in docs/DEPLOYMENT.md.
+**Preview:** native GitHub authorization and full editor-flow verification remain pending; see [verification evidence](docs/evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate). The manual installation path remains available.
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https%3A%2F%2Fgithub.com%2Fhbmartin%2Fnoteflare)
-
--->
 
 Follow the [manual installation steps](docs/DEPLOYMENT.md#existing-production-deployment):
 
