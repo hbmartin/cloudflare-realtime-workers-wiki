@@ -4,14 +4,17 @@ Upgrade an existing installation through its normal deployment command after che
 
 ## Upgrade procedure
 
+Stop any running Notion import before starting the upgrade. Keep imports stopped until migrations and the Worker rollout finish.
+
 1. Export D1 with `pnpm db:export --remote` and back up R2, as described in
    [Backup and recovery](BACKUP_AND_RECOVERY.md). Confirm the export is non-empty before continuing;
    `wrangler d1 export` on its own fails on this schema.
 2. Build and test the exact revision locally with `pnpm check`. CI runs a superset of the same gate on
    every push and the deploy workflow refuses to proceed unless it passed, so a failure here is a
    failure there.
-3. Use the installation’s deployment target: `pnpm run deploy` or `pnpm deploy:production` for named legacy production; `pnpm deploy:one-click` or its configured Workers Builds flow for a portable installation. These build, apply pending guarded migrations, and then upload the Worker.
+3. Use the installation’s deployment target: `pnpm run deploy` or `pnpm run deploy:production` for named legacy production; `pnpm run deploy:one-click` or its configured Workers Builds flow for a portable installation. These build, apply pending guarded migrations, and then upload the Worker.
    Confirm every migration in `migrations/` reports success before the Worker upload starts.
+   Deploying the new Worker before its required migrations are applied causes runtime failures.
    The directory is the source of truth for what must be applied; do not rely on a list enumerated in
    documentation, which drifts.
 4. Test sign-in, page metadata, document and workspace-event WebSockets, attachment range and
@@ -97,7 +100,7 @@ reconnect.
 
 ## Migrations 0067 to 0079
 
-Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, `0075`, `0076`, `0077`, or `0078` require
+Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, `0075`, `0076`, `0077`, `0078`, or `0079` require
 `SLACK_REVIEW_MIGRATION_SAFE=true` after the [Slack rollout pause](#slack-review-follow-up-migration).
 This guard applies to both `pnpm db:remote` and `pnpm run deploy`; local database migrations do not
 require confirmation. The confirmation acknowledges an operator-completed pause and drain, rather
