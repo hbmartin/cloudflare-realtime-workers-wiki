@@ -1,10 +1,14 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { unstable_readConfig } from "wrangler";
 import {
   deployPrepared,
+  configurationHash,
   initializedDatabase,
   installationOrigin,
   missingSecrets,
@@ -30,6 +34,111 @@ const dependencies = () => ({
   migrateDatabase: vi.fn().mockReturnValue(0),
   upload: vi.fn(),
   health: vi.fn(),
+});
+
+function buildFixture() {
+  const path = mkdtempSync(resolve(tmpdir(), "noteflare-build-"));
+  writeFileSync(
+    resolve(path, "wrangler.jsonc"),
+    JSON.stringify({
+      name: "portable",
+      vars: { BETTER_AUTH_URL: "auto" },
+      env: { production: { name: "legacy", vars: { BETTER_AUTH_URL: "https://legacy.example" } } },
+    }),
+  );
+  const stub = resolve(path, "build.cjs");
+  writeFileSync(
+    stub,
+    `
+      const fs = require("node:fs");
+      fs.writeFileSync("command-ran", process.argv.slice(2).join(" "));
+      fs.mkdirSync("dist/worker", { recursive: true });
+      fs.mkdirSync(".wrangler/deploy", { recursive: true });
+      fs.writeFileSync("dist/worker/wrangler.json", JSON.stringify({ name: "legacy", vars: { BETTER_AUTH_URL: "https://legacy.example" } }));
+      fs.writeFileSync(".wrangler/deploy/config.json", JSON.stringify({ configPath: "../../dist/worker/wrangler.json" }));
+    `,
+  );
+  const launcher = resolve(path, process.platform === "win32" ? "pnpm.cmd" : "pnpm");
+  writeFileSync(
+    launcher,
+    process.platform === "win32"
+      ? `@"${process.execPath}" "${stub}" %*\r\n`
+      : `#!${process.execPath}\nrequire(${JSON.stringify(stub)});\n`,
+  );
+  chmodSync(launcher, 0o755);
+  const env = { ...process.env, PATH: `${path}${process.platform === "win32" ? ";" : ":"}${process.env.PATH}` };
+  for (const key of [
+    "WORKERS_CI",
+    "WORKERS_CI_BUILD_UUID",
+    "WORKERS_CI_COMMIT_SHA",
+    "CLOUDFLARE_ENV",
+    "WRANGLER_CI_OVERRIDE_NAME",
+    "CLOUDFLARE_ACCOUNT_ID",
+  ])
+    delete env[key];
+  return { path, env };
+}
+describe("deployment entry point", () => {
+  const entry = fileURLToPath(new URL("./deploy.mjs", import.meta.url));
+  it("builds an archive without Git and removes obsolete reusable manifests", () => {
+    const { path, env } = buildFixture();
+    try {
+      mkdirSync(resolve(path, ".wrangler"));
+      writeFileSync(resolve(path, ".wrangler/noteflare-build.json"), "{}");
+      expect(existsSync(resolve(path, ".git"))).toBe(false);
+      const result = spawnSync(process.execPath, [entry, "build"], { cwd: path, env, encoding: "utf8" });
+      expect(result.stderr).not.toContain("git");
+      expect(result.status).toBe(0);
+      expect(readFileSync(resolve(path, "command-ran"), "utf8")).toBe("run build:app");
+      expect(existsSync(resolve(path, ".wrangler/noteflare-build.json"))).toBe(false);
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
+  it.each(["origin", "overrides", "old manifest"])("rejects a changed %s before migration or upload", (change) => {
+    const { path, env } = buildFixture();
+    try {
+      const git = (args) => spawnSync("git", args, { cwd: path, encoding: "utf8" });
+      expect(git(["init", "-q"]).status).toBe(0);
+      writeFileSync(resolve(path, ".gitignore"), ".wrangler/\ndist/\ncommand-ran\n");
+      git(["add", "."]);
+      expect(
+        git(["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "fixture"]).status,
+      ).toBe(0);
+      const hash = createHash("sha256").update(git(["rev-parse", "HEAD"]).stdout);
+      for (const file of git(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+        .stdout.split("\0")
+        .filter(Boolean)
+        .sort()) {
+        hash.update(file).update(readFileSync(resolve(path, file)));
+      }
+      const context = { target: "production", name: "legacy", origin: "https://legacy.example", account: null };
+      const manifest = {
+        ...context,
+        source: hash.digest("hex"),
+        buildUUID: null,
+        revision: null,
+        configurationHash: configurationHash(context),
+      };
+      if (change === "origin") manifest.origin = "https://old.example";
+      if (change === "overrides")
+        manifest.configurationHash = configurationHash({ ...context, overrides: { vars: { FLAG: "false" } } });
+      if (change === "old manifest") delete manifest.configurationHash;
+      mkdirSync(resolve(path, ".wrangler"));
+      writeFileSync(resolve(path, ".wrangler/noteflare-build.json"), JSON.stringify(manifest));
+      const result = spawnSync(process.execPath, [entry, "deploy", "--production"], {
+        cwd: path,
+        env: { ...env, WORKERS_CI: "1" },
+        encoding: "utf8",
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("Run the build again before deployment");
+      expect(result.stderr).not.toContain("Wrangler");
+      expect(existsSync(resolve(path, "command-ran"))).toBe(false);
+    } finally {
+      rmSync(path, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("deployment targets and portable configuration", () => {
@@ -68,6 +177,12 @@ describe("deployment targets and portable configuration", () => {
     "invalid",
   ])("rejects invalid remote origin %s", (value) => {
     expect(() => installationOrigin(value)).toThrow("exact HTTPS origin");
+  });
+  it.each([undefined, "", "auto"])("resolves an omitted origin %s without inventing a subdomain", (value) => {
+    expect(installationOrigin(value, undefined, "notes", "account")).toBe("https://notes.account.workers.dev");
+    expect(installationOrigin(value, "https://saved.example", "notes")).toBe("https://saved.example");
+    expect(() => installationOrigin(value, undefined, "notes")).toThrow("valid workers.dev subdomain");
+    expect(() => installationOrigin(value, undefined, "notes", "account/path")).toThrow("valid workers.dev subdomain");
   });
   it("keeps portable defaults distinct from the legacy production environment", () => {
     const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
@@ -205,7 +320,7 @@ describe("deployment targets and portable configuration", () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
-  it.each(["source", "buildUUID", "revision", "target", "name", "account"])(
+  it.each(["source", "buildUUID", "revision", "target", "name", "account", "origin"])(
     "rejects artifacts with mismatched %s",
     (key) => {
       const manifest = {
@@ -215,11 +330,33 @@ describe("deployment targets and portable configuration", () => {
         target: "",
         name: "notes",
         account: "account",
+        origin: "https://notes.example",
       };
+      manifest.configurationHash = configurationHash(manifest);
       expect(() => verifyBuild(manifest, manifest)).not.toThrow();
       expect(() => verifyBuild(manifest, { ...manifest, [key]: "different" })).toThrow(`match ${key}`);
     },
   );
+  it("compares nested configuration without depending on object key order", () => {
+    const context = {
+      origin: "https://notes.example",
+      overrides: { vars: { FIRST: "one", SECOND: "two" }, queues: ["first", "second"] },
+    };
+    const manifest = { ...context, configurationHash: configurationHash(context) };
+    expect(() =>
+      verifyBuild(manifest, {
+        ...context,
+        overrides: { queues: ["first", "second"], vars: { SECOND: "two", FIRST: "one" } },
+      }),
+    ).not.toThrow();
+    expect(() =>
+      verifyBuild(manifest, { ...context, overrides: { ...context.overrides, vars: { FIRST: "changed" } } }),
+    ).toThrow("configuration overrides");
+    expect(() =>
+      verifyBuild(manifest, { ...context, overrides: { ...context.overrides, queues: ["second", "first"] } }),
+    ).toThrow("configuration overrides");
+    expect(() => verifyBuild(context, context)).toThrow("configuration overrides");
+  });
 });
 
 describe("portable database selection", () => {
@@ -264,7 +401,7 @@ describe("portable database selection", () => {
     expect(result.database_id).toBe(newDB);
     expect(result.database_name).not.toBe("noteflare");
     expect(result.database_name.length).toBeLessThanOrEqual(64);
-    expect(api).toHaveBeenNthCalledWith(1, `/d1/database?name=${result.database_name}`);
+    expect(api).toHaveBeenNthCalledWith(1, `/d1/database?name=${result.database_name}&per_page=100&page=1`);
     expect(api).toHaveBeenNthCalledWith(2, "/d1/database", { method: "POST", body: { name: result.database_name } });
   });
   it("respects custom database names and keeps dry runs free of provisioning", async () => {
@@ -298,7 +435,7 @@ describe("portable database selection", () => {
       expect(api).toHaveBeenCalledTimes(2);
     },
   );
-  it.each([null, [{ name: "other-db", uuid: existingDB }], [{ name: "wiki-db" }, { name: "wiki-db" }]])(
+  it.each([null, [{}], [{ name: "wiki-db" }, { name: "wiki-db" }]])(
     "rejects ambiguous database lookups %#",
     async (matches) => {
       const api = vi.fn().mockResolvedValue(matches);
@@ -306,6 +443,40 @@ describe("portable database selection", () => {
       expect(api).toHaveBeenCalledTimes(1);
     },
   );
+  it("ignores partial matches and follows pagination before selecting a database", async () => {
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce(
+        Array.from({ length: 100 }, (_, i) => ({ name: `wiki-db-staging-${i}`, uuid: existingDB })),
+      )
+      .mockResolvedValueOnce([
+        { name: "wiki-db", uuid: newDB },
+        { name: "wiki-db-other", uuid: existingDB },
+      ])
+      .mockResolvedValueOnce([{ success: true, results: [] }]);
+    expect((await portableDatabase(config, null, "wiki", api)).database_id).toBe(newDB);
+    expect(api).toHaveBeenNthCalledWith(2, "/d1/database?name=wiki-db&per_page=100&page=2");
+    expect(api.mock.calls.every(([, options]) => !options || options.body?.name === undefined)).toBe(true);
+  });
+  it("rejects exact duplicates across pages before querying or creating a database", async () => {
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce([
+        { name: "wiki-db", uuid: existingDB },
+        ...Array.from({ length: 99 }, () => ({ name: "wiki-db-staging" })),
+      ])
+      .mockResolvedValueOnce([{ name: "wiki-db", uuid: newDB }]);
+    await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("ambiguous D1 resources");
+    expect(api).toHaveBeenCalledTimes(2);
+  });
+  it("creates a database when the search contains only partial names", async () => {
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce([{ name: "wiki-db-staging" }])
+      .mockResolvedValueOnce({ uuid: newDB });
+    expect((await portableDatabase(config, null, "wiki", api)).database_id).toBe(newDB);
+    expect(api).toHaveBeenLastCalledWith("/d1/database", { method: "POST", body: { name: "wiki-db" } });
+  });
   it.each([undefined, "invalid", placeholderID])("rejects invalid provisioning IDs: %s", async (id) => {
     const api = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce({ uuid: id });
     await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("valid database ID");

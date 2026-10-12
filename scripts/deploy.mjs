@@ -117,9 +117,15 @@ export async function portableDatabase(config, settings, name, api, dryRun = fal
   const databaseName =
     declared.database_name === "noteflare" ? installationResourceName(name, "-db") : declared.database_name;
   if (!id && !dryRun) {
-    const matches = await api(`/d1/database?name=${encodeURIComponent(databaseName)}`);
-    if (!Array.isArray(matches) || matches.length > 1 || matches.some((entry) => entry?.name !== databaseName))
-      throw new Error("Cloudflare returned ambiguous D1 resources.");
+    const matches = [];
+    for (let page = 1; ; page++) {
+      const resources = await api(`/d1/database?name=${encodeURIComponent(databaseName)}&per_page=100&page=${page}`);
+      if (!Array.isArray(resources) || resources.some((entry) => typeof entry?.name !== "string"))
+        throw new Error("Cloudflare returned ambiguous D1 resources.");
+      matches.push(...resources.filter((entry) => entry.name === databaseName));
+      if (matches.length > 1) throw new Error("Cloudflare returned ambiguous D1 resources.");
+      if (resources.length < 100) break;
+    }
     if (matches.length) {
       id = matches[0].uuid;
       if (typeof id !== "string" || !databaseID.test(id) || id === placeholderID)
@@ -150,6 +156,11 @@ export async function portableDatabase(config, settings, name, api, dryRun = fal
 }
 
 export function installationOrigin(configured, saved, name, subdomain) {
+  if ((!configured || configured === "auto") && (!saved || saved === "auto")) {
+    const label = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+    if (typeof name !== "string" || !label.test(name) || typeof subdomain !== "string" || !label.test(subdomain))
+      throw new Error("Activate a valid workers.dev subdomain in Cloudflare before deploying.");
+  }
   const origin =
     configured && configured !== "auto"
       ? configured
@@ -281,11 +292,9 @@ async function prepare(forced, dryRun) {
     (binding) => binding.name === "BETTER_AUTH_URL" && binding.type === "plain_text" && binding.text !== "auto",
   )?.text;
   const subdomain =
-    root.vars.BETTER_AUTH_URL === "auto" && !savedURL
+    (!root.vars.BETTER_AUTH_URL || root.vars.BETTER_AUTH_URL === "auto") && !savedURL
       ? (await connection.api("/workers/subdomain"))?.subdomain
       : undefined;
-  if (root.vars.BETTER_AUTH_URL === "auto" && !savedURL && !subdomain)
-    throw new Error("Activate a workers.dev subdomain in Cloudflare before deploying.");
   const origin = installationOrigin(root.vars.BETTER_AUTH_URL, savedURL, name, subdomain);
   return {
     target,
@@ -317,14 +326,34 @@ export function outputConfig(root = process.cwd()) {
 }
 
 export function verifyBuild(manifest, expected) {
-  for (const key of ["source", "buildUUID", "revision", "target", "name", "account"])
+  for (const key of ["source", "buildUUID", "revision", "target", "name", "account", "origin"])
     if (manifest[key] !== expected[key])
       throw new Error(`Build artifact does not match ${key}. Run the build again before deployment.`);
+  if (manifest.configurationHash !== configurationHash(expected))
+    throw new Error("Build artifact does not match configuration overrides. Run the build again before deployment.");
+}
+
+function canonical(value) {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .map((key) => [key, canonical(value[key])]),
+    );
+  return value;
+}
+
+export function configurationHash(context) {
+  return createHash("sha256")
+    .update(JSON.stringify(canonical({ origin: context.origin, overrides: context.overrides ?? null })))
+    .digest("hex");
 }
 
 async function build(context) {
   rmSync(manifestPath, { force: true });
-  const source = fingerprint();
+  const workersCI = process.env.WORKERS_CI === "1";
+  const source = workersCI ? fingerprint() : null;
   const environment = { ...process.env, CLOUDFLARE_ENV: context.target };
   if (context.overrides) environment.NOTES_DEPLOY_OVERRIDES = JSON.stringify(context.overrides);
   else delete environment.NOTES_DEPLOY_OVERRIDES;
@@ -332,6 +361,7 @@ async function build(context) {
     env: environment,
     stdio: "inherit",
     timeout: undefined,
+    shell: process.platform === "win32",
   });
   const configPath = outputConfig();
   const generated = unstable_readConfig({ config: configPath, env: "" }, { hideWarnings: true });
@@ -346,10 +376,13 @@ async function build(context) {
     revision: process.env.WORKERS_CI_COMMIT_SHA ?? null,
     configPath,
     configHash: createHash("sha256").update(readFileSync(configPath)).digest("hex"),
+    configurationHash: configurationHash(context),
   };
-  if (fingerprint() !== source) throw new Error("Source changed during the build. Rebuild before deployment.");
-  mkdirSync(dirname(manifestPath), { recursive: true });
-  writeFileSync(manifestPath, JSON.stringify(manifest));
+  if (workersCI) {
+    if (fingerprint() !== source) throw new Error("Source changed during the build. Rebuild before deployment.");
+    mkdirSync(dirname(manifestPath), { recursive: true });
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+  }
   return manifest;
 }
 
