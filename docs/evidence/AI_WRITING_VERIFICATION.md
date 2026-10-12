@@ -156,7 +156,7 @@ pnpm exec playwright test tests/e2e/writing.spec.ts tests/e2e/plugin-ui.spec.ts 
 
 ## Rollout work requiring the deployment environment
 
-Follow [AI writing setup](AI_WRITING.md) and the [private plugin setup](CHATGPT_PLUGIN.md). The feature already includes migration `0080_ai_writing.sql`; this reliability update adds no migration. No production migration, deployment, ChatGPT registration, private installation/publication, or paid model-selection evaluation was performed.
+Follow [AI writing setup](../AI_WRITING.md) and the [private plugin setup](../CHATGPT_PLUGIN.md). The feature already includes migration `0080_ai_writing.sql`; this reliability update adds no migration. No production migration, deployment, ChatGPT registration, private installation/publication, or paid model-selection evaluation was performed.
 
 Workspace API writing needs the operator's `OPENAI_API_KEY` Worker secret and owner-enabled writing/funding/model settings. Defaults keep writing and API funding disabled until configured.
 

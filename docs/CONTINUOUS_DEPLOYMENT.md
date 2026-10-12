@@ -11,13 +11,11 @@ everything the workflow does is the manual sequence in
 
 ## What deploying on every push means here
 
-There is no staging environment. A commit that reaches `main` reaches users, and the only thing
-standing between the two is CI on that exact commit. Two consequences are worth stating plainly
-before enabling this:
+There is no staging environment. Passing CI makes the current `main` revision eligible for deployment; migration guards or workflow failures can still stop it. Check the successful deployment SHA before treating a merge as live. Two consequences matter before enabling this:
 
 - **D1 migrations are forward-only.** The workflow applies them before deploying the Worker. A
   release that includes a migration cannot be undone with `wrangler rollback` alone; see
-  [Rollback](DEPLOYMENT.md#rollback).
+  [Rollback](UPGRADING.md#rollback).
 - **A red CI run blocks the deploy, but a passing one is not proof of a good release.** CI does not
   exercise a live Cloudflare account — no real D1, R2, or Durable Object.
 
@@ -63,7 +61,7 @@ Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_sla
 Pause the shared delivery queue, disable live Slack channel validation, and allow 16 minutes for
 existing invocations to finish before dispatching with `confirm_slack_review_migration_safe` checked.
 Keep both paused through migration and deployment. Follow the exact
-[Slack release sequence](DEPLOYMENT.md#slack-review-follow-up-migration) to verify the release and resume
+[Slack release sequence](UPGRADING.md#slack-review-follow-up-migration) to verify the release and resume
 delivery. The confirmation is accepted only on manual dispatch and is passed as
 `SLACK_REVIEW_MIGRATION_SAFE=true` to the remote migration wrapper. Local releases require the same
 environment confirmation; local database migrations do not. Once 0069 through 0078 are applied, later
@@ -256,7 +254,7 @@ tag releases are too slow.
 ### Terraform and other infrastructure as code
 
 The Cloudflare provider can manage the Worker, D1 database, and buckets declaratively. This
-repository instead declares bindings in `wrangler.jsonc` and creates the resources by hand once, per
+repository declares bindings in `wrangler.jsonc`; portable installation uses Cloudflare provisioning and the existing manual path creates resources once, per
 [Create resources](DEPLOYMENT.md#1-create-resources). Both owners for one resource is the usual
 failure, so adopting Terraform means moving resource creation out of the deployment docs entirely —
 worth it across many Workers, not for one.

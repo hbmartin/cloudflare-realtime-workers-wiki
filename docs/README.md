@@ -1,65 +1,41 @@
-# Operator documentation
+# Documentation
 
-NoteFlare is a single-workspace, self-hosted collaborative wiki running entirely on
-Cloudflare Workers Paid, D1, R2, and two SQLite-backed Durable Object classes.
+Choose the guide for your role. Feature availability depends on environment flags, owner settings, credentials, and live acceptance; use [Flags](FLAGS.md) and [release status](roadmap/README.md) when planning rollout.
 
-## I need to…
+## Members
 
-| Task                                                    | Document                                              |
-| ------------------------------------------------------- | ----------------------------------------------------- |
-| Connect ChatGPT to the wiki and pilot the plugin        | [ChatGPT plugin](CHATGPT_PLUGIN.md)                   |
-| Stand up a new installation                             | [Deployment](DEPLOYMENT.md)                           |
-| Deploy automatically on every push to `main`            | [Continuous deployment](CONTINUOUS_DEPLOYMENT.md)     |
-| Look up a variable, secret, binding, or limit           | [Configuration](CONFIGURATION.md)                     |
-| Turn a feature flag or owner setting on or off          | [Flags and release controls](FLAGS.md)                |
-| Invite members, rotate secrets, inspect the work queues | [Operations](OPERATIONS.md)                           |
-| Import a Notion workspace export                        | [Operations](OPERATIONS.md#importing-a-notion-export) |
-| Diagnose an error code, close code, or failed deploy    | [Troubleshooting](TROUBLESHOOTING.md)                 |
-| Set up monitoring and alerts                            | [Observability](OBSERVABILITY.md)                     |
-| Back up, restore, or recover data                       | [Backup and recovery](BACKUP_AND_RECOVERY.md)         |
-| Assess compatibility with the Notion public API         | [Notion API compatibility](API_COMPATIBILITY.md)      |
-| Plan the next product capabilities                      | [Phased roadmap](roadmap/README.md)                   |
-| Report a vulnerability                                  | [Security policy](../SECURITY.md)                     |
-| Understand what the architecture cannot do              | [Limitations](../Limitations.md)                      |
+- [Using NoteFlare](USER_GUIDE.md): documents, tasks, reminders, offline use, embeds, sharing, and Slack capture.
+- [Account security](ACCOUNT_SECURITY.md): enrollment, trusted browsers, recovery codes, and protection.
+- [AI writing](AI_WRITING.md): explicit sources, drafts, application, funding, and private history.
+- [ChatGPT plugin](CHATGPT_PLUGIN.md): connecting, finding sources, editing, and save recovery.
 
-## System model
+## Operators
 
-Three durable planes hold state. Knowing which one is authoritative for a given fact determines every
-recovery decision.
+- [Deployment](DEPLOYMENT.md) and [Upgrading and rollback](UPGRADING.md).
+- [Configuration](CONFIGURATION.md) and [Flags and release controls](FLAGS.md).
+- [Operations](OPERATIONS.md): membership, secret rotation, queues, leases, imports, AI/plugin setup, and state ownership.
+- [Troubleshooting](TROUBLESHOOTING.md), [Login diagnostics](LOGIN_DIAGNOSTICS.md), and [Observability](OBSERVABILITY.md).
+- [Backup and recovery](BACKUP_AND_RECOVERY.md).
+- [Continuous deployment](CONTINUOUS_DEPLOYMENT.md).
 
-| Plane                 | Authoritative for                                                                                                                                         | Recovery source                                        |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
-| D1                    | Accounts, sessions, membership, page metadata, FTS5 search, backlink/mention projections, attachment and version metadata, structured tables, work queues | `pnpm db:export` (search index rebuilt on import)      |
-| R2                    | Current document snapshots, immutable version snapshots, attachment bodies                                                                                | Bucket copy or replication                             |
-| Durable Object SQLite | The Yjs update log after the last snapshot, plus room metadata                                                                                            | Not exportable in bulk; the DO itself is the only copy |
+## Integrators
 
-A document's current state is the R2 snapshot plus an ordered replay of the Durable Object update log.
-Neither half is sufficient alone. Projections in D1 (search, backlinks, mentions, previews) follow
-compaction, not keystrokes, so they lag edits by up to the 30-second compaction interval.
+- [Integrations](INTEGRATIONS.md): `/v1` bearer tokens, OAuth/MCP, and signed webhooks.
+- [Notion API compatibility](API_COMPATIBILITY.md): supported routes and explicit boundaries.
+- [Behavior specifications](specs/README.md): AI writing and ChatGPT plugin contracts.
 
-`WorkspaceEvents` Durable Objects hold no authoritative state. They only fan out page-tree and
-projection-invalidation events; losing one costs freshness, not data.
+## Contributors
 
-## The cron is load-bearing
+- [Contributing](../CONTRIBUTING.md): setup, checks, test tiers, migrations, and documentation conventions.
+- [License](../LICENSE), [security policy](../SECURITY.md), and [third-party notices](../THIRD_PARTY_NOTICES.md).
+- [Changelog](../CHANGELOG.md) and [verification evidence](evidence/README.md).
 
-`triggers.crons` in `wrangler.jsonc` is set to `*/15 * * * *`. The scheduled handler retries document-room
-disconnects left behind by archive, and Durable Object and R2 targets left behind by permanent deletion.
-Disabling it does not degrade gracefully: archived pages keep live editors connected, and permanently
-deleted pages leak Durable Objects and R2 objects indefinitely.
+## Planning
 
-Each tick drains at most 10 deletion jobs and 50 archive-disconnect targets, four times an hour. See
-[Configuration](CONFIGURATION.md#cron-drain-rates-and-backoff) for what that means for backlogs.
+- [Phased roadmap](roadmap/README.md), including each phase's exit matrix.
+- [Product ideas](IDEAS.md) and [Slack integration roadmap](SLACK_INTEGRATION_ROADMAP.md).
 
-## Degradation matrix
+## Background and research
 
-What survives when a dependency fails. Read this first during an incident.
-
-| Down                 | Still works                                                                                | Breaks                                                                                                                                                         |
-| -------------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1                   | Warm and hibernating document rooms keep accepting edits and buffering to their own SQLite | Every API request and WebSocket upgrade fails; a _cold_ Durable Object cannot start; compaction fails, re-dirties the room, and retries every 30 seconds       |
-| R2                   | The Durable Object update log is preserved intact                                          | Rooms cannot load; compaction retries; attachments return `attachment_missing`; versions return `version_missing`; restore returns 503                         |
-| `WorkspaceEvents` DO | Everything, silently                                                                       | Page-tree, backlink, and mention pushes stop. The UI goes stale until a reconnect triggers a full `/api/pages/tree` reload. **No user-facing error is raised** |
-| One `Document` DO    | The rest of the workspace                                                                  | That one page is unavailable. Archive and permanent-delete cleanup land in the retry tables and drain on the cron                                              |
-
-`GET /api/health` only probes D1. It reports healthy during a complete R2 or Durable Object outage. See
-[Observability](OBSERVABILITY.md#health-checking).
+- [Historical research](research/README.md): architectural assessments preserved with provenance.
+- Current supported restrictions are the README's [accepted v1 limits](../README.md#accepted-v1-limits).

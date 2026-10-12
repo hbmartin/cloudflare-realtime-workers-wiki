@@ -1,8 +1,6 @@
 # Phase 3: date mentions and reminders
 
-Status: implemented in #203 (merged 30 September 2026) and deployed to production with no
-flag. Migrations `0057`, `0059`, and `0060` are applied. Live checks of scheduler lag and email
-and Slack delivery are pending.
+Status: merged and deployed at audited `b61dfbd`; release controls and live exit acceptance are tracked in the [roadmap](README.md) and [audit evidence](../evidence/documentation-audit-2026-10-12.md).
 
 ## User contract
 

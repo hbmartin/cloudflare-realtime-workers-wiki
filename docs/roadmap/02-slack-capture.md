@@ -1,9 +1,6 @@
 # Phase 2: finish Slack capture
 
-Status: implemented in #202 (merged 30 September 2026) and deployed to production with no
-flag, so both shortcuts publish through the new capture path. The live signed-capture checks in
-[02-phase2-evidence.md](02-phase2-evidence.md) are still pending. This plan closed the
-Milestone 3 contract in `SLACK_INTEGRATION_ROADMAP.md`.
+Status: merged and deployed at audited `b61dfbd`; release controls and live exit acceptance are tracked in the [roadmap](README.md) and [audit evidence](../evidence/documentation-audit-2026-10-12.md).
 
 ## User contract and baseline audit
 

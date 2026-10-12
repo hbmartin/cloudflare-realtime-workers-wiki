@@ -11,6 +11,8 @@ identifiers. These deployment names are compatibility details; the product prese
 
 ## Browser deployment
 
+The portable deployment implementation is integrated on `main`. The native GitHub authorization and five editor-flow acceptance checks remain pending; the README deploy button is available as a preview. See [deployment evidence](evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate).
+
 For a new installation, use Cloudflare's native
 [Deploy to Cloudflare flow](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
 Account authorization, Workers Paid activation, and R2 activation are user steps. The application
@@ -74,12 +76,13 @@ results, and failed queries stop deployment before upload.
 
 Every other database retains page-move and Slack migration confirmations and digest-collision
 preflights. No deployment helper sets those confirmations automatically. SQL files and ordering are
-unchanged; follow the upgrade procedures below before retrying a guarded upgrade.
+unchanged; follow the upgrade procedures in [Upgrading](UPGRADING.md) before retrying a guarded upgrade.
 
 ### Native-button release checklist
 
-Publish the README deploy button only after testing a disposable deployment with Cloudflare's default
-authorization and package-manager launcher. Verify owner creation, MFA, collaborative editing,
+The README button is available as a preview. Complete this checklist before removing the preview
+status: test a disposable deployment with Cloudflare's default authorization and package-manager
+launcher. Verify owner creation, MFA, collaborative editing,
 attachment upload, export, and each of the five enabled editor features. Then remove the setup key,
 create content, change a feature setting, and redeploy. Confirm the resource bindings, origin, secret
 names, owner, content, and saved feature settings persist. Validate the existing GitHub Actions
@@ -249,122 +252,13 @@ These are configured in the Cloudflare dashboard, not in this repository.
 
 ## 5. Migrate and deploy
 
+**Existing installation:** read [Upgrading and rollback](UPGRADING.md) before deployment, including pending receipt and Slack pause/drain prerequisites. Fresh databases use the narrowly verified preflight described above.
+
 ```sh
 pnpm run deploy
 ```
 
-Migrations must complete before the Worker is deployed. The Worker queries the projection, mention,
-deletion-job, archive-disconnect, table-state, page-creation receipt, and page-move receipt tables on
-ordinary request paths; deploying code that expects a migration which has not been applied produces
-runtime failures rather than a clean startup error.
-
-`pnpm run deploy` runs the full typecheck and production build, applies all pending D1 migrations,
-then deploys the Worker. A failed build or migration stops the command before deployment. Already
-applied migrations are skipped. Use this command for local releases; invoking `wrangler deploy`
-directly bypasses the D1 migration step. CI also applies migrations before uploading the Worker; see
-[Automated deployment](#automated-deployment).
-
-`0001_initial.sql` is the squashed pre-production baseline. Files `0002` and later are forward-only
-production migrations and must remain in order; never edit an applied migration or mark it applied by
-hand. Before upgrading an existing installation, take a D1 export and stop any running Notion import,
-then run `pnpm run deploy` to apply pending migrations before deploying the Worker that consumes the
-new schema. `pnpm db:remote` remains available for a deliberate migration-only operation.
-
-Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, `0075`, `0076`, `0077`, or `0078` require
-`SLACK_REVIEW_MIGRATION_SAFE=true` after the [Slack rollout pause](#slack-review-follow-up-migration).
-This guard applies to both `pnpm db:remote` and `pnpm run deploy`; verified fresh databases and local
-database migrations do not require upgrade confirmation. Pending remote `0011` also requires
-`PAGE_MOVE_RECEIPT_MIGRATION_SAFE=true` after the page-move compatibility or quiescence check below. The confirmation acknowledges an operator-completed pause and drain, rather
-than pausing consumers automatically.
-
-Before an older database applies `0067_review_delivery.sql`, quiesce legacy digest scheduling and keep it
-quiesced through migration application and the Worker rollout. `pnpm db:local` and `pnpm db:remote` run
-`scripts/migrate-d1.mjs`, which checks the exact first-ten-page event assignments that 0067 will backfill.
-CLI deployment and CI both use the guarded remote command. Overlapping pending receipts that assign the
-same event stop the command before any migration is applied, with a collision count and at most 20 event
-samples and 10 receipt IDs per sample. IDs are limited to 200 characters in the report. The guard performs
-read-only queries and never repairs data. Export D1 and investigate reported receipt windows before retrying.
-Already-upgraded databases and fresh databases without legacy receipt tables skip the collision query.
-Existing migrations, including 0067, remain unchanged. Direct Wrangler migration application bypasses this guard.
-
-Apply the additive `0068_slack_recovery.sql` before deploying this recovery update. It adds guarded virtual
-receipt identities, indexes for receipt/retry and deadline lookups, separate claim rechecks, paused-operation
-scope requirements, and channel-validation scope-failure bookkeeping. Existing history and payloads remain
-intact. Production migration, deployment and feature activation are separate release actions.
-
-The wrapper allows 60 seconds for migration listing and defaults to 300,000 ms **per preflight query**.
-For a slower legacy database, pass `--preflight-timeout-ms` with a positive integer, for example
-`pnpm db:remote --preflight-timeout-ms 600000` (or the same option with `pnpm db:local`). The wrapper reports
-the failing stage and identifies `ETIMEDOUT` distinctly. Migration application inherits interactive output and
-has no wrapper deadline, including time spent at Wrangler's confirmation prompt. Existing CI/job deadlines
-still apply. The collision guard and quiescing requirements above remain in force.
-
-For OAuth and MCP releases, apply `0062_oauth_mcp.sql`, `0063_oauth_staged_receipt_index.sql`,
-`0064_oauth_cleanup_indexes.sql`, and `0065_mcp_workspace_generation.sql` in order before
-deploying this Worker. Migration `0065` adds a workspace consent generation and a pending-code
-index; it preserves existing grants and document content. Disabling MCP after deployment revokes
-all workspace connections and pending authorization codes. Re-enabling MCP requires clients to
-reconnect.
-
-For the security lifecycle follow-up, apply `0029_security_lifecycle.sql` and then
-`0030_security_review_followups.sql` before deploying the updated Worker. Migration `0030` is compatible
-with the Worker released alongside `0029`, so both migrations can finish before the code rollout. It adds
-expiring invitation claim leases, staged recovery-code storage, rate-limit retention indexing, stricter
-invite-completion validation, and restore-order-safe account-security initialization.
-
-`0005_import_reliability.sql` adopts existing multipart sessions as `active`, so uploads already in
-progress remain recoverable. It also clears legacy bulk-write replay receipts because they have no
-request hash and cannot safely distinguish a retry from reuse of the same request id with different
-content. Newly hashed receipts are durable until their table is deleted; do not run an old importer
-between applying `0005` and deploying the matching Worker, because it can create another unhashed
-receipt in that window.
-
-`0006_page_create_receipts.sql` introduces request receipts for client-addressed page creation without
-backfilling existing pages, because a batch's original request grouping cannot be reconstructed.
-`0007_page_create_receipt_lifecycle.sql` retains only receipts whose live page still exists in the same
-workspace, reduces them to request hashes, and makes them cascade when that page is permanently deleted.
-`0008_page_create_receipt_integrity.sql` constrains future receipts to the same workspace/page pair.
-Pages without receipts continue to use the legacy live-metadata replay check, while active receipt
-replays return current authoritative page metadata instead of a creation-time snapshot. Apply all three
-migrations before deploying the Worker that reads or writes these receipts.
-
-`0009_page_move_receipts.sql` adds operation-specific move receipts. Each receipt stores the committed
-page snapshot so an uncertain client request can distinguish its own move from a later reorder of the
-same page. Receipts cascade when their page or workspace is permanently deleted. Missing operation ids
-from older browser bundles are generated by the Worker. `0010_page_move_receipt_retention.sql` indexes
-receipt age so the scheduled Worker cleanup can prune entries after seven days. Apply `0009` before
-deploying any Worker that handles page moves or serves move-receipt lookups; every move writes a receipt,
-including moves from older browser bundles. Apply `0010` before deploying this Worker version: its
-already-configured scheduled handler prunes receipts on every run, and the index prevents a full-table scan.
-`0011_page_move_receipt_envelopes.sql` wraps receipts already written in the temporary bare-page format. For a
-normal upgrade from a Worker that already reads both bare receipts and versioned envelopes, apply it with the
-other migrations before deploying this Worker version. If the live Worker only reads bare receipts, first
-quiesce page-move requests and keep them quiesced until both the migration and Worker deployment complete; the
-migration can otherwise rewrite a receipt that the live Worker still needs to replay. A bridge release that
-reads both formats while continuing to write bare receipts is an alternative when downtime is unacceptable.
-
-This Worker writes explicitly versioned receipt envelopes but continues to read bare-page receipts during the
-compatibility window. Record when the last deployed Worker capable of writing bare receipts is retired, keep
-the fallback for at least the seven-day receipt-retention window after that time, and verify scheduled pruning is
-healthy before removing it.
-
-Before removing the fallback, run this against every production database. A non-zero count blocks removal. A
-zero count is necessary but not sufficient: `0011` rewrites historical bare receipts, so the query does not
-prove that every bare-writing Worker has retired or that the retention window has elapsed.
-
-```sql
-SELECT COUNT(*) AS bare_receipts
-  FROM page_move_receipts
- WHERE CASE
-         WHEN json_valid(response_json) THEN
-           CASE
-             WHEN json_type(response_json) = 'object' THEN
-               json_type(response_json, '$.pageMoveReceiptVersion') IS NULL
-             ELSE 0
-           END
-         ELSE 0
-       END;
-```
+This command selects named legacy production locally, builds, applies guarded D1 migrations, then uploads the Worker. A build or migration failure stops deployment. Applied migrations are skipped. Direct `wrangler deploy` bypasses D1 migration safeguards. For a portable installation, use `pnpm deploy:one-click` or its configured Workers Builds flow instead.
 
 ## 6. Bootstrap the owner
 
@@ -428,61 +322,17 @@ Compare the ID with `pnpm wrangler deployments list --env production`.
 
 The last item must be measured on a deployed account; Miniflare cannot prove billing behavior.
 
-## Upgrade procedure
-
-1. Export D1 with `pnpm db:export --remote` and back up R2, as described in
-   [Backup and recovery](BACKUP_AND_RECOVERY.md). Confirm the export is non-empty before continuing;
-   `wrangler d1 export` on its own fails on this schema.
-2. Build and test the exact revision locally with `pnpm check`. CI runs a superset of the same gate on
-   every push and the deploy workflow refuses to proceed unless it passed, so a failure here is a
-   failure there.
-3. Run `pnpm run deploy`, which builds, applies pending migrations, and then deploys the Worker.
-   Confirm every migration in `migrations/` reports success before the Worker upload starts.
-   The directory is the source of truth for what must be applied; do not rely on a list enumerated in
-   documentation, which drifts.
-4. Test sign-in, page metadata, document and workspace-event WebSockets, attachment range and
-   conditional download, table lease acquisition, and version listing.
-
-Durable Object migrations are append-only in `wrangler.jsonc`. Never rename or delete the `Document` or
-`WorkspaceEvents` classes or their bindings without a Cloudflare Durable Object migration plan.
-
-## Rollback
-
-Rollback is asymmetric. Worker code is reversible; data schema is not.
-
-| Change                          | Reversible                                                           |
-| ------------------------------- | -------------------------------------------------------------------- |
-| Worker code and assets          | Yes — `pnpm wrangler rollback` or the dashboard's deployment history |
-| `vars` and secrets              | Yes — set the previous value                                         |
-| D1 migrations                   | **No** — migrations are forward-only; there are no down migrations   |
-| Durable Object SQLite schema    | **No** — applied inline on room start                                |
-| Durable Object class migrations | **No** — append-only by design                                       |
-
-To roll back a release that included a migration:
-
-1. Stop writes if the schema change is destructive.
-2. Restore D1 from the export taken in step 1 of the upgrade procedure, into a replacement database.
-3. Point the `DB` binding at the restored database.
-4. Deploy the previous revision.
-5. Accept that Durable Object update logs are ahead of the restored D1 metadata. Documents converge on
-   reconnect; page metadata does not. Verify page tree, membership, and version listings before
-   reopening access.
-
-If the release contained no migration, `pnpm wrangler rollback` alone is sufficient.
-
 ## Automated deployment
 
 `.github/workflows/deploy.yml` deploys after successful CI for the current tip of `main`, and on a
-manual `workflow_dispatch` after running `pnpm check`. There is no staging environment, so a bad
-commit on `main` reaches users if its CI passes; the workflow applies D1 migrations before deploying,
-matching the normal manual order above. Before applying migrations, the workflow lists the production
+manual `workflow_dispatch` after running `pnpm check`. There is no staging environment. Passing CI makes the current `main` revision eligible; guarded migrations and workflow failures can still prevent deployment. The workflow applies D1 migrations before uploading code, matching the manual order above. Before applying migrations, the workflow lists the production
 database's pending migrations. If `0011_page_move_receipt_envelopes.sql` is pending, an automatic run stops
 before making changes. Quiesce page moves or verify that the live Worker already reads versioned receipts,
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
 until that manually dispatched run has deployed the new Worker.
 
 Pending `0069_slack_file_cleanup.sql`, `0070_slack_review_fences.sql`, `0071_slack_authorization_cleanup.sql`, `0072_slack_link_authorization_started_at.sql`, `0073_slack_membership_revocation.sql`, `0074_slack_enqueue_recovery.sql`, `0075_slack_delivery_recovery.sql`, `0076_slack_delivery_recovery_followup.sql`, `0077_slack_recovery_query_indexes.sql`, `0078_slack_delivery_recovery_repairs.sql`, or `0079_slack_verified_recovery.sql` also stop automatic deployment.
-Follow the [Slack rollout pause](#slack-review-follow-up-migration), then manually dispatch with
+Follow the [Slack rollout pause](UPGRADING.md#slack-review-follow-up-migration), then manually dispatch with
 `confirm_slack_review_migration_safe` checked. The workflow passes this confirmation to the guarded
 remote migration command. Once these migrations are applied, later automatic releases need no Slack
 confirmation.
@@ -495,116 +345,4 @@ managed by the workflow; they persist across deploys and are set once, manually,
 
 See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md) for the gate's behavior, the credentials, the
 optional manual-approval gate, how to switch to manual releases, and what Workers Builds, gradual
-deployments, or a staging environment would trade instead. The workflow has not been exercised
-against a live Cloudflare account in this repository; validate it on a throwaway Worker before
-relying on it.
-
-### Slack review follow-up migration
-
-Apply additive `0069_slack_file_cleanup.sql` before deploying the Slack review follow-up. It snapshots
-allocation ownership and adds an indexed cleanup ledger plus transactional capture triggers. Additive
-`0070_slack_review_fences.sql` adds a monotonically increasing channel-validation revision.
-`0071_slack_authorization_cleanup.sql` separates primary login from private Slack access, binds access and primary proofs to protection generations, records file-scope blocks and preserves explicit allocation ownership. It keeps existing links only for accounts with an enrolled factor, saved recovery codes and no recovery in progress; their original linking authorization cannot be established. Existing transient primary proofs are cleared, and proof reads reject older writes without authenticated-source metadata. `0072_slack_link_authorization_started_at.sql` separates the continuous access-grant start from verification and relink timestamps, preserving eligible earlier previews through unchanged relinking or legacy verification. It backfills only known timestamps; lost historical grant times are not reconstructed. `0073_slack_membership_revocation.sql` removes links without workspace membership and revokes workspace Slack links whenever a member is removed. Rejoining requires explicit relinking with a new access-grant start. Installation disconnect/reconnect still requires explicit relinking. OAuth login is preserved. Do not roll back to code that allows linking without fresh verification.
-
-`0074_slack_enqueue_recovery.sql` adds persistent enqueue intent, repairs pending Activity rows damaged by
-legacy recovery, and backfills missing share-response identities only from verified bindings authorized continuously
-since before the accepted request. It requeues responses blocked solely by `request_identity_unavailable`.
-Scope-paused, completed, sending, uncertain, and actively claimed work is preserved. Apply this migration before
-the updated Worker, using the same queue pause and validation drain below.
-
-`0075_slack_delivery_recovery.sql` and `0076_slack_delivery_recovery_followup.sql` remain historical migrations for
-enqueue counters, cleanup cursors, and recovery indexes. The migration runner no longer reconstructs legacy share
-identities or performs compatibility repairs outside migrations.
-
-`0077_slack_recovery_query_indexes.sql` adds a partial index on pending, never-attempted digest children for orphan reservation discovery. It is an index-only forward migration; it does not backfill or revive work. Apply it under the same pause, disabled-validation, backup, 16-minute drain, deployment, and verification sequence below.
-
-`0078_slack_delivery_recovery_repairs.sql` establishes missing recovery deadlines for already-enqueued Round 2-owned channel receipts, including legacy IDs on initialized mappings. It preserves completed/suppressed receipts, scope pauses, fresh claims, existing schedules, retry budgets, and explicit repair signatures. Apply it before deploying the Worker using the queue pause, validation disable, backup, and 16-minute drain sequence below. Verify the repaired rows before restoring flags and delivery.
-
-`0079_slack_verified_recovery.sql` adds fixed-window history progress, installation/generation/method cooldowns,
-and a partial recovery index beginning with `subscription_id`. It requires verified identity authorization and drops
-the obsolete token table. It does not backfill, convert, or replay historical records. Historical migrations and
-compatibility columns remain; the runtime no longer reads initialization or migration-state columns.
-
-Slack recovery after these migrations is forward-only. Keep the queue paused and channel validation disabled
-if migration or deployment fails, and repair the forward migration/deployment sequence before resuming delivery.
-Do not deploy legacy Slack code that relies on the removed token table or permits linking without fresh
-identity verification. The general code rollback procedure does not make that legacy code compatible.
-
-Slack has not been deployed. Apply the full forward migration chain before its first deployment, keeping production
-flags off until deployment is separately verified. Validation disabled holds all channel delivery; enabling it
-resumes the saved backlog without spending another retry. Mapping revalidation runs independently when enabled.
-
-Maintenance queues uncertain delivery, with at most one history page per invocation. Owner Verify and Repair each
-process one batch of at most five receipts and five history calls within twenty seconds. Continue verification uses
-a mapping token and fixed pass boundary. Uncertain sends remain incomplete through a 60-second settle window
-from the send attempt without making history calls. After settling, the first scan fixes the search window;
-incomplete searches retain that window, timestamp progress, and candidate match without a fixed total page cap.
-Earlier incomplete searches whose upper bound does not extend beyond the settle window restart before scanning.
-Permanent or ambiguous results block automatic polling; authentication and supported scope errors
-pause recovery. Transient errors retain retry deadlines. Honor `retryAt` and persisted method cooldowns before
-continuing. Never resend uncertain messages.
-
-Inspect digest/bulk cleanup, recovery-stage failures, stranded counts, enqueue failures, and queue errors. Obsolete
-installation-generation retirement uses `slack.delivery.retired` structured logging rather than a delivery failure
-for every retired receipt.
-
-`outbox.slack_enqueue_failure_count` drives enqueue backoff and persistent failure alerts;
-`outbox.attempts` remains the scheduling version. A cached destination error preserves work until
-revalidation; a fresh permanent destination failure retires unsent work in all three delivery modes.
-
-Existing failed/retired allocations are backfilled; allocations whose original Slack identity cannot be verified
-are reported for manual cleanup rather than deleted. Existing migrations remain unchanged.
-
-When any of these migrations is pending, perform this sequence **before applying migrations**:
-
-1. Pause the shared production delivery queue:
-
-   ```sh
-   pnpm wrangler queues pause-delivery cloudflare-realtime-notes-delivery --env production
-   ```
-
-2. In the live Worker's Cloudflare settings, set `SLACK_CHANNEL_VALIDATION_ENABLED` to `false` and
-   apply the variable change using the currently deployed code. Keep it `false` in the release's
-   production configuration too. This stops scheduled channel validation; the queue pause stops
-   new thumbnail consumers. Other queued jobs and notifications wait, while page editing remains
-   available. Record the intended Slack flags so they can be restored after verification.
-3. Wait **16 minutes after both changes take effect** for existing queue and scheduled invocations
-   to finish. The 60-second artifact claim expiry is not proof that an old consumer has stopped.
-   The interval exceeds Cloudflare's documented
-   [15-minute queue and cron invocation limit](https://developers.cloudflare.com/queues/platform/limits/).
-4. Export D1, then either manually dispatch the release workflow with
-   `confirm_slack_review_migration_safe` checked, or run:
-
-   ```sh
-   SLACK_REVIEW_MIGRATION_SAFE=true pnpm run deploy
-   ```
-
-   For separate migration and deployment commands, run
-   `SLACK_REVIEW_MIGRATION_SAFE=true pnpm db:remote`, then build and deploy the new Worker while
-   keeping the queue paused and channel validation disabled. Any pending page-move migration still
-   requires its separate safety procedure.
-
-5. Verify the deployed revision and readiness, then inspect Slack repair counts, remaining explicit
-   candidates, enqueue-failure counts, overdue recovery deadlines, and cleanup records before restoring flags or queue delivery.
-   Allow maintenance to repair recoverable damage while the flags remain disabled. Restore the intended Slack flags, synchronize configuration, and resume delivery:
-
-   ```sh
-   pnpm wrangler queues resume-delivery cloudflare-realtime-notes-delivery --env production
-   ```
-
-6. After recovery resumes, verify scope-pause wakes preserve share budgets, obsolete thumbnail allocations reach the existing cleanup ledger, and Slack delivery IDs and event timestamps show no duplicate sends. Use the existing recovery, scope, file-cleanup, and queue telemetry; investigate any growing overdue count before continuing the rollout.
-
-If migration or deployment fails, leave the queue paused and channel validation disabled until
-recovery is complete. Do not purge queued messages. Queue pause and resume use Cloudflare's
-[delivery controls](https://developers.cloudflare.com/queues/configuration/pause-purge/); queue
-messages remain subject to their normal retention period while paused. Operators need
-[Queues Edit permission](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
-for these controls in addition to the usual deployment credentials.
-
-Use the existing 15-minute cron. Cleanup runs independently of delivery recovery and thumbnail flags,
-with at most 25 candidates and two potentially effective or uncertain deletion attempts per file; definite 429 responses defer without consuming that budget. Validate partial OAuth grants,
-saved repairs with blocked bulk receipts, unmute/expiry wakeups, and cleanup health notices in staging.
-See [configuration and manual cleanup](CONFIGURATION.md#interactive-slack-workspace) for the
-operator procedure. The guarded release may apply migrations and deploy in one run after the manual
-pause and drain. Feature activation follows health verification; this change introduces no new flags
-or cron schedule.
+deployments, or a staging environment would trade instead. Successful named-production deploy records are in the [status audit](evidence/documentation-audit-2026-10-12.md). They do not establish every optional integration or the portable native-form gate.

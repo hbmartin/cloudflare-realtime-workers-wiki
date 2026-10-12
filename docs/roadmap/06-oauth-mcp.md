@@ -1,8 +1,6 @@
 # Phase 6: member-scoped OAuth and MCP
 
-Status: implemented in #206 with review fixes in #209 (merged 30 September 2026) and
-deployed. Migrations `0062` through `0065` are applied. MCP remains disabled until a workspace
-owner enables it; live client discovery, consent, and token rotation are pending.
+Status: merged and deployed at audited `b61dfbd`; release controls and live exit acceptance are tracked in the [roadmap](README.md) and [audit evidence](../evidence/documentation-audit-2026-10-12.md).
 
 ## User contract
 

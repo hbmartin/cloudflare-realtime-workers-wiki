@@ -1,111 +1,64 @@
-<p align="center">
-  <img src="./public/logo.jpg" alt="NoteFlare golden quill and scroll logo" width="360" />
-</p>
-
 # NoteFlare
 
-A private, self-hosted collaborative wiki built entirely on Cloudflare Workers, Durable Objects, D1, and R2.
+A private, self-hosted collaborative wiki built on Cloudflare Workers, Durable Objects, D1, and R2. Write and diagram together, keep knowledge in one workspace, and run the installation in your own Cloudflare account.
 
-Documents use BlockNote backed by Yjs, while diagrams use React Flow backed by the same Yjs room model. Each collaborative page epoch has one hibernating `YServer` Durable Object, a debounced and chunked SQLite update log, an R2 snapshot, presence, and Yjs-backed comments. Documents additionally persist an offline copy in browser IndexedDB; diagrams require a live authoritative connection for changes. A second read-only Durable Object distributes workspace metadata events. Page metadata, membership, lean content projections, deletion jobs, search, and structured tables live in D1. Files and immutable versions live in R2.
+![A NoteFlare handbook with workspace navigation and comments](docs/assets/workspace.png)
 
-## What works
+## Features
 
-- Operator-token bootstrap, mandatory authenticator or passkey enrollment, fixed 30-day trusted browsers, one-use invites, and owner/editor/viewer roles.
-- Workspace and private spaces, nested pages, favorites, pins, tags, templates, archive/restore, queued deletion, and scoped weighted FTS5 search.
-- Realtime BlockNote editing, awareness, local undo, offline IndexedDB, hidden-tab disconnects, server-enforced viewer read-only access, and five-minute connection reauthorization.
-- First-class realtime diagrams with React Flow stencils, connectors, frames, page links, member mentions, presence, node/edge comments, local undo, generated SVG thumbnails, and reconnectable network-required editing.
-- Merged update chunks, 30-second R2 compaction, structured D1 search/reference projection, 16/24 MiB warnings and limits, automatic versions, comparison, and epoch-safe restore.
-- Realtime page-tree metadata, unified page/member mentions, backlinks, authorized hover previews, and a cursor-based mention inbox.
-- Server-authoritative anchored comment threads, watches, in-app notifications, channel preferences, and timezone-aware digests.
-- Private R2 attachments with authorization, all HTTP range forms, conditional ETags, safe disposition, `nosniff`, MIME rejection, inline editor media, and chunked direct-to-R2 uploads for large files.
-- Full-page typed tables with 60-second single-editor leases, revision conflicts, owner force unlock, server-side paging and sorting, replayable bulk writes, and a 20,000-row limit.
-- In-app Markdown, sanitized HTML, Word (.docx), and nested Notion ZIP import with staged verification and atomic publication.
-- Document Markdown/HTML/Word (.docx)/portable ZIP/PDF export and diagram JSON/SVG/PNG/PDF export through resumable Cloudflare Workflows.
-- Optional Slack bot OAuth plus verified Slack OpenID identities, invite-gated Slack signup, private slash search, access-filtered unfurls, channel mappings, and queued personal/channel notifications.
+- **Collaboration.** Collaborative documents and diagrams with presence, anchored comments, versions, restore, mentions, backlinks, and scoped FTS5 search.
+- **Organization.** Nested/private spaces, tags, templates, task lists with Table/Board views, date mentions and reminders. See the [member guide](docs/USER_GUIDE.md).
+- **Writing.** [AI writing](docs/AI_WRITING.md) with explicit sources and private history, enabled by owner settings and credentials. Hosted ChatGPT funding requires separate approval and rollout.
+- **Portability.** Markdown, HTML, Word, Notion ZIP import and document/diagram export, including PDF through the optional browser binding.
+- **App and sharing.** Installable app shell, public document/table share links, and cached documents. Offline edits, expanded embeds, block links, live diagram embeds, and diff digests have [release controls](docs/FLAGS.md).
+- **Integrations.** [Notion-shaped `/v1` API](docs/API_COMPATIBILITY.md) with integration tokens and signed webhooks; member OAuth/MCP and a [ChatGPT plugin](docs/CHATGPT_PLUGIN.md). MCP needs owner enablement; installed-plugin acceptance remains a rollout gate.
+- **Slack.** Verified Slack identities, search, access-filtered unfurls, comment mirrors, and thread capture. Rich digest/share features require configured credentials and their [activation gates](docs/FLAGS.md#slack-round-2-activation).
 
-This is an early v1 implementation. Production billing-grade hibernation verification and high-concurrency load tests still require a deployed Workers Paid account.
+## Why Cloudflare
 
-## Browser support
+Each collaborative page epoch has one hibernating Yjs Durable Object. Its SQLite update log and R2 snapshot hold document state; D1 holds metadata, membership, search projections, comments, and typed tables. Workflows handle resumable jobs and Queues handle delivery. This keeps realtime state close to its authoritative room without a separate database server or Redis service.
 
-The production client supports Chrome and Edge 116+, Firefox 124+, and Safari 17.4+ on macOS and iOS. JavaScript and
-CSS builds target that same matrix. Because build targets do not polyfill runtime APIs, the client checks its required
-`AbortSignal` cancellation features at startup and shows an upgrade message instead of mounting in an unsupported browser.
+Documents retain browser IndexedDB copies. Diagrams require a live authoritative connection for edits. Cross-page search and references follow compaction rather than every keystroke. Production hibernation billing and high-concurrency behavior still require deployed load verification.
 
-## Deploy your own installation
+## Quick start
 
-The browser deployment flow uses Cloudflare's native Deploy to Cloudflare integration. Connect your
-GitHub and Cloudflare accounts, use a Workers Paid account with R2 activated, and choose the Worker
-and resource names offered by Cloudflare. Keep the detected build and deploy commands and leave
-`BETTER_AUTH_URL` as `auto`. Supply one private **setup key** of at least 32 random characters from
-your password manager. Internal secrets, the installation URL, and fresh database migrations are
-configured automatically.
-
-Open the URL printed after deployment, enter the same setup key, and create the workspace owner.
-Enroll an authenticator or passkey and save the recovery codes to enter the workspace. You can then
-remove `BOOTSTRAP_TOKEN` from the Worker's secrets in Cloudflare; redeployment preserves existing
-secrets and never recreates that key after setup.
-
-New installations enable expanded embeds, offline document editing, block links, live diagram
-embeds, and diff digests. Existing installations keep their feature settings. Slack, AI integrations,
-and custom domains are optional follow-up configuration. See [portable deployment and updates](docs/DEPLOYMENT.md#browser-deployment)
-for redeployment, custom domains, and migration safeguards.
-
-<!-- Release gate: uncomment this button only after a disposable native-button
-deployment and redeployment pass the live checklist in docs/DEPLOYMENT.md.
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https%3A%2F%2Fgithub.com%2Fhbmartin%2Fnoteflare)
-
--->
-
-## Local development
-
-Requires Node.js 22.22.2+ in the Node 22 release line, 24.15+ in the Node 24 release line, or 26+; pnpm 11.18.0; and
-[uv](https://docs.astral.sh/uv/) to provision Python 3.13.15 for the pinned Semgrep middleware-policy check.
+Requires Node 22.22.2+ in the Node 22 line, 24.15+ in the Node 24 line, or 26+, and pnpm 11.18.0.
 
 ```sh
-uv venv --python 3.13.15 --seed .venv
-source .venv/bin/activate
-python -m pip install --disable-pip-version-check --require-hashes -r requirements-semgrep.txt
 pnpm install
 cp .dev.vars.local.example .dev.vars
+```
+
+Set a strong `BETTER_AUTH_SECRET` and a private `BOOTSTRAP_TOKEN` in `.dev.vars`, then initialize and start the local app:
+
+```sh
 pnpm db:local
 pnpm dev
 ```
 
-Set a strong local `BETTER_AUTH_SECRET` and choose a private setup key (`BOOTSTRAP_TOKEN`) in `.dev.vars`. Open `http://localhost:5173`, enter the setup key on the first-run screen, and create the owner. The Vite development server supplies the localhost auth origin; remote builds resolve an HTTPS origin before bundling.
+Open `http://localhost:5173`, create the owner with that setup credential, then enroll a passkey or authenticator and save recovery codes. See [account security](docs/ACCOUNT_SECURITY.md) and [contributor tooling](CONTRIBUTING.md).
 
-Every account must enroll an authenticator or passkey and save recovery codes before entering the workspace. See [account protection, recovery, and rollout](docs/ACCOUNT_SECURITY.md). Migration 0028 invalidates existing sessions.
+The client supports Chrome/Edge 116+, Firefox 124+, and Safari 17.4+ on macOS/iOS. Startup checks required cancellation APIs and explains when a browser needs upgrading.
 
-Useful checks:
+## Deploy your own
 
-```sh
-pnpm check                 # formatting, lint, types, tests, dead code, generated types, Worker dry run
-pnpm test:unit             # fast unit and React component tests
-pnpm test:worker           # isolated Workers, D1, R2, and Durable Object integration tests
-pnpm test:e2e              # Chromium UI integration suite against a fresh local D1 state
-pnpm test:e2e:nightly      # Chromium, Firefox, WebKit, and mobile Chromium
-pnpm load:realtime         # 30 authenticated local realtime connections
-```
+Workers Paid is the supported production target. As checked on 12 October 2026, its account minimum is **US$5/month**. A small idle installation staying within included allowances may remain near that baseline; this is not a measured or guaranteed total. Storage, compute, requests, optional browser/PDF usage, and AI provider usage can add charges. See [Cloudflare pricing](https://developers.cloudflare.com/workers/platform/pricing/).
 
-`pnpm lint` uses Oxlint with type-aware rules, `pnpm format:check` uses Oxfmt, and `pnpm analyze` uses
-Fallow for unused dependencies and dead code. `pnpm analyze:audit` adds a changed-code review of duplication and
-maintainability findings without treating the repository's inherited complexity as a new gate. TypeScript is checked
-separately for the browser, Worker, unit tests, Worker integration tests, and build configuration. Coverage thresholds are
-enforced by `pnpm test:coverage` and `pnpm test:worker:coverage`. Semgrep and its Python dependencies are version- and
-hash-locked in `requirements-semgrep.txt`; keep the virtual environment active when running `pnpm check`.
+Use the button below to start Cloudflare’s browser deployment flow. Cloudflare provisions resources and generates internal secrets from one private setup key. New portable defaults enable five editor features; existing named production settings are preserved. See [browser deployment and updates](docs/DEPLOYMENT.md#browser-deployment) for setup, custom domains, and redeployment.
 
-The E2E server deletes only `.wrangler/e2e`, reapplies every D1 migration, and injects dedicated local test bindings.
-Fresh local realtime load checks enroll their own authenticator automatically. To run the realtime load check against a
-deployed environment, set `NOTES_LOAD_BASE_URL`, `NOTES_LOAD_EMAIL`, and `NOTES_LOAD_PASSWORD` for an account with an
-enrolled authenticator, plus either `NOTES_LOAD_TOTP_CODE` (a current six-digit code) or `NOTES_LOAD_TOTP_SECRET` (the
-Base32 authenticator secret used to generate a code). `NOTES_LOAD_CONNECTIONS` and `NOTES_LOAD_HOLD_MS` tune the
-connection count and hold time.
+**Preview:** native GitHub authorization and full editor-flow verification remain pending; see [verification evidence](docs/evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate). The manual installation path remains available.
 
-Pull requests run static checks, coverage suites, production builds, a Wrangler deployment dry run, and Chromium UI
-checks in separate CI jobs. The scheduled workflow adds the full browser/mobile matrix and realtime load checks. Configure
-the `STAGING_BASE_URL` repository variable plus `STAGING_LOAD_EMAIL`, `STAGING_LOAD_PASSWORD`, and
-`STAGING_LOAD_TOTP_SECRET` secrets to include a deployed staging target in that load check. The TOTP secret is exposed
-only to the staging load-check step.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https%3A%2F%2Fgithub.com%2Fhbmartin%2Fnoteflare)
+
+Follow the [manual installation steps](docs/DEPLOYMENT.md#existing-production-deployment):
+
+1. Create your D1, R2, Durable Object, Workflow, Queue, and observability resources.
+2. Configure the exact HTTPS installation origin and bindings.
+3. Set installation secrets; configure Slack, AI, and email only when needed.
+4. Build, apply guarded migrations, and deploy.
+5. Create the owner, complete account protection, and verify health and core flows.
+
+For an existing installation, read [Upgrading](docs/UPGRADING.md) before deploying. Start at the [documentation index](docs/README.md) for operations and recovery.
 
 ## Architecture
 
@@ -136,11 +89,18 @@ WorkspaceEvents Durable Object (read-only) ────┘
 
 There is intentionally no ORM, Redis, Postgres, custom WebSocket protocol, Hocuspocus adapter, or repository layer.
 
-## Production
+### Repository layout
 
-Start at the [operator documentation index](docs/README.md), which covers deployment, configuration,
-day-to-day operations, troubleshooting, observability, and backup and recovery. See also the
-[security policy](SECURITY.md) and [third-party notices](THIRD_PARTY_NOTICES.md).
+| Directory        | Responsibility                                           |
+| ---------------- | -------------------------------------------------------- |
+| `src/client/`    | React app, editors, member and owner UI                  |
+| `src/worker/`    | HTTP API, authorization, rooms, jobs, deliveries         |
+| `src/shared/`    | Shared contracts, document projections, validation       |
+| `src/plugin-ui/` | Embedded MCP/ChatGPT editor                              |
+| `migrations/`    | Forward D1 schema changes                                |
+| `scripts/`       | Build, migration, operational, and verification commands |
+| `plugins/`       | Portable plugin manifest, assets, and skills             |
+| `tests/`         | Browser integration and acceptance scenarios             |
 
 ## Accepted v1 limits
 
@@ -158,4 +118,4 @@ day-to-day operations, troubleshooting, observability, and backup and recovery. 
 
 ## License
 
-AGPL-3.0. See [LICENSE](LICENSE).
+AGPL-3.0. See [LICENSE](LICENSE), [security policy](SECURITY.md), and [third-party notices](THIRD_PARTY_NOTICES.md).

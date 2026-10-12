@@ -1,9 +1,6 @@
 # Phase 4: offline documents
 
-Status: implemented in #204 and #208 (merged 30 September 2026) and deployed with
-`OFFLINE_EDITING_ENABLED=false`. The installable shell and cached catalog ship; offline editing
-waits on the two-device and live reconnection pilot. Tables and diagrams remain online in this
-phase.
+Status: merged and deployed at audited `b61dfbd`; release controls and live exit acceptance are tracked in the [roadmap](README.md) and [audit evidence](../evidence/documentation-audit-2026-10-12.md).
 
 ## User contract
 

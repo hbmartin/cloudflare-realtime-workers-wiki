@@ -1,4 +1,8 @@
+# Historical architecture limitations
+
 Short version: the DO/Workers architecture buys you excellent per-document realtime at near-zero idle cost, and pays for it in **document size, geography, and everything that isn't a live document** — search, exports, imports, and background work.
+
+Historical research, first committed on 14 August 2026. Preserved to explain the original architecture and risk assessment; first-commit provenance is not a verified writing date. This is not current implementation guidance. See [current product limits](../../README.md#accepted-v1-limits) and [operator references](../README.md).
 
 **Per-page ceilings your users will actually hit**
 

@@ -3,6 +3,8 @@
 Every value the installation reads, and every limit it enforces. Source files are given so a value can
 be confirmed rather than trusted.
 
+Portable defaults below are prepared against the locally committed one-click implementation; see [deployment availability](DEPLOYMENT.md#browser-deployment) and its pending native release gate.
+
 ## Variables
 
 Set in the environment's `vars` block of `wrangler.jsonc`. Plaintext; visible in the dashboard and in
@@ -11,6 +13,7 @@ the repository.
 | Name                            | Default                                              | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `BETTER_AUTH_URL`               | portable `auto`; dev localhost                       | The exact origin the installation is served from. Portable deployment resolves `auto` before Vite builds; development uses `http://localhost:5173`. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **The production environment must use its deployed HTTPS origin.** |
+| `EMAIL_FROM`                    | unset                                                | Sender address for the optional email binding; configure with `SEND_EMAIL`.                                                                                                                                                                                                                                                                                                                                                                                              |
 | `EXPANDED_EMBEDS_ENABLED`       | portable/local/E2E `true`, legacy production `false` | Set to `true` to enable Loom, Google, Miro, Spotify, and CodePen frames and the link-preview action. The Worker exposes the flag in `/api/me`. Disabling it preserves stored links and the original YouTube, Vimeo, and Figma frames; `/v1` can round-trip expanded URLs as content while the client renders them as links. Regenerate binding types with `pnpm cf-typegen` after changing the committed value.                                                          |
 | `SLACK_DIGEST_DEFAULT_TIMEZONE` | `America/Los_Angeles`                                | IANA timezone used for new digest mappings at 09:00. Later deployment-default changes affect new mappings only. Existing mappings retain their saved schedules.                                                                                                                                                                                                                                                                                                          |
 
@@ -19,19 +22,22 @@ listed in [Flags and release controls](FLAGS.md).
 
 ## Secrets
 
-Set for deployment with `wrangler secret put --env production`. Never place these in `wrangler.jsonc`.
+Set on the intended Worker under **Settings → Variables and Secrets**. The CLI `wrangler secret put --env production` targets the existing named production installation. Never place these in `wrangler.jsonc`.
 
-| Name                         | Required             | Notes                                                                                                                                                                                                                                        |
-| ---------------------------- | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BETTER_AUTH_SECRET`         | Yes                  | At least 32 random bytes. Signs sessions **and** is the `x-notes-internal` shared secret for Worker-to-Durable-Object calls. Rotation has a wider blast radius than it appears; see [Operations](OPERATIONS.md#rotating-better_auth_secret). |
-| `BOOTSTRAP_TOKEN`            | Yes, until bootstrap | One-time operator install credential, compared in constant time against a SHA-256 digest. Delete or rotate after the owner exists.                                                                                                           |
-| `OBSERVABILITY_PROBE_TOKEN`  | Yes                  | High-entropy bearer value accepted only in `X-Observability-Token` on `GET /api/health/ready`. Store the same value in GitHub Actions.                                                                                                       |
-| `DO_LOCATION_HINT`           | No                   | One of `wnam`, `enam`, `sam`, `weur`, `eeur`, `apac`, `oc`, `afr`, `me`. If unset, derived from the bootstrap request's `cf.continent`, defaulting to `wnam`.                                                                                |
-| `SLACK_CLIENT_ID`            | No                   | Slack app client ID shared by the separate bot-install and Slack OpenID flows. Slack remains visibly disabled unless all four Slack values are set.                                                                                          |
-| `SLACK_CLIENT_SECRET`        | No                   | Slack app client secret. Register both `/api/slack/oauth/callback` and `/api/auth/callback/slack`; OpenID uses only `openid profile email`.                                                                                                  |
-| `SLACK_SIGNING_SECRET`       | No                   | Verifies slash commands, events, and interactive shortcuts; requests older than five minutes and signature replays are rejected.                                                                                                             |
-| `SLACK_TOKEN_ENCRYPTION_KEY` | No                   | High-entropy key used to encrypt bot access and refresh tokens with AES-GCM before D1 storage. Rotate by reinstalling Slack with the new key before removing the old deployment.                                                             |
-| `WEBHOOK_ENCRYPTION_KEY`     | For webhooks         | Exactly 32 random bytes encoded as 43 characters of unpadded base64url. Encrypts integration webhook verification tokens with AES-GCM; webhook subscription creation and delivery remain unavailable when it is unset or malformed.          |
+| Name                         | Required                                         | Notes                                                                                                                                                                                                                                        |
+| ---------------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BETTER_AUTH_SECRET`         | Yes                                              | At least 32 random bytes. Signs sessions **and** is the `x-notes-internal` shared secret for Worker-to-Durable-Object calls. Rotation has a wider blast radius than it appears; see [Operations](OPERATIONS.md#rotating-better_auth_secret). |
+| `BOOTSTRAP_TOKEN`            | Yes, until bootstrap                             | One-time operator install credential, compared in constant time against a SHA-256 digest. Delete or rotate after the owner exists.                                                                                                           |
+| `OBSERVABILITY_PROBE_TOKEN`  | Yes                                              | High-entropy bearer value accepted only in `X-Observability-Token` on `GET /api/health/ready`. Store the same value in GitHub Actions.                                                                                                       |
+| `DO_LOCATION_HINT`           | No                                               | One of `wnam`, `enam`, `sam`, `weur`, `eeur`, `apac`, `oc`, `afr`, `me`. If unset, derived from the bootstrap request's `cf.continent`, defaulting to `wnam`.                                                                                |
+| `SLACK_CLIENT_ID`            | No                                               | Slack app client ID shared by the separate bot-install and Slack OpenID flows. Slack remains visibly disabled unless all four Slack values are set.                                                                                          |
+| `SLACK_CLIENT_SECRET`        | No                                               | Slack app client secret. Register both `/api/slack/oauth/callback` and `/api/auth/callback/slack`; OpenID uses only `openid profile email`.                                                                                                  |
+| `SLACK_SIGNING_SECRET`       | No                                               | Verifies slash commands, events, and interactive shortcuts; requests older than five minutes and signature replays are rejected.                                                                                                             |
+| `SLACK_TOKEN_ENCRYPTION_KEY` | No                                               | High-entropy key used to encrypt bot access and refresh tokens with AES-GCM before D1 storage. Rotate by reinstalling Slack with the new key before removing the old deployment.                                                             |
+| `WEBHOOK_ENCRYPTION_KEY`     | For webhooks                                     | Exactly 32 random bytes encoded as 43 characters of unpadded base64url. Encrypts integration webhook verification tokens with AES-GCM; webhook subscription creation and delivery remain unavailable when it is unset or malformed.          |
+| `OPENAI_API_KEY`             | For workspace API writing                        | Operator API credential. Set as a Worker secret; the owner must also enable writing and API funding and configure usable models.                                                                                                             |
+| `AI_TOKEN_ENCRYPTION_KEY`    | For ChatGPT plan connections                     | Independent high-entropy AES-GCM key for connection tokens and OAuth state. Preserve across deployments; rotation needs migration or reconnection.                                                                                           |
+| `CHATGPT_CLIENT_SECRET`      | If provisioned client authentication requires it | Hosted OpenAI client secret. Only set after the hosted client contract is provisioned.                                                                                                                                                       |
 
 `DO_LOCATION_HINT` is frozen into `workspaces.location_hint` at bootstrap and is **immutable in v1**.
 Changing the secret later has no effect on an existing workspace. It influences first Durable Object
@@ -43,6 +49,19 @@ For local development these live in `.dev.vars`; copy `.dev.vars.local.example`.
 generate missing internal secrets before owner initialization and preserve all existing secrets; see
 [Browser deployment](DEPLOYMENT.md#browser-deployment).
 
+## AI writing credentials
+
+Workspace API writing and ChatGPT plan connections are independent funding paths. See [Operations](OPERATIONS.md#ai-writing-setup) for activation and verification.
+
+| Name                         | Default | Notes                                                                                                             |
+| ---------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
+| `CHATGPT_CONNECTION_ENABLED` | `false` | Enable hosted plan connections only after approval and live acceptance; this does not gate workspace API writing. |
+| `CHATGPT_CLIENT_ID`          | unset   | Actual provisioned hosted client ID.                                                                              |
+| `CHATGPT_TOKEN_AUTH_METHOD`  | unset   | Provisioned `none` or `client_secret_basic` contract; the latter needs `CHATGPT_CLIENT_SECRET`.                   |
+| `CHATGPT_SCOPES`             | unset   | Exact approved hosted inference scopes. Identity-only scopes cannot fund inference.                               |
+
+Never substitute a local/loopback identity for a hosted Worker client. The exact callback is the configured HTTPS `BETTER_AUTH_URL` followed by `/api/ai/chatgpt/callback`. Secret values belong in Worker secrets or the local example's private copy, not in client forms or tracked files.
+
 ## Bindings
 
 Declared in `wrangler.jsonc`, typed in `src/worker/env.ts`.
@@ -51,24 +70,26 @@ The named legacy `production` environment retains the `cloudflare-realtime-notes
 existing data and infrastructure remain in place. The portable template also binds
 `DELIVERY_DEAD_LETTER_QUEUE` so the native form provisions the consumer's dead-letter queue.
 
-| Binding                          | Kind           | Target                                                                                      |
-| -------------------------------- | -------------- | ------------------------------------------------------------------------------------------- |
-| `DB`                             | D1             | `cloudflare-realtime-notes`, migrations in `migrations/`                                    |
-| `BUCKET`                         | R2             | `cloudflare-realtime-notes`, preview `cloudflare-realtime-notes-preview`                    |
-| `DOCUMENT`                       | Durable Object | class `Document`, SQLite-backed, hibernating                                                |
-| `WORKSPACE_EVENTS`               | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, audience-filtered                      |
-| `NOTES_WORKFLOW`                 | Workflow       | resumable imports, exports, template clones, migrations, and reindexing                     |
-| `DELIVERY_QUEUE`                 | Queue          | notification, email, Slack, and digest fan-out; configured with a DLQ                       |
-| `BROWSER`                        | Browser Run    | optional PDF generation and private Slack diagram SVG-to-PNG rasterization                  |
-| `SEND_EMAIL`                     | Email Service  | optional email delivery; the UI reports it unavailable when absent                          |
-| `API_SOURCE_BURST_LIMIT`         | Rate Limit     | Pre-authentication `/v1` throttle: 300 requests per source per 10 seconds                   |
-| `API_SOURCE_MINUTE_LIMIT`        | Rate Limit     | Pre-authentication `/v1` throttle: 1,800 requests per source per minute                     |
-| `API_BURST_LIMIT`                | Rate Limit     | Authenticated `/v1` throttle: 100 requests per integration per 10 seconds                   |
-| `API_MINUTE_LIMIT`               | Rate Limit     | Authenticated `/v1` throttle: 600 requests per integration per minute                       |
-| `CLIENT_TELEMETRY_PREAUTH_LIMIT` | Rate Limit     | Browser telemetry pre-authentication throttle: 300 requests per hashed source IP per minute |
-| `CLIENT_TELEMETRY_LIMIT`         | Rate Limit     | Authenticated browser error reports: 20 requests per hashed user ID per minute              |
-| `OBSERVABILITY`                  | Analytics      | Fixed-position operational metrics; production dataset retained 3 months                    |
-| `CF_VERSION_METADATA`            | Version        | Active Worker version ID, tag, and deployment timestamp                                     |
+| Binding                          | Kind           | Target                                                                                                                                                             |
+| -------------------------------- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `DB`                             | D1             | `cloudflare-realtime-notes`, migrations in `migrations/`                                                                                                           |
+| `BUCKET`                         | R2             | `cloudflare-realtime-notes`, preview `cloudflare-realtime-notes-preview`                                                                                           |
+| `DOCUMENT`                       | Durable Object | class `Document`, SQLite-backed, hibernating                                                                                                                       |
+| `WORKSPACE_EVENTS`               | Durable Object | class `WorkspaceEvents`, SQLite-backed, hibernating, audience-filtered                                                                                             |
+| `NOTES_WORKFLOW`                 | Workflow       | resumable imports, exports, template clones, migrations, and reindexing                                                                                            |
+| `DELIVERY_QUEUE`                 | Queue          | notification, email, Slack, and digest fan-out; configured with a DLQ                                                                                              |
+| `DELIVERY_DEAD_LETTER_QUEUE`     | Queue          | Portable provisioning alias for the consumer’s dead-letter queue. Named production retains its existing queue association; this alias does not add a DLQ consumer. |
+| `BROWSER`                        | Browser Run    | optional PDF generation and private Slack diagram SVG-to-PNG rasterization                                                                                         |
+| `SEND_EMAIL`                     | Email Service  | optional email delivery; the UI reports it unavailable when absent                                                                                                 |
+| `API_SOURCE_BURST_LIMIT`         | Rate Limit     | Pre-authentication `/v1` throttle: 300 requests per source per 10 seconds                                                                                          |
+| `API_SOURCE_MINUTE_LIMIT`        | Rate Limit     | Pre-authentication `/v1` throttle: 1,800 requests per source per minute                                                                                            |
+| `API_BURST_LIMIT`                | Rate Limit     | Authenticated `/v1` throttle: 100 requests per integration per 10 seconds                                                                                          |
+| `API_MINUTE_LIMIT`               | Rate Limit     | Authenticated `/v1` throttle: 600 requests per integration per minute                                                                                              |
+| `CLIENT_TELEMETRY_PREAUTH_LIMIT` | Rate Limit     | Browser telemetry pre-authentication throttle: 300 requests per hashed source IP per minute                                                                        |
+| `CLIENT_TELEMETRY_LIMIT`         | Rate Limit     | Authenticated browser error reports: 20 requests per hashed user ID per minute                                                                                     |
+| `OBSERVABILITY`                  | Analytics      | Fixed-position operational metrics; production dataset retained 3 months                                                                                           |
+| `CF_VERSION_METADATA`            | Version        | Active Worker version ID, tag, and deployment timestamp                                                                                                            |
+| `ASSETS`                         | Fetcher        | Static assets supplied by the Vite/Wrangler assets integration.                                                                                                    |
 
 No KV, Workers AI, Vectorize, Hyperdrive, or Containers bindings are used. Slack is
 inactive until its four secrets are configured. Verified integration webhooks can make outbound HTTPS
@@ -328,7 +349,7 @@ saved modal state do not grant access. Owners may create a replacement share pri
 
 Before first Slack deployment, apply all forward migrations through `0079_slack_verified_recovery.sql` and
 configure `SLACK_DIGEST_DEFAULT_TIMEZONE` for new mappings. Follow the
-[Slack review follow-up migration procedure](DEPLOYMENT.md#slack-review-follow-up-migration): pause queue delivery,
+[Slack review follow-up migration procedure](UPGRADING.md#slack-review-follow-up-migration): pause queue delivery,
 disable validation, wait 16 minutes for existing invocations to drain, export D1, then apply migrations and deploy
 while delivery remains paused through verification. The migration adds persisted history progress,
 method cooldowns, mapping recovery indexes, and verified-only authorization; it drops link tokens without converting
@@ -422,10 +443,7 @@ Apply additive migration `0047_workspace_experience.sql` together with this rele
 
 ## Environments
 
-`wrangler.jsonc` keeps local-safe defaults at the top level and defines two named environments:
-`production`, which holds the deployed D1, R2, Durable Object, and origin bindings; and
-`notes-checks-e2e`, used only by the local Playwright harness. Production scripts always pass
-`--env production` explicitly.
+`wrangler.jsonc` declares portable new-install defaults at the top level and two named environments: `production` retains the existing installation, and `notes-checks-e2e` serves the local browser harness. Ordinary local `pnpm build`, `pnpm deploy`, and `pnpm deploy:production` select named production; `pnpm deploy:one-click` selects the portable target. Workers Builds resolves its target before building, as described in [Deployment](DEPLOYMENT.md#portable-updates-and-custom-domains).
 
 There is no staging environment. `nightly.yml` refers to a `STAGING_BASE_URL` repository variable for
 its realtime load check, but no configuration in this repository deploys such an environment; it must

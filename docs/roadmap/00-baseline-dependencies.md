@@ -2,8 +2,7 @@
 
 Status: Round 1 planning baseline, completed on 28 September 2026 at app commit `499af28`. Rows below
 describe that baseline; for current status see [README.md](README.md).
-Reference: [PARITY.md](../../../PARITY.md), dated 25 September 2026. Refresh this audit if the
-checkout changes before a phase begins; the parity report alone is not an implementation ticket.
+Refresh the code audit before a phase begins; a historical baseline is not an implementation ticket.
 
 ## What already works, and what remains
 
@@ -56,7 +55,7 @@ the arrows are release gates.
 | Check                   | Evidence required before implementation starts                                   |
 | ----------------------- | -------------------------------------------------------------------------------- |
 | Current source          | Recheck named paths and migrations against the target commit                     |
-| PARITY gap              | Mark shipped, partial, or absent with a working behavior test, not a label alone |
+| Capability gap          | Mark shipped, partial, or absent with a working behavior test, not a label alone |
 | Permissions and retries | Identify actor, current access check, authority, and stable operation ID         |
 | Data migration          | Identify source of truth, verification hash/revision, replay, and rollback rule  |
 | Phase completion        | Record the phase exit-matrix evidence and change its status in `README.md`       |

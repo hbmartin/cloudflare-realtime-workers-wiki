@@ -340,3 +340,49 @@ pnpm load:realtime
   and `pnpm observability:report` / `pnpm observability:check` for the production summary and alert thresholds.
 - **Durable Object placement is permanent.** A workspace's location hint is fixed at bootstrap and
   Durable Objects do not relocate after creation.
+
+## AI writing setup
+
+Apply the writing migration through [Upgrading](UPGRADING.md#migrations-0080-to-0082), then set `OPENAI_API_KEY` as a production Worker secret. In Settings → AI writing, enable writing and workspace API funding, configure Fast/Best model IDs available to the credential, conservative context character limits, and the daily quota. Empty model IDs disable a mode. Model discovery verifies access without charging writing quota. Test with synthetic content and an explicitly requested generation.
+
+The default allowance is 20 started API requests per member per UTC day. Follow-ups and regeneration are new requests. Cancellation after dispatch, uncertain transport, stream failures, and provider 5xx responses retain the reservation. Confirmed pre-generation 400/401/403/404/422/429 rejection releases it. There is no automatic fallback between funding sources.
+
+Hosted ChatGPT plan funding requires an approved hosted client contract, the [connection variables and secrets](CONFIGURATION.md#ai-writing-credentials), and an independent encryption key. Keep the gate off until actual hosted consent, refresh, disconnect, model access, streaming, and allowance acceptance pass. Connection approval and successful local mocks are different gates. See the [writing specification](specs/ai-writing.md#hosted-sign-in-with-chatgpt-rollout-gate).
+
+Keep prompts, source content, results, and tokens out of diagnostic logs. Use [AI troubleshooting](TROUBLESHOOTING.md#ai-writing), [monitoring](OBSERVABILITY.md#ai-writing), and [backup guidance](BACKUP_AND_RECOVERY.md#ai-writing-history-and-connection-keys) for operations.
+
+## ChatGPT plugin setup
+
+The wiki connector uses NoteFlare OAuth and `/mcp`; it is independent of ChatGPT plan funding. Enable MCP as an owner and choose a dedicated synthetic pilot space. Confirm discovery metadata and the unauthenticated Bearer challenge, register the actual remote app in the ChatGPT administrator environment, then use its actual `plugin_asdk_app_…` ID with `pnpm plugin:link`. The command creates the environment-specific dependency metadata and install archive; do not fabricate an app ID.
+
+Apply pending migrations through [Upgrading](UPGRADING.md) and build the Worker and embedded UI before installation. Complete installed-client consent, refresh/revocation, search/read/create/update/comment, private-space filtering, read-only access, stale revisions, duplicate retries, and save recovery before private publication. The source package and local browser tests do not certify installed ChatGPT acceptance. See [the plugin guide](CHATGPT_PLUGIN.md), [integrator setup](INTEGRATIONS.md), and [plugin contracts](specs/chatgpt-plugin.md).
+
+## System model
+
+Three durable planes hold state. Knowing which one is authoritative for a given fact determines every
+recovery decision.
+
+| Plane                 | Authoritative for                                                                                                                                                                                                    | Recovery source                                        |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| D1                    | Accounts, sessions, membership, page metadata, FTS5 search, backlink/mention projections, attachment and version metadata, structured tables, private AI history, encrypted connections, quota receipts, work queues | `pnpm db:export` (search index rebuilt on import)      |
+| R2                    | Current document snapshots, immutable version snapshots, attachment bodies                                                                                                                                           | Bucket copy or replication                             |
+| Durable Object SQLite | The Yjs update log after the last snapshot, plus room metadata                                                                                                                                                       | Not exportable in bulk; the DO itself is the only copy |
+
+A document's current state is the R2 snapshot plus an ordered replay of the Durable Object update log.
+Neither half is sufficient alone. Projections in D1 (search, backlinks, mentions, previews) follow
+compaction, not keystrokes, so they lag edits by up to the 30-second compaction interval.
+
+`WorkspaceEvents` Durable Objects hold no authoritative state. They only fan out page-tree and
+projection-invalidation events; losing one costs freshness, not data.
+
+## The cron is load-bearing
+
+`triggers.crons` in `wrangler.jsonc` is set to `*/15 * * * *`. The scheduled handler retries document-room
+disconnects left behind by archive, and Durable Object and R2 targets left behind by permanent deletion.
+Disabling it does not degrade gracefully: archived pages keep live editors connected, and permanently
+deleted pages leak Durable Objects and R2 objects indefinitely.
+
+Each tick drains at most 10 deletion jobs and 50 archive-disconnect targets, four times an hour. See
+[Configuration](CONFIGURATION.md#cron-drain-rates-and-backoff) for what that means for backlogs.
+
+The same scheduled handler expires inactive AI conversations and generation receipts, recovers abandoned generations, and starts retained document-checkpoint/R2 cleanup. Disabling it can retain private history past its cleanup deadline and leave failed work unrecovered. Cleanup does not make an expired conversation readable.
