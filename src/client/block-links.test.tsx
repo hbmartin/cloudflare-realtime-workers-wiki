@@ -162,4 +162,35 @@ describe("block link navigation and native menus", () => {
     await flushFrames();
     expect(scroll).toHaveBeenCalledOnce();
   });
+  it("reveals a pending offline target when it renders locally, then stops observing", async () => {
+    const { root } = fixture({ offline: true, synced: false, id: "other" });
+    await flushFrames();
+    expect(screen.getByLabelText("Block link status").textContent).toContain("cached copy");
+    const block = document.createElement("div");
+    block.className = "bn-block-outer";
+    block.dataset.id = "linked";
+    const scroll = vi.fn();
+    block.scrollIntoView = scroll;
+    await act(async () => root.current!.querySelector(".bn-editor")!.appendChild(block));
+    await flushFrames();
+    expect(scroll).toHaveBeenCalledOnce();
+    expect(screen.getByLabelText("Block link status").textContent).toBe("");
+    const scan = vi.spyOn(root.current!, "querySelectorAll");
+    await act(async () => block.appendChild(document.createElement("span")));
+    await flushFrames();
+    expect(scan).not.toHaveBeenCalled();
+  });
+  it("closes Block actions with Escape from the editor and removes its listener afterward", async () => {
+    const { root } = fixture();
+    await flushFrames();
+    const trigger = screen.getByRole("button", { name: "Block actions" });
+    fireEvent.click(trigger);
+    const text = root.current!.querySelector("p")!;
+    text.addEventListener("keydown", (event) => event.stopPropagation());
+    text.focus();
+    fireEvent.keyDown(text, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(fireEvent.keyDown(text, { key: "Escape" })).toBe(true);
+  });
 });

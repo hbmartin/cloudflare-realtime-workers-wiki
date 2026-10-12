@@ -1,3 +1,4 @@
+import { escapeHtml } from "./html";
 import type { Env, MemberContext } from "./env";
 import { requireMember, requireOwner } from "./auth";
 import { HttpError, sha256 } from "./http";
@@ -422,13 +423,6 @@ export async function registerOAuthClient(request: Request, env: Env) {
   return json(
     { client_id: clientId, client_name: name, redirect_uris: redirects, token_endpoint_auth_method: "none" },
     201,
-  );
-}
-
-function escapeHtml(value: string) {
-  return value.replace(
-    /[&<>"']/g,
-    (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]!,
   );
 }
 

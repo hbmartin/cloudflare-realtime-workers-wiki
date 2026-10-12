@@ -1,3 +1,4 @@
+import { escapeHtml } from "./html";
 import { documentBlocks } from "../shared/notion-blocks";
 import {
   collectLinkedDiagramIds,
@@ -43,15 +44,6 @@ export type SharedPageRow = ShareRow & {
   content_epoch: number;
   page_updated_at: number;
 };
-
-function escapeHtml(value: string) {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
 
 function randomUrlKey() {
   return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(24)));

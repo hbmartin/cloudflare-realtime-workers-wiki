@@ -39,6 +39,7 @@ import { digestMapping, digestPages, deliverDigest, dueRound2Digests, type Diges
 import { deliverRound2ChannelEvent } from "./slack-channel-events";
 import { publishSlackOutbox } from "./slack-outbox";
 import { digestBlocks } from "./slack-blocks";
+import type { DigestComparison } from "../shared/block-diff";
 import {
   encryptSlackToken,
   createSlackOAuthUrl,
@@ -7864,7 +7865,7 @@ describe("bounded verified Slack recovery", () => {
   });
 });
 
-it.each([false, true])("freezes channel comparison coverage, including legacy inputs (%s)", async (legacy) => {
+async function channelComparisonFixture(legacy = false) {
   const m = await mapping();
   await page();
   const r = await receipt(m.id);
@@ -7901,6 +7902,11 @@ it.each([false, true])("freezes channel comparison coverage, including legacy in
   await event(m.id, "page", r.window_end - 10, "page_edit", `activity:page_edit:page:1:1:${m.id}`);
   if (legacy) await event(m.id, "page", r.window_end - 20, "page_edit", "legacy-edit-without-checkpoint");
   const get = vi.spyOn(env.BUCKET, "get");
+  return { m, r, get };
+}
+
+it.each([false, true])("freezes channel comparison coverage, including legacy inputs (%s)", async (legacy) => {
+  const { r, get } = await channelComparisonFixture(legacy);
   await deliverDigest(runtime(), r.id);
   expect(get).toHaveBeenCalledTimes(legacy ? 0 : 2);
   const message = await env.DB.prepare("SELECT comparison_refs_json FROM slack_digest_messages WHERE receipt_id=?")
@@ -7914,6 +7920,29 @@ it.each([false, true])("freezes channel comparison coverage, including legacy in
   expect(posted.includes("Before: Old &lt;message&gt;")).toBe(!legacy);
   expect(posted.includes("After: New")).toBe(!legacy);
   expect(posted.includes("compareFrom=page%3A1%3A1")).toBe(!legacy);
+});
+
+it("evicts failed cached comparisons and retries channel delivery without sending a fallback", async () => {
+  const { m, r, get } = await channelComparisonFixture();
+  const failure = new Error("Temporary comparison storage failure");
+  const comparisons = new Map<string, Promise<DigestComparison>>();
+  const installation = (await round2Installation(runtime(), "installation", 1))!;
+  const currentMapping = (await digestMapping(runtime(), m.id))!;
+  get.mockRejectedValueOnce(failure);
+  await expect(digestPages(runtime(), currentMapping, r, installation, undefined, comparisons)).rejects.toBe(failure);
+  expect(comparisons.size).toBe(0);
+  expect(
+    (await digestPages(runtime(), currentMapping, r, installation, undefined, comparisons))[0]!.comparison!.diff,
+  ).not.toBeNull();
+  get.mockRejectedValueOnce(failure);
+  await expect(deliverDigest(runtime(), r.id)).rejects.toBe(failure);
+  expect(calls.some((call) => call.method === "chat.postMessage")).toBe(false);
+  get.mockClear();
+  await deliverDigest(runtime(), r.id);
+  expect(get).toHaveBeenCalledTimes(2);
+  const posted = JSON.stringify(calls.find((call) => call.method === "chat.postMessage")!.body);
+  expect(posted).toContain("Before: Old &lt;message&gt;");
+  expect(posted).not.toContain("Comparison unavailable");
 });
 
 it.each([
