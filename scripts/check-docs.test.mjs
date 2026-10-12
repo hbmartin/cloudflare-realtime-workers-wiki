@@ -331,6 +331,21 @@ describe("configuration documentation coverage", () => {
 });
 
 describe("current operator references", () => {
+  it("accepts pnpm aliases and reporter values before commands and script names", () => {
+    const f = fixture();
+    f.write(
+      "README.md",
+      `# App
+[Docs](docs/README.md)
+\`pnpm i\` \`pnpm rm old-package\` \`pnpm un old-package\` \`pnpm uninstall old-package\`
+\`pnpm up\` \`pnpm upgrade\` \`pnpm ls\`
+\`pnpm --reporter silent run build\` \`pnpm run --reporter silent build\`
+\`pnpm --reporter="silent" build\` \`pnpm --reporter 'silent' run build\`
+\`pnpm --reporter silent --filter app run --silent missing-script\`
+`,
+    );
+    expect(f.check()).toEqual(["README.md: missing package.json script missing-script"]);
+  });
   it("recognizes built-ins and validates script names after pnpm options", () => {
     const f = fixture();
     f.write(

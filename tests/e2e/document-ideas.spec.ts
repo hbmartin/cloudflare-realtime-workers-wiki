@@ -26,9 +26,14 @@ test("block links remain usable through fragment history and clipboard denial", 
   const id = await block.getAttribute("data-id");
   expect(id).toBeTruthy();
   await page.getByRole("button", { name: "Block actions", exact: true }).click();
+  await page.locator("body").click({ position: { x: 1, y: 1 } });
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Block actions" })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Block actions", exact: true })).not.toBeFocused();
+  await page.getByRole("button", { name: "Block actions", exact: true }).click();
   await editor.click();
   await page.keyboard.press("Escape");
-  await expect(page.getByRole("dialog", { name: "Block actions" })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Block actions" })).toBeHidden();
   await expect(page.getByRole("button", { name: "Block actions", exact: true })).not.toBeFocused();
   await editor.press("ControlOrMeta+End");
   await page.keyboard.press("Enter");
@@ -37,7 +42,8 @@ test("block links remain usable through fragment history and clipboard denial", 
   await expect(suggestion).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(suggestion).toBeHidden();
-  await expect(page.getByRole("dialog", { name: "Block actions" })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "Block actions" })).toBeHidden();
+  await page.getByRole("button", { name: "Block actions", exact: true }).click();
   await page.getByRole("menuitem", { name: "Copy link to block" }).press("Escape");
   await expect(page.getByRole("dialog", { name: "Block actions" })).toBeHidden();
   await expect(page.getByRole("button", { name: "Block actions", exact: true })).toBeFocused();

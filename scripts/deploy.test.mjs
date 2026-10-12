@@ -272,6 +272,61 @@ describe("deployment targets and portable configuration", () => {
     }
     expect(first.map((entry) => entry.simple)).toEqual(root.ratelimits.map((entry) => entry.simple));
   });
+  it.each([1, 50, 51, 52, 54, 55, 59, 63])(
+    "isolates R2 and queues for a %s-character Worker and keeps retry names stable",
+    (length) => {
+      const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
+      const name = "a".repeat(length);
+      const resources = (worker, config = root, settings = null) => {
+        const overrides = portableOverrides(config, settings, worker, "https://example.com", {});
+        expect(overrides.queues.consumers[0]).toMatchObject({
+          queue: overrides.queues.producers[0].queue,
+          dead_letter_queue: overrides.queues.producers[1].queue,
+        });
+        return [overrides.r2_buckets[0].bucket_name, ...overrides.queues.producers.map((entry) => entry.queue)];
+      };
+      const first = resources(name);
+      const other = resources(`${name.slice(0, -1)}b`);
+      expect(first).toEqual(resources(name));
+      expect(new Set([...first, ...other]).size).toBe(6);
+      for (const resource of first) {
+        expect(resource.length).toBeLessThanOrEqual(63);
+        expect(resource).toMatch(/^[a-z0-9][a-z0-9-]+[a-z0-9]$/);
+      }
+      const suffixes = ["-attachments", "-delivery", "-delivery-dlq"];
+      const unshortened = first.filter((_, index) => length + suffixes[index].length <= 63);
+      expect(unshortened).toEqual(
+        suffixes.filter((suffix) => length + suffix.length <= 63).map((suffix) => `${name}${suffix}`),
+      );
+      expect(
+        resources(name, root, {
+          bindings: [
+            { name: "BUCKET", type: "r2_bucket", bucket_name: "noteflare" },
+            { name: "DELIVERY_QUEUE", type: "queue", queue_name: "noteflare-delivery" },
+            { name: "DELIVERY_DEAD_LETTER_QUEUE", type: "queue", queue_name: "noteflare-delivery-dlq" },
+          ],
+        }),
+      ).toEqual(["noteflare", "noteflare-delivery", "noteflare-delivery-dlq"]);
+    },
+  );
+  it("keeps explicit custom resource names on fresh installations", () => {
+    const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
+    const config = {
+      ...root,
+      r2_buckets: [{ binding: "BUCKET", bucket_name: "custom-attachments" }],
+      queues: {
+        ...root.queues,
+        producers: root.queues.producers.map((entry, index) => ({
+          ...entry,
+          queue: index ? "custom-dlq" : "custom-delivery",
+        })),
+      },
+    };
+    const overrides = portableOverrides(config, null, "wiki", "https://example.com", {});
+    expect(overrides.r2_buckets[0].bucket_name).toBe("custom-attachments");
+    expect(overrides.queues.producers.map((entry) => entry.queue)).toEqual(["custom-delivery", "custom-dlq"]);
+    expect(overrides.queues.consumers[0]).toMatchObject({ queue: "custom-delivery", dead_letter_queue: "custom-dlq" });
+  });
   it("preserves existing rate-limit namespaces and allocates only missing bindings", () => {
     const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
     const settings = { bindings: [{ name: root.ratelimits[0].name, type: "ratelimit", namespace_id: "987654" }] };
@@ -424,7 +479,55 @@ describe("portable database selection", () => {
       body: { sql: "SELECT name FROM sqlite_master WHERE type='table';" },
     });
   });
-  it.each(["install_state", "workspaces", "d1_migrations", "unrelated_table"])(
+  it.each([0, 1])("checks migration history before reusing a database with %s applied migrations", async (applied) => {
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce([{ name: "wiki-db", uuid: newDB }])
+      .mockResolvedValueOnce([{ success: true, results: [{ name: "d1_migrations" }, { name: "sqlite_sequence" }] }])
+      .mockResolvedValueOnce([{ success: true, results: [{ applied }] }]);
+    const result = await portableDatabase(config, null, "wiki", api).catch((error) => error.message);
+    expect(result).toEqual(
+      applied === 0
+        ? { database_id: newDB, database_name: "wiki-db" }
+        : "Existing D1 database requires an explicit database_id or saved Worker DB binding before reuse.",
+    );
+    expect(api).toHaveBeenNthCalledWith(3, `/d1/database/${newDB}/query`, {
+      method: "POST",
+      body: { sql: "SELECT count(*) applied FROM d1_migrations;" },
+    });
+  });
+  it.each(
+    [
+      null,
+      [],
+      [{ success: false, results: [{ applied: 0 }] }],
+      ...[
+        [],
+        [{}],
+        [{ applied: "0" }],
+        [{ applied: -1 }],
+        [{ applied: 0.5 }],
+        [{ applied: Number.MAX_SAFE_INTEGER + 1 }],
+        [{ applied: 0 }, { applied: 0 }],
+      ].map((results) => [{ success: true, results }]),
+    ].map((history) => ({ history })),
+  )("rejects malformed migration history %#", async ({ history }) => {
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce([{ name: "wiki-db", uuid: newDB }])
+      .mockResolvedValueOnce([{ success: true, results: [{ name: "d1_migrations" }] }])
+      .mockResolvedValueOnce(history);
+    await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("invalid D1 migration history");
+  });
+  it("stops when the migration history query fails", async () => {
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce([{ name: "wiki-db", uuid: newDB }])
+      .mockResolvedValueOnce([{ success: true, results: [{ name: "d1_migrations" }] }])
+      .mockRejectedValueOnce(new Error("D1 unavailable"));
+    await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("D1 unavailable");
+  });
+  it.each(["install_state", "workspaces", "unrelated_table"])(
     "rejects implicit reuse of a database containing %s",
     async (table) => {
       const api = vi

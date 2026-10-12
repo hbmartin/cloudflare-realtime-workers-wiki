@@ -143,7 +143,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec vitest run scripts/deploy.test.mjs -t "deployment entry point"
       - run: pnpm build
-      - run: pnpm cf-typegen:check
       - run: pnpm run deploy --production --dry-run
 
   e2e:

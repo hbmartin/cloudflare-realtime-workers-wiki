@@ -98,11 +98,11 @@ export function selectTarget({ forced, environment, workersCI, name, production,
     : "";
 }
 
-function installationResourceName(name, suffix) {
+function installationResourceName(name, suffix, limit = 64) {
   const full = `${name}${suffix}`;
-  if (full.length <= 64) return full;
+  if (full.length <= limit) return full;
   const hash = createHash("sha256").update(name).digest("hex").slice(0, 8);
-  return `${name.slice(0, 64 - suffix.length - hash.length - 1)}-${hash}${suffix}`;
+  return `${name.slice(0, limit - suffix.length - hash.length - 1)}-${hash}${suffix}`;
 }
 
 export async function portableDatabase(config, settings, name, api, dryRun = false) {
@@ -143,10 +143,30 @@ export async function portableDatabase(config, settings, name, api, dryRun = fal
         !Array.isArray(result[0].results)
       )
         throw new Error("Cloudflare returned invalid D1 schema results.");
-      if (result[0].results.some((row) => !internalTables.has(row?.name) || row.name === "d1_migrations"))
+      if (result[0].results.some((row) => !internalTables.has(row?.name)))
         throw new Error(
           "Existing D1 database requires an explicit database_id or saved Worker DB binding before reuse.",
         );
+      if (result[0].results.some((row) => row.name === "d1_migrations")) {
+        const history = await api(`/d1/database/${id}/query`, {
+          method: "POST",
+          body: { sql: "SELECT count(*) applied FROM d1_migrations;" },
+        });
+        if (
+          !Array.isArray(history) ||
+          history.length !== 1 ||
+          history[0]?.success !== true ||
+          !Array.isArray(history[0].results) ||
+          history[0].results.length !== 1 ||
+          !Number.isSafeInteger(history[0].results[0]?.applied) ||
+          history[0].results[0].applied < 0
+        )
+          throw new Error("Cloudflare returned invalid D1 migration history results.");
+        if (history[0].results[0].applied !== 0)
+          throw new Error(
+            "Existing D1 database requires an explicit database_id or saved Worker DB binding before reuse.",
+          );
+      }
     } else id = (await api("/d1/database", { method: "POST", body: { name: databaseName } }))?.uuid;
   }
   if (id !== undefined && (typeof id !== "string" || !databaseID.test(id) || id === placeholderID))
@@ -193,6 +213,16 @@ export function portableOverrides(config, settings, name, origin, database) {
     throw new Error(
       "BUCKET differs from the existing deployment. Update the portable configuration explicitly before retrying.",
     );
+  const producers = config.queues.producers.map((producer) => ({
+    ...producer,
+    queue:
+      settings?.bindings?.find((entry) => entry.type === "queue" && entry.name === producer.binding)?.queue_name ??
+      (producer.queue === "noteflare-delivery"
+        ? installationResourceName(name, "-delivery", 63)
+        : producer.queue === "noteflare-delivery-dlq"
+          ? installationResourceName(name, "-delivery-dlq", 63)
+          : producer.queue),
+  }));
   return {
     name,
     vars: { ...config.vars, ...saved, BETTER_AUTH_URL: origin },
@@ -203,7 +233,12 @@ export function portableOverrides(config, settings, name, origin, database) {
         migrations_dir: resolve(config.d1_databases[0].migrations_dir ?? "migrations"),
       },
     ],
-    r2_buckets: config.r2_buckets.map((entry) => ({ ...entry, bucket_name: bucket?.bucket_name ?? entry.bucket_name })),
+    r2_buckets: config.r2_buckets.map((entry) => ({
+      ...entry,
+      bucket_name:
+        bucket?.bucket_name ??
+        (entry.bucket_name === "noteflare" ? installationResourceName(name, "-attachments", 63) : entry.bucket_name),
+    })),
     ratelimits: config.ratelimits.map((entry) => {
       const binding = settings?.bindings?.find(
         (existing) => existing.type === "ratelimit" && existing.name === entry.name,
@@ -219,21 +254,11 @@ export function portableOverrides(config, settings, name, origin, database) {
       return { ...entry, namespace_id: namespace };
     }),
     queues: {
-      producers: config.queues.producers.map((producer) => ({
-        ...producer,
-        queue:
-          settings?.bindings?.find((entry) => entry.type === "queue" && entry.name === producer.binding)?.queue_name ??
-          producer.queue,
-      })),
+      producers,
       consumers: config.queues.consumers.map((consumer) => ({
         ...consumer,
-        queue:
-          settings?.bindings?.find((entry) => entry.type === "queue" && entry.name === "DELIVERY_QUEUE")?.queue_name ??
-          config.queues.producers.find((entry) => entry.binding === "DELIVERY_QUEUE").queue,
-        dead_letter_queue:
-          settings?.bindings?.find((entry) => entry.type === "queue" && entry.name === "DELIVERY_DEAD_LETTER_QUEUE")
-            ?.queue_name ??
-          config.queues.producers.find((entry) => entry.binding === "DELIVERY_DEAD_LETTER_QUEUE").queue,
+        queue: producers.find((entry) => entry.binding === "DELIVERY_QUEUE").queue,
+        dead_letter_queue: producers.find((entry) => entry.binding === "DELIVERY_DEAD_LETTER_QUEUE").queue,
       })),
     },
     // Reuse provisioned Workflows/datasets; only template defaults follow a renamed Worker.

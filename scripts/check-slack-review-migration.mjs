@@ -21,7 +21,7 @@ export function checkSlackReviewMigration(output, confirmed = false) {
     throw new Error(
       "Slack review migrations require a manually confirmed safe upgrade.\n" +
         "Pause the delivery queue and disable live Slack channel validation, then allow 16 minutes for existing invocations to finish.\n" +
-        "Keep both paused through migration and deployment. Set SLACK_REVIEW_MIGRATION_SAFE=true or manually dispatch with confirm_slack_review_migration_safe checked. See https://github.com/hbmartin/cloudflare-realtime-workers-wiki/blob/main/docs/UPGRADING.md#slack-review-follow-up-migration.",
+        "Keep both paused through migration and deployment. Set SLACK_REVIEW_MIGRATION_SAFE=true or manually dispatch with confirm_slack_review_migration_safe checked. See docs/UPGRADING.md#slack-review-follow-up-migration.",
     );
   }
   return pending;

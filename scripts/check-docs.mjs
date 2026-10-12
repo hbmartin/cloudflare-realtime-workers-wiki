@@ -98,12 +98,12 @@ function markdown(source) {
 function declaredNames(source, generated = false) {
   const names = new Set();
   let found = false;
-  const declarations = (nodes, namespace = "") => {
+  const declarations = (nodes) => {
     for (let node of nodes) {
       if (node.type === "ExportNamedDeclaration") node = node.declaration;
       if (!node) continue;
       if (node.type === "TSModuleDeclaration" && node.body?.type === "TSModuleBlock") {
-        if (node.id.name === "Cloudflare") declarations(node.body.body, "Cloudflare");
+        if (node.id.name === "Cloudflare") declarations(node.body.body);
         continue;
       }
       const name = node.id?.name;
@@ -111,7 +111,7 @@ function declaredNames(source, generated = false) {
         ? name &&
           (name.startsWith("__BaseEnv_") ||
             name === "CloudflareBindings" ||
-            (name.endsWith("Env") && name !== "ProcessEnv" && (!namespace || namespace === "Cloudflare")))
+            (name.endsWith("Env") && name !== "ProcessEnv"))
         : name === "AppBindings";
       if (!expected) continue;
       found = true;
@@ -173,10 +173,12 @@ const pnpmBuiltins = new Set([
   "help",
   "import",
   "init",
+  "i",
   "install",
   "link",
   "licenses",
   "list",
+  "ls",
   "login",
   "logout",
   "outdated",
@@ -189,12 +191,17 @@ const pnpmBuiltins = new Set([
   "publish",
   "rebuild",
   "remove",
+  "rm",
   "root",
   "server",
   "setup",
   "store",
   "unlink",
+  "un",
+  "uninstall",
   "update",
+  "up",
+  "upgrade",
   "why",
   "view",
   "whoami",
@@ -210,14 +217,17 @@ function concreteReferences(example, scripts, executables) {
   for (const match of executable.matchAll(/\bpnpm\s+([^\n;&|]+)/g)) {
     const words = match[1].match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
     let index = 0;
-    while (words[index]?.startsWith("-")) {
-      const option = words[index++];
-      if (["--filter", "--filter-prod", "--dir", "-C", "-F"].includes(option)) index++;
-    }
+    const skipOptions = () => {
+      while (words[index]?.startsWith("-")) {
+        const option = words[index++];
+        if (["--filter", "--filter-prod", "--dir", "-C", "-F", "--reporter"].includes(option)) index++;
+      }
+    };
+    skipOptions();
     const run = ["run", "run-script"].includes(words[index]);
     if (run) {
       index++;
-      while (words[index]?.startsWith("-")) index++;
+      skipOptions();
     }
     const command = words[index]?.replace(/^["']|["']$/g, "");
     if (!command || /[<>{}$*…]/.test(command)) continue;
@@ -244,6 +254,7 @@ function concreteReferences(example, scripts, executables) {
 export function checkDocs(root, files) {
   root = realpathSync(root);
   const inventory = new Set(files.map(portable).filter((file) => existsSync(resolve(root, file))));
+  const inventoryFiles = [...inventory];
   const documents = new Map();
   const errors = [];
   for (const file of inventory) {
@@ -278,7 +289,7 @@ export function checkDocs(root, files) {
           : resolve(root, file);
         if (!inside(root, target)) throw new Error("link escapes the Git root");
         let targetFile = portable(relative(root, target));
-        const directory = [...inventory].some((candidate) => candidate.startsWith(targetFile ? `${targetFile}/` : ""));
+        const directory = inventoryFiles.some((candidate) => candidate.startsWith(targetFile ? `${targetFile}/` : ""));
         if (!inventory.has(targetFile) && !directory) throw new Error("target does not exist with this exact path");
         if (!inside(root, realpathSync(target))) throw new Error("symlink target escapes the Git root");
         if (statSync(target).isDirectory()) {
@@ -391,7 +402,7 @@ export function checkDocs(root, files) {
               errors.push(`${file}: ${path}: repository path escapes the Git root`);
             } else if (
               !inventory.has(targetFile) &&
-              ![...inventory].some((name) => name.startsWith(`${targetFile}/`))
+              !inventoryFiles.some((name) => name.startsWith(`${targetFile}/`))
             ) {
               errors.push(`${file}: ${path}: repository path is missing or has incorrect casing`);
             }
