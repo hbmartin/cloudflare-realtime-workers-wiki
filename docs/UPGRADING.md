@@ -4,14 +4,13 @@ Upgrade an existing installation through its normal deployment command after che
 
 ## Upgrade procedure
 
-
 1. Export D1 with `pnpm db:export --remote` and back up R2, as described in
    [Backup and recovery](BACKUP_AND_RECOVERY.md). Confirm the export is non-empty before continuing;
    `wrangler d1 export` on its own fails on this schema.
 2. Build and test the exact revision locally with `pnpm check`. CI runs a superset of the same gate on
    every push and the deploy workflow refuses to proceed unless it passed, so a failure here is a
    failure there.
-3. Run `pnpm run deploy`, which builds, applies pending migrations, and then deploys the Worker.
+3. Use the installation’s deployment target: `pnpm run deploy` or `pnpm deploy:production` for named legacy production; `pnpm deploy:one-click` or its configured Workers Builds flow for a portable installation. These build, apply pending guarded migrations, and then upload the Worker.
    Confirm every migration in `migrations/` reports success before the Worker upload starts.
    The directory is the source of truth for what must be applied; do not rely on a list enumerated in
    documentation, which drifts.
@@ -128,7 +127,6 @@ still apply. The collision guard and quiescing requirements above remain in forc
 
 ### Slack review follow-up migration
 
-
 Apply additive `0069_slack_file_cleanup.sql` before deploying the Slack review follow-up. It snapshots
 allocation ownership and adds an indexed cleanup ledger plus transactional capture triggers. Additive
 `0070_slack_review_fences.sql` adds a monotonically increasing channel-validation revision.
@@ -235,18 +233,22 @@ See [configuration and manual cleanup](CONFIGURATION.md#interactive-slack-worksp
 operator procedure. The guarded release may apply migrations and deploy in one run after the manual
 pause and drain. Feature activation follows health verification; this change introduces no new flags
 or cron schedule.
-## Migrations 0080 to 0081
+
+## Migrations 0080 to 0082
 
 `0080_ai_writing.sql` adds private writing history, funding settings, connections, and quota receipts. Apply it before deploying the writing Worker. Configure optional [AI writing credentials](CONFIGURATION.md#ai-writing-credentials) and owner settings separately. Preserve `AI_TOKEN_ENCRYPTION_KEY` across releases; changing it requires an explicit token migration or member reconnection.
 
 `0081_document_changes.sql` adds document comparison storage for diff digests. Apply it before the Worker uses the new tables. Block links, live diagrams, and diff capture have separate release controls; see [Flags](FLAGS.md#document-ideas-activation). Absent historical baselines remain comparison-unavailable rather than fabricated changes.
+
+`0082_digest_reliability.sql` replaces the digest suppression view with indexed recipient lookups and adds the document cleanup lease. Apply it after `0081_document_changes.sql` and before the follow-up Worker. Retention cleanup runs regardless of diff capture activation; preserve its cleanup ledger and delivery receipts during upgrades.
+
+A verified fresh database alone may skip upgrade-only confirmations: `0001_initial.sql` must be pending, no application tables may exist, and no migration history may be recorded. Only known internal D1/SQLite tables are ignored. Unexpected tables or failed/malformed queries stop deployment. Existing databases still require every applicable pause/drain confirmation; the helper does not provide it automatically.
 
 ## Automated deployment guards
 
 The production workflow stops when `0011_page_move_receipt_envelopes.sql` or a guarded Slack migration is pending. Complete the relevant quiescence procedure, then use manual workflow dispatch with `confirm_page_move_receipt_migration_safe` or `confirm_slack_review_migration_safe`. A confirmation records maintenance already completed; it does not pause live consumers. Later releases need no confirmation after these migrations are applied.
 
 ## Rollback
-
 
 Rollback is asymmetric. Worker code is reversible; data schema is not.
 

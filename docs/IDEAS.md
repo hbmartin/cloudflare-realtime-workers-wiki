@@ -1,10 +1,10 @@
 # Product ideas backlog
 
-Items 17, 62, and 65 were implemented locally on 11 October 2026; release evidence is tracked in
+Items 17, 62, and 65 were merged and deployed by 12 October 2026, with production controls off in audited configuration; release evidence is tracked in
 [Phase 11](roadmap/11-document-ideas.md). Verification/freshness (#60) and workspace export/backups (#41)
 remain outside this increment.
 
-Written on 25 September 2026 against a checkout with 34 migrations. Each item's implementation status was audited on **12 October 2026** against `main` at `b61dfbd` (migrations through `0081`). [Deployment and live acceptance](evidence/documentation-audit-2026-10-12.md) are separate from implementation. Item numbers are stable; cite them as
+Written on 25 September 2026 against a checkout with 34 migrations. Each item's implementation status was audited on **12 October 2026** against `main` at `b61dfbd` (migrations through `0082`). [Deployment and live acceptance](evidence/documentation-audit-2026-10-12.md) are separate from implementation. Item numbers are stable; cite them as
 `IDEAS #n`.
 
 Status key: **Implemented** means the capability is present in the audited merged source; this does not certify production activation or live acceptance. **Partial** means part of the item exists, and the note says what
@@ -14,14 +14,13 @@ code that has since changed, the status note takes precedence.
 
 ## Status at a glance
 
-| Status     | Items                                                                                                 |
-| ---------- | ----------------------------------------------------------------------------------------------------- |
+| Status      | Items                                                                                                                                                                       |
+| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Implemented | 11 palette · 15 toggle headings · 16 date reminders · 17 block links (gated) · 42 MCP · 45 PWA shell · 62 diff digest (gated) · 63 Slack capture · 65 live diagrams (gated) |
-| Planned    | 2, 3, 4 (subset), 9 → roadmap Phases 7–8                                                              |
-| Partial    | 1, 3, 10, 14, 18, 19, 20, 23, 26, 27, 38                                                              |
-| Unverified | 22 (BlockNote defaults only)                                                                          |
-| Local      | 17 block links · 62 document diff digests · 65 whole-diagram embeds (not shipped)                     |
-| Open       | Everything else                                                                                       |
+| Planned     | 2, 3, 4 (subset), 9 → roadmap Phases 7–8                                                                                                                                    |
+| Partial     | 1, 3, 10, 14, 18, 19, 20, 23, 26, 27, 38                                                                                                                                    |
+| Unverified  | 22 (BlockNote defaults only)                                                                                                                                                |
+| Open        | Everything else                                                                                                                                                             |
 
 Implemented and partial items include Round 1 (#201–#210), gated Slack Round 2, writing integrations, and Phase 11. The [roadmap README](roadmap/README.md#round-2)
 lists the open items proposed for Round 2.
@@ -58,7 +57,7 @@ Each stage is independently shippable and each one is visible to users.
 11. **Cmd+K command palette / quick find (S, high impact).** _Status: Implemented — #201: ⌘/Ctrl-K, P, and Shift-P palette with a command registry and `?` shortcut help._ There is no global keyboard handler anywhere in the client. Cmd+K search-and-jump, Cmd+P page jump, Cmd+Shift+P command menu (create page, move, export, toggle theme). Nothing else in this list changes daily feel as much per line of code.
 12. **Comment reactions (S).** _Status: Open — `server-thread-store.ts` still throws `Comment reactions are not enabled.`_ `src/client/server-thread-store.ts:230` literally throws `"Comment reactions are not enabled."` The thread store already carries an empty `reactions: []`. Finish it, and add reactions on blocks too.
 13. **Page covers (S).** _Status: Open — no cover column; `/v1` returns `cover: null`._ `pages` has `icon` but no cover. Add `cover_attachment_id` + `cover_position`, an unsplash-or-upload picker, and render in the page header and gallery cards.
-14. **Page display options (S).** _Status: Partial — full width shipped (migration `0047`). Small text and the page-info popover are open, and `updated_by` is still unused in the UI._ Full-width, small text, and a page-info popover (created by / last edited by / word count / contributors). `updated_by` already exists in schema and is unused in the UI.
+14. **Page display options (S).** _Status: Partial — full width implemented (migration `0047`). Small text and the page-info popover are open, and `updated_by` is still unused in the UI._ Full-width, small text, and a page-info popover (created by / last edited by / word count / contributors). `updated_by` already exists in schema and is unused in the UI.
 15. **Toggle headings (S).** _Status: Implemented — provided by BlockNote's default heading spec and slash menu, and probably already present when this was written. Notion import maps `is_toggleable`._ BlockNote supports them; they're a Notion staple for long wiki pages.
 16. **Date mentions and reminders (M).** _Status: Implemented — #203: `dateMention` tokens, private reminders, and migrations `0057`–`0060`._ No `reminder` exists anywhere. `@tomorrow 9am` inline, backed by a `reminders` table and the existing `*/15` cron + `DELIVERY_QUEUE` + notification preferences. Almost all the plumbing is already built and unused for this.
 17. **Copy link to block + deep-link highlight (S).** _Status: Implemented and deployed — private block actions and deep-link highlighting; production flag off, deployed verification pending. See Phase 11._ Anchoring already exists for comments; reuse the anchor to build `?page=X#block=Y` with a flash highlight on arrival.
@@ -70,7 +69,7 @@ Each stage is independently shippable and each one is visible to users.
 
 ### Navigation, search, structure
 
-23. **"Recently visited" and an Updates feed (S).** _Status: Partial — per-user recent pages shipped. The Activity/Open work feed is implemented behind `WORKSPACE_ACTIVITY_ENABLED`; production flag off._ `ActivitiesTray` today is background-job status, not activity. A per-user recents list (client-side is fine) plus a workspace "what changed" feed from `document_projections` timestamps.
+23. **"Recently visited" and an Updates feed (S).** _Status: Partial — per-user recent pages implemented. The Activity/Open work feed is implemented behind `WORKSPACE_ACTIVITY_ENABLED`; production flag off._ `ActivitiesTray` today is background-job status, not activity. A per-user recents list (client-side is fine) plus a workspace "what changed" feed from `document_projections` timestamps.
 24. **Search operators (S).** _Status: Open — search has dropdown filters persisted in the URL, but no `in:`/`by:` operators and no saved searches._ The search API already takes space/kind/author/date filters; expose them as `in:`, `by:`, `tag:`, `kind:`, `before:`/`after:` in the query box, and let people save searches.
 25. **Typo tolerance (M).** _Status: Open._ BM25 over FTS5 has none. Add a second FTS5 index with the trigram tokenizer for fallback matching when the main query returns nothing, plus prefix matching on titles.
 26. **Sidebar drag-and-drop with drop-into (M).** _Status: Partial — pointer drag-and-drop before, after, and inside works (`WorkspaceTree.tsx`). Multi-select and drag-to-favorite are open._ Fractional indexing and the move API exist; the alt+arrow keyboard path is already tested. Pointer DnD with nesting, multi-select, and drag-to-favorite.

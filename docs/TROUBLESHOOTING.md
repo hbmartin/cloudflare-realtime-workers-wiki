@@ -271,15 +271,29 @@ Object may hold the only copy of a document's recent tail; see
 
 ## AI writing
 
-| Symptom or code | Meaning | Recovery |
-| --- | --- | --- |
-| Writing or a quality mode is unavailable | Owner settings, credentials, model mapping, model access, or source readiness are missing. | Check [setup](OPERATIONS.md#ai-writing-setup), model discovery, online state, and document sync. |
-| `ai_access_unavailable` (503) | Live authorization could not be checked after bounded retries. Private output is withheld. | Restore session/D1 availability and use the explicit conversation-access retry. Do not bypass the gate or automatically restart inference. |
-| `ai_generation_expired` (409 in the SSE error) | Work exceeded the five-minute timeout plus 30-second recovery deadline. | Copy available partial text. Retry explicitly when access and connectivity are restored; abandoned work is not restarted automatically. |
-| `ai_stream_failed` | A stream failed or ended without a usable completion. | Retain/copy available text and inspect provider/connectivity health before an explicit retry. |
-| Provider 502/503 | Credential rejection/malformed response or temporary provider failure. | Check the operator credential and provider model access. Provider failures are distinct from NoteFlare sign-in failures. |
-| `chatgpt_reconnect` (424) | A member's hosted plan connection needs authorization again. | Reconnect after checking hosted-client approval and configuration. API funding remains an explicit member choice. |
-| NoteFlare 401 during generation | Session or account protection was revoked. | Sign in and complete account protection; the sign-in alert also applies to terminal stream failures. |
-| Saved conversation is locked | Access to any page ever supplied to it was lost. | Restore authorized access or delete the conversation; owners have no UI exception to another member's private history. |
+| Symptom or code                                | Meaning                                                                                    | Recovery                                                                                                                                   |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| Writing or a quality mode is unavailable       | Owner settings, credentials, model mapping, model access, or source readiness are missing. | Check [setup](OPERATIONS.md#ai-writing-setup), model discovery, online state, and document sync.                                           |
+| `ai_access_unavailable` (503)                  | Live authorization could not be checked after bounded retries. Private output is withheld. | Restore session/D1 availability and use the explicit conversation-access retry. Do not bypass the gate or automatically restart inference. |
+| `ai_generation_expired` (409 in the SSE error) | Work exceeded the five-minute timeout plus 30-second recovery deadline.                    | Copy available partial text. Retry explicitly when access and connectivity are restored; abandoned work is not restarted automatically.    |
+| `ai_stream_failed`                             | A stream failed or ended without a usable completion.                                      | Retain/copy available text and inspect provider/connectivity health before an explicit retry.                                              |
+| Provider 502/503                               | Credential rejection/malformed response or temporary provider failure.                     | Check the operator credential and provider model access. Provider failures are distinct from NoteFlare sign-in failures.                   |
+| `chatgpt_reconnect` (424)                      | A member's hosted plan connection needs authorization again.                               | Reconnect after checking hosted-client approval and configuration. API funding remains an explicit member choice.                          |
+| NoteFlare 401 during generation                | Session or account protection was revoked.                                                 | Sign in and complete account protection; the sign-in alert also applies to terminal stream failures.                                       |
+| Saved conversation is locked                   | Access to any page ever supplied to it was lost.                                           | Restore authorized access or delete the conversation; owners have no UI exception to another member's private history.                     |
 
 Opening an owned conversation explicitly or making a writing request extends its inactivity timer. List/search/GET/access polling does not. Expired conversations cannot be revived. An expired running request is marked failed on relevant reads or scheduled cleanup; its existing output and quota receipt remain. See [writing contracts](specs/ai-writing.md).
+
+## Degradation matrix
+
+What survives when a dependency fails. Read this first during an incident.
+
+| Down                 | Still works                                                                                | Breaks                                                                                                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1                   | Warm and hibernating document rooms keep accepting edits and buffering to their own SQLite | Every API request and WebSocket upgrade fails; a _cold_ Durable Object cannot start; compaction fails, re-dirties the room, and retries every 30 seconds       |
+| R2                   | The Durable Object update log is preserved intact                                          | Rooms cannot load; compaction retries; attachments return `attachment_missing`; versions return `version_missing`; restore returns 503                         |
+| `WorkspaceEvents` DO | Everything, silently                                                                       | Page-tree, backlink, and mention pushes stop. The UI goes stale until a reconnect triggers a full `/api/pages/tree` reload. **No user-facing error is raised** |
+| One `Document` DO    | The rest of the workspace                                                                  | That one page is unavailable. Archive and permanent-delete cleanup land in the retry tables and drain on the cron                                              |
+
+`GET /api/health` only probes D1. It reports healthy during a complete R2 or Durable Object outage. See
+[Observability](OBSERVABILITY.md#health-and-paging).

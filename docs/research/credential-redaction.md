@@ -1,5 +1,7 @@
 # Credential redaction research
 
+Historical research, first committed on 21 September 2026. Preserved to explain the original architecture and risk assessment; first-commit provenance is not a verified writing date. This is not current implementation guidance. See [current product limits](../../README.md#accepted-v1-limits) and [operator references](../README.md).
+
 Research date: 2026-09-21
 
 ## Conclusions

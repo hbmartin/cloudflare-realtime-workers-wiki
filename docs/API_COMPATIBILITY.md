@@ -2,20 +2,20 @@
 
 NoteFlare implements a bounded Notion-shaped `/v1` API for one installation. It is not a complete Notion server. Requests require an integration bearer token and exactly `Notion-Version: 2026-03-11`. Read [Integrations](INTEGRATIONS.md) for connection and webhook setup.
 
-Audited on 12 October 2026 against `b61dfbd` (migrations through `0081`). The implementation sources are [Worker routes](../src/worker/notion-api.ts), [block mappings](../src/shared/notion-blocks.ts), and [integration authorization](../src/worker/integrations.ts). Deployment and live acceptance are tracked separately in the [audit evidence](evidence/documentation-audit-2026-10-12.md).
+Audited on 12 October 2026 against `b61dfbd` (migrations through `0082`). The implementation sources are [Worker routes](../src/worker/notion-api.ts), [block mappings](../src/shared/notion-blocks.ts), and [integration authorization](../src/worker/integrations.ts). Deployment and live acceptance are tracked separately in the [audit evidence](evidence/documentation-audit-2026-10-12.md).
 
 ## Supported resource families
 
-| Resource | Routes under `/v1` | Contract and limits |
-| --- | --- | --- |
-| Pages | `GET /pages/:id`, `POST /pages`, `PATCH /pages/:id`, `POST /pages/:id/move`, `POST /pages/:id/trash` | Authorized page metadata, creation, property updates, move, and archive operations. One workspace; permissions derive from capability and subtree grants. |
-| Page properties | `GET /pages/:id/properties/:propertyId` | Supported NoteFlare page properties; this does not expose Notion's complete property/database model. |
-| Blocks | `GET /blocks/:id`, `GET/PATCH /blocks/:id/children`, `PATCH/DELETE /blocks/:id` | Stable mapped document blocks. Writes transact through the authoritative Yjs room; unsupported structures are preserved or rejected rather than silently flattened. |
-| Markdown | `GET/PATCH /pages/:id/markdown` | Reads are available independently of the Markdown-write flag. Writes use version/epoch and operation guards; protected blocks, attachments, and comment anchors can restrict changes. |
-| Asynchronous Markdown work | `GET /async_tasks/:id` | Poll tasks returned by an accepted Markdown write. Task ownership, access, retention, and retry rules are enforced. |
-| Search | `POST /search` | Accessible page search, not a full query over every Notion object type. |
-| Users | `GET /users`, `GET /users/:id`, `GET /users/me` | Workspace people and integration bot identities; fields are redacted according to the integration's user-information capability. |
-| Comments | `GET/POST /comments`, `PATCH/DELETE /comments/:id` | Capability-checked comments using NoteFlare's server-authoritative thread model. |
+| Resource                   | Routes under `/v1`                                                                                   | Contract and limits                                                                                                                                                                   |
+| -------------------------- | ---------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pages                      | `GET /pages/:id`, `POST /pages`, `PATCH /pages/:id`, `POST /pages/:id/move`, `POST /pages/:id/trash` | Authorized page metadata, creation, property updates, move, and archive operations. One workspace; permissions derive from capability and subtree grants.                             |
+| Page properties            | `GET /pages/:id/properties/:propertyId`                                                              | Supported NoteFlare page properties; this does not expose Notion's complete property/database model.                                                                                  |
+| Blocks                     | `GET /blocks/:id`, `GET/PATCH /blocks/:id/children`, `PATCH/DELETE /blocks/:id`                      | Stable mapped document blocks. Writes transact through the authoritative Yjs room; unsupported structures are preserved or rejected rather than silently flattened.                   |
+| Markdown                   | `GET/PATCH /pages/:id/markdown`                                                                      | Reads are available independently of the Markdown-write flag. Writes use version/epoch and operation guards; protected blocks, attachments, and comment anchors can restrict changes. |
+| Asynchronous Markdown work | `GET /async_tasks/:id`                                                                               | Poll tasks returned by an accepted Markdown write. Task ownership, access, retention, and retry rules are enforced.                                                                   |
+| Search                     | `POST /search`                                                                                       | Accessible page search, not a full query over every Notion object type.                                                                                                               |
+| Users                      | `GET /users`, `GET /users/:id`, `GET /users/me`                                                      | Workspace people and integration bot identities; fields are redacted according to the integration's user-information capability.                                                      |
+| Comments                   | `GET/POST /comments`, `PATCH/DELETE /comments/:id`                                                   | Capability-checked comments using NoteFlare's server-authoritative thread model.                                                                                                      |
 
 ## Authentication and authorization
 

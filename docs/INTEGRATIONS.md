@@ -38,8 +38,7 @@ Deliveries carry `X-Notion-Signature: sha256=<hex HMAC>`, computed with the veri
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 function authenticWebhook(rawBody, signature, verificationToken) {
-  const expected = `sha256=${createHmac("sha256", verificationToken)
-    .update(rawBody).digest("hex")}`;
+  const expected = `sha256=${createHmac("sha256", verificationToken).update(rawBody).digest("hex")}`;
   const received = Buffer.from(signature ?? "", "utf8");
   const wanted = Buffer.from(expected, "utf8");
   return received.length === wanted.length && timingSafeEqual(received, wanted);

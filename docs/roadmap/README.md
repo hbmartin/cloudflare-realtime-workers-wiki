@@ -1,6 +1,6 @@
 # NoteFlare phased roadmap
 
-Status audited on **12 October 2026** against `main` at `b61dfbd` (migrations through `0081`). Phases 1–6, 9, and 11 are merged; a successful deployment record covers that SHA. Phases 7–8 and 10 remain planned. Production flags, owner enablement, and live acceptance are separate facts; see [audit evidence](../evidence/documentation-audit-2026-10-12.md).
+Status audited on **12 October 2026** against `main` at `b61dfbd` (migrations through `0082`). Phases 1–6, 9, and 11 are merged; a successful deployment record covers that SHA. Phases 7–8 and 10 remain planned. Production flags, owner enablement, and live acceptance are separate facts; see [audit evidence](../evidence/documentation-audit-2026-10-12.md).
 
 This directory records implementation contracts, state ownership, recovery and rollout rules, and exit matrices. Complete a phase's exit matrix against the deployed installation before calling it shipped. A merged patch, visible control, or successful CI run alone is insufficient.
 
@@ -17,38 +17,37 @@ This directory records implementation contracts, state ownership, recovery and r
 
 ## Round 1
 
-| Order | Plan                                                             | PRs        | Migrations    | Production release control                     | Status                         |
-| ----- | ---------------------------------------------------------------- | ---------- | ------------- | ---------------------------------------------- | ------------------------------ |
-| 0     | [Baseline and dependency map](00-baseline-dependencies.md)       | —          | —             | —                                              | Reference                      |
-| 1     | [Editor, navigation, and embeds](01-editor-navigation-embeds.md) | #201       | `0048`–`0052` | `EXPANDED_EMBEDS_ENABLED=false`                | Deployed (flag off)            |
-| 2     | [Slack capture](02-slack-capture.md)                             | #202, #207 | `0053`–`0056` | None; both shortcuts use the new path          | Deployed; live acceptance pending                |
-| 3     | [Date mentions and reminders](03-date-mentions-reminders.md)     | #203       | `0057`–`0060` | None; picker and scheduler are live            | Deployed; live acceptance pending                |
-| 4     | [Offline documents](04-offline-documents.md)                     | #204, #208 | —             | `OFFLINE_EDITING_ENABLED=false` (shell is on)  | Deployed (editing flag off)    |
-| 5     | [Notion Markdown API](05-notion-markdown-api.md)                 | #205       | `0061`        | `NOTION_MARKDOWN_WRITES_ENABLED=false`         | Deployed (GET live, PATCH off) |
-| 6     | [OAuth and MCP](06-oauth-mcp.md)                                 | #206, #209 | `0062`–`0065` | `workspaces.mcp_enabled`, owner-set, default 0 | Deployed (off per workspace)   |
-| 7     | [Collaborative table foundation](07-collaborative-tables.md)     | —          | —             | —                                              | Planned                        |
-| 8     | [Table views and properties](08-table-views-properties.md)       | —          | —             | —                                              | Planned                        |
+| Order | Plan                                                             | PRs        | Migrations    | Production release control                     | Status                                |
+| ----- | ---------------------------------------------------------------- | ---------- | ------------- | ---------------------------------------------- | ------------------------------------- |
+| 0     | [Baseline and dependency map](00-baseline-dependencies.md)       | —          | —             | —                                              | Reference                             |
+| 1     | [Editor, navigation, and embeds](01-editor-navigation-embeds.md) | #201       | `0048`–`0052` | `EXPANDED_EMBEDS_ENABLED=false`                | Deployed (flag off)                   |
+| 2     | [Slack capture](02-slack-capture.md)                             | #202, #207 | `0053`–`0056` | None; both shortcuts use the new path          | Deployed; live acceptance pending     |
+| 3     | [Date mentions and reminders](03-date-mentions-reminders.md)     | #203       | `0057`–`0060` | None; picker and scheduler implemented         | Deployed; live acceptance pending     |
+| 4     | [Offline documents](04-offline-documents.md)                     | #204, #208 | —             | `OFFLINE_EDITING_ENABLED=false` (shell is on)  | Deployed (editing flag off)           |
+| 5     | [Notion Markdown API](05-notion-markdown-api.md)                 | #205       | `0061`        | `NOTION_MARKDOWN_WRITES_ENABLED=false`         | Deployed (GET implemented, PATCH off) |
+| 6     | [OAuth and MCP](06-oauth-mcp.md)                                 | #206, #209 | `0062`–`0065` | `workspaces.mcp_enabled`, owner-set, default 0 | Deployed; owner setting unverified    |
+| 7     | [Collaborative table foundation](07-collaborative-tables.md)     | —          | —             | —                                              | Planned                               |
+| 8     | [Table views and properties](08-table-views-properties.md)       | —          | —             | —                                              | Planned                               |
 
 #207 and #210 fixed review findings across Phases 1, 2, and task leases. Exit evidence for Phases 1 and 2 is in
-[01-phase1-evidence.md](01-phase1-evidence.md) and [02-phase2-evidence.md](02-phase2-evidence.md). Phases 3–6 record
-their verification only in their PR descriptions. Closeout step C1 below moves that evidence into files in this
-directory.
+[01-phase1-evidence.md](../evidence/01-phase1-evidence.md) and [02-phase2-evidence.md](../evidence/02-phase2-evidence.md). Phases 3–6 record
+their verification only in their PR descriptions. Closeout step C1 below moves that evidence into the [evidence directory](../evidence/README.md).
 
 ### Round 1 release closeout
 
-These steps involve no new product code. Each one ends by setting the phase to **Shipped** in the table above.
+These steps involve no new product code. Record the evidence completed by each step; only a completed live exit matrix and enabled controls justify **Shipped** status.
 
-| Step | Phase | Remaining live work                                                                                                                                                                                                                                                                                              |
-| ---- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C1   | 3–6   | Write `03-phase3-evidence.md` through `06-phase6-evidence.md` from the PR verification sections, mapping each exit-matrix row to a test, as in Phases 1 and 2.                                                                                                                                                   |
-| C2   | 1     | Confirm the live CSP header, rich-block rendering, and that `/api/me` reports `expandedEmbeds:false`. Flip `EXPANDED_EMBEDS_ENABLED=true`, run `pnpm cf-typegen`, deploy, and recheck a preview, every provider origin, and health ([steps 2–4](01-phase1-evidence.md#production-rollout)).                      |
-| C3   | 2     | Live signed message capture, a private thread capture, a failed-job retry through `/?activity=1`, and a regression pass over search, App Home, notifications, and unfurls. The source receipt and final page IDs must agree.                                                                                     |
-| C4   | 3     | Observe a reminder's due-to-inbox lag under the 15-minute cron. Confirm email and Slack delivery honor preferences, and that a cron retry yields one logical event.                                                                                                                                              |
-| C5   | 4     | Two-device and two-tab pilot of offline edit, refresh, reconnect, epoch change, and sign-out, then flip `OFFLINE_EDITING_ENABLED=true`.                                                                                                                                                                          |
-| C6   | 5     | Notion SDK `retrieveMarkdown`/`updateMarkdown` against production with a pilot integration, plus a concurrent browser edit during PATCH. Then flip `NOTION_MARKDOWN_WRITES_ENABLED=true`.                                                                                                                        |
-| C7   | 6     | Enable MCP on one workspace. Connect a real MCP client through discovery, consent, and PKCE. Exercise all ten current tools, refresh rotation, and revocation mid-session. Confirm that disabling MCP revokes grants.                                                                                                   |
-| C8   | all   | Get the nightly cross-browser workflow green. The latest inspected run (12 October, `a19edb1`) failed; inspect current job evidence instead of assuming the older failure causes still apply. |
-| C9   | docs  | Current API documentation is refreshed in this PR. Keep its route matrix and integration examples aligned with future API changes.                                                                                                                                                    |
+| Step | Phase | Remaining live work                                                                                                                                                                                                                                                                                     |
+| ---- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| C1   | 3–6   | Write `03-phase3-evidence.md` through `06-phase6-evidence.md` from the PR verification sections, mapping each exit-matrix row to a test, as in Phases 1 and 2.                                                                                                                                          |
+| C2   | 1     | Confirm the live CSP header, rich-block rendering, and that `/api/me` reports `expandedEmbeds:false`. Flip `EXPANDED_EMBEDS_ENABLED=true`, run `pnpm cf-typegen`, deploy, and recheck a preview, every provider origin, and health ([steps 2–4](../evidence/01-phase1-evidence.md#production-rollout)). |
+| C3   | 2     | Live signed message capture, a private thread capture, a failed-job retry through `/?activity=1`, and a regression pass over search, App Home, notifications, and unfurls. The source receipt and final page IDs must agree.                                                                            |
+| C4   | 3     | Observe a reminder's due-to-inbox lag under the 15-minute cron. Confirm email and Slack delivery honor preferences, and that a cron retry yields one logical event.                                                                                                                                     |
+| C5   | 4     | Two-device and two-tab pilot of offline edit, refresh, reconnect, epoch change, and sign-out, then flip `OFFLINE_EDITING_ENABLED=true`.                                                                                                                                                                 |
+| C6   | 5     | Notion SDK `retrieveMarkdown`/`updateMarkdown` against production with a pilot integration, plus a concurrent browser edit during PATCH. Then flip `NOTION_MARKDOWN_WRITES_ENABLED=true`.                                                                                                               |
+| C7   | 6     | Enable MCP on one workspace. Connect a real MCP client through discovery, consent, and PKCE. Exercise all ten current tools, refresh rotation, and revocation mid-session. Confirm that disabling MCP revokes grants.                                                                                   |
+| C8   | all   | Get the nightly cross-browser workflow green. The latest inspected run (12 October, `a19edb1`) failed; inspect current job evidence instead of assuming the older failure causes still apply.                                                                                                           |
+| C9   | docs  | Current API documentation is refreshed as part of this audit. Keep its route matrix and integration examples aligned with future API changes.                                                                                                                                                           |
 
 ## Round 2
 
@@ -59,12 +58,12 @@ Closeout C1–C9 ──┬─→ Track A: Phase 7 table authority ──→ Phas
                  └─→ Track B: Phase 9 Slack digests + shares ──→ Phase 10 operations incidents
 ```
 
-| Order | Plan                                                                     | Source                                    | Depends on                                                                   | Status  |
-| ----- | ------------------------------------------------------------------------ | ----------------------------------------- | ---------------------------------------------------------------------------- | ------- |
-| 7     | [Collaborative table foundation](07-collaborative-tables.md)             | IDEAS #9                                  | Round 1 closeout                                                             | Planned |
-| 8     | [Table views and properties](08-table-views-properties.md)               | IDEAS #2–4                                | Phase 7 cutover                                                              | Planned |
-| 9     | [Slack digests and share lifecycle](09-slack-digests-shares.md)          | Slack Milestone 4, channel-validation gap | Slack Milestones 0–2 (shipped)                                               | Deployed; controls off |
-| 10    | [Operations incidents and Slack ops channel](10-operations-incidents.md) | Slack Milestone 5                         | None for the incident ledger; Phase 9's file and refresh topic patterns help | Planned |
+| Order | Plan                                                                     | Source                                    | Depends on                                                                   | Status                 |
+| ----- | ------------------------------------------------------------------------ | ----------------------------------------- | ---------------------------------------------------------------------------- | ---------------------- |
+| 7     | [Collaborative table foundation](07-collaborative-tables.md)             | IDEAS #9                                  | Round 1 closeout                                                             | Planned                |
+| 8     | [Table views and properties](08-table-views-properties.md)               | IDEAS #2–4                                | Phase 7 cutover                                                              | Planned                |
+| 9     | [Slack digests and share lifecycle](09-slack-digests-shares.md)          | Slack Milestone 4, channel-validation gap | Slack Milestones 0–2 (implemented)                                           | Deployed; controls off |
+| 10    | [Operations incidents and Slack ops channel](10-operations-incidents.md) | Slack Milestone 5                         | None for the incident ledger; Phase 9's file and refresh topic patterns help | Planned                |
 
 Phases 7 and 8 were planned in Round 1 and remain valid. Recheck them against these changes since their baseline:
 
@@ -99,8 +98,6 @@ Durable Object or R2 state is authoritative, how to detect lag, and how to rebui
 must include migration verification, a recovery path, and tests at the user-visible boundary.
 No new capability is counted shipped merely because a menu item or API route exists.
 
-Because `main` is eligible for production deployment after CI; migration guards and workflow failures can stop a release. Check the exact deployed SHA and current controls before updating status.
-
 ## Round 1 starting point (28 September 2026, `499af28`)
 
 Historical: this is the baseline the Round 1 plans were written against. Each item is resolved by the phase noted.
@@ -113,12 +110,8 @@ Historical: this is the baseline the Round 1 plans were written against. Each it
 - Tables were D1-authoritative with five property types and a 60-second lease. This remains true and is Phase 7's
   starting point.
 
-## Document ideas — Phase 11
-
-The approved [document ideas plan](11-document-ideas.md) implements IDEAS #17, #65, and #62 in that release order.
-All three controls are initially off in production. They are implemented in the local checkout; no merged, deployed,
-or shipped status is claimed here. Verification/freshness and workspace export/backups are excluded.
-
 ## Phase 11 and writing integrations
 
 [Phase 11](11-document-ideas.md) implements block links, live diagram embeds, and document diff digests. All three are deployed with checked-in production controls off, pending their independent live exit matrices. [AI writing](../AI_WRITING.md) and the [ChatGPT plugin](../CHATGPT_PLUGIN.md) have merged implementations; owner settings, hosted provider approval, plugin registration, and installed-client acceptance are separate rollout gates.
+
+The Phase 11 release order is IDEAS #17, #65, then #62. Verification/freshness and workspace export/backups remain outside that increment.

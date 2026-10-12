@@ -19,11 +19,11 @@ User-visible and operator-relevant changes. The dated summaries below are retros
 - Production observability and hardened credential redaction.
 - Verified Slack identities, bidirectional comment mirrors, interactive workspace views, and atomic thread capture.
 - Task lists with Table/Board views, command palette, richer embeds, date mentions/reminders, and installable offline document capabilities.
-- `/v1` Markdown and asynchronous tasks plus member-scoped OAuth/MCP.
+- Collaborative diagram pages, Notion-shaped `/v1` operations, signed webhooks, public sharing, Markdown/asynchronous tasks, and member-scoped OAuth/MCP.
 
 ## August 2026
 
-- Initial Cloudflare-native collaborative wiki with documents, diagrams, workspace navigation, search, versions, typed tables, attachments, import/export, and background jobs.
-- Forward migrations added durable request receipts, comment/notification foundations, and integration/share/webhook support.
+- Initial Cloudflare-native collaborative wiki with documents, workspace navigation, search, versions, typed tables, attachments, import/export, and background jobs.
+- Forward migrations added durable request receipts, resumable import verification, and background job recovery.
 
 For migration requirements, use [Upgrading](docs/UPGRADING.md), not this historical summary.

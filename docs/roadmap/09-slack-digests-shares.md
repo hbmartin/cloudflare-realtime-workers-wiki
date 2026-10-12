@@ -123,7 +123,7 @@ See [Flags](../FLAGS.md) and [Configuration](../CONFIGURATION.md).
 ## Exit matrix
 
 Local automated coverage is in `slack-round2.integration.test.ts`, the Activity/picker client tests and
-`tests/e2e/slack-round2.spec.ts`. See the [review-fix evidence](09-review-fixes-evidence.md) for the five increments,
+`tests/e2e/slack-round2.spec.ts`. See the [review-fix evidence](../evidence/09-review-fixes-evidence.md) for the five increments,
 local gate results, bundle verification and DOCX memory measurements. These do not replace the live Slack/Worker matrix.
 
 | Scenario                                                                                    | Required result                                                                                             |

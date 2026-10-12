@@ -1,5 +1,7 @@
 # Porting AFFiNE, Outline, and Docmost to Cloudflare Workers: A Code-Grounded Feasibility Analysis
 
+Historical research, first committed on 14 August 2026. Preserved to explain the original architecture and risk assessment; first-commit provenance is not a verified writing date. This is not current implementation guidance. See [current product limits](../../README.md#accepted-v1-limits) and [operator references](../README.md).
+
 ## TL;DR
 
 - **None of the three ports cleanly to Cloudflare Workers as-is; all three are long-lived Node.js server processes (NestJS/Koa) that assume TCP sockets, Redis-backed blocking queues, and persistent WebSocket servers — Docmost is the least-bad port target, Outline is second, and AFFiNE is effectively impossible to port because its backend loads a napi-rs Rust `.node` native addon (`@affine/server-native`) at runtime, which V8 isolates cannot execute.**

@@ -1,5 +1,7 @@
 # Open-Source Yjs-on-Cloudflare-Durable-Objects Note/Wiki Apps — Landscape & Porting Assessment
 
+Historical research, first committed on 14 August 2026. Preserved to explain the original architecture and risk assessment; first-commit provenance is not a verified writing date. This is not current implementation guidance. See [current product limits](../../README.md#accepted-v1-limits) and [operator references](../README.md).
+
 ## TL;DR
 
 - **No production-grade, full open-source Notion/wiki app runs natively on Cloudflare Workers + Yjs-on-Durable-Objects today.** What exists is a mature _sync-infrastructure_ layer (Cloudflare's own `y-partyserver`, `napolab/y-durableobjects`, `TimoWilhelm/yjs-cf-ws-provider`) plus non-Yjs full-app precedent (tldraw sync). The full apps you shortlisted (AFFiNE, Outline, Docmost) are all Node/NestJS/Postgres/Redis monoliths that do **not** run on workerd.

@@ -11,6 +11,8 @@ identifiers. These deployment names are compatibility details; the product prese
 
 ## Browser deployment
 
+The portable deployment implementation is integrated on `main`. The native GitHub authorization and five editor-flow acceptance checks remain pending; the README deploy button stays disabled. See [deployment evidence](evidence/ONE_CLICK_DEPLOYMENT_VERIFICATION.md#remaining-release-gate).
+
 For a new installation, use Cloudflare's native
 [Deploy to Cloudflare flow](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
 Account authorization, Workers Paid activation, and R2 activation are user steps. The application
@@ -74,7 +76,7 @@ results, and failed queries stop deployment before upload.
 
 Every other database retains page-move and Slack migration confirmations and digest-collision
 preflights. No deployment helper sets those confirmations automatically. SQL files and ordering are
-unchanged; follow the upgrade procedures below before retrying a guarded upgrade.
+unchanged; follow the upgrade procedures in [Upgrading](UPGRADING.md) before retrying a guarded upgrade.
 
 ### Native-button release checklist
 
@@ -249,13 +251,13 @@ These are configured in the Cloudflare dashboard, not in this repository.
 
 ## 5. Migrate and deploy
 
-**Existing installation:** complete [Upgrading and rollback](UPGRADING.md) before running a deployment command. Pending receipt and Slack migrations can require a maintenance window and explicit confirmations.
+**Existing installation:** read [Upgrading and rollback](UPGRADING.md) before deployment, including pending receipt and Slack pause/drain prerequisites. Fresh databases use the narrowly verified preflight described above.
 
 ```sh
 pnpm run deploy
 ```
 
-The command builds, applies pending D1 migrations, and uploads the Worker only after migration success. Already-applied migrations are skipped. Use the guarded command rather than invoking `wrangler deploy` or D1 migration application directly. The migration directory is authoritative; do not rely on a fixed migration list in documentation.
+This command selects named legacy production locally, builds, applies guarded D1 migrations, then uploads the Worker. A build or migration failure stops deployment. Applied migrations are skipped. Direct `wrangler deploy` bypasses D1 migration safeguards. For a portable installation, use `pnpm deploy:one-click` or its configured Workers Builds flow instead.
 
 ## 6. Bootstrap the owner
 
@@ -319,16 +321,10 @@ Compare the ID with `pnpm wrangler deployments list --env production`.
 
 The last item must be measured on a deployed account; Miniflare cannot prove billing behavior.
 
-## Upgrades and rollback
-
-See [Upgrading and rollback](UPGRADING.md) for maintenance requirements, migration-specific warnings, and recovery.
-
 ## Automated deployment
 
 `.github/workflows/deploy.yml` deploys after successful CI for the current tip of `main`, and on a
-manual `workflow_dispatch` after running `pnpm check`. There is no staging environment, so a bad
-commit on `main` reaches users if its CI passes; the workflow applies D1 migrations before deploying,
-matching the normal manual order above. Before applying migrations, the workflow lists the production
+manual `workflow_dispatch` after running `pnpm check`. There is no staging environment. Passing CI makes the current `main` revision eligible; guarded migrations and workflow failures can still prevent deployment. The workflow applies D1 migrations before uploading code, matching the manual order above. Before applying migrations, the workflow lists the production
 database's pending migrations. If `0011_page_move_receipt_envelopes.sql` is pending, an automatic run stops
 before making changes. Quiesce page moves or verify that the live Worker already reads versioned receipts,
 then use `workflow_dispatch` and check its page-move receipt migration confirmation. Keep requests quiesced
@@ -348,4 +344,4 @@ managed by the workflow; they persist across deploys and are set once, manually,
 
 See [Continuous deployment](CONTINUOUS_DEPLOYMENT.md) for the gate's behavior, the credentials, the
 optional manual-approval gate, how to switch to manual releases, and what Workers Builds, gradual
-deployments, or a staging environment would trade instead. Successful production deployment records are linked in the [documentation audit](evidence/documentation-audit-2026-10-12.md). A successful deploy does not certify each optional integration or its live exit matrix.
+deployments, or a staging environment would trade instead. Successful named-production deploy records are in the [status audit](evidence/documentation-audit-2026-10-12.md). They do not establish every optional integration or the portable native-form gate.
