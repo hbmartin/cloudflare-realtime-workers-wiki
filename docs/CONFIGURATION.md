@@ -33,6 +33,10 @@ Set for deployment with `wrangler secret put --env production`. Never place thes
 | `SLACK_TOKEN_ENCRYPTION_KEY` | No                   | High-entropy key used to encrypt bot access and refresh tokens with AES-GCM before D1 storage. Rotate by reinstalling Slack with the new key before removing the old deployment.                                                             |
 | `WEBHOOK_ENCRYPTION_KEY`     | For webhooks         | Exactly 32 random bytes encoded as 43 characters of unpadded base64url. Encrypts integration webhook verification tokens with AES-GCM; webhook subscription creation and delivery remain unavailable when it is unset or malformed.          |
 
+| `OPENAI_API_KEY` | For workspace API writing | Operator API credential. Set as a Worker secret; the owner must also enable writing and API funding and configure usable models. |
+| `AI_TOKEN_ENCRYPTION_KEY` | For ChatGPT plan connections | Independent high-entropy AES-GCM key for connection tokens and OAuth state. Preserve across deployments; rotation needs migration or reconnection. |
+| `CHATGPT_CLIENT_SECRET` | If provisioned client authentication requires it | Hosted OpenAI client secret. Only set after the hosted client contract is provisioned. |
+
 `DO_LOCATION_HINT` is frozen into `workspaces.location_hint` at bootstrap and is **immutable in v1**.
 Changing the secret later has no effect on an existing workspace. It influences first Durable Object
 placement only; it is an optimization, not a data-residency boundary. D1 and other Cloudflare metadata
@@ -42,6 +46,19 @@ For local development these live in `.dev.vars`; copy `.dev.vars.local.example`.
 `.dev.vars.example` contains only the private setup key for browser deployment. Portable deployments
 generate missing internal secrets before owner initialization and preserve all existing secrets; see
 [Browser deployment](DEPLOYMENT.md#browser-deployment).
+
+## AI writing credentials
+
+Workspace API writing and ChatGPT plan connections are independent funding paths. See [Operations](OPERATIONS.md#ai-writing-setup) for activation and verification.
+
+| Name | Default | Notes |
+| --- | --- | --- |
+| `CHATGPT_CONNECTION_ENABLED` | `false` | Enable hosted plan connections only after approval and live acceptance; this does not gate workspace API writing. |
+| `CHATGPT_CLIENT_ID` | unset | Actual provisioned hosted client ID. |
+| `CHATGPT_TOKEN_AUTH_METHOD` | unset | Provisioned `none` or `client_secret_basic` contract; the latter needs `CHATGPT_CLIENT_SECRET`. |
+| `CHATGPT_SCOPES` | unset | Exact approved hosted inference scopes. Identity-only scopes cannot fund inference. |
+
+Never substitute a local/loopback identity for a hosted Worker client. The exact callback is the configured HTTPS `BETTER_AUTH_URL` followed by `/api/ai/chatgpt/callback`. Secret values belong in Worker secrets or the local example's private copy, not in client forms or tracked files.
 
 ## Bindings
 

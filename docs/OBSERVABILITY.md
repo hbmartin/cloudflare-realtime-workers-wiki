@@ -246,3 +246,11 @@ After migrations and deploy:
    and client event families as applicable.
 5. Wait for the next cron and verify every `observability_task_runs.last_succeeded_at` advances.
 6. Manually dispatch the Production observability workflow and confirm its job summary is healthy.
+
+## AI writing
+
+Correlate writing request failures with request IDs, Worker/D1 availability, generation latency, and provider status. Treat `ai_access_unavailable` as an authorization-verification availability failure and `ai_generation_expired` as abandoned or overlong work; neither should trigger automatic generation retries. Expected errors remain metrics under the existing log contract, not a new log of conversation content.
+
+A passing D1 health probe does not prove upstream model availability or hosted account eligibility. Use owner model discovery for credential/model checks; use a requested synthetic generation for streaming acceptance. Verify the 15-minute scheduled handler continues cleanup of expired history and running work.
+
+Prompts, selected sources, generated results, API keys, and access/refresh tokens are excluded from application logs. Never export conversation rows into an incident report. Consult [AI troubleshooting](TROUBLESHOOTING.md#ai-writing) and the [behavior specification](specs/ai-writing.md) for interpreting terminal states.

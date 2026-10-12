@@ -1,7 +1,6 @@
 # Slack integration roadmap
 
-Status: Milestones 0–3 shipped; Milestone 4 partial; Milestone 5 not started (audited 1 October 2026 against
-`main` at `2ef1450`)
+Status audited 12 October 2026 against `b61dfbd`: Milestones 0–4 are implemented and deployed; Milestone 4 release controls remain off in checked-in production configuration. Milestone 5 remains planned. Live integration acceptance is separate; see [audit evidence](evidence/documentation-audit-2026-10-12.md).
 
 Scope: product requirements and phased implementation milestones
 
@@ -28,7 +27,7 @@ identity, and an owner opts an existing mapping into the relevant behavior.
 
 ## Implementation status
 
-Audited on 1 October 2026 against `main` at `2ef1450`. Milestones are listed in their implementation order.
+Audited on 12 October 2026 against `main` at `b61dfbd` (migrations through `0081`). Milestones are listed in their implementation order.
 
 | Milestone                               | Status                     | Evidence and remaining work                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | --------------------------------------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -36,7 +35,7 @@ Audited on 1 October 2026 against `main` at `2ef1450`. Milestones are listed in 
 | 1 — Bidirectional threads               | Shipped                    | Owner mirror opt-in (`PATCH /api/slack/channels/:id/mirror`). `slack_thread_links` and `slack_thread_deliveries` handle outbound delivery. Inbound replies go through `slack_inbound_receipts`, mrkdwn conversion, mention translation, and source suppression (`src/worker/slack-threads.ts`, `slack-thread-fanout.ts`). Migrations `0036`–`0046` add delivery ordering, recovery, and redrive.                                                                                                                                                                                                          |
 | 2 — Interactive workspace               | Shipped                    | `POST /api/slack/interactions` acknowledges within a 2.7-second deadline. It handles Resolve/Reopen, Watch, Mute, Snooze (1, 8, or 24 hours), and owner share actions; the search modal (ten-result paging); and the App Home Mentions inbox (`src/worker/slack-workspace.ts`, `slack-blocks.ts`). Interaction receipts are in `slack_interaction_receipts` and `slack_action_commits`.                                                                                                                                                                                                                   |
 | 3 — Atomic capture                      | Shipped (#202)             | Both shortcuts claim `slack_captures` and publish a hidden staged import only after verification (`src/worker/slack-capture.ts`, `slack-capture-content.ts`; migrations `0053`–`0056`). Live signed-capture verification is tracked in [roadmap Phase 2](roadmap/02-phase2-evidence.md). The shipped modal can also create a **task**; this roadmap describes documents only.                                                                                                                                                                                                                             |
-| 4 — Rich digests and share lifecycle    | Implemented locally; gated | Round 2 adds validated channel selection, saved daily schedules, canonical Activity/Open work, multiple digest messages with persisted page/event partitions, bulk move/archive summaries with paused follow-ups, import channel suppression, private PNG uploads with phase-aware retries, transactional share refreshes and delivery reconciliation. Forward migration `0067` adds review fixes; activation uses scheduled maintenance or the owner configuration-sync endpoint. Production controls remain off pending the [Phase 9 live exit matrix](roadmap/09-slack-digests-shares.md#exit-matrix). |
+| 4 — Rich digests and share lifecycle    | Deployed; gated | Round 2 adds validated channel selection, saved daily schedules, canonical Activity/Open work, multiple digest messages with persisted page/event partitions, bulk move/archive summaries with paused follow-ups, import channel suppression, private PNG uploads with phase-aware retries, transactional share refreshes and delivery reconciliation. Forward migration `0067` adds review fixes; activation uses scheduled maintenance or the owner configuration-sync endpoint. Production controls remain off pending the [Phase 9 live exit matrix](roadmap/09-slack-digests-shares.md#exit-matrix). |
 | 5 — Operations channel and GA hardening | Not started                | `slack_operations_destinations` and `slack_incidents` exist only as tables from `0035`. Nothing produces incidents, and there is no `slack_ops_alert` topic. No queue consumer reads the delivery DLQs configured in `wrangler.jsonc`, and there is no ops-channel API, UI, or `SlackStatus` field. **Partial:** delivery-health endpoints (`slack_delivery_failures`, `0043`) and mirror disable without uninstalling.                                                                                                                                                                                   |
 
 Open gaps outside the milestone list:
@@ -489,7 +488,7 @@ on its required scopes.
 
 ### Milestone 0 — Secure foundation and single reauthorization
 
-Status: Shipped.
+Status: Implemented and deployed; current live exit acceptance is unverified in this audit.
 
 #### Deliverables
 
@@ -508,7 +507,7 @@ not yet reauthorized.
 
 ### Milestone 1 — Canonical bidirectional threads
 
-Status: Shipped.
+Status: Implemented and deployed; current live exit acceptance is unverified in this audit.
 
 #### Deliverables
 
@@ -526,7 +525,7 @@ writes.
 
 ### Milestone 2 — Interactive Slack workspace
 
-Status: Shipped.
+Status: Implemented and deployed; current live exit acceptance is unverified in this audit.
 
 #### Deliverables
 
@@ -542,7 +541,7 @@ receipts prevent duplicate mutations, and handlers acknowledge within Slack's de
 
 ### Milestone 3 — Atomic Slack capture
 
-Status: Shipped in #202; live verification pending.
+Status: Implemented in #202 and deployed; signed live capture acceptance remains unverified.
 
 #### Deliverables
 
@@ -559,7 +558,7 @@ and a workflow failure leaves no published partial page.
 
 ### Milestone 4 — Rich digests and share lifecycle
 
-Status: implemented locally behind production controls initially off; deployed validation and live exit gates remain.
+Status: implemented and deployed; production controls are off in audited configuration, and the live exit gates remain.
 
 #### Deliverables
 

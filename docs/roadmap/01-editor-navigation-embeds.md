@@ -1,9 +1,6 @@
 # Phase 1: editor, navigation, and embeds
 
-Status: implemented in #201 (merged 29 September 2026) and deployed to production with
-`EXPANDED_EMBEDS_ENABLED=false`. The palette, CSP correction, and code highlighting are live; the
-expanded provider catalog and preview cards wait on the live exit matrix. Evidence:
-[01-phase1-evidence.md](01-phase1-evidence.md).
+Status: merged and deployed at audited `b61dfbd`; release controls and live exit acceptance are tracked in the [roadmap](README.md) and [audit evidence](../evidence/documentation-audit-2026-10-12.md).
 
 ## User contract
 

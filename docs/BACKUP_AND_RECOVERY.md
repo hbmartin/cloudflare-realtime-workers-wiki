@@ -186,3 +186,13 @@ Repeat the permanent-deletion portion with a disposable diagram and confirm its 
 
 Queries for steps 6 and 7 are in [Operations](OPERATIONS.md#inspecting-the-work-queues). Step 7 may
 take up to an hour if the first cleanup attempt fails.
+
+## AI writing history and connection keys
+
+Private conversation prompts and results are stored in D1, so a full database export contains member writing history. Operator database access still applies even though owners cannot browse another member's history in the UI. Restrict, encrypt, and retain exports as sensitive workspace data; application logs do not contain these bodies.
+
+History expires after 30 days without an explicit conversation open or writing request. GET reads, search, listing, and access polls do not extend retention. Scheduled cleanup removes expired records; quota/request receipts also have 30-day retention. A backup can retain content after the live installation has removed it, so align backup retention with the organization's privacy policy.
+
+Preserve `AI_TOKEN_ENCRYPTION_KEY` separately through the approved secret-management process when restoring D1 connections or OAuth state. A D1 export does not back up Worker secrets. An incorrect or lost key requires connection recovery/migration or member reconnection, not replacement of ciphertext with plaintext. `OPENAI_API_KEY` is an upstream credential configured separately.
+
+After restoration, retain the normal expiry checks and verify scheduled cleanup. Old expired history must remain unavailable; abandoned running work must become failed without restarting inference. Check current source permissions before revealing restored history and verify quota/idempotency behavior against the [writing specification](specs/ai-writing.md).

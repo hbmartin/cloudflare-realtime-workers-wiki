@@ -340,3 +340,19 @@ pnpm load:realtime
   and `pnpm observability:report` / `pnpm observability:check` for the production summary and alert thresholds.
 - **Durable Object placement is permanent.** A workspace's location hint is fixed at bootstrap and
   Durable Objects do not relocate after creation.
+
+## AI writing setup
+
+Apply the writing migration through [Upgrading](UPGRADING.md#migrations-0080-to-0081), then set `OPENAI_API_KEY` as a production Worker secret. In Settings → AI writing, enable writing and workspace API funding, configure Fast/Best model IDs available to the credential, conservative context character limits, and the daily quota. Empty model IDs disable a mode. Model discovery verifies access without charging writing quota. Test with synthetic content and an explicitly requested generation.
+
+The default allowance is 20 started API requests per member per UTC day. Follow-ups and regeneration are new requests. Cancellation after dispatch, uncertain transport, stream failures, and provider 5xx responses retain the reservation. Confirmed pre-generation 400/401/403/404/422/429 rejection releases it. There is no automatic fallback between funding sources.
+
+Hosted ChatGPT plan funding requires an approved hosted client contract, the [connection variables and secrets](CONFIGURATION.md#ai-writing-credentials), and an independent encryption key. Keep the gate off until actual hosted consent, refresh, disconnect, model access, streaming, and allowance acceptance pass. Connection approval and successful local mocks are different gates. See the [writing specification](specs/ai-writing.md#hosted-sign-in-with-chatgpt-rollout-gate).
+
+Keep prompts, source content, results, and tokens out of diagnostic logs. Use [AI troubleshooting](TROUBLESHOOTING.md#ai-writing), [monitoring](OBSERVABILITY.md#ai-writing), and [backup guidance](BACKUP_AND_RECOVERY.md#ai-writing-history-and-connection-keys) for operations.
+
+## ChatGPT plugin setup
+
+The wiki connector uses NoteFlare OAuth and `/mcp`; it is independent of ChatGPT plan funding. Enable MCP as an owner and choose a dedicated synthetic pilot space. Confirm discovery metadata and the unauthenticated Bearer challenge, register the actual remote app in the ChatGPT administrator environment, then use its actual `plugin_asdk_app_…` ID with `pnpm plugin:link`. The command creates the environment-specific dependency metadata and install archive; do not fabricate an app ID.
+
+Apply pending migrations through [Upgrading](UPGRADING.md) and build the Worker and embedded UI before installation. Complete installed-client consent, refresh/revocation, search/read/create/update/comment, private-space filtering, read-only access, stale revisions, duplicate retries, and save recovery before private publication. The source package and local browser tests do not certify installed ChatGPT acceptance. See [the plugin guide](CHATGPT_PLUGIN.md), [integrator setup](INTEGRATIONS.md), and [plugin contracts](specs/chatgpt-plugin.md).

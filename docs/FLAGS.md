@@ -36,11 +36,17 @@ To change a flag:
 
 1. Edit `wrangler.jsonc`.
 2. Run `pnpm cf-typegen`.
-3. Commit both files together and merge. `main` deploys automatically.
+3. Commit both files together and merge. Check the deployment workflow result; a merge alone does not prove deployment or activation.
 
 Flip a production flag only after that phase's live exit matrix passes. The pending flips are steps C2, C5, and C6 in
 the [roadmap closeout](roadmap/README.md#round-1-release-closeout). To roll back, set the flag to `"false"` and deploy
 again; none of these flags deletes data.
+
+## AI connection gate
+
+| Name | Local and E2E | Production | Behavior |
+| --- | --- | --- | --- |
+| `CHATGPT_CONNECTION_ENABLED` | `false` | `false` | Allows hosted ChatGPT plan connection only after hosted approval and live acceptance. Workspace API writing is independent. |
 
 ## Owner settings
 
@@ -51,6 +57,10 @@ These live in D1 and are changed at runtime by a workspace owner. They require n
 | MCP access             | `workspaces.mcp_enabled`                                | `GET`/`POST /api/oauth/workspace`                                                           | off     | Gates OAuth consent and `/mcp`. Disabling bumps `mcp_generation`, revoking every grant and pending code; clients must reconnect after re-enabling.                       |
 | Slack thread mirroring | `slack_channel_subscriptions.mirror_enabled`            | `PATCH /api/slack/channels/:id/mirror`                                                      | off     | At most one space-wide and one page-specific mirror is allowed, and a page mirror wins. Disabling retires that mapping's thread links (trigger `slack_mirror_disabled`). |
 | Slack mute and snooze  | `slack_channel_subscriptions.muted_at`, `snoozed_until` | `PATCH /api/slack/channels/:id/pause` (`mute`, `unmute`, or `snooze` for 1, 8, or 24 hours) | off     | Stops new channel notifications, digests, and mirror roots. Replies under existing linked threads still sync.                                                            |
+
+### AI writing owner controls
+
+Settings → AI writing stores the workspace's writing enablement, API funding enablement, Fast/Best model mappings and context character limits, and daily allowance in `ai_settings.settings_json`. These owner controls require no deployment. Writing starts disabled; workspace API requests also need `OPENAI_API_KEY`, and hosted plan requests need the approved connection contract and encryption key. See [setup](OPERATIONS.md#ai-writing-setup).
 
 ## Implicit gates
 

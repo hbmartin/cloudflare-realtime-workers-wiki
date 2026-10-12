@@ -1,9 +1,6 @@
 # Phase 9: Slack digests, share lifecycle, and workspace activity
 
-Status: implemented locally; release controls remain off in production. Deployment verification and the live exit
-matrix below are required before marking this phase shipped. Round 2, Track B closes Slack roadmap
-[Milestone 4](../SLACK_INTEGRATION_ROADMAP.md#milestone-4--rich-digests-and-share-lifecycle). Operations alerts remain
-Phase 10. This document incorporates the approved product interview decisions.
+Status: merged and deployed at audited `b61dfbd`; release controls and live exit acceptance are tracked in the [roadmap](README.md) and [audit evidence](../evidence/documentation-audit-2026-10-12.md).
 
 ## Channel settings and schedules
 

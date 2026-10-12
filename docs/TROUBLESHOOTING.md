@@ -268,3 +268,18 @@ Before escalating a data-affecting issue, capture:
 Do not delete Durable Objects, remove queue rows, or recreate a room to clear a symptom. The Durable
 Object may hold the only copy of a document's recent tail; see
 [Backup and recovery](BACKUP_AND_RECOVERY.md#r2-current-snapshot-missing).
+
+## AI writing
+
+| Symptom or code | Meaning | Recovery |
+| --- | --- | --- |
+| Writing or a quality mode is unavailable | Owner settings, credentials, model mapping, model access, or source readiness are missing. | Check [setup](OPERATIONS.md#ai-writing-setup), model discovery, online state, and document sync. |
+| `ai_access_unavailable` (503) | Live authorization could not be checked after bounded retries. Private output is withheld. | Restore session/D1 availability and use the explicit conversation-access retry. Do not bypass the gate or automatically restart inference. |
+| `ai_generation_expired` (409 in the SSE error) | Work exceeded the five-minute timeout plus 30-second recovery deadline. | Copy available partial text. Retry explicitly when access and connectivity are restored; abandoned work is not restarted automatically. |
+| `ai_stream_failed` | A stream failed or ended without a usable completion. | Retain/copy available text and inspect provider/connectivity health before an explicit retry. |
+| Provider 502/503 | Credential rejection/malformed response or temporary provider failure. | Check the operator credential and provider model access. Provider failures are distinct from NoteFlare sign-in failures. |
+| `chatgpt_reconnect` (424) | A member's hosted plan connection needs authorization again. | Reconnect after checking hosted-client approval and configuration. API funding remains an explicit member choice. |
+| NoteFlare 401 during generation | Session or account protection was revoked. | Sign in and complete account protection; the sign-in alert also applies to terminal stream failures. |
+| Saved conversation is locked | Access to any page ever supplied to it was lost. | Restore authorized access or delete the conversation; owners have no UI exception to another member's private history. |
+
+Opening an owned conversation explicitly or making a writing request extends its inactivity timer. List/search/GET/access polling does not. Expired conversations cannot be revived. An expired running request is marked failed on relevant reads or scheduled cleanup; its existing output and quota receipt remain. See [writing contracts](specs/ai-writing.md).

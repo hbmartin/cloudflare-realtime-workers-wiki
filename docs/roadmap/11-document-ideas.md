@@ -1,8 +1,6 @@
 # Phase 11: Block links, live diagrams, and document diff digests
 
-Status: implemented locally, pending review and deployed verification. Production release controls remain off.
-IDEAS #17 → #65 → #62 are three independently controlled increments. Verification/freshness, exports, and backups
-are excluded. Local validation results belong in [the evidence ledger](11-document-ideas-evidence.md).
+Status: merged and deployed at audited `b61dfbd`; release controls and live exit acceptance are tracked in the [roadmap](README.md) and [audit evidence](../evidence/documentation-audit-2026-10-12.md).
 
 ## Increment 1: Private block links
 
