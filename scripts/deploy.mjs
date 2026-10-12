@@ -6,7 +6,13 @@ import { tmpdir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { unstable_readConfig } from "wrangler";
-import { internalTables, main as migrate, queryRows } from "./migrate-d1.mjs";
+import {
+  emptyDatabaseSchema,
+  emptyMigrationHistory,
+  internalTables,
+  main as migrate,
+  queryRows,
+} from "./migrate-d1.mjs";
 
 const require = createRequire(import.meta.url);
 const manifestPath = ".wrangler/noteflare-build.json";
@@ -57,10 +63,14 @@ async function cloudflare() {
     account = identity.accounts[0].id;
   }
   if (!/^[a-f0-9]{32}$/.test(account)) throw new Error("Invalid CLOUDFLARE_ACCOUNT_ID.");
-  const api = async (path, { method = "GET", body, allowMissing = false } = {}) => {
+  const api = async (path, { method = "GET", body, allowMissing = false, paginated = false, jurisdiction } = {}) => {
     const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}${path}`, {
       method,
-      headers: { ...headers, "Content-Type": "application/json" },
+      headers: {
+        ...headers,
+        "Content-Type": "application/json",
+        ...(jurisdiction ? { "cf-r2-jurisdiction": jurisdiction } : {}),
+      },
       ...(body ? { body: JSON.stringify(body) } : {}),
       signal: AbortSignal.timeout(60_000),
     });
@@ -72,9 +82,9 @@ async function cloudflare() {
     } catch {
       throw new Error(`Cloudflare ${method} request returned invalid JSON.`);
     }
-    if (!response.ok || value.success !== true)
+    if (!response.ok || value?.success !== true)
       throw new Error(`Cloudflare ${method} request failed (${response.status}). Check account permissions.`);
-    return value.result;
+    return paginated ? { result: value.result, result_info: value.result_info } : value.result;
   };
   return { account, api };
 }
@@ -113,9 +123,12 @@ export async function portableDatabase(config, settings, name, api, dryRun = fal
     throw new Error("Configured DB has an invalid database ID.");
   if (savedID && id && id !== savedID)
     throw new Error("DB differs from the existing deployment. Refusing to deploy to another database.");
+  const sourceDatabaseID = id;
   id ??= savedID;
   const databaseName =
-    declared.database_name === "noteflare" ? installationResourceName(name, "-db") : declared.database_name;
+    declared.database_name === "noteflare" && !sourceDatabaseID
+      ? installationResourceName(name, "-db")
+      : declared.database_name;
   if (!id && !dryRun) {
     const matches = [];
     for (let page = 1; ; page++) {
@@ -132,41 +145,26 @@ export async function portableDatabase(config, settings, name, api, dryRun = fal
         throw new Error("D1 provisioning did not return a valid database ID.");
       // A build/deploy retry may reuse an empty provisioned resource. Populated databases
       // require a saved Worker binding or an explicit database_id before any migration.
-      const result = await api(`/d1/database/${id}/query`, {
-        method: "POST",
-        body: { sql: "SELECT name FROM sqlite_master WHERE type='table';" },
-      });
+      const query = async (sql) => {
+        const result = await api(`/d1/database/${id}/query`, { method: "POST", body: { sql } });
+        if (
+          !Array.isArray(result) ||
+          result.length !== 1 ||
+          result[0]?.success !== true ||
+          !Array.isArray(result[0].results)
+        )
+          throw new Error("Cloudflare returned invalid D1 query results.");
+        return result[0].results;
+      };
+      const tables = await query("SELECT name FROM sqlite_master WHERE type='table';");
       if (
-        !Array.isArray(result) ||
-        result.length !== 1 ||
-        result[0]?.success !== true ||
-        !Array.isArray(result[0].results)
+        !emptyDatabaseSchema(tables) ||
+        (tables.some((row) => row.name === "d1_migrations") &&
+          !emptyMigrationHistory(await query("SELECT count(*) applied FROM d1_migrations;")))
       )
-        throw new Error("Cloudflare returned invalid D1 schema results.");
-      if (result[0].results.some((row) => !internalTables.has(row?.name)))
         throw new Error(
           "Existing D1 database requires an explicit database_id or saved Worker DB binding before reuse.",
         );
-      if (result[0].results.some((row) => row.name === "d1_migrations")) {
-        const history = await api(`/d1/database/${id}/query`, {
-          method: "POST",
-          body: { sql: "SELECT count(*) applied FROM d1_migrations;" },
-        });
-        if (
-          !Array.isArray(history) ||
-          history.length !== 1 ||
-          history[0]?.success !== true ||
-          !Array.isArray(history[0].results) ||
-          history[0].results.length !== 1 ||
-          !Number.isSafeInteger(history[0].results[0]?.applied) ||
-          history[0].results[0].applied < 0
-        )
-          throw new Error("Cloudflare returned invalid D1 migration history results.");
-        if (history[0].results[0].applied !== 0)
-          throw new Error(
-            "Existing D1 database requires an explicit database_id or saved Worker DB binding before reuse.",
-          );
-      }
     } else id = (await api("/d1/database", { method: "POST", body: { name: databaseName } }))?.uuid;
   }
   if (id !== undefined && (typeof id !== "string" || !databaseID.test(id) || id === placeholderID))
@@ -196,7 +194,141 @@ export function installationOrigin(configured, saved, name, subdomain) {
   return origin;
 }
 
-export function portableOverrides(config, settings, name, origin, database) {
+const templateSuffixes = new Map([
+  ["bucket:noteflare", "-attachments"],
+  ["queue:noteflare-delivery", "-delivery"],
+  ["queue:noteflare-delivery-dlq", "-delivery-dlq"],
+]);
+
+export function portableResources(config, settings, name) {
+  // Only the source ID expresses operator intent. A discovered/created ID does not.
+  const sourceID = config.d1_databases[0].database_id;
+  const provisioned = typeof sourceID === "string" && databaseID.test(sourceID) && sourceID !== placeholderID;
+  const resolveResource = (type, binding, configured, jurisdiction) => {
+    const matches = (settings?.bindings ?? []).filter(
+      (entry) => entry.name === binding && entry.type === (type === "bucket" ? "r2_bucket" : "queue"),
+    );
+    if (matches.length > 1) throw new Error(`Ambiguous saved ${binding} binding.`);
+    const saved = matches[0]?.[type === "bucket" ? "bucket_name" : "queue_name"];
+    if (matches.length && (typeof saved !== "string" || !saved)) throw new Error(`Invalid saved ${binding} name.`);
+    const suffix = templateSuffixes.get(`${type}:${configured}`);
+    const explicit = provisioned || !suffix;
+    if (saved && explicit && saved !== configured)
+      throw new Error(
+        `${binding} differs from the existing deployment. Update the portable configuration explicitly before retrying.`,
+      );
+    return {
+      type,
+      binding,
+      name: saved ?? (explicit ? configured : installationResourceName(name, suffix, 63)),
+      provenance: saved ? "saved" : explicit ? "configured" : "generated",
+      ...(jurisdiction ? { jurisdiction } : {}),
+    };
+  };
+  return [
+    ...config.r2_buckets.map((entry) =>
+      resolveResource("bucket", entry.binding, entry.bucket_name, entry.jurisdiction),
+    ),
+    ...config.queues.producers.map((entry) => resolveResource("queue", entry.binding, entry.queue)),
+  ];
+}
+
+export async function preflightGeneratedResources(resources, api) {
+  for (const resource of resources.filter((entry) => entry.provenance === "generated")) {
+    let exists = false;
+    if (resource.type === "bucket") {
+      const bucket = await api(`/r2/buckets/${encodeURIComponent(resource.name)}`, {
+        allowMissing: true,
+        jurisdiction: resource.jurisdiction,
+      });
+      if (bucket !== null && bucket?.name !== resource.name)
+        throw new Error("Cloudflare returned ambiguous R2 resources.");
+      exists = bucket !== null;
+    } else {
+      let totalPages;
+      const seen = new Set();
+      for (let page = 1; ; page++) {
+        const response = await api(`/queues?name=${encodeURIComponent(resource.name)}&per_page=100&page=${page}`, {
+          paginated: true,
+        });
+        const entries = response?.result,
+          info = response?.result_info;
+        if (
+          !Array.isArray(entries) ||
+          entries.some(
+            (entry) =>
+              typeof entry?.queue_name !== "string" ||
+              !entry.queue_name ||
+              typeof entry?.queue_id !== "string" ||
+              !entry.queue_id,
+          ) ||
+          !info ||
+          info.page !== page ||
+          !Number.isSafeInteger(info.total_pages) ||
+          info.total_pages < 0 ||
+          info.total_pages > 10_000 ||
+          (info.count !== undefined && (!Number.isSafeInteger(info.count) || info.count !== entries.length)) ||
+          (info.per_page !== undefined &&
+            (!Number.isSafeInteger(info.per_page) || info.per_page < 1 || entries.length > info.per_page)) ||
+          (info.total_count !== undefined &&
+            (!Number.isSafeInteger(info.total_count) || info.total_count < entries.length)) ||
+          (page > 1 && totalPages !== info.total_pages) ||
+          (info.total_pages === 0 && entries.length !== 0) ||
+          (info.total_pages > 0 && page > info.total_pages)
+        )
+          throw new Error("Cloudflare returned ambiguous queue resources or pagination.");
+        totalPages = info.total_pages;
+        for (const entry of entries) {
+          if (seen.has(entry.queue_id)) throw new Error("Cloudflare returned ambiguous queue resources.");
+          seen.add(entry.queue_id);
+          if (entry.queue_name === resource.name) {
+            if (exists) throw new Error("Cloudflare returned ambiguous queue resources.");
+            exists = true;
+          }
+        }
+        if (page >= totalPages) break;
+      }
+    }
+    if (exists)
+      throw new Error(
+        `Generated ${resource.type} ${resource.name} already exists. Configure its name explicitly to adopt it before retrying.`,
+      );
+  }
+}
+
+export async function createGeneratedResources(resources, api) {
+  for (const resource of resources.filter((entry) => entry.provenance === "generated")) {
+    // POST is create-only: a race must fail, never silently adopt another installation.
+    const result = await api(resource.type === "bucket" ? "/r2/buckets" : "/queues", {
+      method: "POST",
+      body: resource.type === "bucket" ? { name: resource.name } : { queue_name: resource.name },
+      jurisdiction: resource.jurisdiction,
+    });
+    if (
+      (resource.type === "bucket" ? result?.name : result?.queue_name) !== resource.name ||
+      (resource.type === "queue" && (typeof result?.queue_id !== "string" || !result.queue_id))
+    )
+      throw new Error(
+        `Cloudflare returned invalid ${resource.type} creation results. Check provisioned resources before retrying.`,
+      );
+  }
+}
+
+export async function portablePreparation(config, settings, name, api, dryRun = false) {
+  const resources = portableResources(config, settings, name);
+  if (!dryRun) await preflightGeneratedResources(resources, api);
+  const database = await portableDatabase(config, settings, name, api, dryRun);
+  return { resources, database };
+}
+
+export function portableOverrides(
+  config,
+  settings,
+  name,
+  origin,
+  database,
+  resources = portableResources(config, settings, name),
+) {
   const saved = Object.fromEntries(
     (settings?.bindings ?? [])
       .filter((binding) => binding.type === "plain_text")
@@ -204,25 +336,19 @@ export function portableOverrides(config, settings, name, origin, database) {
   );
   if (Object.keys({ ...config.vars, ...saved }).some((key) => privateVariable.test(key)))
     throw new Error("Move private credentials from plaintext variables to Worker secrets before deploying.");
-  const bucket = settings?.bindings?.find((binding) => binding.name === "BUCKET" && binding.type === "r2_bucket");
-  if (
-    bucket &&
-    config.r2_buckets[0].bucket_name !== "noteflare" &&
-    bucket.bucket_name !== config.r2_buckets[0].bucket_name
-  )
-    throw new Error(
-      "BUCKET differs from the existing deployment. Update the portable configuration explicitly before retrying.",
-    );
+  const resourceName = (type, binding) =>
+    resources.find((entry) => entry.type === type && entry.binding === binding).name;
   const producers = config.queues.producers.map((producer) => ({
     ...producer,
-    queue:
-      settings?.bindings?.find((entry) => entry.type === "queue" && entry.name === producer.binding)?.queue_name ??
-      (producer.queue === "noteflare-delivery"
-        ? installationResourceName(name, "-delivery", 63)
-        : producer.queue === "noteflare-delivery-dlq"
-          ? installationResourceName(name, "-delivery-dlq", 63)
-          : producer.queue),
+    queue: resourceName("queue", producer.binding),
   }));
+  const queueNames = new Map(
+    config.queues.producers.map((producer, index) => [producer.queue, producers[index].queue]),
+  );
+  const consumerQueue = (queue, template, binding) =>
+    queueNames.get(queue) ??
+    (queue === template ? producers.find((entry) => entry.binding === binding)?.queue : undefined) ??
+    queue;
   return {
     name,
     vars: { ...config.vars, ...saved, BETTER_AUTH_URL: origin },
@@ -233,12 +359,7 @@ export function portableOverrides(config, settings, name, origin, database) {
         migrations_dir: resolve(config.d1_databases[0].migrations_dir ?? "migrations"),
       },
     ],
-    r2_buckets: config.r2_buckets.map((entry) => ({
-      ...entry,
-      bucket_name:
-        bucket?.bucket_name ??
-        (entry.bucket_name === "noteflare" ? installationResourceName(name, "-attachments", 63) : entry.bucket_name),
-    })),
+    r2_buckets: config.r2_buckets.map((entry) => ({ ...entry, bucket_name: resourceName("bucket", entry.binding) })),
     ratelimits: config.ratelimits.map((entry) => {
       const binding = settings?.bindings?.find(
         (existing) => existing.type === "ratelimit" && existing.name === entry.name,
@@ -257,8 +378,16 @@ export function portableOverrides(config, settings, name, origin, database) {
       producers,
       consumers: config.queues.consumers.map((consumer) => ({
         ...consumer,
-        queue: producers.find((entry) => entry.binding === "DELIVERY_QUEUE").queue,
-        dead_letter_queue: producers.find((entry) => entry.binding === "DELIVERY_DEAD_LETTER_QUEUE").queue,
+        queue: consumerQueue(consumer.queue, "noteflare-delivery", "DELIVERY_QUEUE"),
+        ...(consumer.dead_letter_queue
+          ? {
+              dead_letter_queue: consumerQueue(
+                consumer.dead_letter_queue,
+                "noteflare-delivery-dlq",
+                "DELIVERY_DEAD_LETTER_QUEUE",
+              ),
+            }
+          : {}),
       })),
     },
     // Reuse provisioned Workflows/datasets; only template defaults follow a renamed Worker.
@@ -312,7 +441,7 @@ async function prepare(forced, dryRun) {
   }
   connection ??= await cloudflare();
   settings ??= await connection.api(`/workers/scripts/${name}/settings`, { allowMissing: true });
-  const database = await portableDatabase(root, settings, name, connection.api, dryRun);
+  const { database, resources } = await portablePreparation(root, settings, name, connection.api, dryRun);
   const savedURL = settings?.bindings?.find(
     (binding) => binding.name === "BETTER_AUTH_URL" && binding.type === "plain_text" && binding.text !== "auto",
   )?.text;
@@ -326,7 +455,8 @@ async function prepare(forced, dryRun) {
     name,
     origin,
     account: connection.account,
-    overrides: portableOverrides(root, settings, name, origin, database),
+    resources,
+    overrides: portableOverrides(root, settings, name, origin, database, resources),
   };
 }
 
@@ -354,7 +484,10 @@ export function verifyBuild(manifest, expected) {
   for (const key of ["source", "buildUUID", "revision", "target", "name", "account", "origin"])
     if (manifest[key] !== expected[key])
       throw new Error(`Build artifact does not match ${key}. Run the build again before deployment.`);
-  if (manifest.configurationHash !== configurationHash(expected))
+  if (
+    manifest.configurationHash !== configurationHash(expected) ||
+    manifest.configurationHash !== configurationHash(manifest)
+  )
     throw new Error("Build artifact does not match configuration overrides. Run the build again before deployment.");
 }
 
@@ -371,7 +504,16 @@ function canonical(value) {
 
 export function configurationHash(context) {
   return createHash("sha256")
-    .update(JSON.stringify(canonical({ origin: context.origin, overrides: context.overrides ?? null })))
+    .update(
+      JSON.stringify(
+        canonical({
+          version: 2,
+          origin: context.origin,
+          overrides: context.overrides ?? null,
+          resources: context.resources ?? null,
+        }),
+      ),
+    )
     .digest("hex");
 }
 
@@ -451,7 +593,7 @@ export async function withSecretsFile(secrets, operation) {
 
 export async function deployPrepared(
   manifest,
-  { migrateDatabase, upload, inspectSecrets, isInitialized, health, random = randomBytes },
+  { migrateDatabase, provisionResources, upload, inspectSecrets, isInitialized, health, random = randomBytes },
 ) {
   const secrets = {};
   if (!manifest.target) {
@@ -471,6 +613,10 @@ export async function deployPrepared(
   }
   if ((await migrateDatabase()) !== 0)
     throw new Error("D1 migration preflight/application failed. Worker upload was not started.");
+  if (manifest.resources?.some((entry) => entry.provenance === "generated")) {
+    if (!provisionResources) throw new Error("Resource provisioning is unavailable. Rebuild before deployment.");
+    await provisionResources();
+  }
   await withSecretsFile(secrets, upload);
   await health();
 }
@@ -547,6 +693,12 @@ export async function main(argv) {
         slackReviewMigrationSafe: process.env.SLACK_REVIEW_MIGRATION_SAFE === "true",
         pageMoveMigrationSafe: process.env.PAGE_MOVE_RECEIPT_MIGRATION_SAFE === "true",
       }),
+    provisionResources: async () => {
+      const connection = await cloudflare();
+      if (connection.account !== manifest.account)
+        throw new Error("Cloudflare account changed. Rebuild before deployment.");
+      await createGeneratedResources(manifest.resources, connection.api);
+    },
     upload: (path) => {
       const result = wrangler(["deploy", ...configArgs, ...(path ? ["--secrets-file", path] : [])], {
         stdio: "inherit",

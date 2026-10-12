@@ -207,6 +207,18 @@ const pnpmBuiltins = new Set([
   "whoami",
 ]);
 
+const pnpmValueOptions = new Set([
+  "--filter",
+  "--filter-prod",
+  "--dir",
+  "-C",
+  "-F",
+  "--reporter",
+  "--loglevel",
+  "--workspace-concurrency",
+  "--resume-from",
+]);
+
 function concreteReferences(example, scripts, executables) {
   const errors = [];
   const executable = example
@@ -220,7 +232,7 @@ function concreteReferences(example, scripts, executables) {
     const skipOptions = () => {
       while (words[index]?.startsWith("-")) {
         const option = words[index++];
-        if (["--filter", "--filter-prod", "--dir", "-C", "-F", "--reporter"].includes(option)) index++;
+        if (pnpmValueOptions.has(option)) index++;
       }
     };
     skipOptions();

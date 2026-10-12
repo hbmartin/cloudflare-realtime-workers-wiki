@@ -59,18 +59,29 @@ export function queryRows(result, stage) {
   return value.flatMap((entry) => entry.results);
 }
 
+// Shared by the REST deployment adapter and the synchronous Wrangler preflight.
+export function emptyDatabaseSchema(rows) {
+  if (!Array.isArray(rows) || rows.some((row) => !row || typeof row.name !== "string"))
+    throw new Error("Invalid database schema result.");
+  return rows.every((row) => internalTables.has(row.name));
+}
+
+export function emptyMigrationHistory(rows) {
+  if (!Array.isArray(rows) || rows.length !== 1 || !Number.isSafeInteger(rows[0]?.applied) || rows[0].applied < 0)
+    throw new Error("Invalid migration history result.");
+  return rows[0].applied === 0;
+}
+
 export function freshDatabase(pending, query) {
   if (!pending.includes("0001_initial.sql")) return false;
   const tables = query("SELECT name FROM sqlite_master WHERE type='table';", "fresh database schema preflight");
-  if (tables.some((row) => !row || typeof row.name !== "string")) throw new Error("Invalid database schema result.");
-  if (tables.some((row) => !internalTables.has(row.name)))
+  if (!emptyDatabaseSchema(tables))
     throw new Error("Initial migration is pending on a nonempty database. Refusing to treat it as a fresh install.");
-  if (tables.some((row) => row.name === "d1_migrations")) {
-    const rows = query("SELECT count(*) applied FROM d1_migrations;", "fresh database history preflight");
-    if (rows.length !== 1 || !Number.isSafeInteger(rows[0]?.applied) || rows[0].applied < 0)
-      throw new Error("Invalid migration history result.");
-    if (rows[0].applied !== 0) throw new Error("Initial migration is pending after other migrations were applied.");
-  }
+  if (
+    tables.some((row) => row.name === "d1_migrations") &&
+    !emptyMigrationHistory(query("SELECT count(*) applied FROM d1_migrations;", "fresh database history preflight"))
+  )
+    throw new Error("Initial migration is pending after other migrations were applied.");
   return true;
 }
 

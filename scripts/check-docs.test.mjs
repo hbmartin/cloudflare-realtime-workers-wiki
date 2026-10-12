@@ -331,7 +331,7 @@ describe("configuration documentation coverage", () => {
 });
 
 describe("current operator references", () => {
-  it("accepts pnpm aliases and reporter values before commands and script names", () => {
+  it("accepts pnpm aliases and value options before commands and script names", () => {
     const f = fixture();
     f.write(
       "README.md",
@@ -341,6 +341,10 @@ describe("current operator references", () => {
 \`pnpm up\` \`pnpm upgrade\` \`pnpm ls\`
 \`pnpm --reporter silent run build\` \`pnpm run --reporter silent build\`
 \`pnpm --reporter="silent" build\` \`pnpm --reporter 'silent' run build\`
+\`pnpm --loglevel silent run build\` \`pnpm run --loglevel='silent' build\`
+\`pnpm --workspace-concurrency 2 run build\` \`pnpm run --workspace-concurrency=2 build\`
+\`pnpm --resume-from app run build\` \`pnpm run --resume-from "app" build\`
+\`pnpm --loglevel silent --workspace-concurrency 2 --resume-from app run missing-script\`
 \`pnpm --reporter silent --filter app run --silent missing-script\`
 `,
     );

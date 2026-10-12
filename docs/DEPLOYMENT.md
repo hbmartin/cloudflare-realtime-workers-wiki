@@ -49,7 +49,7 @@ later.
 
 Push an update to the repository Cloudflare created, or use **Retry deployment** after correcting a
 failed build. Workers Builds prepares once, builds once, then verifies the build UUID, revision,
-source, target, auth origin, configuration overrides, and generated configuration before migrating and uploading. Its ignored
+source, target, auth origin, resource names and provenance, configuration overrides, and generated configuration before migrating and uploading. Its ignored
 `.wrangler/noteflare-build.json` metadata must belong to the current run. Retry reuses resource bindings
 and already-applied migrations. Saved dashboard variables, including feature settings, are retained.
 If those settings change between build and deploy, rebuild before retrying; verification stops before migrations or upload. Older manifests also require rebuilding. Override object-key order does not matter, but array order does.
@@ -63,13 +63,33 @@ the Worker dashboard or explicitly set its `database_id` in the portable configu
 This also applies when an upload fails after migrations have run but before the first DB binding is saved.
 Existing bindings recognize `database_id` and the older `id` field and reject conflicting configured IDs.
 
-Without saved bindings or explicit custom resource names, fresh portable installations use
-`<worker>-attachments` for R2, `<worker>-delivery` for the delivery queue, and
-`<worker>-delivery-dlq` for its dead-letter queue. Producer and consumer bindings use the same resolved
-queue names. These names remain stable across retries and are shortened with a deterministic hash
-when needed to fit the 63-character R2/queue limits. Existing installations retain their saved bucket
-and queue bindings, including the earlier `noteflare` defaults. An explicitly configured bucket that
-conflicts with a saved binding stops deployment until the configuration is corrected.
+Resource naming uses this precedence:
+
+- Saved Worker bucket and queue bindings are retained when the source still contains template defaults.
+- Custom source names are explicit selections. A valid, non-placeholder D1 ID already in the source
+  configuration also makes its configured bucket and queue names explicit, including `noteflare`,
+  `noteflare-delivery`, and `noteflare-delivery-dlq`. This recognizes the provisioned configuration
+  produced by the native deployment form; a database ID discovered or created during preparation
+  does not establish that intent. Conflicting explicit names and saved bindings stop deployment for
+  both buckets and queues. Correct the source to match the intended saved bindings before retrying.
+- Untouched templates use `<worker>-attachments`, `<worker>-delivery`, and `<worker>-delivery-dlq`.
+  These generated names are stable and shortened with a deterministic hash to fit the 63-character
+  R2/queue limits. Producer and consumer names resolve together. A consumer with no dead-letter
+  producer retains its configured dead-letter name, or omits that setting if none was configured.
+
+Before creating D1 or running migrations, preparation checks each generated bucket by exact name
+and searches every queue lookup page. Failed, malformed, and ambiguous lookups stop preparation.
+An existing generated name requires explicit adoption: set the intended bucket/queue names in the
+source configuration (and the concrete D1 ID when adopting template-default names). Review those
+resources before selecting them; generated-name collisions are never adopted automatically.
+
+After migrations and before upload, generated buckets and queues are created through create-only
+requests. A creation race stops deployment. Saved and explicit resources follow Wrangler's normal
+provisioning. A successful installation continues using its saved bindings. If first deployment fails
+after partial provisioning or before upload saves the bindings, inspect the created resources and
+explicitly configure the intended names and D1 ID before retrying. Applied migrations are retained;
+unbound databases with populated migration history require an explicit ID. An empty database with
+an empty migration history remains safe to reuse.
 
 New rate-limit namespace IDs are derived from the Worker and binding names; retries keep the same IDs
 and updates retain saved IDs. Generated Workflow and database names stay within 64 characters by
@@ -90,7 +110,7 @@ both GitHub Actions and Workers Builds as independent production release systems
 
 Ordinary local builds and deployments always build fresh and do not require Git or a reusable manifest, so archive downloads work after installing dependencies. Git fingerprints and reusable manifests apply only to Workers Builds, where build and deploy run as separate commands.
 
-Default `pnpm dev` keeps the previous `cloudflare-realtime-notes` Worker identity and R2 bucket, including the `cloudflare-realtime-notes-preview` preview bucket. Existing local documents and attachments remain available alongside the unchanged local D1 database. Explicit named environments, the browser-test harness, and portable deployment overrides use their selected configuration.
+Default `pnpm dev` keeps the previous `cloudflare-realtime-notes` Worker identity and R2 bucket, including the `cloudflare-realtime-notes-preview` preview bucket. The Workflow keeps `cloudflare-realtime-notes-jobs-local`, and the delivery and dead-letter queues keep `cloudflare-realtime-notes-delivery-local` and `cloudflare-realtime-notes-delivery-dlq-local`. Existing local documents, attachments, D1 data, and persisted Workflow instances remain available. Queue identities are preserved; local queues do not promise message persistence across runtime restarts. Explicit named environments, the browser-test harness, and portable deployment overrides use their selected configuration.
 
 ### Fresh installs and upgrade safeguards
 

@@ -214,6 +214,19 @@ describe("block link navigation and native menus", () => {
     expect(screen.queryByRole("dialog", { name: "Block actions" })).toBeNull();
     expect(document.activeElement).toBe(origin);
   });
+  it("leaves outside-target Escape unconsumed while the menu remains open", async () => {
+    const { root } = fixture();
+    await flushFrames();
+    fireEvent.click(screen.getByRole("button", { name: "Block actions" }));
+    const outside = root.current!.querySelector("p")!;
+    const handle = vi.fn();
+    outside.addEventListener("keydown", handle);
+    const focus = document.activeElement;
+    expect(fireEvent.keyDown(outside, { key: "Escape" })).toBe(true);
+    expect(handle).toHaveBeenCalledOnce();
+    expect(screen.getByRole("dialog", { name: "Block actions" })).toBeTruthy();
+    expect(document.activeElement).toBe(focus);
+  });
   it("dismisses on blank-area pointer down without consuming a later Escape", async () => {
     fixture();
     await flushFrames();

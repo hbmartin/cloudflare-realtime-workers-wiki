@@ -1,3 +1,4 @@
+import { countedD1 } from "../../tests/helpers/count-d1";
 import { enrollAccount, protectSlackFixtureUsers } from "../../tests/helpers/security";
 import {
   abortAllDurableObjects,
@@ -1240,252 +1241,385 @@ describe("notification feed and subscriptions", () => {
     ).toEqual({ delivered: 0 });
   });
 
-  it("keeps a full email and Slack digest tick within the statement budget", async () => {
-    const installed = await bootstrap();
-    const timestamp = Date.UTC(2026, 8, 5, 11, 5);
-    const configured: Env = { ...slackEnv(), DIFF_DIGESTS_ENABLED: "false" };
-    const token = await encryptSlackToken(configured, "xoxb-budget");
-    await env.DB.batch([
-      env.DB.prepare(
-        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+  it.each(["steady", "refresh", "recovery", "contention", "finalization", "cleanup", "diff"])(
+    "keeps a full email and Slack digest tick within the statement budget (%s)",
+    async (scenario) => {
+      const installed = await bootstrap();
+      const timestamp = Date.UTC(2026, 8, 5, 11, 5);
+      const configured: Env = { ...slackEnv(), DIFF_DIGESTS_ENABLED: scenario === "diff" ? "true" : "false" };
+      const token = await encryptSlackToken(configured, "xoxb-budget");
+      await env.DB.batch([
+        env.DB.prepare(
+          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
          SELECT printf('budget-user-%02d', n), printf('Budget User %02d', n),
                 printf('budget-user-%02d@example.test', n), 1, ?, ? FROM sequence`,
-      ).bind(timestamp, timestamp),
-      env.DB.prepare(
-        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+        ).bind(timestamp, timestamp),
+        env.DB.prepare(
+          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
          SELECT ?, printf('budget-user-%02d', n), 'viewer', ? FROM sequence`,
-      ).bind(installed.workspaceId, timestamp),
-      env.DB.prepare(
-        `INSERT INTO slack_installations
+        ).bind(installed.workspaceId, timestamp),
+        env.DB.prepare(
+          `INSERT INTO slack_installations
           (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
            installed_by, created_at, updated_at)
          VALUES ('digest-budget-installation', ?, 'TBUDGET', 'Budget', 'BBUDGET', ?,
                  'chat:write', ?, ?, ?)`,
-      ).bind(installed.workspaceId, token, installed.userId, timestamp, timestamp),
-      env.DB.prepare(
-        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+        ).bind(installed.workspaceId, token, installed.userId, timestamp, timestamp),
+        env.DB.prepare(
+          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation)
          SELECT 'digest-budget-installation', printf('budget-user-%02d', n), printf('UBUDGET%02d', n), ?,0
            FROM sequence`,
-      ).bind(timestamp),
-      env.DB.prepare(
-        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+        ).bind(timestamp),
+        env.DB.prepare(
+          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
          SELECT printf('budget-user-%02d', n), 'mention', 1, 'digest', 'digest', 'UTC' FROM sequence`,
-      ),
-      env.DB.prepare(
-        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+        ),
+        env.DB.prepare(
+          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO notifications
            (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
          SELECT printf('budget-notification-%02d', n), ?, printf('budget-user-%02d', n), 'mention', ?, ?, ?,
                 '{}', printf('budget-%02d', n), ? FROM sequence`,
-      ).bind(
-        installed.workspaceId,
-        installed.userId,
-        installed.page.spaceId,
-        installed.page.id,
-        timestamp - 3 * 60 * 60_000,
-      ),
-      env.DB.prepare(
-        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+        ).bind(
+          installed.workspaceId,
+          installed.userId,
+          installed.page.spaceId,
+          installed.page.id,
+          timestamp - 3 * 60 * 60_000,
+        ),
+        env.DB.prepare(
+          `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
          SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
            FROM notifications WHERE id LIKE 'budget-notification-%'`,
-      ).bind(timestamp, timestamp),
-    ]);
-    await verifySlackDigestRecipients(
-      Array.from({ length: 10 }, (_, n) => `budget-user-${String(n + 1).padStart(2, "0")}`),
-    );
-    let statementCount = 0;
-    const queries: string[] = [];
-    const countedDatabase = new Proxy(env.DB, {
-      get(target, property) {
-        if (property === "prepare") {
-          return (query: string) => {
-            statementCount += 1;
-            queries.push(query);
-            return target.prepare(query);
-          };
+        ).bind(timestamp, timestamp),
+      ]);
+      await verifySlackDigestRecipients(
+        Array.from({ length: 10 }, (_, n) => `budget-user-${String(n + 1).padStart(2, "0")}`),
+      );
+      if (["refresh", "recovery", "contention"].includes(scenario)) {
+        await env.DB.prepare(
+          `UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?,auth_error=?,auth_error_at=?,refresh_lease_token=?,refresh_lease_until=? WHERE id='digest-budget-installation'`,
+        )
+          .bind(
+            await encryptSlackToken(configured, "xoxr-budget"),
+            scenario === "refresh" ? "token_revoked" : null,
+            scenario === "refresh" ? Date.now() - 1000 : null,
+            scenario === "contention" ? "stuck" : null,
+            Date.now() + 30_000,
+          )
+          .run();
+      }
+      const batchMetadata = new WeakMap<D1PreparedStatement, { statement: D1PreparedStatement; sql: string }>();
+      const wrapBudgetStatement = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => {
+        const proxy = new Proxy(statement, {
+          get(target, property) {
+            if (property === "bind") return (...args: unknown[]) => wrapBudgetStatement(target.bind(...args), sql);
+            if (scenario === "cleanup" && property === "all" && sql.includes("UPDATE deliveries SET status = ?"))
+              return async () => {
+                throw new Error("D1 cleanup unavailable");
+              };
+            const value: unknown = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        batchMetadata.set(proxy, { statement, sql });
+        return proxy;
+      };
+      const failingDatabase = new Proxy(env.DB, {
+        get(target, property) {
+          if (property === "batch")
+            return async (statements: D1PreparedStatement[]) => {
+              if (
+                scenario === "finalization" &&
+                batchMetadata.get(statements[0]!)?.sql.includes("UPDATE deliveries SET status = ?")
+              )
+                throw new Error("D1 finalization unavailable");
+              return target.batch(statements.map((statement) => batchMetadata.get(statement)!.statement));
+            };
+          if (property === "prepare") return (sql: string) => wrapBudgetStatement(target.prepare(sql), sql);
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const { database: countedDatabase, statements: queries } = countedD1(failingDatabase);
+      const send = vi.fn(async () => {
+        if (scenario === "cleanup") throw new Error("mailbox unavailable");
+        return { messageId: "budget-email" };
+      });
+      const bindings = new Proxy(configured, {
+        get(target, property, receiver) {
+          if (property === "DB") return countedDatabase;
+          if (property === "SEND_EMAIL") return { send };
+          if (property === "EMAIL_FROM") return "notes@example.test";
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      let firstSlackPayload: Record<string, unknown> | undefined;
+      const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).endsWith("oauth.v2.access")) {
+          if (scenario === "recovery") return Response.json({ ok: false, error: "invalid_refresh_token" });
+          return Response.json({
+            ok: true,
+            access_token: "xoxb-refreshed",
+            refresh_token: "xoxr-refreshed",
+            expires_in: 3600,
+          });
         }
-        const value: unknown = Reflect.get(target, property, target);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-    const send = vi.fn(async () => ({ messageId: "budget-email" }));
-    const bindings = new Proxy(configured, {
-      get(target, property, receiver) {
-        if (property === "DB") return countedDatabase;
-        if (property === "SEND_EMAIL") return { send };
-        if (property === "EMAIL_FROM") return "notes@example.test";
-        return Reflect.get(target, property, receiver);
-      },
-    });
-    let firstSlackPayload: Record<string, unknown> | undefined;
-    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      firstSlackPayload ??= JSON.parse(String(init?.body)) as Record<string, unknown>;
-      return Response.json({ ok: true });
-    });
-    vi.stubGlobal("fetch", fetchMock);
+        firstSlackPayload ??= JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return scenario === "cleanup"
+          ? Response.json({ ok: false, error: "channel_not_found" })
+          : Response.json({ ok: true });
+      });
+      vi.stubGlobal("fetch", fetchMock);
 
-    await sendDueNotificationDigests(bindings, timestamp);
+      const error = await sendDueNotificationDigests(bindings, timestamp).then(
+        () => null,
+        (failure: unknown) => failure,
+      );
+      const expectedError = expect.any(Error);
+      expect(error).toEqual(["finalization", "cleanup"].includes(scenario) ? expectedError : null);
 
-    expect(send).toHaveBeenCalledTimes(10);
-    expect(fetchMock).toHaveBeenCalledTimes(10);
-    expect(send).toHaveBeenCalledWith(
-      expect.objectContaining({ subject: "1 NoteFlare update", text: expect.stringContaining("NoteFlare digest") }),
-    );
-    expect(firstSlackPayload).toMatchObject({
-      text: expect.stringContaining("Your daily NoteFlare digest"),
-      blocks: [{ text: { text: expect.stringContaining("Your daily NoteFlare digest") } }],
-    });
-    expect(statementCount).toBeLessThanOrEqual(240);
-    expect(queries.some((query) => /page_change_(checkpoints|recipients)/.test(query))).toBe(false);
-  });
+      const slackDispatches = scenario === "diff" ? 5 : 6;
+      expect(send).toHaveBeenCalledTimes(scenario === "diff" ? 7 : 10);
+      expect(fetchMock).toHaveBeenCalledTimes(
+        scenario === "contention"
+          ? 0
+          : scenario === "recovery"
+            ? 1
+            : slackDispatches + (scenario === "refresh" ? 1 : 0),
+      );
+      expect(typeof firstSlackPayload?.text).toBe(
+        ["contention", "recovery"].includes(scenario) ? "undefined" : "string",
+      );
+      expect(queries.length).toBeLessThanOrEqual(240);
+      const slackStart = queries.findIndex(
+        (sql) => sql.startsWith("SELECT COALESCE(preference.timezone") && sql.includes("n.slack_at"),
+      );
+      expect(slackStart).toBeGreaterThan(0);
+      expect(slackStart).toBeLessThanOrEqual(120);
+      expect(queries.length - slackStart).toBeLessThanOrEqual(120);
+      expect(queries.some((query) => /page_change_(checkpoints|recipients)/.test(query))).toBe(scenario === "diff");
+      expect(queries.filter((query) => query.includes("SET refresh_lease_token=?,refresh_lease_until=?"))).toHaveLength(
+        ["contention", "refresh", "recovery"].includes(scenario) ? 1 : 0,
+      );
+    },
+  );
 
-  it("defers only the rate-limited Slack installation and retries it on a later tick", async () => {
-    const installed = await bootstrap();
-    const timestamp = Date.UTC(2026, 8, 5, 9, 5);
-    const configured = slackEnv();
-    const [firstToken, secondToken] = await Promise.all([
-      encryptSlackToken(configured, "xoxb-rate-limited"),
-      encryptSlackToken(configured, "xoxb-available"),
-    ]);
-    await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO workspaces (id, name, created_at) VALUES ('rate-workspace-two', 'Second workspace', ?)`,
-      ).bind(timestamp),
-      env.DB.prepare(
-        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES
+  it.each(["rate", "contention", "installation-change", "network", "timeout", "http", "malformed", "recovery"])(
+    "defers only the affected Slack workspace (%s) and retries it on a later tick",
+    async (reason) => {
+      const installed = await bootstrap();
+      const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+      const configured = slackEnv();
+      const [firstToken, secondToken] = await Promise.all([
+        encryptSlackToken(configured, "xoxb-rate-limited"),
+        encryptSlackToken(configured, "xoxb-available"),
+      ]);
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO workspaces (id, name, created_at) VALUES ('rate-workspace-two', 'Second workspace', ?)`,
+        ).bind(timestamp),
+        env.DB.prepare(
+          `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES
           ('rate-user-a', 'Rate A', 'rate-a@example.test', 1, ?, ?),
           ('rate-user-b', 'Rate B', 'rate-b@example.test', 1, ?, ?),
           ('rate-user-c', 'Rate C', 'rate-c@example.test', 1, ?, ?)`,
-      ).bind(timestamp, timestamp, timestamp, timestamp, timestamp, timestamp),
-      env.DB.prepare(
-        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES
+        ).bind(timestamp, timestamp, timestamp, timestamp, timestamp, timestamp),
+        env.DB.prepare(
+          `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES
           (?, 'rate-user-a', 'viewer', ?),
           (?, 'rate-user-b', 'viewer', ?),
           ('rate-workspace-two', ?, 'owner', ?),
           ('rate-workspace-two', 'rate-user-c', 'viewer', ?)`,
-      ).bind(
-        installed.workspaceId,
-        timestamp,
-        installed.workspaceId,
-        timestamp,
-        installed.userId,
-        timestamp,
-        timestamp,
-      ),
-      env.DB.prepare(
-        `INSERT INTO pages
+        ).bind(
+          installed.workspaceId,
+          timestamp,
+          installed.workspaceId,
+          timestamp,
+          installed.userId,
+          timestamp,
+          timestamp,
+        ),
+        env.DB.prepare(
+          `INSERT INTO pages
           (id, workspace_id, kind, position, title, created_by, created_at, updated_at, space_id)
          VALUES ('rate-page-two', 'rate-workspace-two', 'document', 'a0', 'Second page', ?, ?, ?,
                  'rate-workspace-two-general')`,
-      ).bind(installed.userId, timestamp, timestamp),
-      env.DB.prepare(
-        `INSERT INTO slack_installations
+        ).bind(installed.userId, timestamp, timestamp),
+        env.DB.prepare(
+          `INSERT INTO slack_installations
           (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
            installed_by, created_at, updated_at)
          VALUES
           ('rate-installation-one', ?, 'TRATE1', 'Rate limited', 'BRATE1', ?, 'chat:write', ?, ?, ?),
           ('rate-installation-two', 'rate-workspace-two', 'TRATE2', 'Available', 'BRATE2', ?, 'chat:write', ?, ?, ?)`,
-      ).bind(
-        installed.workspaceId,
-        firstToken,
-        installed.userId,
-        timestamp,
-        timestamp,
-        secondToken,
-        installed.userId,
-        timestamp,
-        timestamp,
-      ),
-      env.DB.prepare(
-        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation) VALUES
+        ).bind(
+          installed.workspaceId,
+          firstToken,
+          installed.userId,
+          timestamp,
+          timestamp,
+          secondToken,
+          installed.userId,
+          timestamp,
+          timestamp,
+        ),
+        env.DB.prepare(
+          `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation) VALUES
           ('rate-installation-one', 'rate-user-a', 'URATEA', ?,0),
           ('rate-installation-one', 'rate-user-b', 'URATEB', ?,0),
           ('rate-installation-two', 'rate-user-c', 'URATEC', ?,0)`,
-      ).bind(timestamp, timestamp, timestamp),
-      env.DB.prepare(
-        `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone) VALUES
-          ('rate-user-a', 'mention', 1, 'off', 'digest', 'UTC'),
-          ('rate-user-b', 'mention', 1, 'off', 'digest', 'UTC'),
-          ('rate-user-c', 'mention', 1, 'off', 'digest', 'UTC')`,
-      ),
-      env.DB.prepare(
-        `INSERT INTO notifications
+        ).bind(timestamp, timestamp, timestamp),
+        env.DB.prepare(
+          `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone) VALUES
+          ('rate-user-a', 'mention', 1, 'digest', 'digest', 'UTC'),
+          ('rate-user-b', 'mention', 1, 'digest', 'digest', 'UTC'),
+          ('rate-user-c', 'mention', 1, 'digest', 'digest', 'UTC')`,
+        ),
+        env.DB.prepare(
+          `INSERT INTO notifications
           (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
          VALUES
           ('rate-notification-a', ?, 'rate-user-a', 'mention', ?, ?, ?, '{}', 'rate-a', ?),
           ('rate-notification-b', ?, 'rate-user-b', 'mention', ?, ?, ?, '{}', 'rate-b', ?),
           ('rate-notification-c', 'rate-workspace-two', 'rate-user-c', 'mention', ?,
            'rate-workspace-two-general', 'rate-page-two', '{}', 'rate-c', ?)`,
-      ).bind(
-        installed.workspaceId,
-        installed.userId,
-        installed.page.spaceId,
-        installed.page.id,
-        timestamp - 10 * 60_000,
-        installed.workspaceId,
-        installed.userId,
-        installed.page.spaceId,
-        installed.page.id,
-        timestamp - 10 * 60_000,
-        installed.userId,
-        timestamp - 10 * 60_000,
-      ),
-      env.DB.prepare(
-        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+        ).bind(
+          installed.workspaceId,
+          installed.userId,
+          installed.page.spaceId,
+          installed.page.id,
+          timestamp - 10 * 60_000,
+          installed.workspaceId,
+          installed.userId,
+          installed.page.spaceId,
+          installed.page.id,
+          timestamp - 10 * 60_000,
+          installed.userId,
+          timestamp - 10 * 60_000,
+        ),
+        env.DB.prepare(
+          `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
          SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
            FROM notifications WHERE id LIKE 'rate-notification-%'`,
-      ).bind(timestamp, timestamp),
-    ]);
-    await verifySlackDigestRecipients(["rate-user-a", "rate-user-b", "rate-user-c"]);
-    const channels: string[] = [];
-    let remainingRateLimits = 1;
-    const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
-      channels.push(JSON.parse(String(init?.body)).channel as string);
-      const authorization = new Headers(init?.headers).get("authorization");
-      return authorization === "Bearer xoxb-rate-limited" && remainingRateLimits-- > 0
-        ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
-        : Response.json({ ok: true });
-    });
-    vi.stubGlobal("fetch", fetchMock);
-    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const now = vi.spyOn(Date, "now").mockReturnValue(timestamp);
+        ).bind(timestamp, timestamp),
+      ]);
+      await verifySlackDigestRecipients(["rate-user-a", "rate-user-b", "rate-user-c"]);
+      const now = vi.spyOn(Date, "now").mockReturnValue(timestamp);
+      if (reason !== "rate")
+        await env.DB.prepare(
+          `UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?,refresh_lease_token=?,refresh_lease_until=? WHERE id='rate-installation-one'`,
+        )
+          .bind(
+            await encryptSlackToken(configured, "xoxr-old"),
+            reason === "contention" ? "crashed" : null,
+            timestamp + 30_000,
+          )
+          .run();
+      const counter = countedD1(env.DB);
+      const email = vi.fn(async () => ({ messageId: "healthy-email" }));
+      const metric = vi.fn();
+      const bindings: Env = {
+        ...configured,
+        DB: counter.database,
+        SEND_EMAIL: { send: email } as NonNullable<Env["SEND_EMAIL"]>,
+        EMAIL_FROM: "notes@example.test",
+        OBSERVABILITY: { writeDataPoint: metric } as NonNullable<Env["OBSERVABILITY"]>,
+      };
+      const channels: string[] = [];
+      let recovered = false;
+      let changed = false;
+      const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        if (String(input).endsWith("oauth.v2.access")) {
+          if (!recovered) {
+            if (reason === "network") throw new TypeError("network unavailable");
+            if (reason === "timeout") throw new DOMException("timed out", "TimeoutError");
+            if (reason === "http") return Response.json({ ok: false, error: "service_unavailable" }, { status: 503 });
+            if (reason === "malformed") return Response.json(null);
+            if (reason === "recovery") return Response.json({ ok: false, error: "invalid_refresh_token" });
+            if (reason === "installation-change" && !changed) {
+              changed = true;
+              await env.DB.prepare(
+                "UPDATE slack_installations SET generation=generation+1 WHERE id='rate-installation-one'",
+              ).run();
+            }
+          }
+          return Response.json({
+            ok: true,
+            access_token: "xoxb-retried",
+            refresh_token: "xoxr-retried",
+            expires_in: 3600,
+          });
+        }
+        channels.push(JSON.parse(String(init?.body)).channel as string);
+        const authorization = new Headers(init?.headers).get("authorization");
+        return reason === "rate" && authorization === "Bearer xoxb-rate-limited" && !recovered
+          ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
+          : Response.json({ ok: true });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      await executeScheduledTasks(bindings, createExecutionContext(), [
+        { name: "notification_digests", run: () => sendDueNotificationDigests(bindings, timestamp) },
+      ]);
+      expect(email).toHaveBeenCalledTimes(3);
+      expect(counter.statements.length).toBeLessThanOrEqual(240);
+      expect(
+        counter.statements.filter((sql) => sql.includes("SET refresh_lease_token=?,refresh_lease_until=?")),
+      ).toHaveLength(reason === "rate" ? 0 : 1);
+      expect(
+        counter.statements.filter((sql) => sql.includes("SELECT * FROM slack_installations WHERE id=?")),
+      ).toHaveLength(["contention", "recovery"].includes(reason) ? 1 : 0);
+      const integration = metric.mock.calls
+        .map(([point]) => point as { indexes: string[]; blobs: string[] })
+        .filter((point) => point.indexes[0] === "integration.call" && point.blobs[1] === "notifications");
+      expect(integration).toHaveLength(1);
+      expect(integration[0]!.blobs[3]).toBe(
+        ["contention", "installation-change"].includes(reason) ? "skipped" : "failure",
+      );
 
-    await sendDueNotificationDigests(configured, timestamp);
-
-    expect(channels).toEqual(["URATEA", "URATEC"]);
-    expect(
-      await env.DB.prepare(
-        `SELECT id, slack_at IS NOT NULL delivered FROM notifications
+      expect(channels).toEqual(reason === "rate" ? ["URATEA", "URATEC"] : ["URATEC"]);
+      expect(
+        await env.DB.prepare(
+          `SELECT id, slack_at IS NOT NULL delivered FROM notifications
           WHERE id LIKE 'rate-notification-%' ORDER BY id`,
-      ).all(),
-    ).toMatchObject({
-      results: [
-        { id: "rate-notification-a", delivered: 0 },
-        { id: "rate-notification-b", delivered: 0 },
-        { id: "rate-notification-c", delivered: 1 },
-      ],
-    });
+        ).all(),
+      ).toMatchObject({
+        results: [
+          { id: "rate-notification-a", delivered: 0 },
+          { id: "rate-notification-b", delivered: 0 },
+          { id: "rate-notification-c", delivered: 1 },
+        ],
+      });
 
-    now.mockReturnValue(timestamp + 15_000);
-    await sendDueNotificationDigests(configured, timestamp + 15_000);
-    expect(channels).toEqual(["URATEA", "URATEC"]);
+      now.mockReturnValue(timestamp + 15_000);
+      await sendDueNotificationDigests(bindings, timestamp + 15_000);
+      expect(channels).toEqual(reason === "rate" ? ["URATEA", "URATEC"] : ["URATEC"]);
 
-    now.mockReturnValue(timestamp + 15 * 60_000);
-    await sendDueNotificationDigests(configured, timestamp + 15 * 60_000);
+      recovered = true;
+      if (reason === "installation-change")
+        await env.DB.prepare(
+          `UPDATE slack_user_links SET installation_generation=(SELECT generation FROM slack_installations WHERE id=installation_id) WHERE installation_id='rate-installation-one'`,
+        ).run();
+      now.mockReturnValue(timestamp + 15 * 60_000);
+      await sendDueNotificationDigests(bindings, timestamp + 15 * 60_000);
 
-    expect(channels).toEqual(["URATEA", "URATEC", "URATEA", "URATEB"]);
-    expect(
-      await env.DB.prepare(
-        `SELECT COUNT(*) delivered FROM notifications
+      expect(channels).toEqual(
+        reason === "rate" ? ["URATEA", "URATEC", "URATEA", "URATEB"] : ["URATEC", "URATEA", "URATEB"],
+      );
+      expect(
+        await env.DB.prepare(
+          `SELECT COUNT(*) delivered FROM notifications
           WHERE id LIKE 'rate-notification-%' AND slack_at IS NOT NULL`,
-      ).first(),
-    ).toEqual({ delivered: 3 });
-    log.mockRestore();
-  });
+        ).first(),
+      ).toEqual({ delivered: 3 });
+      log.mockRestore();
+    },
+  );
 
   it.each([
     ...(["email", "slack"] as const).flatMap((channel) =>
@@ -1496,7 +1630,6 @@ describe("notification feed and subscriptions", () => {
     { channel: "slack" as const, failure: "dispatch-database" as const },
     { channel: "slack" as const, failure: "identity-revoked" as const },
     { channel: "slack" as const, failure: "identity-cleanup" as const },
-    { channel: "slack" as const, failure: "refresh-contention" as const },
   ])(
     "reports $channel $failure failures after healthy recipients and the other channel progress",
     async ({ channel, failure }) => {
@@ -1559,20 +1692,8 @@ describe("notification feed and subscriptions", () => {
         ),
       ]);
       await verifySlackDigestRecipients(["recovery-a", "recovery-b", "recovery-c"]);
-      if (failure === "refresh-contention") {
-        await env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1,
-          bot_refresh_token_ciphertext=?,refresh_lease_token='competing-refresh',refresh_lease_until=?
-          WHERE id='recovery-installation'`)
-          .bind(await encryptSlackToken(configured, "xoxr-digest-recovery"), Date.now() + 30_000)
-          .run();
-        const originalSetTimeout = globalThis.setTimeout;
-        vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, _delay, ...args) =>
-          originalSetTimeout(callback, 0, ...args),
-        );
-      }
       const injected = new Error(`injected ${failure}`);
       let failed = false;
-      let refreshReads = 0;
       const metadata = new WeakMap<
         D1PreparedStatement,
         { statement: D1PreparedStatement; sql: string; values: unknown[] }
@@ -1604,25 +1725,6 @@ describe("notification feed and subscriptions", () => {
                 failed = true;
                 await env.DB.prepare(`DELETE FROM slack_user_links WHERE user_id='recovery-a'`).run();
                 return target.first();
-              };
-            }
-            if (
-              property === "first" &&
-              failure === "refresh-contention" &&
-              sql.includes("SELECT * FROM slack_installations WHERE id=?")
-            ) {
-              return async () => {
-                const row = await target.first();
-                if (++refreshReads === 15) {
-                  failed = true;
-                  // The first sender exhausts its lease wait. Later recipients
-                  // observe the completed rotation and can still make progress.
-                  await env.DB.prepare(`UPDATE slack_installations SET token_expires_at=?,
-                    refresh_lease_token=NULL,refresh_lease_until=NULL WHERE id='recovery-installation'`)
-                    .bind(Date.now() + 3_600_000)
-                    .run();
-                }
-                return row;
               };
             }
             const value: unknown = Reflect.get(target, property, target);
@@ -1682,12 +1784,8 @@ describe("notification feed and subscriptions", () => {
         },
       });
       const providerFails = failure === "provider" || failure === "cleanup";
-      const expectedProviderFailure =
-        providerFails ||
-        failure === "identity-revoked" ||
-        failure === "identity-cleanup" ||
-        failure === "refresh-contention";
-      const taskFails = failure !== "provider" && failure !== "identity-revoked" && failure !== "refresh-contention";
+      const expectedProviderFailure = providerFails;
+      const taskFails = failure !== "provider" && failure !== "identity-revoked";
       const send = vi.fn(async (message: { to: string }) => {
         if (channel === "email" && providerFails && message.to === "recovery-a@example.test")
           throw new Error("mailbox unavailable");
@@ -1762,27 +1860,47 @@ describe("notification feed and subscriptions", () => {
           blobs: expect.arrayContaining([taskFails ? "failure" : "success"]),
         }),
       );
-      const identityFailures = log.mock.calls.filter(
-        ([record]) =>
-          record.event === "notification.digest_slack.failed" && record.errorCode === "slack_identity_required",
-      );
-      expect(identityFailures).toHaveLength(failure === "identity-revoked" || failure === "identity-cleanup" ? 1 : 0);
-      const refreshFailures = log.mock.calls.filter(
-        ([record]) =>
-          record.event === "notification.digest_slack.failed" &&
-          record.errorName === "SlackTokenRefreshInProgressError",
-      );
-      expect(refreshFailures).toHaveLength(failure === "refresh-contention" ? 1 : 0);
-      expect(refreshReads).toBe(failure === "refresh-contention" ? 15 : 0);
-      if (failure === "refresh-contention") {
-        await sendDueNotificationDigests(bindings, timestamp);
-      }
-      const retried = await env.DB.prepare(`SELECT status FROM deliveries WHERE idempotency_key=?`)
-        .bind(`outbox:recovery-notification-recovery-a:${channel}`)
-        .first();
-      expect(retried).toEqual(failure === "refresh-contention" ? { status: "sent" } : first);
+      expect(
+        log.mock.calls.some(
+          ([record]) =>
+            record.event === "notification.digest_slack.failed" && record.errorCode === "slack_identity_required",
+        ),
+      ).toBe(false);
+      const skipped = metric.mock.calls
+        .map(([point]) => point as { indexes: string[]; blobs: string[] })
+        .filter((point) => point.indexes[0] === "integration.call" && point.blobs[3] === "skipped");
+      expect(skipped).toHaveLength(failure === "identity-revoked" || failure === "identity-cleanup" ? 1 : 0);
     },
   );
+
+  it("logs both original discovery failures before aggregating channels", async () => {
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            if (sql.startsWith("SELECT COALESCE(preference.timezone"))
+              throw new Error(
+                sql.includes("n.emailed_at") ? "email discovery unavailable" : "slack discovery unavailable",
+              );
+            return target.prepare(sql);
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const configured = {
+      ...slackEnv(),
+      DB: database,
+      SEND_EMAIL: { send: vi.fn() },
+      EMAIL_FROM: "notes@example.test",
+    } as unknown as Env;
+    await expect(sendDueNotificationDigests(configured)).rejects.toThrow("Notification digest channels failed.");
+    for (const channel of ["email", "slack"])
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({ channel, stage: "discovery", errorMessage: `${channel} discovery unavailable` }),
+      );
+  });
 
   it("logs simultaneous candidate and cursor failures with their channel and timezone", async () => {
     const installed = await bootstrap();
