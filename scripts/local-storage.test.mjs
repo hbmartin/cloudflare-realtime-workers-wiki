@@ -1,13 +1,11 @@
 import { mkdtempSync, rmSync } from "node:fs";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { afterEach, expect, it, vi } from "vitest";
+import { Miniflare } from "miniflare";
 import viteConfig from "../vite.config.ts";
 
 const plugin = vi.hoisted(() => vi.fn(() => ({ name: "cloudflare" })));
 vi.mock("@cloudflare/vite-plugin", () => ({ cloudflare: plugin }));
-const require = createRequire(createRequire(import.meta.url).resolve("wrangler"));
-const { Miniflare } = require("miniflare");
 
 afterEach(() => vi.unstubAllEnvs());
 
