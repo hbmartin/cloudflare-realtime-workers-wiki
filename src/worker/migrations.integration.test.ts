@@ -7,7 +7,7 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
-  it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076", "0077", "0078", "0079"])(
+  it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076", "0077", "0078", "0079", "0081", "0082"])(
     "upgrades a database before %s through the additive follow-up",
     async (foundation) => {
       await applyD1Migrations(

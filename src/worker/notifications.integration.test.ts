@@ -9,6 +9,7 @@ import type { Env } from "./env";
 import {
   deliverNotification,
   digestCandidates,
+  saveDigestCursor,
   notificationFanoutStatements,
   sendDueNotificationDigests,
 } from "./notifications";
@@ -1091,11 +1092,13 @@ describe("notification feed and subscriptions", () => {
     }));
 
     await digestCandidates(env, "email", "UTC", 10, read);
+    await saveDigestCursor(env, "email", "UTC");
     const first = await env.DB.prepare(
       `SELECT user_id, workspace_id, updated_at FROM digest_delivery_cursors
         WHERE channel = 'email' AND timezone = 'UTC'`,
     ).first();
     await digestCandidates(env, "email", "UTC", 10, read);
+    await saveDigestCursor(env, "email", "UTC");
     const second = await env.DB.prepare(
       `SELECT user_id, workspace_id, updated_at FROM digest_delivery_cursors
         WHERE channel = 'email' AND timezone = 'UTC'`,
@@ -1231,7 +1234,7 @@ describe("notification feed and subscriptions", () => {
   it("keeps a full email and Slack digest tick within the statement budget", async () => {
     const installed = await bootstrap();
     const timestamp = Date.UTC(2026, 8, 5, 11, 5);
-    const configured = slackEnv();
+    const configured: Env = { ...slackEnv(), DIFF_DIGESTS_ENABLED: "false" };
     const token = await encryptSlackToken(configured, "xoxb-budget");
     await env.DB.batch([
       env.DB.prepare(
@@ -1286,11 +1289,13 @@ describe("notification feed and subscriptions", () => {
       Array.from({ length: 10 }, (_, n) => `budget-user-${String(n + 1).padStart(2, "0")}`),
     );
     let statementCount = 0;
+    const queries: string[] = [];
     const countedDatabase = new Proxy(env.DB, {
       get(target, property) {
         if (property === "prepare") {
           return (query: string) => {
             statementCount += 1;
+            queries.push(query);
             return target.prepare(query);
           };
         }
@@ -1326,6 +1331,7 @@ describe("notification feed and subscriptions", () => {
       blocks: [{ text: { text: expect.stringContaining("Your daily NoteFlare digest") } }],
     });
     expect(statementCount).toBeLessThanOrEqual(240);
+    expect(queries.some((query) => /page_change_(checkpoints|recipients)/.test(query))).toBe(false);
   });
 
   it("defers only the rate-limited Slack installation and retries it on a later tick", async () => {
@@ -1526,7 +1532,7 @@ describe("notification feed and subscriptions", () => {
 
     await sendDueNotificationDigests(bindings, timestamp);
     expect(send.mock.calls.some(([message]) => message.to === "cursor-user-31@example.test")).toBe(false);
-    for (let tick = 1; tick < 4; tick += 1) {
+    for (let tick = 1; tick < 5; tick += 1) {
       await sendDueNotificationDigests(bindings, timestamp + tick * 15 * 60_000);
       if (send.mock.calls.some(([message]) => message.to === "cursor-user-31@example.test")) break;
     }

@@ -1,4 +1,5 @@
-import { expect, test } from "@playwright/test";
+import * as Y from "yjs";
+import { expect, test, type Route } from "@playwright/test";
 import { signInOwner, completeEnrollment } from "./security-helpers";
 test.setTimeout(60000);
 
@@ -103,6 +104,87 @@ test("comparison links open History with an honest expired state", async ({ page
   await expect(page.getByRole("region", { name: "Digest comparison" })).toContainText(
     "This comparison is no longer available.",
   );
+});
+
+test("History previews the full saved version before restore", async ({ page }) => {
+  await signInOwner(page);
+  const created = await (
+    await page.request.post("/api/pages", { data: { kind: "document", title: `Saved preview ${Date.now()}` } })
+  ).json();
+  await page.goto(`/?page=${created.page.id}`);
+  const editor = page.locator(".bn-editor");
+  await expect(editor).toBeVisible();
+  await editor.click();
+  await page.keyboard.insertText("Unchanged paragraph");
+  await page.keyboard.press("Enter");
+  await page.keyboard.insertText("Original paragraph");
+  const ids = await editor
+    .locator(".bn-block-outer")
+    .evaluateAll((blocks) => blocks.map((block) => block.getAttribute("data-id")!));
+  const saved = new Y.Doc();
+  const group = new Y.XmlElement("blockGroup");
+  ["Unchanged paragraph", "Original paragraph"].forEach((value, index) => {
+    const container = new Y.XmlElement("blockContainer"),
+      paragraph = new Y.XmlElement("paragraph"),
+      text = new Y.XmlText();
+    container.setAttribute("id", ids[index]!);
+    text.insert(0, value);
+    paragraph.insert(0, [text]);
+    container.insert(0, [paragraph]);
+    group.insert(index, [container]);
+  });
+  saved.getXmlFragment("document-store").insert(0, [group]);
+  const bytes = Y.encodeStateAsUpdate(saved);
+  saved.destroy();
+  await page.route(`**/api/pages/${created.page.id}/versions`, (route) =>
+    route.fulfill({
+      json: {
+        versions: [
+          {
+            id: "saved-preview",
+            title: created.page.title,
+            epoch: 1,
+            sequence: 1,
+            byteSize: bytes.length,
+            createdAt: Date.now(),
+          },
+          { id: "late-preview", title: "Older version", epoch: 1, sequence: 0, byteSize: 0, createdAt: 1 },
+        ],
+      },
+    }),
+  );
+  await page.route("**/api/versions/saved-preview", (route) =>
+    route.fulfill({ body: Buffer.from(bytes), contentType: "application/octet-stream" }),
+  );
+  const second = editor.locator(".bn-inline-content").filter({ hasText: "Original paragraph" });
+  await second.click();
+  await page.keyboard.press("Home");
+  await page.keyboard.press("Shift+End");
+  await page.keyboard.insertText("Changed paragraph");
+  await page.getByRole("button", { name: "Page details", exact: true }).click();
+  await page.getByRole("button", { name: "History", exact: true }).click();
+  await page.locator(".version-list button").first().click();
+  const preview = page.getByRole("region", { name: "Saved version preview" });
+  await expect(preview).toContainText("Unchanged paragraph");
+  await expect(preview).toContainText("Original paragraph");
+  await expect(page.getByLabel("Block-level version comparison")).not.toContainText("Unchanged paragraph");
+  await expect(page.getByRole("button", { name: "Restore this version" })).toBeVisible();
+  let receiveLate!: (route: Route) => void;
+  const lateRequest = new Promise<Route>((resolve) => {
+    receiveLate = resolve;
+  });
+  await page.route("**/api/versions/late-preview", (route) => {
+    receiveLate(route);
+  });
+  await page.locator(".version-list button").nth(1).click();
+  const lateRoute = await lateRequest;
+  await expect(page.getByRole("button", { name: "Restore this version" })).not.toBeVisible();
+  await expect(page.getByText("Loading saved version…", { exact: true })).toBeVisible();
+  await page.locator(".version-list button").first().click();
+  await expect(preview).toContainText("Original paragraph");
+  await lateRoute.fulfill({ body: Buffer.from([0, 0]), contentType: "application/octet-stream" });
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(preview).toContainText("Original paragraph");
 });
 
 test("nested block links expand local toggles and remain keyboard-accessible to viewers", async ({ page, browser }) => {

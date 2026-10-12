@@ -11,7 +11,8 @@ actions control for viewers. The existing page URL carries `#block=<encoded Bloc
 are preserved. Navigation handles first load, same-page fragments, and history; changing pages discards stale block
 targets. Collapsed ancestors expand through BlockNote's local toggle state. Highlighting respects reduced motion.
 Missing targets have an explicit notice; offline misses request reconnection instead of claiming deletion. Clipboard
-failure leaves a selectable URL. Permission checks remain the normal page checks; public shares stay static.
+failure leaves a selectable URL. Native editor and text-input context menus remain available. Connectivity changes
+retry only unresolved targets; confirmed missing targets stop observing document edits. Permission checks remain the normal page checks; public shares stay static.
 
 ## Increment 2: Whole-diagram live embeds
 
@@ -36,15 +37,15 @@ Channel digest edit events retain exact checkpoint references even when immediat
 The shared comparison matches stable IDs, compares own content separately from children, and distinguishes additions,
 removals, modifications, and moves. Cosmetic marks/colors/layout are ignored. Link destinations, attachments, formulas,
 Mermaid source, and linked-page properties participate. Digests provide counts and at most three excerpts, capped at
-240 Unicode characters per before/after value. History uses this same engine and displays the full comparison.
+240 Unicode characters per before/after value. History uses this same engine and displays changed blocks alongside the full saved-version text before restore.
 
 Personal email, personal Slack, and mapped channel digests keep current preferences, schedules/timezones, actor
 exclusion, subscriptions, mappings, mute/snooze rules, departure notices, open-work summaries, and delivery claims.
 Selected checkpoint pairs are frozen in receipts before sending. Inputs missing, expired, or larger than 2 MiB each
 fall back to the existing summary with an explicit unavailable notice. Slack sections/messages are bounded after
 escaping; compact summaries and comparison links remain when all excerpts cannot fit.
-Personal diff digests select up to ten page/event groups per invocation, with the existing delivery cursor advancing
-fairly through pending recipients. One busy page occupies one slot regardless of its edit count. Its frozen range
+Personal diff digests select up to forty item groups, including at most ten retained document comparisons. The
+existing delivery cursor advances only through processed recipients, stopping before a candidate exceeds the tick budget. One busy page occupies one slot regardless of its edit count. Its frozen range
 covers every qualifying checkpoint before the existing timezone cutoff; successful delivery consumes that range
 without consuming edits that arrive during delivery. The original notification delivery timestamps are updated in
 that same transaction so checkpoint expiration cannot resurface an already delivered change.
@@ -57,6 +58,21 @@ The authenticated comparison endpoint validates page ownership of both checkpoin
 read access, then rechecks access after R2 reads. Digest URLs use compareFrom/compareTo to open History. Current
 surviving blocks have block links; removed content is available only in the comparison. Retention is 30 days.
 Checkpoint cascades enqueue retryable R2 cleanup on permanent deletion, alongside existing page-prefix cleanup.
+Migration `0082` changes digest suppression to recipient primary-key lookups and indexes delivery outbox/channel
+lookups. Finalization consumes only explicit IDs from claimed receipts and indexed page/time ranges. Malformed
+personal comparison JSON is repaired under the delivery claim; valid frozen pairs remain unchanged.
+
+Cleanup keeps checkpoints for all documents for 30 days. Each leased invocation removes up to five ordered batches
+of 100 expired checkpoints and ten batches of 100 GC keys, with a 30-second work budget. GC checks current and
+retained projection references with indexes, deletes unreferenced R2 objects in bulk, and leaves failed deletions
+retryable. Backlogs continue through the existing delivery queue using `documentChangesCleanup`; the 15-minute cron
+recovers interrupted work. Cleanup logs report deleted checkpoints, examined/deleted projections, continuation, and
+the oldest expired checkpoint instead of counting all retained rows.
+
+Mapped Slack edit events use the activity trigger when activity is enabled and direct fanout otherwise. Coverage
+accepts both checkpoint-backed IDs, including already pending duplicates. Each delivery invocation reuses the
+comparison for a page/checkpoint pair while repeating current access checks before dispatch. Slack display text is
+escaped separately from URL targets, so underscores in page and block IDs survive.
 
 ## Release and deployed exit matrix
 

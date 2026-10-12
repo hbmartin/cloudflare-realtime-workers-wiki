@@ -95,13 +95,22 @@ export function BlockLinkControls({
   const menuSelect = useRef<HTMLSelectElement>(null);
   const menuTrigger = useRef<HTMLButtonElement>(null);
   const selected = useRef<string | null>(null);
+  const offlineRef = useRef(offline);
+  const retryPending = useRef<(() => void) | null>(null);
+  useEffect(() => {
+    offlineRef.current = offline;
+    retryPending.current?.();
+  }, [offline]);
   useEffect(() => {
     const shell = root.current;
     if (!shell) return undefined;
     let active = true;
     let timer: number | undefined;
+    let frame: number | undefined;
     let target: string | null = null;
+    const observer = new MutationObserver(() => scheduleAttempt());
     const attempt = () => {
+      frame = undefined;
       if (!target) return;
       if (revealBlock(shell, target)) {
         setHighlight(target);
@@ -109,48 +118,36 @@ export function BlockLinkControls({
           if (active) setHighlight(null);
         }, 2500);
         target = null;
+        observer.disconnect();
         setMessage("");
-      } else if (bundle.provider.synced || offline || !navigator.onLine) {
+      } else if (bundle.provider.synced || offlineRef.current || !navigator.onLine) {
+        observer.disconnect();
+        const disconnected = offlineRef.current || !navigator.onLine;
         setMessage(
-          offline || !navigator.onLine
+          disconnected
             ? "This block is not in the cached copy. Reconnect to locate it."
             : "This block is no longer available.",
         );
+        if (!disconnected) target = null;
+      } else {
+        observer.observe(shell, { childList: true, subtree: true });
       }
+    };
+    const scheduleAttempt = () => {
+      if (target && frame === undefined) frame = window.requestAnimationFrame(attempt);
     };
     const navigate = () => {
       setHighlight(null);
       if (timer !== undefined) window.clearTimeout(timer);
       const page = new URL(window.location.href).searchParams.get("page");
       target = page === pageId ? blockTarget(window.location.hash) : null;
+      observer.disconnect();
       setMessage("");
-      attempt();
+      scheduleAttempt();
     };
     const identify = (event: Event) => {
       if (event.target instanceof Element)
         selected.current = event.target.closest<HTMLElement>(BLOCK_SELECTOR)?.dataset.id ?? selected.current;
-    };
-    const context = (event: MouseEvent) => {
-      identify(event);
-      if (!selected.current) return;
-      event.preventDefault();
-      setMenu({
-        id: selected.current,
-        blocks: blockOptions(shell),
-        x: Math.min(event.clientX, window.innerWidth - 220),
-        y: Math.max(0, Math.min(event.clientY, window.innerHeight - 140)),
-      });
-    };
-    const keyboard = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setMenu(null);
-      if ((event.shiftKey && event.key === "F10") || event.key === "ContextMenu") {
-        identify(event);
-        const id = selected.current ?? shell.querySelector<HTMLElement>(BLOCK_SELECTOR)?.dataset.id;
-        if (!id) return;
-        event.preventDefault();
-        const bounds = shell.getBoundingClientRect();
-        setMenu({ id, x: Math.max(0, bounds.left), y: Math.max(0, bounds.top), blocks: blockOptions(shell) });
-      }
     };
     const copyLink = async (event: Event) => {
       const id: unknown = (event as CustomEvent).detail;
@@ -171,31 +168,30 @@ export function BlockLinkControls({
     const copy = (event: Event) => {
       void copyLink(event);
     };
-    const observer = new MutationObserver(attempt);
-    observer.observe(shell, { childList: true, subtree: true });
+    retryPending.current = scheduleAttempt;
     shell.addEventListener("pointerdown", identify);
     shell.addEventListener("focusin", identify);
-    shell.addEventListener("contextmenu", context);
-    shell.addEventListener("keydown", keyboard);
     window.addEventListener("hashchange", navigate);
     window.addEventListener("popstate", navigate);
     window.addEventListener(COPY_EVENT, copy);
-    bundle.provider.on("sync", attempt);
+    window.addEventListener("online", scheduleAttempt);
+    bundle.provider.on("sync", scheduleAttempt);
     navigate();
     return () => {
       active = false;
       observer.disconnect();
+      retryPending.current = null;
+      if (frame !== undefined) window.cancelAnimationFrame(frame);
       if (timer !== undefined) window.clearTimeout(timer);
       shell.removeEventListener("pointerdown", identify);
       shell.removeEventListener("focusin", identify);
-      shell.removeEventListener("contextmenu", context);
-      shell.removeEventListener("keydown", keyboard);
       window.removeEventListener("hashchange", navigate);
       window.removeEventListener("popstate", navigate);
       window.removeEventListener(COPY_EVENT, copy);
-      bundle.provider.off("sync", attempt);
+      window.removeEventListener("online", scheduleAttempt);
+      bundle.provider.off("sync", scheduleAttempt);
     };
-  }, [bundle, offline, pageId, root]);
+  }, [bundle, pageId, root]);
   const menuOpen = Boolean(menu);
   useEffect(() => {
     if (menuOpen) menuButton.current?.focus();
@@ -209,6 +205,12 @@ export function BlockLinkControls({
         type="button"
         ref={menuTrigger}
         aria-haspopup="dialog"
+        onKeyDown={(event) => {
+          if ((event.shiftKey && event.key === "F10") || event.key === "ContextMenu") {
+            event.preventDefault();
+            event.currentTarget.click();
+          }
+        }}
         onClick={(event) => {
           const id = selected.current ?? root.current?.querySelector<HTMLElement>(BLOCK_SELECTOR)?.dataset.id;
           if (id) {

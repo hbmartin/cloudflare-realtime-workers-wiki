@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi } from "vitest";
-import { blockLink, blockTarget, revealBlock } from "./block-links";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { createRef } from "react";
+import type { CollaborationBundle } from "./collaboration";
+import { BlockLinkControls, blockLink, blockTarget, revealBlock } from "./block-links";
 
 describe("private block links", () => {
   it("encodes stable IDs and replaces unrelated page targets", () => {
@@ -30,5 +33,133 @@ describe("private block links", () => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     root.remove();
+  });
+});
+
+describe("block link navigation and native menus", () => {
+  const frames = new Map<number, FrameRequestCallback>();
+  let nextFrame = 0;
+  beforeEach(() => {
+    window.history.replaceState(null, "", "/?page=page#block=linked");
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+      frames.delete(id);
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    frames.clear();
+    vi.restoreAllMocks();
+    window.history.replaceState(null, "", "/");
+  });
+  async function flushFrames() {
+    await act(async () => {
+      while (frames.size) {
+        const pending = [...frames.values()];
+        frames.clear();
+        pending.forEach((callback) => callback(0));
+      }
+    });
+  }
+  function fixture({ offline = false, synced = true, id = "linked" } = {}) {
+    const root = createRef<HTMLDivElement>();
+    const handlers = new Map<string, () => void>();
+    const provider = {
+      synced,
+      on: (event: string, callback: () => void) => handlers.set(event, callback),
+      off: (event: string) => handlers.delete(event),
+    };
+    const bundle = { provider } as unknown as CollaborationBundle;
+    const component = (disconnected: boolean) => (
+      <div ref={root}>
+        <div className="bn-editor">
+          <div className="bn-block-outer" data-id={id}>
+            <p contentEditable suppressContentEditableWarning>
+              Text
+            </p>
+          </div>
+        </div>
+        <BlockLinkControls root={root} pageId="page" bundle={bundle} offline={disconnected} />
+      </div>
+    );
+    const view = render(component(offline));
+    const block = root.current!.querySelector<HTMLElement>(".bn-block-outer")!;
+    const scroll = vi.fn();
+    block.scrollIntoView = scroll;
+    return { root, provider, handlers, scroll, view, component };
+  }
+  it("does not scroll a resolved fragment again on offline and reconnect transitions", async () => {
+    const { view, component, scroll, handlers } = fixture();
+    await flushFrames();
+    expect(scroll).toHaveBeenCalledOnce();
+    view.rerender(component(true));
+    await flushFrames();
+    view.rerender(component(false));
+    handlers.get("sync")?.();
+    await flushFrames();
+    expect(scroll).toHaveBeenCalledOnce();
+  });
+  it("preserves native right-click and keyboard menus in editable text and copy fallback", async () => {
+    const { root } = fixture();
+    await flushFrames();
+    const text = root.current!.querySelector("p")!;
+    expect(fireEvent.contextMenu(text)).toBe(true);
+    expect(fireEvent.keyDown(text, { key: "F10", shiftKey: true })).toBe(true);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    fireEvent.keyDown(screen.getByRole("button", { name: "Block actions" }), { key: "F10", shiftKey: true });
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    const original = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: vi.fn(async () => {
+          throw new Error("denied");
+        }),
+      },
+    });
+    try {
+      await act(async () => {
+        fireEvent.click(screen.getByRole("menuitem", { name: "Copy link to block" }));
+      });
+      const fallback = screen.getByRole("textbox", { name: "Block link" });
+      expect(fireEvent.contextMenu(fallback)).toBe(true);
+      expect(fireEvent.keyDown(fallback, { key: "ContextMenu" })).toBe(true);
+      expect(screen.queryByRole("dialog")).toBeNull();
+    } finally {
+      if (original) Object.defineProperty(navigator, "clipboard", original);
+      else Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
+  it("stops observing deleted blocks and rearms only on explicit navigation", async () => {
+    const { root, scroll } = fixture({ id: "other" });
+    const scan = vi.spyOn(root.current!, "querySelectorAll");
+    await flushFrames();
+    expect(screen.getByLabelText("Block link status").textContent).toContain("no longer available");
+    const scans = scan.mock.calls.length;
+    root.current!.querySelector("p")!.appendChild(document.createElement("span"));
+    await flushFrames();
+    expect(scan).toHaveBeenCalledTimes(scans);
+    root.current!.querySelector(".bn-block-outer")!.setAttribute("data-id", "linked");
+    fireEvent(window, new HashChangeEvent("hashchange"));
+    await flushFrames();
+    expect(scroll).toHaveBeenCalledOnce();
+  });
+  it("keeps a missing cached target pending until reconnect and synchronization", async () => {
+    const { root, view, component, provider, handlers, scroll } = fixture({
+      offline: true,
+      synced: false,
+      id: "other",
+    });
+    await flushFrames();
+    expect(screen.getByLabelText("Block link status").textContent).toContain("cached copy");
+    root.current!.querySelector(".bn-block-outer")!.setAttribute("data-id", "linked");
+    provider.synced = true;
+    view.rerender(component(false));
+    handlers.get("sync")?.();
+    await flushFrames();
+    expect(scroll).toHaveBeenCalledOnce();
   });
 });

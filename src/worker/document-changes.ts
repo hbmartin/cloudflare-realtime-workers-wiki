@@ -2,7 +2,7 @@ import { diffDocuments, digestExcerpts, type DigestComparison, type DocumentDiff
 import type { DocumentContentEnvelope } from "../shared/types";
 import type { Env } from "./env";
 import { HttpError } from "./http";
-import { logger } from "./observability";
+import { currentObservabilityContext, logger } from "./observability";
 
 export const CHANGE_RETENTION_MS = 30 * 86400_000;
 const MAX_COMPARISON_BYTES = 2 * 1024 * 1024;
@@ -171,32 +171,85 @@ export function comparisonLines(comparison: DigestComparison) {
   }
   return lines;
 }
-export async function pruneDocumentChanges(env: Env, timestamp = Date.now()) {
-  const expired = await env.DB.prepare(
-    `SELECT * FROM page_change_checkpoints WHERE created_at<? ORDER BY created_at,id LIMIT 100`,
-  )
-    .bind(timestamp - CHANGE_RETENTION_MS)
-    .all<ChangeCheckpoint>();
-  await env.DB.prepare(`DELETE FROM page_change_checkpoints WHERE id IN (SELECT value FROM json_each(?))`)
-    .bind(JSON.stringify(expired.results.map((row) => row.id)))
-    .run();
-  const queued = await env.DB.prepare("SELECT r2_key FROM page_change_projection_gc LIMIT 200").all<{
-    r2_key: string;
-  }>();
-  for (const { r2_key: key } of queued.results) {
-    const used = await env.DB.prepare(`SELECT 1 FROM document_projections WHERE r2_key=? UNION ALL
-      SELECT 1 FROM page_change_checkpoints WHERE before_key=? OR after_key=? LIMIT 1`)
-      .bind(key, key, key)
-      .first();
-    if (!used) await env.BUCKET.delete(key);
-    await env.DB.prepare("DELETE FROM page_change_projection_gc WHERE r2_key=?").bind(key).run();
+// Bound each invocation; the existing delivery queue drains larger backlogs.
+export async function pruneDocumentChanges(
+  env: Env,
+  timestamp = Date.now(),
+): Promise<"completed" | "contended" | "lease-lost"> {
+  const token = crypto.randomUUID();
+  const start = Date.now();
+  const leaseMs = 5 * 60_000;
+  const claimed = await env.DB.prepare(`UPDATE document_changes_cleanup_state
+    SET lease_token=?,lease_until=?,updated_at=? WHERE id=1 AND lease_until<=? RETURNING id`)
+    .bind(token, start + leaseMs, start, start)
+    .first();
+  if (!claimed) return "contended";
+  const cutoff = timestamp - CHANGE_RETENTION_MS;
+  let removed = 0,
+    examined = 0,
+    deleted = 0;
+  const fence = `EXISTS(SELECT 1 FROM document_changes_cleanup_state WHERE id=1 AND lease_token=? AND lease_until>?)`;
+  const renew = async () => {
+    const now = Date.now();
+    return Boolean(
+      await env.DB.prepare(`UPDATE document_changes_cleanup_state SET lease_until=?,updated_at=?
+      WHERE id=1 AND lease_token=? AND lease_until>? RETURNING id`)
+        .bind(now + leaseMs, now, token, now)
+        .first(),
+    );
+  };
+  try {
+    for (let batch = 0; batch < 5 && Date.now() - start < 30_000; batch++) {
+      if (!(await renew())) return "lease-lost";
+      const expired = await env.DB.prepare(`DELETE FROM page_change_checkpoints
+        WHERE id IN (SELECT id FROM page_change_checkpoints WHERE created_at<? ORDER BY created_at,id LIMIT 100)
+          AND ${fence} RETURNING id`)
+        .bind(cutoff, token, Date.now())
+        .all<{ id: string }>();
+      removed += expired.results.length;
+      if (expired.results.length < 100) break;
+    }
+    for (let batch = 0; batch < 10 && Date.now() - start < 30_000; batch++) {
+      if (!(await renew())) return "lease-lost";
+      const queued = await env.DB.prepare(`SELECT r2_key,
+        EXISTS(SELECT 1 FROM document_projections p WHERE p.r2_key=gc.r2_key)
+          OR EXISTS(SELECT 1 FROM page_change_checkpoints c WHERE c.before_key=gc.r2_key)
+          OR EXISTS(SELECT 1 FROM page_change_checkpoints c WHERE c.after_key=gc.r2_key) used
+        FROM page_change_projection_gc gc ORDER BY r2_key LIMIT 100`).all<{ r2_key: string; used: number }>();
+      const unused = queued.results.filter((row) => !row.used).map((row) => row.r2_key);
+      if (unused.length) await env.BUCKET.delete(unused);
+      if (!(await renew())) return "lease-lost";
+      await env.DB.prepare(`DELETE FROM page_change_projection_gc
+        WHERE r2_key IN (SELECT value FROM json_each(?)) AND ${fence}`)
+        .bind(JSON.stringify(queued.results.map((row) => row.r2_key)), token, Date.now())
+        .run();
+      examined += queued.results.length;
+      deleted += unused.length;
+      if (queued.results.length < 100) break;
+    }
+    const oldest = await env.DB.prepare(`SELECT created_at FROM page_change_checkpoints
+      WHERE created_at<? ORDER BY created_at,id LIMIT 1`)
+      .bind(cutoff)
+      .first<{ created_at: number }>();
+    const projections = await env.DB.prepare("SELECT 1 FROM page_change_projection_gc LIMIT 1").first();
+    const continued = Boolean(oldest || projections);
+    if (continued) {
+      if (!(await renew())) return "lease-lost";
+      const correlationId = currentObservabilityContext()?.correlationId;
+      await env.DELIVERY_QUEUE.send({ documentChangesCleanup: true, ...(correlationId ? { correlationId } : {}) });
+    }
+    logger.info("document.comparison.pruned", "document", "Expired comparison history pruned.", {
+      count: removed,
+      examinedProjections: examined,
+      deletedProjections: deleted,
+      continued,
+      oldestExpiredAt: oldest?.created_at ?? null,
+    });
+    return "completed";
+  } finally {
+    await env.DB.prepare(`UPDATE document_changes_cleanup_state SET lease_token=NULL,lease_until=0,updated_at=?
+      WHERE id=1 AND lease_token=?`)
+      .bind(Date.now(), token)
+      .run();
   }
-  const retained = await env.DB.prepare("SELECT count(*) count FROM page_change_checkpoints").first<{
-    count: number;
-  }>();
-  logger.info("document.comparison.pruned", "document", "Expired comparison history pruned.", {
-    count: expired.results.length,
-    retainedCheckpoints: retained?.count ?? 0,
-    examinedProjections: queued.results.length,
-  });
 }

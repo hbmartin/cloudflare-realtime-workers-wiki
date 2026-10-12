@@ -1861,7 +1861,7 @@ export function slackChannelFanoutStatements(
               AND p.is_template=0 AND (? IS NULL OR p.content_epoch = ?))
             AND subscription.space_id = ? AND (subscription.page_id IS NULL OR subscription.page_id = ?)
             AND subscription.notification_blocked_at IS NULL
-            AND (NOT EXISTS(SELECT 1 FROM round2_runtime WHERE activity_enabled=1) OR (?=1 AND subscription.cadence='digest'))
+            AND NOT EXISTS(SELECT 1 FROM round2_runtime WHERE activity_enabled=1)
             AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
             AND NOT EXISTS (SELECT 1 FROM slack_thread_links mirror WHERE mirror.installation_id = installation.id
               AND mirror.thread_id = ? AND mirror.channel_id = subscription.channel_id AND mirror.state IN ('pending', 'active'))
@@ -1886,7 +1886,6 @@ export function slackChannelFanoutStatements(
         fanout.contentEpoch ?? null,
         fanout.spaceId,
         fanout.pageId,
-        fanout.retainDigestChanges ? 1 : 0,
         fanout.createdAt,
         fanout.threadId,
         fanout.eventType,

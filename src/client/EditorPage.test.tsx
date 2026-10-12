@@ -194,6 +194,31 @@ describe("EditorPage close reconciliation", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    window.history.replaceState(null, "", "/");
+  });
+
+  it.each([
+    ["?page=page-1&compareFrom=first&compareTo=last", true, true],
+    ["?page=other&compareFrom=first&compareTo=last", true, false],
+    ["?page=page-1&compareFrom=first", true, false],
+    ["?page=page-1&compareTo=last", true, false],
+    ["?page=page-1&compareFrom=first&compareTo=last", false, false],
+  ])("opens History only for a complete current-page comparison (%s, enabled=%s)", async (query, enabled, open) => {
+    window.history.replaceState(null, "", `/${query}`);
+    mocks.api.mockResolvedValue({ versions: [], comparison: { diff: null } });
+    render(
+      <EditorPage
+        page={page}
+        member={{ ...member, features: { expandedEmbeds: false, diffDigests: enabled } }}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    await act(async () => Promise.resolve());
+    expect(Boolean(screen.queryByRole("heading", { name: "History" }))).toBe(open);
   });
 
   it("retains launches through initialization, acknowledges delivery, and does not replay after a child remount", async () => {

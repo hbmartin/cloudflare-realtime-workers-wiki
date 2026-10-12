@@ -228,9 +228,15 @@ export function EditorPage({
     typeof ClipboardItem !== "undefined" && Boolean(navigator.clipboard && "write" in navigator.clipboard);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(() =>
-    Boolean(member.features?.diffDigests && new URLSearchParams(window.location.search).get("compareFrom")),
-  );
+  const [historyOpen, setHistoryOpen] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    return Boolean(
+      member.features?.diffDigests &&
+      params.get("page") === page.id &&
+      params.get("compareFrom") &&
+      params.get("compareTo"),
+    );
+  });
   useEffect(() => {
     const openComparison = () => {
       const params = new URLSearchParams(window.location.search);
@@ -2038,26 +2044,51 @@ function HistoryPanel({
   const [versions, setVersions] = useState<Version[]>([]);
   const [selected, setSelected] = useState<Version | null>(null);
   const [snapshot, setSnapshot] = useState<Y.Doc | null>(null);
+  const [snapshotError, setSnapshotError] = useState("");
+  const selectionRequest = useRef(0);
   const [busy, setBusy] = useState(false);
+  useEffect(
+    () => () => {
+      selectionRequest.current++;
+    },
+    [],
+  );
+  useEffect(() => () => snapshot?.destroy(), [snapshot]);
 
   useEffect(() => {
     void api<{ versions: Version[] }>(`/api/pages/${page.id}/versions`).then((data) => setVersions(data.versions));
   }, [page.id]);
 
   async function choose(version: Version) {
+    const request = ++selectionRequest.current;
     setSelected(version);
-    const response = await fetch(`/api/versions/${version.id}`);
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    const doc = new Y.Doc();
-    Y.applyUpdate(doc, bytes);
-    setSnapshot((previous) => {
-      previous?.destroy();
-      return doc;
-    });
+    setSnapshot(null);
+    setSnapshotError("");
+    try {
+      const response = await fetch(`/api/versions/${version.id}`);
+      if (!response.ok) throw new Error("This saved version could not be loaded.");
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (selectionRequest.current !== request) return;
+      const doc = new Y.Doc();
+      try {
+        Y.applyUpdate(doc, bytes);
+      } catch (error) {
+        doc.destroy();
+        throw error;
+      }
+      setSnapshot(doc);
+    } catch (error) {
+      if (selectionRequest.current === request)
+        setSnapshotError(apiErrorMessage(error, "This saved version could not be loaded."));
+    }
   }
 
   async function restore() {
-    if (!selected || !confirm(`Restore “${selected.title}” from ${new Date(selected.createdAt).toLocaleString()}?`))
+    if (
+      !selected ||
+      !snapshot ||
+      !confirm(`Restore “${selected.title}” from ${new Date(selected.createdAt).toLocaleString()}?`)
+    )
       return;
     setBusy(true);
     try {
@@ -2091,8 +2122,15 @@ function HistoryPanel({
         ))}
         {!versions.length && <p className="empty-copy">No compacted versions yet.</p>}
       </div>
+      {selected && !snapshot && <output>{snapshotError || "Loading saved version…"}</output>}
       {snapshot && current && <BlockDiff oldDoc={snapshot} currentDoc={current} />}
-      {member.role === "owner" && selected && (
+      {snapshot && (
+        <section aria-label="Saved version preview">
+          <h3>Saved version preview</h3>
+          <pre>{plainYDoc(snapshot)}</pre>
+        </section>
+      )}
+      {member.role === "owner" && selected && snapshot && (
         <button className="danger-button" onClick={() => void restore()} disabled={busy}>
           {busy ? "Restoring…" : "Restore this version"}
         </button>

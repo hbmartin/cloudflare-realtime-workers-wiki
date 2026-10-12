@@ -105,7 +105,7 @@ export function digestBlocks(pages: DigestPage[], origin: string, mappingId: str
 }
 
 // Bound the escaped output as well as the source, including pathological names/excerpts.
-function digestText(value: string, max: number) {
+export function digestText(value: string, max: number) {
   let result = "";
   for (const char of value) {
     const escaped =
@@ -442,4 +442,9 @@ export function homeView(input: {
     });
   if (!input.tasks?.length) blocks.push({ type: "section", text: { type: "plain_text", text: "No assigned tasks." } });
   return { type: "home", private_metadata: input.sessionId, blocks };
+}
+
+export function digestLink(href: string, label: string) {
+  const url = href.replaceAll("&", "&amp;").replaceAll("<", "%3C").replaceAll(">", "%3E").replaceAll("|", "%7C");
+  return `<${url}|${digestText(label, 120)}>`;
 }
