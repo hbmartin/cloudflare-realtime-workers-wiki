@@ -56,10 +56,20 @@ If those settings change between build and deploy, rebuild before retrying; veri
 
 Without a saved D1 binding, the helper derives a database name from the Worker name (`<worker>-db`)
 instead of sharing the template's `noteflare` database. The lookup follows pagination and selects only exact names; similarly named databases are ignored, and duplicate exact matches stop deployment. It reuses a named resource only while that
-database is empty. If application tables or migration history exist, bind the intended database in
+database has no application tables or applied migration history. An empty `d1_migrations` table created
+by Wrangler's migration listing is safe to reuse, including after a failed first migration attempt.
+Failed or malformed schema/history queries stop preparation. If application tables or applied migrations exist, bind the intended database in
 the Worker dashboard or explicitly set its `database_id` in the portable configuration before retrying.
 This also applies when an upload fails after migrations have run but before the first DB binding is saved.
 Existing bindings recognize `database_id` and the older `id` field and reject conflicting configured IDs.
+
+Without saved bindings or explicit custom resource names, fresh portable installations use
+`<worker>-attachments` for R2, `<worker>-delivery` for the delivery queue, and
+`<worker>-delivery-dlq` for its dead-letter queue. Producer and consumer bindings use the same resolved
+queue names. These names remain stable across retries and are shortened with a deterministic hash
+when needed to fit the 63-character R2/queue limits. Existing installations retain their saved bucket
+and queue bindings, including the earlier `noteflare` defaults. An explicitly configured bucket that
+conflicts with a saved binding stops deployment until the configuration is corrected.
 
 New rate-limit namespace IDs are derived from the Worker and binding names; retries keep the same IDs
 and updates retain saved IDs. Generated Workflow and database names stay within 64 characters by

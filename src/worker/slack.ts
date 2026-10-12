@@ -119,6 +119,13 @@ export type SlackInteractionPayload = {
   action_id?: unknown;
 };
 
+export class SlackTokenRefreshInProgressError extends Error {
+  constructor() {
+    super("Slack token refresh is already in progress.");
+    this.name = "SlackTokenRefreshInProgressError";
+  }
+}
+
 export class SlackRateLimitError extends Error {
   constructor(
     readonly retryAfter: number,
@@ -1467,7 +1474,7 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
       if (signal?.aborted) onAbort();
     });
   }
-  if (!claimed) throw new Error("Slack token refresh is already in progress.");
+  if (!claimed) throw new SlackTokenRefreshInProgressError();
   try {
     const response = await fetch("https://slack.com/api/oauth.v2.access", {
       method: "POST",

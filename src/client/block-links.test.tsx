@@ -186,7 +186,7 @@ describe("block link navigation and native menus", () => {
     const trigger = screen.getByRole("button", { name: "Block actions" });
     fireEvent.click(trigger);
     const origin = target === "menu" ? screen.getByRole("menuitem") : trigger;
-    origin.focus();
+    await act(async () => origin.focus());
     expect(fireEvent.keyDown(origin, { key: "Escape" })).toBe(false);
     expect(screen.queryByRole("dialog")).toBeNull();
     expect(document.activeElement).toBe(trigger);
@@ -208,10 +208,32 @@ describe("block link navigation and native menus", () => {
     origin.tabIndex = 0;
     const handle = vi.fn((event: Event) => event.stopPropagation());
     origin.addEventListener("keydown", handle);
-    origin.focus();
+    await act(async () => origin.focus());
     expect(fireEvent.keyDown(origin, { key: "Escape" })).toBe(true);
     expect(handle).toHaveBeenCalledOnce();
-    expect(screen.getByRole("dialog", { name: "Block actions" })).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "Block actions" })).toBeNull();
     expect(document.activeElement).toBe(origin);
+  });
+  it("dismisses on blank-area pointer down without consuming a later Escape", async () => {
+    fixture();
+    await flushFrames();
+    const trigger = screen.getByRole("button", { name: "Block actions" });
+    fireEvent.click(trigger);
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(fireEvent.keyDown(document.body, { key: "Escape" })).toBe(true);
+    expect(document.activeElement).not.toBe(trigger);
+  });
+  it("keeps the menu open for internal pointer and focus transitions", async () => {
+    fixture();
+    await flushFrames();
+    const trigger = screen.getByRole("button", { name: "Block actions" });
+    fireEvent.click(trigger);
+    const select = screen.getByRole("combobox", { name: "Block to link" });
+    fireEvent.pointerDown(select);
+    await act(async () => select.focus());
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    await act(async () => trigger.focus());
+    expect(screen.getByRole("dialog")).toBeTruthy();
   });
 });

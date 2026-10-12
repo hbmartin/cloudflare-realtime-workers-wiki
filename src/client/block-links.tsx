@@ -94,6 +94,7 @@ export function BlockLinkControls({
   const menuButton = useRef<HTMLButtonElement>(null);
   const menuSelect = useRef<HTMLSelectElement>(null);
   const menuTrigger = useRef<HTMLButtonElement>(null);
+  const menuDialog = useRef<HTMLDialogElement>(null);
   const selected = useRef<string | null>(null);
   const offlineRef = useRef(offline);
   const retryPending = useRef<(() => void) | null>(null);
@@ -199,12 +200,13 @@ export function BlockLinkControls({
   useEffect(() => {
     if (!menuOpen) return undefined;
     menuButton.current?.focus();
+    const inside = (target: EventTarget | null) =>
+      target instanceof Node && (menuTrigger.current?.contains(target) || menuDialog.current?.contains(target));
+    const dismiss = (event: Event) => {
+      if (!inside(event.target)) setMenu(null);
+    };
     const close = (event: KeyboardEvent) => {
-      if (
-        event.key === "Escape" &&
-        event.target instanceof Node &&
-        (menuTrigger.current?.contains(event.target) || menuButton.current?.closest("dialog")?.contains(event.target))
-      ) {
+      if (event.key === "Escape" && inside(event.target)) {
         event.preventDefault();
         event.stopPropagation();
         setMenu(null);
@@ -212,7 +214,13 @@ export function BlockLinkControls({
       }
     };
     window.addEventListener("keydown", close, true);
-    return () => window.removeEventListener("keydown", close, true);
+    window.addEventListener("pointerdown", dismiss, true);
+    window.addEventListener("focusin", dismiss, true);
+    return () => {
+      window.removeEventListener("keydown", close, true);
+      window.removeEventListener("pointerdown", dismiss, true);
+      window.removeEventListener("focusin", dismiss, true);
+    };
   }, [menuOpen]);
   return (
     <>
@@ -252,6 +260,7 @@ export function BlockLinkControls({
       )}
       {menu && (
         <dialog
+          ref={menuDialog}
           open
           tabIndex={-1}
           aria-label="Block actions"

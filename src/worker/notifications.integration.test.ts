@@ -1494,6 +1494,9 @@ describe("notification feed and subscriptions", () => {
       ),
     ),
     { channel: "slack" as const, failure: "dispatch-database" as const },
+    { channel: "slack" as const, failure: "identity-revoked" as const },
+    { channel: "slack" as const, failure: "identity-cleanup" as const },
+    { channel: "slack" as const, failure: "refresh-contention" as const },
   ])(
     "reports $channel $failure failures after healthy recipients and the other channel progress",
     async ({ channel, failure }) => {
@@ -1556,8 +1559,20 @@ describe("notification feed and subscriptions", () => {
         ),
       ]);
       await verifySlackDigestRecipients(["recovery-a", "recovery-b", "recovery-c"]);
+      if (failure === "refresh-contention") {
+        await env.DB.prepare(`UPDATE slack_installations SET token_expires_at=1,
+          bot_refresh_token_ciphertext=?,refresh_lease_token='competing-refresh',refresh_lease_until=?
+          WHERE id='recovery-installation'`)
+          .bind(await encryptSlackToken(configured, "xoxr-digest-recovery"), Date.now() + 30_000)
+          .run();
+        const originalSetTimeout = globalThis.setTimeout;
+        vi.spyOn(globalThis, "setTimeout").mockImplementation((callback, _delay, ...args) =>
+          originalSetTimeout(callback, 0, ...args),
+        );
+      }
       const injected = new Error(`injected ${failure}`);
       let failed = false;
+      let refreshReads = 0;
       const metadata = new WeakMap<
         D1PreparedStatement,
         { statement: D1PreparedStatement; sql: string; values: unknown[] }
@@ -1568,7 +1583,7 @@ describe("notification feed and subscriptions", () => {
             if (property === "bind") return (...args: unknown[]) => wrap(target.bind(...args), sql, args);
             if (
               property === "all" &&
-              failure === "cleanup" &&
+              (failure === "cleanup" || failure === "identity-cleanup") &&
               sql.includes("UPDATE deliveries SET status") &&
               values[0] === "failed" &&
               values[5] === channel
@@ -1576,6 +1591,38 @@ describe("notification feed and subscriptions", () => {
               return async () => {
                 failed = true;
                 throw injected;
+              };
+            }
+            if (
+              property === "first" &&
+              !failed &&
+              (failure === "identity-revoked" || failure === "identity-cleanup") &&
+              sql.includes("SELECT 1 FROM slack_authorized_user_links link WHERE") &&
+              values[2] === "recovery-a"
+            ) {
+              return async () => {
+                failed = true;
+                await env.DB.prepare(`DELETE FROM slack_user_links WHERE user_id='recovery-a'`).run();
+                return target.first();
+              };
+            }
+            if (
+              property === "first" &&
+              failure === "refresh-contention" &&
+              sql.includes("SELECT * FROM slack_installations WHERE id=?")
+            ) {
+              return async () => {
+                const row = await target.first();
+                if (++refreshReads === 15) {
+                  failed = true;
+                  // The first sender exhausts its lease wait. Later recipients
+                  // observe the completed rotation and can still make progress.
+                  await env.DB.prepare(`UPDATE slack_installations SET token_expires_at=?,
+                    refresh_lease_token=NULL,refresh_lease_until=NULL WHERE id='recovery-installation'`)
+                    .bind(Date.now() + 3_600_000)
+                    .run();
+                }
+                return row;
               };
             }
             const value: unknown = Reflect.get(target, property, target);
@@ -1635,6 +1682,12 @@ describe("notification feed and subscriptions", () => {
         },
       });
       const providerFails = failure === "provider" || failure === "cleanup";
+      const expectedProviderFailure =
+        providerFails ||
+        failure === "identity-revoked" ||
+        failure === "identity-cleanup" ||
+        failure === "refresh-contention";
+      const taskFails = failure !== "provider" && failure !== "identity-revoked" && failure !== "refresh-contention";
       const send = vi.fn(async (message: { to: string }) => {
         if (channel === "email" && providerFails && message.to === "recovery-a@example.test")
           throw new Error("mailbox unavailable");
@@ -1657,7 +1710,7 @@ describe("notification feed and subscriptions", () => {
           return Reflect.get(target, property, receiver);
         },
       });
-      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
       const scheduled = executeScheduledTasks(bindings, createExecutionContext(), [
         { name: "notification_digests", run: () => sendDueNotificationDigests(bindings, timestamp) },
       ]);
@@ -1665,9 +1718,7 @@ describe("notification feed and subscriptions", () => {
         () => null,
         (error: unknown) => error,
       );
-      expect(result instanceof Error ? result.message : result).toBe(
-        failure === "provider" ? null : "Scheduled tasks failed",
-      );
+      expect(result instanceof Error ? result.message : result).toBe(taskFails ? "Scheduled tasks failed" : null);
       expect(failed || failure === "provider").toBe(true);
       expect(
         await env.DB.prepare(`SELECT user_id FROM digest_delivery_cursors WHERE channel=?`).bind(channel).first(),
@@ -1687,7 +1738,14 @@ describe("notification feed and subscriptions", () => {
       expect(first).toEqual(
         failure === "preparation"
           ? null
-          : { status: failure === "cleanup" ? "pending" : failure === "finalization-response" ? "sent" : "failed" },
+          : {
+              status:
+                failure === "cleanup" || failure === "identity-cleanup"
+                  ? "pending"
+                  : failure === "finalization-response"
+                    ? "sent"
+                    : "failed",
+            },
       );
       const failures = metric.mock.calls
         .map(([point]) => point as { indexes: string[]; blobs: string[] })
@@ -1697,15 +1755,111 @@ describe("notification feed and subscriptions", () => {
             point.blobs[1] === "notifications" &&
             point.blobs[3] === "failure",
         );
-      expect(failures).toHaveLength(providerFails ? 1 : 0);
+      expect(failures).toHaveLength(expectedProviderFailure ? 1 : 0);
       expect(metric).toHaveBeenCalledWith(
         expect.objectContaining({
           indexes: ["scheduled.task"],
-          blobs: expect.arrayContaining([failure === "provider" ? "success" : "failure"]),
+          blobs: expect.arrayContaining([taskFails ? "failure" : "success"]),
         }),
       );
+      const identityFailures = log.mock.calls.filter(
+        ([record]) =>
+          record.event === "notification.digest_slack.failed" && record.errorCode === "slack_identity_required",
+      );
+      expect(identityFailures).toHaveLength(failure === "identity-revoked" || failure === "identity-cleanup" ? 1 : 0);
+      const refreshFailures = log.mock.calls.filter(
+        ([record]) =>
+          record.event === "notification.digest_slack.failed" &&
+          record.errorName === "SlackTokenRefreshInProgressError",
+      );
+      expect(refreshFailures).toHaveLength(failure === "refresh-contention" ? 1 : 0);
+      expect(refreshReads).toBe(failure === "refresh-contention" ? 15 : 0);
+      if (failure === "refresh-contention") {
+        await sendDueNotificationDigests(bindings, timestamp);
+      }
+      const retried = await env.DB.prepare(`SELECT status FROM deliveries WHERE idempotency_key=?`)
+        .bind(`outbox:recovery-notification-recovery-a:${channel}`)
+        .first();
+      expect(retried).toEqual(failure === "refresh-contention" ? { status: "sent" } : first);
     },
   );
+
+  it("logs simultaneous candidate and cursor failures with their channel and timezone", async () => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+    const configured = slackEnv();
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO notification_preferences(user_id,event_type,in_app,email,slack,timezone)
+        VALUES (?,'mention',1,'digest','digest','UTC')`).bind(installed.userId),
+      env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at)
+        VALUES ('logging-installation',?,'TLOGGING','Logging','BLOGGING',?,'chat:write',?,?,?)`).bind(
+        installed.workspaceId,
+        await encryptSlackToken(configured, "xoxb-logging"),
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,security_generation)
+        VALUES ('logging-installation',?,'ULOGGING',?,0)`).bind(installed.userId, timestamp),
+      env.DB.prepare(`INSERT INTO notifications(id,workspace_id,user_id,event_type,actor_id,space_id,page_id,data_json,dedupe_key,created_at)
+        VALUES ('logging-notification',?,?,'mention',?,?,?,'{}','logging',?)`).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 600_000,
+      ),
+    ]);
+    await verifySlackDigestRecipients([installed.userId]);
+    const database = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (sql: string) => {
+            if (sql.startsWith("SELECT user_id, workspace_id, timezone FROM digest_delivery_cursors"))
+              throw new Error("candidate read unavailable");
+            if (sql.startsWith("INSERT INTO digest_delivery_cursors")) throw new Error("cursor write unavailable");
+            return target.prepare(sql);
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const send = vi.fn();
+    await expect(
+      sendDueNotificationDigests(
+        {
+          ...configured,
+          DB: database,
+          SEND_EMAIL: { send },
+          EMAIL_FROM: "notes@example.test",
+        } as unknown as Env,
+        timestamp,
+      ),
+    ).rejects.toThrow("Notification digest channels failed.");
+    for (const channel of ["email", "slack"]) {
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel,
+          timezone: "UTC",
+          phase: "candidates",
+          message: "Digest candidate loading failed.",
+          errorMessage: "candidate read unavailable",
+        }),
+      );
+      expect(log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          channel,
+          timezone: "UTC",
+          phase: "cursor",
+          message: "Digest cursor save failed.",
+          errorMessage: "cursor write unavailable",
+        }),
+      );
+    }
+    expect(send).not.toHaveBeenCalled();
+  });
 
   it("advances the persisted digest cursor past a failing leading cohort", async () => {
     const installed = await bootstrap();

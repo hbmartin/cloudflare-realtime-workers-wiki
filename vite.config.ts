@@ -38,20 +38,23 @@ export default defineConfig(({ command }) => {
             }
           : command === "serve" && !isE2E
             ? {
-                config: {
-                  ...(!process.env.CLOUDFLARE_ENV
-                    ? {
-                        name: "cloudflare-realtime-notes",
-                        r2_buckets: [
-                          {
-                            binding: "BUCKET",
-                            bucket_name: "cloudflare-realtime-notes",
-                            preview_bucket_name: "cloudflare-realtime-notes-preview",
-                          },
-                        ],
-                      }
-                    : {}),
-                  vars: { BETTER_AUTH_URL: "http://localhost:5173", NOTION_MARKDOWN_WRITES_ENABLED: "true" },
+                config: (config) => {
+                  // Object overrides concatenate binding arrays. Replace the legacy
+                  // development bucket in place so the template BUCKET cannot win.
+                  if (!process.env.CLOUDFLARE_ENV) {
+                    config.name = "cloudflare-realtime-notes";
+                    config.r2_buckets = [
+                      {
+                        binding: "BUCKET",
+                        bucket_name: "cloudflare-realtime-notes",
+                        preview_bucket_name: "cloudflare-realtime-notes-preview",
+                      },
+                    ];
+                  }
+                  Object.assign(config.vars, {
+                    BETTER_AUTH_URL: "http://localhost:5173",
+                    NOTION_MARKDOWN_WRITES_ENABLED: "true",
+                  });
                 },
               }
             : {}),

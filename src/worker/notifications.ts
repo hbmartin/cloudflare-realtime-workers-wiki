@@ -17,6 +17,7 @@ import {
   sendPersonalSlackNotification,
   SlackApiError,
   SlackRateLimitError,
+  SlackTokenRefreshInProgressError,
   slackChannelFanoutStatements,
 } from "./slack";
 import { currentObservabilityContext, logger, recordMetric, safeTelemetryErrorMessage, traced } from "./observability";
@@ -1142,11 +1143,25 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
         }
       }
     } catch (error) {
+      logger.error(
+        "notification.digest_email.infrastructure_failed",
+        "notifications",
+        "Digest candidate loading failed.",
+        { channel: "email", timezone: window.timezone, phase: "candidates" },
+        error,
+      );
       failures.push(error);
     }
     try {
       await saveDigestCursor(env, "email", window.timezone, lastAttempted);
     } catch (error) {
+      logger.error(
+        "notification.digest_email.secondary_failed",
+        "notifications",
+        "Digest cursor save failed.",
+        { channel: "email", timezone: window.timezone, phase: "cursor" },
+        error,
+      );
       failures.push(error);
     }
   }
@@ -1259,7 +1274,11 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           );
         } catch (error) {
           const providerFailure =
-            phase === "provider" && (error instanceof SlackApiError || error instanceof SlackRateLimitError);
+            phase === "provider" &&
+            (error instanceof SlackApiError ||
+              error instanceof SlackRateLimitError ||
+              error instanceof SlackTokenRefreshInProgressError ||
+              (error instanceof HttpError && error.status === 403 && error.code === "slack_identity_required"));
           if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
           // One unreachable recipient must not starve the digests queued behind it.
           logger.error(
@@ -1283,11 +1302,25 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
         }
       }
     } catch (error) {
+      logger.error(
+        "notification.digest_slack.infrastructure_failed",
+        "notifications",
+        "Digest candidate loading failed.",
+        { channel: "slack", timezone: window.timezone, phase: "candidates" },
+        error,
+      );
       failures.push(error);
     }
     try {
       await saveDigestCursor(env, "slack", window.timezone, lastAttempted);
     } catch (error) {
+      logger.error(
+        "notification.digest_slack.secondary_failed",
+        "notifications",
+        "Digest cursor save failed.",
+        { channel: "slack", timezone: window.timezone, phase: "cursor" },
+        error,
+      );
       failures.push(error);
     }
   }
