@@ -180,17 +180,38 @@ describe("block link navigation and native menus", () => {
     await flushFrames();
     expect(scan).not.toHaveBeenCalled();
   });
-  it("closes Block actions with Escape from the editor and removes its listener afterward", async () => {
+  it.each(["menu", "trigger"])("handles Escape within its %s and restores trigger focus", async (target) => {
+    fixture();
+    await flushFrames();
+    const trigger = screen.getByRole("button", { name: "Block actions" });
+    fireEvent.click(trigger);
+    const origin = target === "menu" ? screen.getByRole("menuitem") : trigger;
+    origin.focus();
+    expect(fireEvent.keyDown(origin, { key: "Escape" })).toBe(false);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(fireEvent.keyDown(origin, { key: "Escape" })).toBe(true);
+  });
+  it.each(["editor", "dialog"])("leaves Escape in another %s to that surface", async (target) => {
     const { root } = fixture();
     await flushFrames();
     const trigger = screen.getByRole("button", { name: "Block actions" });
     fireEvent.click(trigger);
-    const text = root.current!.querySelector("p")!;
-    text.addEventListener("keydown", (event) => event.stopPropagation());
-    text.focus();
-    fireEvent.keyDown(text, { key: "Escape" });
-    expect(screen.queryByRole("dialog")).toBeNull();
-    expect(document.activeElement).toBe(trigger);
-    expect(fireEvent.keyDown(text, { key: "Escape" })).toBe(true);
+    if (target === "dialog")
+      render(
+        <dialog open aria-label="Another dialog">
+          <button>Close dialog</button>
+        </dialog>,
+      );
+    const origin =
+      target === "editor" ? root.current!.querySelector("p")! : screen.getByRole("button", { name: "Close dialog" });
+    origin.tabIndex = 0;
+    const handle = vi.fn((event: Event) => event.stopPropagation());
+    origin.addEventListener("keydown", handle);
+    origin.focus();
+    expect(fireEvent.keyDown(origin, { key: "Escape" })).toBe(true);
+    expect(handle).toHaveBeenCalledOnce();
+    expect(screen.getByRole("dialog", { name: "Block actions" })).toBeTruthy();
+    expect(document.activeElement).toBe(origin);
   });
 });

@@ -1,0 +1,23 @@
+rules:
+  - id: deploy-d1-deprecated-id
+    languages: [javascript, typescript]
+    message: Read saved D1 identities through deployedDatabaseID so database_id takes precedence and malformed bindings fail closed.
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern: $BINDING.id
+          - pattern: $BINDING?.id
+      - metavariable-regex:
+          metavariable: $BINDING
+          regex: (?i)^.*(?:db|database|binding)$
+      - pattern-not-inside: |
+          function deployedDatabaseID(...) { ... }
+
+  - id: deploy-d1-template-name
+    languages: [javascript, typescript]
+    message: Resolve Worker-specific D1 names through portableDatabase before looking up or creating resources.
+    severity: ERROR
+    pattern-either:
+      - pattern: $API(`/d1/database?name=${encodeURIComponent($CONFIG.database_name)}`, ...)
+      - pattern: '$API("/d1/database", { ..., body: { ..., name: $CONFIG.database_name, ... }, ... })'
+      - pattern: $API("/d1/database?name=noteflare", ...)

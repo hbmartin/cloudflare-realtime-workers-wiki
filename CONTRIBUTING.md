@@ -59,7 +59,11 @@ only to the staging load-check step.
 
 ## Plugin verification
 
-`pnpm dev` builds the UI before starting Vite and watches its imports for rebuilds. `pnpm build`, Worker tests, and local browser tests also build it. Generated `public/plugin-ui/noteflare.html` is ignored by Git and copied into production assets.
+`pnpm dev` builds the UI before starting Vite and watches its imports for rebuilds. `pnpm build`, Worker tests, and local browser tests also build it.
+
+<!-- check-docs:ignore-next -->
+
+Generated `public/plugin-ui/noteflare.html` is ignored by Git and copied into production assets.
 
 ```sh
 pnpm check
@@ -82,6 +86,8 @@ Applied D1 migrations are forward-only. Never edit/reorder an applied SQL migrat
 Write for members, operators, integrators, or contributors and link each new guide through [the documentation index](docs/README.md) or its research/evidence/specification indexes. Keep task instructions in guides, configuration in exact-name reference tables, contracts in specifications, and dated test outcomes in evidence.
 
 Run `pnpm check:docs` after moving a file, renaming a heading, adding a binding/secret, or adding a document. Local links must stay inside the Git root and match paths and heading fragments exactly. Use repository links, not paths into a sibling checkout. External availability is reviewed separately from the deterministic checker.
+
+The checker also validates project scripts, dependency executables, and explicit repository paths in inline code and shell examples in the README and current operator guides. Use `pnpm run deploy` because pnpm also has its own built-in deploy command. Mark placeholder names with angle brackets or braces. For schematic or generated examples, put `<!-- check-docs:ignore-next -->` immediately before the block, or label a shell fence `sh non-executable`. Historical evidence retains link checks without requiring old commands or files to exist today.
 
 Record implementation SHA, deployed SHA, production/default flags, and outstanding live acceptance separately. Preserve dated research as historical rather than silently updating old forecasts. Never put credentials, prompts, private drafts, or provider tokens into documentation or screenshots.
 

@@ -200,7 +200,11 @@ export function BlockLinkControls({
     if (!menuOpen) return undefined;
     menuButton.current?.focus();
     const close = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
+      if (
+        event.key === "Escape" &&
+        event.target instanceof Node &&
+        (menuTrigger.current?.contains(event.target) || menuButton.current?.closest("dialog")?.contains(event.target))
+      ) {
         event.preventDefault();
         event.stopPropagation();
         setMenu(null);

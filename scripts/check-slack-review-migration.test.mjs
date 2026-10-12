@@ -22,6 +22,7 @@ describe("Slack review migration deployment gate", () => {
   ])("requires confirmation while %s is pending", (migration) => {
     const pending = listing([migration]);
     expect(() => checkSlackReviewMigration(pending)).toThrow("manually confirmed safe upgrade");
+    expect(() => checkSlackReviewMigration(pending)).toThrow("docs/UPGRADING.md#slack-review-follow-up-migration");
     expect(checkSlackReviewMigration(pending, true)).toEqual([migration]);
   });
 

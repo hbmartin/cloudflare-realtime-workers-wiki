@@ -49,22 +49,38 @@ later.
 
 Push an update to the repository Cloudflare created, or use **Retry deployment** after correcting a
 failed build. Workers Builds prepares once, builds once, then verifies the build UUID, revision,
-source, target, and generated configuration before migrating and uploading. Its ignored
+source, target, auth origin, configuration overrides, and generated configuration before migrating and uploading. Its ignored
 `.wrangler/noteflare-build.json` metadata must belong to the current run. Retry reuses resource bindings
 and already-applied migrations. Saved dashboard variables, including feature settings, are retained.
+If those settings change between build and deploy, rebuild before retrying; verification stops before migrations or upload. Older manifests also require rebuilding. Override object-key order does not matter, but array order does.
+
+Without a saved D1 binding, the helper derives a database name from the Worker name (`<worker>-db`)
+instead of sharing the template's `noteflare` database. The lookup follows pagination and selects only exact names; similarly named databases are ignored, and duplicate exact matches stop deployment. It reuses a named resource only while that
+database is empty. If application tables or migration history exist, bind the intended database in
+the Worker dashboard or explicitly set its `database_id` in the portable configuration before retrying.
+This also applies when an upload fails after migrations have run but before the first DB binding is saved.
+Existing bindings recognize `database_id` and the older `id` field and reject conflicting configured IDs.
+
+New rate-limit namespace IDs are derived from the Worker and binding names; retries keep the same IDs
+and updates retain saved IDs. Generated Workflow and database names stay within 64 characters by
+adding a deterministic hash when shortening is necessary. Provisioned Workflow names are preserved.
 
 For a custom domain, attach it under **Settings → Domains & Routes** and set the Worker's
 `BETTER_AUTH_URL` plaintext variable to that exact HTTPS origin (no path or trailing slash), then
-redeploy. The portable template's `auto` value preserves this saved origin. An explicit HTTPS origin
+redeploy. The portable template's `auto` value, an empty value, or an omitted setting preserves this saved origin. Without a saved origin, the helper requires a valid account subdomain before deriving the workers.dev URL. An explicit HTTPS origin
 in the repository overrides `auto`; keep the repository and dashboard in agreement. Secrets remain
 Worker secrets and do not need to be copied into the repository or build settings.
 
-Operators redeploying a portable installation from a local checkout use `pnpm deploy:one-click`;
-ordinary local `pnpm build`, `pnpm deploy`, and `pnpm deploy:production` still select the named legacy
+Operators redeploying a portable installation from a local checkout use `pnpm run deploy:one-click`;
+ordinary local `pnpm build`, `pnpm run deploy`, and `pnpm run deploy:production` still select the named legacy
 `production` environment. In Workers Builds, an explicit `CLOUDFLARE_ENV` takes precedence; otherwise
 an existing Worker is recognized as legacy production only when its Worker identity and D1 binding
 both match that environment. `WRANGLER_CI_OVERRIDE_NAME` selects the actual Worker name. Do not enable
 both GitHub Actions and Workers Builds as independent production release systems.
+
+Ordinary local builds and deployments always build fresh and do not require Git or a reusable manifest, so archive downloads work after installing dependencies. Git fingerprints and reusable manifests apply only to Workers Builds, where build and deploy run as separate commands.
+
+Default `pnpm dev` keeps the previous `cloudflare-realtime-notes` Worker identity and R2 bucket, including the `cloudflare-realtime-notes-preview` preview bucket. Existing local documents and attachments remain available alongside the unchanged local D1 database. Explicit named environments, the browser-test harness, and portable deployment overrides use their selected configuration.
 
 ### Fresh installs and upgrade safeguards
 
@@ -258,7 +274,7 @@ These are configured in the Cloudflare dashboard, not in this repository.
 pnpm run deploy
 ```
 
-This command selects named legacy production locally, builds, applies guarded D1 migrations, then uploads the Worker. A build or migration failure stops deployment. Applied migrations are skipped. Direct `wrangler deploy` bypasses D1 migration safeguards. For a portable installation, use `pnpm deploy:one-click` or its configured Workers Builds flow instead.
+This command selects named legacy production locally, builds, applies guarded D1 migrations, then uploads the Worker. A build or migration failure stops deployment. Applied migrations are skipped. Direct `wrangler deploy` bypasses D1 migration safeguards. For a portable installation, use `pnpm run deploy:one-click` or its configured Workers Builds flow instead.
 
 ## 6. Bootstrap the owner
 

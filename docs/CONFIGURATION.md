@@ -56,7 +56,7 @@ Workspace API writing and ChatGPT plan connections are independent funding paths
 | Name                         | Default | Notes                                                                                                             |
 | ---------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------- |
 | `CHATGPT_CONNECTION_ENABLED` | `false` | Enable hosted plan connections only after approval and live acceptance; this does not gate workspace API writing. |
-| `CHATGPT_CLIENT_ID`          | unset   | Actual provisioned hosted client ID.                                                                              |
+| `CHATGPT_CLIENT_ID`          | unset   | Actual provisioned hosted client ID beginning with `oaiapp_`; other prefixes fail the connection gate.            |
 | `CHATGPT_TOKEN_AUTH_METHOD`  | unset   | Provisioned `none` or `client_secret_basic` contract; the latter needs `CHATGPT_CLIENT_SECRET`.                   |
 | `CHATGPT_SCOPES`             | unset   | Exact approved hosted inference scopes. Identity-only scopes cannot fund inference.                               |
 
@@ -443,7 +443,9 @@ Apply additive migration `0047_workspace_experience.sql` together with this rele
 
 ## Environments
 
-`wrangler.jsonc` declares portable new-install defaults at the top level and two named environments: `production` retains the existing installation, and `notes-checks-e2e` serves the local browser harness. Ordinary local `pnpm build`, `pnpm deploy`, and `pnpm deploy:production` select named production; `pnpm deploy:one-click` selects the portable target. Workers Builds resolves its target before building, as described in [Deployment](DEPLOYMENT.md#portable-updates-and-custom-domains).
+`wrangler.jsonc` declares portable new-install defaults at the top level and two named environments: `production` retains the existing installation, and `notes-checks-e2e` serves the local browser harness. Ordinary local `pnpm build`, `pnpm run deploy`, and `pnpm run deploy:production` select named production; `pnpm run deploy:one-click` selects the portable target. Workers Builds resolves its target before building, as described in [Deployment](DEPLOYMENT.md#portable-updates-and-custom-domains).
+
+Default `pnpm dev` overrides the Worker and R2 identities in `vite.config.ts` to preserve existing local storage: `cloudflare-realtime-notes` for the Worker and bucket, and `cloudflare-realtime-notes-preview` for the preview bucket. D1 keeps its existing local identity. This compatibility override applies only to default development; named environments, E2E, and portable deployments retain their selected identities.
 
 There is no staging environment. `nightly.yml` refers to a `STAGING_BASE_URL` repository variable for
 its realtime load check, but no configuration in this repository deploys such an environment; it must

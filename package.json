@@ -27,6 +27,7 @@
     "lint": "oxlint --deny-warnings --report-unused-disable-directives .",
     "lint:fix": "oxlint --fix .",
     "check:middleware": "semgrep scan --strict --no-git-ignore --error --config .semgrep/middleware.yml --exclude='**/*.test.ts' --exclude='**/*.integration.test.ts' src/worker && semgrep test --strict --config .semgrep/middleware.yml .semgrep/middleware.test.ts",
+    "check:deploy": "semgrep scan --strict --no-git-ignore --error --config .semgrep/deploy.yml scripts/deploy.mjs && semgrep test --strict --config .semgrep/deploy.yml .semgrep/deploy.test.ts",
     "format": "oxfmt",
     "format:check": "oxfmt --check",
     "typecheck": "pnpm typecheck:client && pnpm typecheck:worker && pnpm typecheck:unit && pnpm typecheck:worker-tests && pnpm typecheck:config",
@@ -44,7 +45,7 @@
     "db:local": "node scripts/migrate-d1.mjs --local",
     "db:remote": "node scripts/migrate-d1.mjs --env production --remote",
     "db:export": "node scripts/d1-export.mjs",
-    "check": "pnpm format:check && pnpm check:docs && pnpm lint && pnpm check:middleware && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker",
+    "check": "pnpm format:check && pnpm check:docs && pnpm lint && pnpm check:middleware && pnpm check:deploy && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker",
     "deploy": "node scripts/deploy.mjs deploy",
     "security:reset": "node scripts/security-reset.mjs",
     "observability:report": "node scripts/observability.mjs report",
@@ -98,6 +99,7 @@
   },
   "devDependencies": {
     "@axe-core/playwright": "4.13.0",
+    "@babel/parser": "8.0.7",
     "@cloudflare/vite-plugin": "1.63.0",
     "@cloudflare/vitest-plugin": "1.4.0",
     "@cloudflare/workers-types": "5.20261007.1",
@@ -118,7 +120,7 @@
     "fallow": "3.32.0",
     "github-slugger": "2.0.0",
     "jsdom": "30.1.2",
-    "jsonc-parser": "3.3.1",
+    "miniflare": "5.20261006.0-alpha",
     "oxfmt": "0.72.0",
     "oxlint": "1.87.0",
     "oxlint-tsgolint": "7.0.2003",
@@ -134,7 +136,7 @@
         "description": "Your private **setup key**. Generate at least 32 random characters with a password manager. Enter the same key on the first-run screen to create the owner. Keep it private; you can delete this secret after setup."
       },
       "BETTER_AUTH_URL": {
-        "description": "Leave **auto** to use the installation\u2019s workers.dev URL. Set an exact HTTPS origin only when using your own domain."
+        "description": "Leave **auto** to use the installation’s workers.dev URL. Set an exact HTTPS origin only when using your own domain."
       }
     }
   }
