@@ -26,7 +26,23 @@ test("block links remain usable through fragment history and clipboard denial", 
   const id = await block.getAttribute("data-id");
   expect(id).toBeTruthy();
   await page.getByRole("button", { name: "Block actions", exact: true }).click();
-  await page.locator("body").click({ position: { x: 1, y: 1 } });
+  await page.evaluate(() => {
+    const outside = document.createElement("div");
+    outside.dataset.testid = "inert-menu-outside";
+    Object.assign(outside.style, {
+      position: "fixed",
+      right: "8px",
+      bottom: "8px",
+      width: "24px",
+      height: "24px",
+      zIndex: "99999",
+    });
+    document.body.append(outside);
+  });
+  await page.getByTestId("inert-menu-outside").hover();
+  await page.mouse.down();
+  await expect(page.getByRole("dialog", { name: "Block actions" })).toBeHidden();
+  await page.mouse.up();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog", { name: "Block actions" })).toBeHidden();
   await expect(page.getByRole("button", { name: "Block actions", exact: true })).not.toBeFocused();

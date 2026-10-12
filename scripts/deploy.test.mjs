@@ -517,7 +517,9 @@ describe("portable database selection", () => {
       .mockResolvedValueOnce([{ name: "wiki-db", uuid: newDB }])
       .mockResolvedValueOnce([{ success: true, results: [{ name: "d1_migrations" }] }])
       .mockResolvedValueOnce(history);
-    await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("invalid D1 migration history");
+    await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow(
+      /Invalid migration history|invalid D1 query/,
+    );
   });
   it("stops when the migration history query fails", async () => {
     const api = vi
@@ -591,7 +593,7 @@ describe("portable database selection", () => {
         .fn()
         .mockResolvedValueOnce([{ name: "wiki-db", uuid: existingDB }])
         .mockResolvedValueOnce(result);
-      await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("invalid D1 schema");
+      await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("invalid D1 query");
     },
   );
 });

@@ -1,4 +1,5 @@
 let historyTimestamp: string;
+import { countedD1 } from "../../tests/helpers/count-d1";
 import { afterD1 } from "../../tests/helpers/d1-races";
 import { protectSlackFixtureUsers } from "../../tests/helpers/security";
 import { createShare, revokeShare } from "./shares";
@@ -47,6 +48,8 @@ import {
   setSlackChannelPause,
   usableBotToken,
   SlackApiError,
+  SlackInstallationChangedError,
+  SlackTokenRefreshInProgressError,
   SlackRateLimitError,
   upsertSlackChannelSubscription,
   verifySlackRequest,
@@ -2048,6 +2051,149 @@ describe("interactive Slack workspace", () => {
       WHERE id='installation'`).first(),
     ).toEqual({ auth_error: "invalid_refresh_token", refresh_lease_token: null });
   });
+
+  it.each([
+    { kind: "network", code: "network_error", status: 503 },
+    { kind: "timeout", code: "timeout", status: 504 },
+    { kind: "http", code: "service_unavailable", status: 503 },
+    { kind: "json", code: "invalid_response", status: 200 },
+    { kind: "null", code: "invalid_response", status: 200 },
+    { kind: "token", code: "invalid_response", status: 200 },
+    { kind: "expiry", code: "invalid_response", status: 200 },
+  ])("normalizes OAuth refresh $kind failures and releases the lease", async ({ kind, code, status }) => {
+    await env.DB.prepare(
+      "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='installation'",
+    )
+      .bind(await encryptSlackToken(runtime(), "xoxr-old"))
+      .run();
+    const installed = (await env.DB.prepare(
+      "SELECT * FROM slack_installations WHERE id='installation'",
+    ).first<SlackInstallation>())!;
+    const cause =
+      kind === "timeout" ? new DOMException("timed out", "TimeoutError") : new TypeError("network unavailable");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        if (kind === "network" || kind === "timeout") throw cause;
+        if (kind === "http") return Response.json({ ok: false, error: "service_unavailable" }, { status });
+        if (kind === "json") return new Response("malformed");
+        if (kind === "null") return Response.json(null);
+        if (kind === "token") return Response.json({ ok: true, access_token: 42 });
+        return Response.json({ ok: true, access_token: "xoxb-new", expires_in: "3600" });
+      }),
+    );
+    const counter = countedD1(env.DB);
+    await expect(
+      usableBotToken({ ...runtime(), DB: counter.database }, installed, undefined, "defer"),
+    ).rejects.toMatchObject({
+      name: "SlackApiError",
+      method: "oauth.v2.access",
+      code,
+      status,
+      ...(["network", "timeout"].includes(kind) ? { cause } : {}),
+    });
+    expect(counter.statements).toHaveLength(2);
+    expect(
+      await env.DB.prepare(
+        "SELECT refresh_lease_token,auth_error FROM slack_installations WHERE id='installation'",
+      ).first(),
+    ).toEqual({ refresh_lease_token: null, auth_error: null });
+  });
+
+  it("defers a held lease after one attempt and reread without a timer", async () => {
+    await env.DB.prepare(
+      "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?,refresh_lease_token='crashed',refresh_lease_until=? WHERE id='installation'",
+    )
+      .bind(await encryptSlackToken(runtime(), "xoxr-old"), Date.now() + 30_000)
+      .run();
+    const installed = (await env.DB.prepare(
+      "SELECT * FROM slack_installations WHERE id='installation'",
+    ).first<SlackInstallation>())!;
+    const counter = countedD1(env.DB);
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    await expect(
+      usableBotToken({ ...runtime(), DB: counter.database }, installed, undefined, "defer"),
+    ).rejects.toBeInstanceOf(SlackTokenRefreshInProgressError);
+    expect(counter.statements).toHaveLength(2);
+    expect(timer).not.toHaveBeenCalled();
+  });
+
+  it.each(["lease", "persistence"])("types an installation change at the %s checkpoint", async (checkpoint) => {
+    await env.DB.prepare(
+      "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='installation'",
+    )
+      .bind(await encryptSlackToken(runtime(), "xoxr-old"))
+      .run();
+    const installed = (await env.DB.prepare(
+      "SELECT * FROM slack_installations WHERE id='installation'",
+    ).first<SlackInstallation>())!;
+    if (checkpoint === "lease")
+      await env.DB.prepare("UPDATE slack_installations SET generation=generation+1 WHERE id='installation'").run();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        await env.DB.prepare("UPDATE slack_installations SET generation=generation+1 WHERE id='installation'").run();
+        return Response.json({ ok: true, access_token: "xoxb-new" });
+      }),
+    );
+    const counter = countedD1(env.DB);
+    await expect(
+      usableBotToken({ ...runtime(), DB: counter.database }, installed, undefined, "defer"),
+    ).rejects.toBeInstanceOf(SlackInstallationChangedError);
+    expect(counter.statements).toHaveLength(checkpoint === "lease" ? 2 : 5);
+  });
+
+  it.each([false, true])(
+    "bounds invalid-token recovery to one reread (competing token saved=%s)",
+    async (completed) => {
+      await env.DB.prepare(
+        "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='installation'",
+      )
+        .bind(await encryptSlackToken(runtime(), "xoxr-old"))
+        .run();
+      const installed = (await env.DB.prepare(
+        "SELECT * FROM slack_installations WHERE id='installation'",
+      ).first<SlackInstallation>())!;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          if (completed)
+            await env.DB.prepare(
+              "UPDATE slack_installations SET bot_token_ciphertext=?,token_expires_at=? WHERE id='installation'",
+            )
+              .bind(await encryptSlackToken(runtime(), "xoxb-competing"), Date.now() + 3_600_000)
+              .run();
+          return Response.json({ ok: false, error: "invalid_refresh_token" });
+        }),
+      );
+      const counter = countedD1(env.DB);
+      const timer = vi.spyOn(globalThis, "setTimeout");
+      const result = usableBotToken({ ...runtime(), DB: counter.database }, installed, undefined, "defer");
+      const outcome = await result.then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error }),
+      );
+      const expectedError = expect.objectContaining({ code: "invalid_refresh_token" });
+      expect(outcome).toEqual(completed ? { value: "xoxb-competing" } : { error: expectedError });
+      expect(counter.statements).toHaveLength(3);
+      expect(timer).not.toHaveBeenCalled();
+      expect(
+        await env.DB.prepare(
+          "SELECT auth_error,refresh_lease_token FROM slack_installations WHERE id='installation'",
+        ).first(),
+      ).toEqual({ auth_error: null, refresh_lease_token: null });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          Response.json({ ok: true, access_token: "xoxb-retried", refresh_token: "xoxr-retried", expires_in: 3600 }),
+        ),
+      );
+      expect(await usableBotToken({ ...runtime(), DB: counter.database }, installed, undefined, "defer")).toBe(
+        completed ? "xoxb-competing" : "xoxb-retried",
+      );
+      expect(counter.statements).toHaveLength(completed ? 3 : 7);
+    },
+  );
 
   it("uses a valid bot token without a generation and requires one for refresh", async () => {
     const installation = (await env.DB.prepare(

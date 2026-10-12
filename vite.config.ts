@@ -43,6 +43,30 @@ export default defineConfig(({ command }) => {
                   // development bucket in place so the template BUCKET cannot win.
                   if (!process.env.CLOUDFLARE_ENV) {
                     config.name = "cloudflare-realtime-notes";
+                    config.workflows = config.workflows.map((workflow) => ({
+                      ...workflow,
+                      name:
+                        workflow.binding === "NOTES_WORKFLOW" ? "cloudflare-realtime-notes-jobs-local" : workflow.name,
+                    }));
+                    const legacyQueues = {
+                      "noteflare-delivery": "cloudflare-realtime-notes-delivery-local",
+                      "noteflare-delivery-dlq": "cloudflare-realtime-notes-delivery-dlq-local",
+                    };
+                    config.queues.producers = (config.queues.producers ?? []).map((producer) => ({
+                      ...producer,
+                      queue: legacyQueues[producer.queue as keyof typeof legacyQueues] ?? producer.queue,
+                    }));
+                    config.queues.consumers = (config.queues.consumers ?? []).map((consumer) => ({
+                      ...consumer,
+                      queue: legacyQueues[consumer.queue as keyof typeof legacyQueues] ?? consumer.queue,
+                      ...(consumer.dead_letter_queue
+                        ? {
+                            dead_letter_queue:
+                              legacyQueues[consumer.dead_letter_queue as keyof typeof legacyQueues] ??
+                              consumer.dead_letter_queue,
+                          }
+                        : {}),
+                    }));
                     config.r2_buckets = [
                       {
                         binding: "BUCKET",

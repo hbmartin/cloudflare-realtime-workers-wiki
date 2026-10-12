@@ -126,6 +126,13 @@ export class SlackTokenRefreshInProgressError extends Error {
   }
 }
 
+export class SlackInstallationChangedError extends Error {
+  constructor() {
+    super("The Slack installation changed during token refresh.");
+    this.name = "SlackInstallationChangedError";
+  }
+}
+
 export class SlackRateLimitError extends Error {
   constructor(
     readonly retryAfter: number,
@@ -144,8 +151,9 @@ export class SlackApiError extends Error {
     readonly status: number,
     readonly credentialRevision = 0,
     readonly neededScopes: readonly string[] = [],
+    cause?: unknown,
   ) {
-    super(`Slack ${method} failed.`);
+    super(`Slack ${method} failed.`, { cause });
     this.name = "SlackApiError";
   }
 }
@@ -1427,7 +1435,14 @@ async function activeInstallation(env: Env, teamId: string) {
     .first<SlackInstallation>();
 }
 
-export async function usableBotToken(env: Env, installation: SlackInstallation, signal?: AbortSignal) {
+export type TokenRefreshMode = "wait" | "defer";
+
+export async function usableBotToken(
+  env: Env,
+  installation: SlackInstallation,
+  signal?: AbortSignal,
+  tokenRefreshMode: TokenRefreshMode = "wait",
+) {
   signal?.throwIfAborted();
   if (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000) {
     return decryptSlackToken(env, installation.bot_token_ciphertext);
@@ -1440,7 +1455,7 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
   const oldCiphertext = installation.bot_token_ciphertext;
   const leaseToken = crypto.randomUUID();
   let claimed = false;
-  for (let attempt = 0; attempt < 15; attempt++) {
+  for (let attempt = 0; attempt < (tokenRefreshMode === "defer" ? 1 : 15); attempt++) {
     signal?.throwIfAborted();
     const now = Date.now();
     const lease = await env.DB.prepare(`UPDATE slack_installations SET refresh_lease_token=?,refresh_lease_until=?
@@ -1455,12 +1470,12 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
     const current = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL`)
       .bind(installation.id)
       .first<SlackInstallation>();
-    if (!current || current.generation !== installation.generation)
-      throw new Error("The Slack installation changed during token refresh.");
+    if (!current || current.generation !== installation.generation) throw new SlackInstallationChangedError();
     if (current.bot_token_ciphertext !== oldCiphertext) {
       Object.assign(installation, current);
       return decryptSlackToken(env, current.bot_token_ciphertext);
     }
+    if (tokenRefreshMode === "defer") break;
     await new Promise<void>((resolve, reject) => {
       const onAbort = () => {
         clearTimeout(timer);
@@ -1476,6 +1491,8 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
   }
   if (!claimed) throw new SlackTokenRefreshInProgressError();
   try {
+    // Decryption failures belong to infrastructure, outside the request boundary.
+    const refreshToken = await decryptSlackToken(env, installation.bot_refresh_token_ciphertext);
     const response = await fetch("https://slack.com/api/oauth.v2.access", {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -1483,23 +1500,51 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
         client_id: env.SLACK_CLIENT_ID!,
         client_secret: env.SLACK_CLIENT_SECRET!,
         grant_type: "refresh_token",
-        refresh_token: await decryptSlackToken(env, installation.bot_refresh_token_ciphertext),
+        refresh_token: refreshToken,
       }),
       // Once Slack accepts a refresh token, persist its replacement even if the
       // caller's short acknowledgment deadline expires.
       signal: AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
+    }).catch((cause: unknown) => {
+      if (isTimeoutAbort(cause) || cause instanceof TypeError)
+        throw new SlackApiError(
+          "oauth.v2.access",
+          isTimeoutAbort(cause) ? "timeout" : "network_error",
+          isTimeoutAbort(cause) ? 504 : 503,
+          installation.credential_revision,
+          [],
+          cause,
+        );
+      throw cause;
     });
-    const result = await response.json<{
-      ok?: boolean;
-      error?: string;
-      access_token?: string;
-      refresh_token?: string;
-      expires_in?: number;
-    }>();
-    if (!response.ok || !result.ok || !result.access_token) {
+    let result: { ok: boolean; error?: string; access_token?: string; refresh_token?: string; expires_in?: number };
+    try {
+      result = await response.json<typeof result>();
+      if (
+        !result ||
+        typeof result !== "object" ||
+        Array.isArray(result) ||
+        typeof result.ok !== "boolean" ||
+        (result.error !== undefined && (typeof result.error !== "string" || !/^[a-z0-9_]{1,64}$/.test(result.error))) ||
+        (result.ok && (typeof result.access_token !== "string" || !result.access_token)) ||
+        (result.refresh_token !== undefined && (typeof result.refresh_token !== "string" || !result.refresh_token)) ||
+        (result.expires_in !== undefined && (!Number.isSafeInteger(result.expires_in) || result.expires_in <= 0))
+      )
+        throw new Error("Invalid OAuth refresh response shape.");
+    } catch (cause) {
+      throw new SlackApiError(
+        "oauth.v2.access",
+        "invalid_response",
+        response.status,
+        installation.credential_revision,
+        [],
+        cause,
+      );
+    }
+    if (!response.ok || !result.ok) {
       if (result.error === "invalid_refresh_token") {
         // A worker from the previous deployment may still have won the refresh.
-        for (let attempt = 0; attempt < 15; attempt++) {
+        for (let attempt = 0; attempt < (tokenRefreshMode === "defer" ? 1 : 15); attempt++) {
           const current = await env.DB.prepare(
             `SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL`,
           )
@@ -1509,7 +1554,7 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
             Object.assign(installation, current);
             return decryptSlackToken(env, current.bot_token_ciphertext);
           }
-          await new Promise((resolve) => setTimeout(resolve, 200));
+          if (tokenRefreshMode === "wait") await new Promise((resolve) => setTimeout(resolve, 200));
         }
         const error = new SlackApiError(
           "oauth.v2.access",
@@ -1517,15 +1562,20 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
           response.status,
           installation.credential_revision,
         );
-        await recordSlackInstallationError(env, installation.id, error);
+        // A competing refresh may still be persisting its token. An abbreviated
+        // recovery check cannot establish that the installation needs relinking.
+        if (tokenRefreshMode === "wait") await recordSlackInstallationError(env, installation.id, error);
         throw error;
       }
-      if (typeof result.error === "string" && INSTALLATION_ERRORS.has(result.error))
-        throw new SlackApiError("oauth.v2.access", result.error, response.status, installation.credential_revision);
-      throw new Error(`Slack token refresh failed (${result.error ?? response.status}).`);
+      throw new SlackApiError(
+        "oauth.v2.access",
+        result.error ?? (response.ok ? "invalid_response" : "http_error"),
+        response.status,
+        installation.credential_revision,
+      );
     }
     const updatedAt = Date.now();
-    const accessTokenCiphertext = await encryptSlackToken(env, result.access_token);
+    const accessTokenCiphertext = await encryptSlackToken(env, result.access_token!);
     const refreshTokenCiphertext = result.refresh_token
       ? await encryptSlackToken(env, result.refresh_token)
       : installation.bot_refresh_token_ciphertext;
@@ -1559,8 +1609,7 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
       const current = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id = ? AND disconnected_at IS NULL`)
         .bind(installation.id)
         .first<SlackInstallation>();
-      if (!current || current.generation !== installation.generation)
-        throw new Error("The Slack installation changed during token refresh.");
+      if (!current || current.generation !== installation.generation) throw new SlackInstallationChangedError();
       if (current.bot_token_ciphertext === oldCiphertext) throw new Error("Slack token refresh was not persisted.");
       installation.bot_token_ciphertext = current.bot_token_ciphertext;
       installation.bot_refresh_token_ciphertext = current.bot_refresh_token_ciphertext;
@@ -1589,7 +1638,7 @@ export async function usableBotToken(env: Env, installation: SlackInstallation, 
         );
       }
     }
-    return result.access_token;
+    return result.access_token!;
   } finally {
     await env.DB.prepare(`UPDATE slack_installations SET refresh_lease_token=NULL,refresh_lease_until=NULL
       WHERE id=? AND refresh_lease_token=?`)
@@ -1602,6 +1651,7 @@ export type SlackApiOptions<Method extends SlackApiMethod> = {
   timeoutMs?: number;
   signal?: AbortSignal;
   preparedToken?: string;
+  tokenRefreshMode?: TokenRefreshMode;
   beforeDispatch?: (() => Promise<void | SlackApiContracts[Method]["input"]>) | undefined;
   onDispatch?: () => void;
 };
@@ -1625,7 +1675,7 @@ export async function slackApi<Method extends SlackApiMethod>(
     const token =
       method === "auth.revoke"
         ? await decryptSlackToken(env, installation.bot_token_ciphertext)
-        : (preparedToken ?? (await usableBotToken(env, installation, signal)));
+        : (preparedToken ?? (await usableBotToken(env, installation, signal, options.tokenRefreshMode)));
     signal?.throwIfAborted();
     const dispatchPayload = (beforeDispatch ? await beforeDispatch() : undefined) ?? payload;
     const url = new URL(`https://slack.com/api/${method}`);
@@ -2014,6 +2064,7 @@ export async function sendPersonalSlackNotification(
   text: string,
   pageId: string,
   presentation?: { escaped: boolean; sections?: string[] },
+  options: { tokenRefreshMode?: TokenRefreshMode } = {},
 ) {
   // A user linked in several workspaces must only hear about a workspace through that workspace's installation.
   const row = await env.DB.prepare(
@@ -2056,6 +2107,7 @@ export async function sendPersonalSlackNotification(
           ],
     },
     {
+      ...options,
       beforeDispatch: slackAccessAuthorization(env, row, {
         userId,
         slackUserId: row.slack_user_id,

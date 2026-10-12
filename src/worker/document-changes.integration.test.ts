@@ -15,6 +15,7 @@ import type { Env } from "./env";
 import type { DocumentContentEnvelope } from "../shared/types";
 import { logger } from "./observability";
 import { encryptSlackToken } from "./slack";
+import { countedD1 } from "../../tests/helpers/count-d1";
 import { protectSlackFixtureUsers } from "../../tests/helpers/security";
 const bindings = env as unknown as Env;
 function emailRuntime(send = vi.fn(async (_message: unknown) => ({ messageId: "digest" }))) {
@@ -709,9 +710,13 @@ it("keeps forty ordinary items while limiting comparisons to ten pages", async (
   );
 });
 
-it.each([false, true])(
-  "preserves budget-deferred candidates across ticks with multiple timezones=%s",
-  async (multipleTimezones) => {
+it.each(
+  (["email", "slack"] as const).flatMap((channel) =>
+    [false, true].map((multipleTimezones) => ({ channel, multipleTimezones })),
+  ),
+)(
+  "preserves $channel budget-deferred comparisons across ticks with multiple timezones=$multipleTimezones",
+  async ({ channel, multipleTimezones }) => {
     await fixture();
     await env.DB.batch([
       env.DB.prepare(`WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<8)
@@ -730,43 +735,39 @@ it.each([false, true])(
       SELECT 'outbox:'||r.id,c.workspace_id,'notification_digest_change','{}',9007199254740991,c.created_at
       FROM page_change_recipients r JOIN page_change_checkpoints c ON c.id=r.checkpoint_id`),
     ]);
-    if (multipleTimezones)
-      await env.DB.prepare(`INSERT INTO notification_preferences(user_id,event_type,email,slack,timezone)
-    SELECT id,'page_edit','digest','off',CASE WHEN id<='cost-user-04' THEN 'Africa/Abidjan' ELSE 'UTC' END FROM user WHERE id LIKE 'cost-user-%'`).run();
-    let statements = 0;
-    const db = new Proxy(bindings.DB, {
-      get(target, property) {
-        if (property === "prepare")
-          return (query: string) => {
-            statements++;
-            return target.prepare(query);
-          };
-        const value: unknown = Reflect.get(target, property, target);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
-    const { configured, send } = emailRuntime();
+    await env.DB.prepare(`INSERT INTO notification_preferences(user_id,event_type,email,slack,timezone)
+      SELECT id,'page_edit',?,?,CASE WHEN ? AND id<='cost-user-04' THEN 'Africa/Abidjan' ELSE 'UTC' END FROM user WHERE id LIKE 'cost-user-%'`)
+      .bind(channel === "email" ? "digest" : "off", channel === "slack" ? "digest" : "off", multipleTimezones)
+      .run();
+    const { database: db, statements } = countedD1(bindings.DB);
+    const { configured, send } = await digestRuntime(
+      channel,
+      Array.from({ length: 8 }, (_, n) => `cost-user-${String(n + 1).padStart(2, "0")}`),
+    );
     const counted = new Proxy(configured, {
       get(target, property, receiver) {
         return property === "DB" ? db : Reflect.get(target, property, receiver);
       },
     });
-    for (let tick = 1; tick <= 4; tick++) {
-      statements = 0;
+    const recipientsPerTick = channel === "email" ? 2 : 1;
+    for (let tick = 1; tick <= 8 / recipientsPerTick; tick++) {
+      statements.length = 0;
       await sendDueNotificationDigests(counted, digestTimestamp());
-      expect(send).toHaveBeenCalledTimes(tick * 2);
-      expect(statements).toBeLessThanOrEqual(120);
-      const timezone = multipleTimezones && tick % 2 ? "Africa/Abidjan" : "UTC";
+      expect(send).toHaveBeenCalledTimes(tick * recipientsPerTick);
+      expect(statements.length).toBeLessThanOrEqual(120);
+      const recipient = (send.mock.lastCall![0] as { to: string }).to;
+      const number = Number(/(\d+)(?:@example.test)?$/.exec(recipient)![1]);
+      const timezone = multipleTimezones && number <= 4 ? "Africa/Abidjan" : "UTC";
       expect(
-        await env.DB.prepare("SELECT user_id FROM digest_delivery_cursors WHERE channel='email' AND timezone=?")
-          .bind(timezone)
+        await env.DB.prepare("SELECT user_id FROM digest_delivery_cursors WHERE channel=? AND timezone=?")
+          .bind(channel, timezone)
           .first(),
-      ).toEqual({
-        user_id: `cost-user-${String(multipleTimezones ? [2, 6, 4, 8][tick - 1] : tick * 2).padStart(2, "0")}`,
-      });
+      ).toEqual({ user_id: `cost-user-${String(number).padStart(2, "0")}` });
     }
     expect(
-      await env.DB.prepare("SELECT count(*) count FROM page_change_recipients WHERE emailed_at IS NULL").first(),
+      await env.DB.prepare(
+        `SELECT count(*) count FROM page_change_recipients WHERE ${channel === "email" ? "emailed_at" : "slack_at"} IS NULL`,
+      ).first(),
     ).toEqual({ count: 0 });
   },
 );
