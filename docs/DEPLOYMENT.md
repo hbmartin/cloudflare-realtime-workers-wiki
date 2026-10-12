@@ -53,6 +53,17 @@ source, target, and generated configuration before migrating and uploading. Its 
 `.wrangler/noteflare-build.json` metadata must belong to the current run. Retry reuses resource bindings
 and already-applied migrations. Saved dashboard variables, including feature settings, are retained.
 
+Without a saved D1 binding, the helper derives a database name from the Worker name (`<worker>-db`)
+instead of sharing the template's `noteflare` database. It reuses a named resource only while that
+database is empty. If application tables or migration history exist, bind the intended database in
+the Worker dashboard or explicitly set its `database_id` in the portable configuration before retrying.
+This also applies when an upload fails after migrations have run but before the first DB binding is saved.
+Existing bindings recognize `database_id` and the older `id` field and reject conflicting configured IDs.
+
+New rate-limit namespace IDs are derived from the Worker and binding names; retries keep the same IDs
+and updates retain saved IDs. Generated Workflow and database names stay within 64 characters by
+adding a deterministic hash when shortening is necessary. Provisioned Workflow names are preserved.
+
 For a custom domain, attach it under **Settings → Domains & Routes** and set the Worker's
 `BETTER_AUTH_URL` plaintext variable to that exact HTTPS origin (no path or trailing slash), then
 redeploy. The portable template's `auto` value preserves this saved origin. An explicit HTTPS origin

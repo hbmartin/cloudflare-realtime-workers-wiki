@@ -12,6 +12,7 @@ const require = createRequire(import.meta.url);
 const manifestPath = ".wrangler/noteflare-build.json";
 const secretKeys = ["BETTER_AUTH_SECRET", "WEBHOOK_ENCRYPTION_KEY", "OBSERVABILITY_PROBE_TOKEN", "BOOTSTRAP_TOKEN"];
 const placeholderID = "00000000-0000-0000-0000-000000000000";
+const databaseID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const privateVariable = /(?:SECRET|TOKEN|PASSWORD|ENCRYPTION_KEY|API_KEY)$/;
 
 function command(program, args, options = {}) {
@@ -78,13 +79,74 @@ async function cloudflare() {
   return { account, api };
 }
 
+function deployedDatabaseID(settings) {
+  const binding = settings?.bindings?.find((entry) => entry.name === "DB" && entry.type === "d1");
+  if (!binding) return undefined;
+  const id = binding.database_id ?? binding.id;
+  if (typeof id !== "string" || !databaseID.test(id) || id === placeholderID)
+    throw new Error("Existing DB binding has an invalid database ID. Refusing to select another database.");
+  return id;
+}
+
 export function selectTarget({ forced, environment, workersCI, name, production, settings }) {
   if (forced === "production") return "production";
   if (forced === "portable") return "";
   if (environment !== undefined) return environment;
   if (!workersCI) return "production";
-  const deployedDB = settings?.bindings?.find((binding) => binding.name === "DB" && binding.type === "d1");
-  return name === production.name && deployedDB?.id === production.d1_databases?.[0]?.database_id ? "production" : "";
+  return name === production.name && deployedDatabaseID(settings) === production.d1_databases?.[0]?.database_id
+    ? "production"
+    : "";
+}
+
+function installationResourceName(name, suffix) {
+  const full = `${name}${suffix}`;
+  if (full.length <= 64) return full;
+  const hash = createHash("sha256").update(name).digest("hex").slice(0, 8);
+  return `${name.slice(0, 64 - suffix.length - hash.length - 1)}-${hash}${suffix}`;
+}
+
+export async function portableDatabase(config, settings, name, api, dryRun = false) {
+  const declared = config.d1_databases[0];
+  const savedID = deployedDatabaseID(settings);
+  let id = declared.database_id === placeholderID ? undefined : declared.database_id;
+  if (id !== undefined && (typeof id !== "string" || !databaseID.test(id)))
+    throw new Error("Configured DB has an invalid database ID.");
+  if (savedID && id && id !== savedID)
+    throw new Error("DB differs from the existing deployment. Refusing to deploy to another database.");
+  id ??= savedID;
+  const databaseName =
+    declared.database_name === "noteflare" ? installationResourceName(name, "-db") : declared.database_name;
+  if (!id && !dryRun) {
+    const matches = await api(`/d1/database?name=${encodeURIComponent(databaseName)}`);
+    if (!Array.isArray(matches) || matches.length > 1 || matches.some((entry) => entry?.name !== databaseName))
+      throw new Error("Cloudflare returned ambiguous D1 resources.");
+    if (matches.length) {
+      id = matches[0].uuid;
+      if (typeof id !== "string" || !databaseID.test(id) || id === placeholderID)
+        throw new Error("D1 provisioning did not return a valid database ID.");
+      // A build/deploy retry may reuse an empty provisioned resource. Populated databases
+      // require a saved Worker binding or an explicit database_id before any migration.
+      const result = await api(`/d1/database/${id}/query`, {
+        method: "POST",
+        body: { sql: "SELECT name FROM sqlite_master WHERE type='table';" },
+      });
+      if (
+        !Array.isArray(result) ||
+        result.length !== 1 ||
+        result[0]?.success !== true ||
+        !Array.isArray(result[0].results)
+      )
+        throw new Error("Cloudflare returned invalid D1 schema results.");
+      if (result[0].results.some((row) => !internalTables.has(row?.name) || row.name === "d1_migrations"))
+        throw new Error(
+          "Existing D1 database requires an explicit database_id or saved Worker DB binding before reuse.",
+        );
+    } else id = (await api("/d1/database", { method: "POST", body: { name: databaseName } }))?.uuid;
+  }
+  if (id !== undefined && (typeof id !== "string" || !databaseID.test(id) || id === placeholderID))
+    throw new Error("D1 provisioning did not return a valid database ID.");
+  if (!id && !dryRun) throw new Error("D1 provisioning did not return a valid database ID.");
+  return { database_id: id ?? placeholderID, database_name: databaseName };
 }
 
 export function installationOrigin(configured, saved, name, subdomain) {
@@ -131,6 +193,20 @@ export function portableOverrides(config, settings, name, origin, database) {
       },
     ],
     r2_buckets: config.r2_buckets.map((entry) => ({ ...entry, bucket_name: bucket?.bucket_name ?? entry.bucket_name })),
+    ratelimits: config.ratelimits.map((entry) => {
+      const binding = settings?.bindings?.find(
+        (existing) => existing.type === "ratelimit" && existing.name === entry.name,
+      );
+      const namespace = binding
+        ? binding.namespace_id
+        : String(
+            1_000_000 +
+              Number.parseInt(createHash("sha256").update(`${name}:${entry.name}`).digest("hex").slice(0, 13), 16),
+          );
+      if (typeof namespace !== "string" || !/^[1-9][0-9]*$/.test(namespace))
+        throw new Error("Existing rate-limit binding has an invalid namespace ID.");
+      return { ...entry, namespace_id: namespace };
+    }),
     queues: {
       producers: config.queues.producers.map((producer) => ({
         ...producer,
@@ -154,7 +230,8 @@ export function portableOverrides(config, settings, name, origin, database) {
       ...workflow,
       name:
         settings?.bindings?.find((entry) => entry.type === "workflow" && entry.name === workflow.binding)
-          ?.workflow_name ?? (workflow.name === "noteflare-jobs" ? `${name}-jobs` : workflow.name),
+          ?.workflow_name ??
+        (workflow.name === "noteflare-jobs" ? installationResourceName(name, "-jobs") : workflow.name),
     })),
     analytics_engine_datasets: config.analytics_engine_datasets.map((dataset) => ({
       ...dataset,
@@ -199,26 +276,7 @@ async function prepare(forced, dryRun) {
   }
   connection ??= await cloudflare();
   settings ??= await connection.api(`/workers/scripts/${name}/settings`, { allowMissing: true });
-  const savedDB = settings?.bindings?.find((binding) => binding.name === "DB" && binding.type === "d1");
-  const declaredDB = root.d1_databases[0];
-  let id = declaredDB.database_id;
-  if (savedDB && id && id !== placeholderID && id !== savedDB.id)
-    throw new Error("DB differs from the existing deployment. Refusing to deploy to another database.");
-  if (!id || id === placeholderID) id = savedDB?.id;
-  if (!id && !dryRun) {
-    const matches = await connection.api(`/d1/database?name=${encodeURIComponent(declaredDB.database_name)}`);
-    if (
-      !Array.isArray(matches) ||
-      matches.length > 1 ||
-      matches.some((entry) => entry.name !== declaredDB.database_name)
-    )
-      throw new Error("Cloudflare returned ambiguous D1 resources.");
-    id = matches[0]?.uuid;
-    if (!id)
-      id = (await connection.api("/d1/database", { method: "POST", body: { name: declaredDB.database_name } })).uuid;
-  }
-  if ((id && !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(id)) || (!dryRun && (!id || id === placeholderID)))
-    throw new Error("D1 provisioning did not return a valid database ID.");
+  const database = await portableDatabase(root, settings, name, connection.api, dryRun);
   const savedURL = settings?.bindings?.find(
     (binding) => binding.name === "BETTER_AUTH_URL" && binding.type === "plain_text" && binding.text !== "auto",
   )?.text;
@@ -234,7 +292,7 @@ async function prepare(forced, dryRun) {
     name,
     origin,
     account: connection.account,
-    overrides: portableOverrides(root, settings, name, origin, { database_id: id ?? placeholderID }),
+    overrides: portableOverrides(root, settings, name, origin, database),
   };
 }
 

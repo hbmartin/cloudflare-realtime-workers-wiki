@@ -9,6 +9,7 @@ import {
   installationOrigin,
   missingSecrets,
   outputConfig,
+  portableDatabase,
   portableOverrides,
   selectTarget,
   verifyBuild,
@@ -16,8 +17,11 @@ import {
 } from "./deploy.mjs";
 
 afterEach(() => vi.unstubAllEnvs());
-const production = { name: "legacy-notes", d1_databases: [{ binding: "DB", database_id: "legacy-db" }] };
-const binding = { name: "DB", type: "d1", id: "legacy-db" };
+const existingDB = "11111111-1111-1111-1111-111111111111";
+const newDB = "22222222-2222-2222-2222-222222222222";
+const placeholderID = "00000000-0000-0000-0000-000000000000";
+const production = { name: "legacy-notes", d1_databases: [{ binding: "DB", database_id: existingDB }] };
+const binding = { name: "DB", type: "d1", id: existingDB };
 const selection = { name: "legacy-notes", workersCI: true, production, settings: { bindings: [binding] } };
 const queryResult = (rows) => ({ status: 0, stdout: JSON.stringify([{ success: true, results: rows }]) });
 const dependencies = () => ({
@@ -32,8 +36,14 @@ describe("deployment targets and portable configuration", () => {
   it("recognizes a legacy Workers Builds deployment by name and database", () => {
     expect(selectTarget(selection)).toBe("production");
     expect(selectTarget({ ...selection, name: "new-notes" })).toBe("");
-    expect(selectTarget({ ...selection, settings: { bindings: [{ ...binding, id: "new-db" }] } })).toBe("");
+    expect(selectTarget({ ...selection, settings: { bindings: [{ ...binding, id: newDB }] } })).toBe("");
     expect(selectTarget({ ...selection, settings: null })).toBe("");
+  });
+  it("recognizes canonical D1 bindings and prefers database_id over the deprecated id", () => {
+    expect(
+      selectTarget({ ...selection, settings: { bindings: [{ name: "DB", type: "d1", database_id: existingDB }] } }),
+    ).toBe("production");
+    expect(selectTarget({ ...selection, settings: { bindings: [{ ...binding, database_id: newDB }] } })).toBe("");
   });
   it("preserves local production defaults and honors explicit profiles/environments", () => {
     expect(selectTarget({ ...selection, workersCI: false })).toBe("production");
@@ -133,6 +143,55 @@ describe("deployment targets and portable configuration", () => {
     expect(overrides.workflows[0].name).toBe("chosen-jobs");
     expect(overrides.analytics_engine_datasets[0].dataset).toBe("chosen_metrics");
   });
+  it("isolates new rate-limit namespaces by Worker and binding and keeps them stable across retries", () => {
+    const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
+    const first = portableOverrides(root, null, "first-wiki", "https://example.com", {}).ratelimits;
+    const second = portableOverrides(root, null, "second-wiki", "https://example.com", {}).ratelimits;
+    expect(first).toEqual(portableOverrides(root, null, "first-wiki", "https://example.com", {}).ratelimits);
+    const ids = [...first, ...second].map((entry) => entry.namespace_id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const id of ids) {
+      expect(root.ratelimits.some((entry) => entry.namespace_id === id)).toBe(false);
+      expect(Number.isSafeInteger(Number(id))).toBe(true);
+      expect(Number(id)).toBeGreaterThan(0);
+    }
+    expect(first.map((entry) => entry.simple)).toEqual(root.ratelimits.map((entry) => entry.simple));
+  });
+  it("preserves existing rate-limit namespaces and allocates only missing bindings", () => {
+    const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
+    const settings = { bindings: [{ name: root.ratelimits[0].name, type: "ratelimit", namespace_id: "987654" }] };
+    const overrides = portableOverrides(root, settings, "wiki", "https://example.com", {});
+    expect(overrides.ratelimits[0].namespace_id).toBe("987654");
+    expect(overrides.ratelimits.slice(1)).toEqual(
+      portableOverrides(root, null, "wiki", "https://example.com", {}).ratelimits.slice(1),
+    );
+    settings.bindings[0].namespace_id = "invalid";
+    expect(() => portableOverrides(root, settings, "wiki", "https://example.com", {})).toThrow("invalid namespace ID");
+  });
+  it.each([59, 60, 61, 62, 63])("bounds generated Workflow names for a %s-character Worker", (length) => {
+    const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
+    const name = "a".repeat(length);
+    const generated = portableOverrides(root, null, name, "https://example.com", {}).workflows[0].name;
+    expect(generated.length).toBeLessThanOrEqual(64);
+    expect(generated).toMatch(/^[a-z0-9-]+-jobs$/);
+    expect(generated).toBe(portableOverrides(root, null, name, "https://example.com", {}).workflows[0].name);
+    const other = portableOverrides(root, null, `${name.slice(0, -1)}b`, "https://example.com", {}).workflows[0].name;
+    expect(other).not.toBe(generated);
+    expect(
+      portableOverrides(
+        root,
+        { bindings: [{ name: "NOTES_WORKFLOW", type: "workflow", workflow_name: "saved-jobs" }] },
+        name,
+        "https://example.com",
+        {},
+      ).workflows[0].name,
+    ).toBe("saved-jobs");
+  });
+  it("keeps the full generated Workflow name at the 64-character boundary", () => {
+    const root = unstable_readConfig({ config: "wrangler.jsonc", env: "" }, { hideWarnings: true });
+    const name = "a".repeat(59);
+    expect(portableOverrides(root, null, name, "https://example.com", {}).workflows[0].name).toBe(`${name}-jobs`);
+  });
   it("uses Vite's output pointer for renamed Workers and rejects output outside dist", () => {
     const directory = mkdtempSync(resolve(tmpdir(), "noteflare-output-"));
     try {
@@ -159,6 +218,106 @@ describe("deployment targets and portable configuration", () => {
       };
       expect(() => verifyBuild(manifest, manifest)).not.toThrow();
       expect(() => verifyBuild(manifest, { ...manifest, [key]: "different" })).toThrow(`match ${key}`);
+    },
+  );
+});
+
+describe("portable database selection", () => {
+  const config = { d1_databases: [{ binding: "DB", database_name: "noteflare", database_id: placeholderID }] };
+  it.each([{ database_id: existingDB }, { id: existingDB }, { database_id: existingDB, id: newDB }])(
+    "preserves a saved D1 identity without provisioning %#",
+    async (identity) => {
+      const api = vi.fn();
+      const settings = { bindings: [{ name: "DB", type: "d1", ...identity }] };
+      expect((await portableDatabase(config, settings, "wiki", api)).database_id).toBe(existingDB);
+      expect(api).not.toHaveBeenCalled();
+    },
+  );
+  it("requires an explicitly configured database ID before reusing an application database", async () => {
+    const explicit = { d1_databases: [{ ...config.d1_databases[0], database_id: existingDB }] };
+    const api = vi.fn();
+    expect((await portableDatabase(explicit, null, "wiki", api)).database_id).toBe(existingDB);
+    await expect(
+      portableDatabase(explicit, { bindings: [{ name: "DB", type: "d1", database_id: newDB }] }, "wiki", api),
+    ).rejects.toThrow("DB differs");
+    expect(api).not.toHaveBeenCalled();
+  });
+  it.each([{}, { database_id: "" }, { database_id: "invalid" }, { database_id: placeholderID }])(
+    "rejects a malformed saved identity before provisioning %#",
+    async (identity) => {
+      const api = vi.fn();
+      const settings = { bindings: [{ name: "DB", type: "d1", ...identity }] };
+      await expect(portableDatabase(config, settings, "wiki", api)).rejects.toThrow("Existing DB binding");
+      expect(api).not.toHaveBeenCalled();
+    },
+  );
+  it.each(["", "invalid", null])("rejects an invalid configured database ID: %s", async (id) => {
+    const api = vi.fn();
+    await expect(
+      portableDatabase({ d1_databases: [{ ...config.d1_databases[0], database_id: id }] }, null, "wiki", api),
+    ).rejects.toThrow("Configured DB");
+    expect(api).not.toHaveBeenCalled();
+  });
+  it.each(["noteflare", "team-wiki", "a".repeat(63)])("creates a Worker-specific database for %s", async (name) => {
+    const api = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce({ uuid: newDB });
+    const result = await portableDatabase(config, null, name, api);
+    expect(result.database_id).toBe(newDB);
+    expect(result.database_name).not.toBe("noteflare");
+    expect(result.database_name.length).toBeLessThanOrEqual(64);
+    expect(api).toHaveBeenNthCalledWith(1, `/d1/database?name=${result.database_name}`);
+    expect(api).toHaveBeenNthCalledWith(2, "/d1/database", { method: "POST", body: { name: result.database_name } });
+  });
+  it("respects custom database names and keeps dry runs free of provisioning", async () => {
+    const api = vi.fn();
+    const custom = { d1_databases: [{ ...config.d1_databases[0], database_name: "chosen-db" }] };
+    expect(await portableDatabase(custom, null, "wiki", api, true)).toEqual({
+      database_name: "chosen-db",
+      database_id: placeholderID,
+    });
+    expect(api).not.toHaveBeenCalled();
+  });
+  it("reuses only empty named databases when a build is retried before upload", async () => {
+    const api = vi
+      .fn()
+      .mockResolvedValueOnce([{ name: "wiki-db", uuid: newDB }])
+      .mockResolvedValueOnce([{ success: true, results: [{ name: "_cf_KV" }] }]);
+    expect(await portableDatabase(config, null, "wiki", api)).toEqual({ database_id: newDB, database_name: "wiki-db" });
+    expect(api).toHaveBeenNthCalledWith(2, `/d1/database/${newDB}/query`, {
+      method: "POST",
+      body: { sql: "SELECT name FROM sqlite_master WHERE type='table';" },
+    });
+  });
+  it.each(["install_state", "workspaces", "d1_migrations", "unrelated_table"])(
+    "rejects implicit reuse of a database containing %s",
+    async (table) => {
+      const api = vi
+        .fn()
+        .mockResolvedValueOnce([{ name: "wiki-db", uuid: existingDB }])
+        .mockResolvedValueOnce([{ success: true, results: [{ name: table }] }]);
+      await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("explicit database_id");
+      expect(api).toHaveBeenCalledTimes(2);
+    },
+  );
+  it.each([null, [{ name: "other-db", uuid: existingDB }], [{ name: "wiki-db" }, { name: "wiki-db" }]])(
+    "rejects ambiguous database lookups %#",
+    async (matches) => {
+      const api = vi.fn().mockResolvedValue(matches);
+      await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("ambiguous D1 resources");
+      expect(api).toHaveBeenCalledTimes(1);
+    },
+  );
+  it.each([undefined, "invalid", placeholderID])("rejects invalid provisioning IDs: %s", async (id) => {
+    const api = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce({ uuid: id });
+    await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("valid database ID");
+  });
+  it.each([null, [], [{ success: false, results: [] }], [{ success: true, results: null }]])(
+    "rejects malformed database schema results %#",
+    async (result) => {
+      const api = vi
+        .fn()
+        .mockResolvedValueOnce([{ name: "wiki-db", uuid: existingDB }])
+        .mockResolvedValueOnce(result);
+      await expect(portableDatabase(config, null, "wiki", api)).rejects.toThrow("invalid D1 schema");
     },
   );
 });
