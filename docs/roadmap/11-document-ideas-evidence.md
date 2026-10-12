@@ -31,6 +31,38 @@ The existing opt-in 10,000-node mention benchmark is skipped unless `MENTION_BEN
 the final UI changes; subsequent fixes affected digest finalization and test assertions. The Worker dry run confirmed
 all three production release controls are false. No deployed verification is inferred from a dry run.
 
+## Review follow-up validation
+
+All repository check stages passed after the follow-up changes: formatting, lint, middleware Semgrep rules/tests,
+all five TypeScript targets, unit and Worker coverage, dependency analysis, generated-binding verification, client
+build, and production Worker dry run. The existing opt-in mention benchmark remains skipped.
+
+| Suite                             | Result                  |
+| --------------------------------- | ----------------------- |
+| Unit coverage                     | 2,010 passed, 1 skipped |
+| Worker integration coverage       | 1,703 passed            |
+| Document-ideas Chromium scenarios | 5 passed                |
+
+Regressions cover malformed personal frozen receipts, valid frozen fallbacks, underscore URL targets, forty mixed
+items with ten comparison pages, budget-bound cursor progress, stolen delivery claims, 2,000 inaccessible edits,
+checkpoint and GC continuation above their invocation caps, lease contention/loss, failed enqueue recovery, and
+failed R2 deletion. Channel tests cover all activity/diff flag combinations and pending duplicate IDs. A valid
+channel comparison loads its two R2 inputs once across all three access checks.
+
+D1 `EXPLAIN QUERY PLAN` assertions verify indexed finalization and preservation of 10,000 unrelated notifications.
+The feature-off digest budget test also asserts that no checkpoint/recipient query runs. Fresh migrations and
+upgrades from before `0081` and `0082` pass. The digest view's suppression lookup uses the recipient primary key.
+
+Editor tests cover native context menus and clipboard fallback, reconnect without a second scroll, stopping scans
+for deleted blocks, retrying cached misses after synchronization, and opening History only for complete links to
+the current page. Chromium verifies full saved text alongside changed blocks using saved Yjs version fixtures,
+including hiding Restore while loading and rejecting a late response for an earlier selection.
+The Slack test timestamp fixture now preserves six fractional digits even at exact whole seconds.
+
+Apply `0082_digest_reliability.sql` after `0081` and before deploying the follow-up Worker. Thirty-day checkpoint
+coverage still includes documents without digest subscribers. Continuation uses the existing delivery queue;
+production feature defaults remain false. No production migration, deployment, or live messages ran.
+
 ## Feature evidence
 
 | Area                     | Coverage                                                                                                                                                                                                                                                                                                                                                                    |

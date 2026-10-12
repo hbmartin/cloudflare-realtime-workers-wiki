@@ -374,7 +374,7 @@ async function action(
 }
 
 beforeEach(async () => {
-  historyTimestamp = String((Date.now() - 1000) / 1000);
+  historyTimestamp = ((Date.now() - 1000) / 1000).toFixed(6);
   await reset();
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
   posts = [];

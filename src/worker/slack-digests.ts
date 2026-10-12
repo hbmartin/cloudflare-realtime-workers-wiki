@@ -1,3 +1,4 @@
+import type { DigestComparison } from "../shared/block-diff";
 import { digestComparison, type ChangeCheckpoint } from "./document-changes";
 import { withSlackPrimaryError } from "./slack-delivery";
 import { verifyHistoryPage as reconcileBotPost, type HistoryVerificationOptions } from "./slack-history";
@@ -335,6 +336,7 @@ export async function digestPages(
   receipt: DigestReceipt,
   installation: SlackInstallation,
   message?: { page_ids_json: string; event_ids_json: string; sequence?: number; comparison_refs_json?: string },
+  comparisons = new Map<string, Promise<DigestComparison>>(),
 ): Promise<DigestPage[]> {
   const threads = OPEN_THREAD_COUNT_SQL.replaceAll("p.", "page.");
   const status = TASK_STATUS_SQL.replaceAll("p.", "page.");
@@ -406,19 +408,35 @@ export async function digestPages(
           .bind(row.id, receipt.window_start, receipt.window_end)
           .all<ChangeCheckpoint>();
         const qualifying = checkpoints.results.filter((checkpoint) =>
-          events.some((event) => event.eventId.startsWith(`page_edit:${checkpoint.id}:`)),
+          events.some(
+            (event) =>
+              event.eventId.startsWith(`page_edit:${checkpoint.id}:`) ||
+              event.eventId.startsWith(`activity:page_edit:${checkpoint.id}:`),
+          ),
         );
         const covered = events
           .filter((event) => event.type === "page_edit")
-          .every((event) => qualifying.some((checkpoint) => event.eventId.startsWith(`page_edit:${checkpoint.id}:`)));
+          .every((event) =>
+            qualifying.some(
+              (checkpoint) =>
+                event.eventId.startsWith(`page_edit:${checkpoint.id}:`) ||
+                event.eventId.startsWith(`activity:page_edit:${checkpoint.id}:`),
+            ),
+          );
         pair = {
           first: covered ? (qualifying[0]?.id ?? "") : "",
           last: covered ? (qualifying.at(-1)?.id ?? "") : "",
         };
       }
-      item.comparison = pair
-        ? await digestComparison(env, row.id, pair.first, pair.last)
-        : { first: "", last: "", diff: null };
+      if (pair?.first && pair.last) {
+        const key = JSON.stringify([row.id, pair.first, pair.last]);
+        let comparison = comparisons.get(key);
+        if (!comparison) {
+          comparison = digestComparison(env, row.id, pair.first, pair.last);
+          comparisons.set(key, comparison);
+        }
+        item.comparison = await comparison;
+      } else item.comparison = { first: "", last: "", diff: null };
     }
     if (row.kind === "diagram" && available && !departure)
       await attachThumbnail(env, item, installation, row.content_epoch);
@@ -537,6 +555,7 @@ async function nextMessage(
   mapping: Mapping,
   installation: SlackInstallation,
   token: string,
+  comparisons: Map<string, Promise<DigestComparison>>,
 ) {
   const existing = await env.DB.prepare(
     `SELECT * FROM slack_digest_messages WHERE receipt_id=? AND state IN ('pending','sending') ORDER BY sequence LIMIT 1`,
@@ -544,7 +563,7 @@ async function nextMessage(
     .bind(receipt.id)
     .first<DigestMessage>();
   if (existing) return existing;
-  const pages = await digestPages(env, mapping, receipt, installation);
+  const pages = await digestPages(env, mapping, receipt, installation, undefined, comparisons);
   if (!pages.length) return null;
   const sequence = (await env.DB.prepare(
     `SELECT coalesce(max(sequence)+1,0) n FROM slack_digest_messages WHERE receipt_id=?`,
@@ -615,6 +634,7 @@ export async function deliverDigest(
     );
     return;
   }
+  const comparisons = new Map<string, Promise<DigestComparison>>();
   const token = crypto.randomUUID();
   const claim = await env.DB.prepare(
     `UPDATE slack_digest_receipts SET claim_token=?,claimed_at=? WHERE id=? AND state IN ('pending','sending'${reconcileOnly ? ",'blocked'" : ""}) AND (claimed_at IS NULL OR claimed_at<?)`,
@@ -766,12 +786,12 @@ export async function deliverDigest(
       if (!mapping || mapping.channel_id !== receipt.channel_id || !eligible(mapping, Date.now())) return;
       if (mapping.validation_revision !== validation.revision) throw new StaleSlackValidationError();
       await retireDeniedDigestEvents(env, receipt, token);
-      message ??= await nextMessage(env, receipt, mapping, installation, token);
+      message ??= await nextMessage(env, receipt, mapping, installation, token, comparisons);
       if (!message) {
         await updateRoot("skipped");
         return;
       }
-      const pages = await digestPages(env, mapping, receipt, installation, message);
+      const pages = await digestPages(env, mapping, receipt, installation, message, comparisons);
       if (!pages.length) {
         await finishMessage("retired", null);
       } else {
@@ -811,7 +831,14 @@ export async function deliverDigest(
                   throw new SlackDispatchSkippedError();
                 }
                 await retireDeniedDigestEvents(env, receipt!, token);
-                const currentPages = await digestPages(env, currentMapping, receipt!, installation, message!);
+                const currentPages = await digestPages(
+                  env,
+                  currentMapping,
+                  receipt!,
+                  installation,
+                  message!,
+                  comparisons,
+                );
                 if (!currentPages.length) {
                   await finishMessage("retired", null);
                   await updateRoot("pending");
@@ -985,7 +1012,7 @@ export async function deliverDigest(
       await retireRoot("obsolete");
       return;
     }
-    const next = await nextMessage(env, receipt, mapping, installation, token);
+    const next = await nextMessage(env, receipt, mapping, installation, token, comparisons);
     if (!next) {
       await updateRoot("sent");
       return;

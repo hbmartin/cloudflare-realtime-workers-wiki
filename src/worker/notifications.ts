@@ -1,3 +1,4 @@
+import { escapeHtml } from "./html";
 import { composePersonalDigest } from "./personal-diff-digest";
 import type {
   Notification,
@@ -598,51 +599,46 @@ async function finishClaimedDeliveries(
     const finished = await finish.all<{ outbox_id: string }>();
     return finished.results.map((row) => row.outbox_id);
   }
-  const notificationIds = JSON.stringify(
-    uniqueOutboxIds.filter((id) => id.startsWith("outbox:")).map((id) => id.slice("outbox:".length)),
-  );
-  const [finished] = await env.DB.batch<{ outbox_id: string }>([
-    finish,
-    env.DB.prepare(
-      `UPDATE notifications SET ${notificationTimestampColumn} = COALESCE(${notificationTimestampColumn}, ?)
-        WHERE (id IN (SELECT value FROM json_each(?))
-          AND EXISTS (
-            SELECT 1 FROM deliveries delivery
-             WHERE delivery.idempotency_key = 'outbox:' || notifications.id || ':' || ?
-               AND delivery.status = 'sent' AND delivery.claim_token = ?
-          )) OR (event_type='page_edit' AND EXISTS (
-            SELECT 1 FROM deliveries delivery
-            JOIN digest_notifications anchor ON delivery.outbox_id='outbox:'||anchor.id
-            JOIN page_change_checkpoints first ON first.id=json_extract(delivery.comparison_json,'$.first')
-            JOIN page_change_checkpoints last ON last.id=json_extract(delivery.comparison_json,'$.last')
-            JOIN page_change_checkpoints c ON notifications.id='page_edit:'||c.id||':'||anchor.user_id
-            WHERE delivery.idempotency_key IN (SELECT value||':'||? FROM json_each(?))
-              AND delivery.status='sent' AND delivery.claim_token=?
-              AND anchor.user_id=notifications.user_id AND anchor.page_id=c.page_id
-              AND first.page_id=c.page_id AND last.page_id=c.page_id
-              AND (c.created_at,c.content_epoch,c.sequence)>=(first.created_at,first.content_epoch,first.sequence)
-              AND (c.created_at,c.content_epoch,c.sequence)<=(last.created_at,last.content_epoch,last.sequence)
-          ))`,
-    ).bind(timestamp, notificationIds, channel, token, channel, ids, token),
-    env.DB.prepare(
-      `UPDATE page_change_recipients SET ${notificationTimestampColumn} = COALESCE(${notificationTimestampColumn}, ?)
-        WHERE EXISTS (
-          SELECT 1 FROM deliveries delivery
-          JOIN digest_notifications anchor ON delivery.outbox_id='outbox:'||anchor.id
-          JOIN page_change_checkpoints first ON first.id=json_extract(delivery.comparison_json,'$.first')
-          JOIN page_change_checkpoints last ON last.id=json_extract(delivery.comparison_json,'$.last')
-          JOIN page_change_checkpoints c ON c.id=page_change_recipients.checkpoint_id
-          WHERE delivery.idempotency_key IN (SELECT value||':'||? FROM json_each(?))
-            AND delivery.status='sent' AND delivery.claim_token=?
-            AND anchor.user_id=page_change_recipients.user_id AND anchor.page_id=c.page_id
-            AND first.page_id=c.page_id AND last.page_id=c.page_id
-            AND (c.created_at,c.content_epoch,c.sequence)>=(first.created_at,first.content_epoch,first.sequence)
-            AND (c.created_at,c.content_epoch,c.sequence)<=(last.created_at,last.content_epoch,last.sequence)
-        ) OR (id IN (SELECT value FROM json_each(?)) AND EXISTS (
-          SELECT 1 FROM deliveries delivery WHERE delivery.idempotency_key='outbox:'||page_change_recipients.id||':'||?
-          AND delivery.status='sent' AND delivery.claim_token=?))`,
-    ).bind(timestamp, channel, ids, token, notificationIds, channel, token),
-  ]);
+  // Start with the claimed delivery primary keys. Both target tables are updated
+  // by explicit IDs; unrelated notification/checkpoint history is never scanned.
+  const claimed = `SELECT delivery.* FROM json_each(?) requested
+    JOIN deliveries delivery ON delivery.idempotency_key=requested.value||':'||?
+    WHERE delivery.status='sent' AND delivery.claim_token=?`;
+  const covered = `WITH claimed AS (${claimed}), bounds AS (
+    SELECT anchor.user_id,first.page_id,first.created_at first_at,first.content_epoch first_epoch,first.sequence first_sequence,
+      last.created_at last_at,last.content_epoch last_epoch,last.sequence last_sequence
+    FROM claimed delivery
+    JOIN page_change_recipients anchor ON anchor.id=substr(delivery.outbox_id,8)
+    JOIN page_change_checkpoints anchor_checkpoint ON anchor_checkpoint.id=anchor.checkpoint_id
+    JOIN page_change_checkpoints first ON first.id=json_extract(CASE WHEN json_valid(delivery.comparison_json) THEN delivery.comparison_json ELSE '{}' END,'$.first')
+    JOIN page_change_checkpoints last ON last.id=json_extract(CASE WHEN json_valid(delivery.comparison_json) THEN delivery.comparison_json ELSE '{}' END,'$.last')
+    WHERE first.page_id=anchor_checkpoint.page_id AND last.page_id=first.page_id
+  ), covered AS (
+    SELECT c.id,range.user_id FROM bounds range JOIN page_change_checkpoints c
+      ON c.page_id=range.page_id AND c.created_at>=range.first_at AND c.created_at<=range.last_at
+    WHERE (c.created_at,c.content_epoch,c.sequence)>=(range.first_at,range.first_epoch,range.first_sequence)
+      AND (c.created_at,c.content_epoch,c.sequence)<=(range.last_at,range.last_epoch,range.last_sequence)
+  )`;
+  const statements = [finish];
+  if (env.DIFF_DIGESTS_ENABLED === "true") {
+    statements.push(
+      env.DB.prepare(`${covered} UPDATE notifications
+        SET ${notificationTimestampColumn}=COALESCE(${notificationTimestampColumn},?)
+        WHERE id IN (SELECT substr(outbox_id,8) FROM claimed
+          UNION ALL SELECT 'page_edit:'||id||':'||user_id FROM covered)`).bind(ids, channel, token, timestamp),
+      env.DB.prepare(`${covered} UPDATE page_change_recipients
+        SET ${notificationTimestampColumn}=COALESCE(${notificationTimestampColumn},?)
+        WHERE id IN (SELECT substr(outbox_id,8) FROM claimed
+          UNION ALL SELECT r.id FROM covered c JOIN page_change_recipients r
+            ON r.checkpoint_id=c.id AND r.user_id=c.user_id)`).bind(ids, channel, token, timestamp),
+    );
+  } else {
+    statements.push(
+      env.DB.prepare(`UPDATE notifications SET ${notificationTimestampColumn}=COALESCE(${notificationTimestampColumn},?)
+      WHERE id IN (SELECT substr(outbox_id,8) FROM (${claimed}))`).bind(timestamp, ids, channel, token),
+    );
+  }
+  const [finished] = await env.DB.batch<{ outbox_id: string }>(statements);
   return (finished?.results ?? []).map((row) => row.outbox_id);
 }
 
@@ -664,13 +660,6 @@ async function accessibleNotifications(
     .all<DeliveryRow>();
   const accessible = new Set(rows.results.map((row) => row.id));
   return { rows: rows.results, suppressed: notificationIds.filter((id) => !accessible.has(id)) };
-}
-
-function escapeHtml(value: string) {
-  return value.replace(/[&<>"']/g, (character) => {
-    const escaped: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
-    return escaped[character]!;
-  });
 }
 
 function notificationCopy(row: DeliveryRow) {
@@ -787,7 +776,7 @@ function digestCandidateCost(env: Env, pages: number) {
   // shared receipt/access reads and the additional eligibility timestamp.
   return (
     DIGEST_STATEMENTS_PER_CANDIDATE +
-    (env.DIFF_DIGESTS_ENABLED === "true" ? 4 * Math.min(DIFF_DIGEST_PAGE_LIMIT, pages) : 0)
+    (env.DIFF_DIGESTS_ENABLED === "true" ? 4 + 4 * Math.min(DIFF_DIGEST_PAGE_LIMIT, pages) : 0)
   );
 }
 const DIGEST_STATEMENTS_PER_WINDOW = 4;
@@ -845,8 +834,11 @@ function digestIdsSql(env: Env, channel: DigestChannel) {
     WHERE n.user_id=? AND n.workspace_id=? AND n.${channel === "email" ? "emailed_at" : "slack_at"} IS NULL
       AND ${digestModeSql(channel)} AND COALESCE(preference.timezone,'UTC')=? AND n.created_at<?`;
   return `WITH eligible AS (${eligible}), ranked AS (
-    SELECT id,created_at,row_number() OVER(PARTITION BY digest_group ORDER BY created_at,id) rank FROM eligible
-  ) SELECT id FROM ranked WHERE rank=1 ORDER BY created_at,id LIMIT ${env.DIFF_DIGESTS_ENABLED === "true" ? DIFF_DIGEST_PAGE_LIMIT : 40}`;
+    SELECT id,created_at,digest_group,row_number() OVER(PARTITION BY digest_group ORDER BY created_at,id) rank FROM eligible
+  ), groups AS (SELECT *,sum(CASE WHEN digest_group LIKE 'page:%' THEN 1 ELSE 0 END)
+    OVER(ORDER BY created_at,id) comparison_rank FROM ranked WHERE rank=1)
+  SELECT id FROM groups WHERE digest_group NOT LIKE 'page:%' OR comparison_rank<=${DIFF_DIGEST_PAGE_LIMIT}
+  ORDER BY created_at,id LIMIT 40`;
 }
 
 function digestRecipientSql(channel: DigestChannel) {
@@ -940,23 +932,62 @@ export async function digestCandidates<T extends { user_id: string; workspace_id
       wrapped = true;
     }
   }
-  // Keep even an empty scan in the ordering so untouched timezones get a turn
-  // on later ticks instead of sorting behind the same updated_at = 0 window.
-  const next = candidates.length
-    ? digestCursor(candidates.at(-1)!)
-    : stored
-      ? digestCursor(stored)
-      : { userId: "", workspaceId: "", timezone };
-  await env.DB.prepare(
-    `INSERT INTO digest_delivery_cursors (channel, user_id, workspace_id, timezone, updated_at)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT(channel, timezone) DO UPDATE SET user_id = excluded.user_id,
-       workspace_id = excluded.workspace_id,
-       updated_at = MAX(digest_delivery_cursors.updated_at + 1, excluded.updated_at)`,
-  )
-    .bind(channel, next.userId, next.workspaceId, next.timezone, Date.now())
-    .run();
   return candidates;
+}
+
+export async function saveDigestCursor(env: Env, channel: DigestChannel, timezone: string, row?: DigestCursor) {
+  // An empty window still advances its timestamp without moving its saved position.
+  await env.DB.prepare(`INSERT INTO digest_delivery_cursors(channel,user_id,workspace_id,timezone,updated_at)
+    VALUES(?,?,?,?,?) ON CONFLICT(channel,timezone) DO UPDATE SET
+    user_id=CASE WHEN ? THEN excluded.user_id ELSE digest_delivery_cursors.user_id END,
+    workspace_id=CASE WHEN ? THEN excluded.workspace_id ELSE digest_delivery_cursors.workspace_id END,
+    updated_at=MAX(digest_delivery_cursors.updated_at+1,excluded.updated_at)`)
+    .bind(channel, row?.userId ?? "", row?.workspaceId ?? "", timezone, Date.now(), Boolean(row), Boolean(row))
+    .run();
+}
+
+async function suppressDigestRows(
+  env: Env,
+  channel: DigestChannel,
+  ids: string[],
+  candidate: {
+    user_id: string;
+    workspace_id: string;
+  },
+  timestamp: number,
+  cutoff: number,
+) {
+  if (!ids.length) return;
+  const column = channel === "email" ? "emailed_at" : "slack_at";
+  const inaccessible = `NOT EXISTS(SELECT 1 FROM pages p JOIN spaces s ON s.id=p.space_id
+    JOIN workspace_members m ON m.workspace_id=p.workspace_id AND m.user_id=?
+    LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=m.user_id
+    WHERE p.id=c.page_id AND p.workspace_id=? AND p.archived_at IS NULL
+      AND p.import_job_id IS NULL AND p.is_template=0
+      AND (m.role='owner' OR s.visibility='workspace' OR sm.user_id IS NOT NULL))`;
+  const covered = `WITH covered AS (
+    SELECT c.id,r.id recipient_id,r.user_id FROM json_each(?) selected
+    JOIN page_change_recipients anchor ON anchor.id=selected.value
+    JOIN page_change_checkpoints first ON first.id=anchor.checkpoint_id
+    JOIN page_change_checkpoints c ON c.page_id=first.page_id AND c.created_at<?
+    JOIN page_change_recipients r ON r.checkpoint_id=c.id AND r.user_id=anchor.user_id
+    WHERE r.user_id=? AND r.${column} IS NULL AND ${inaccessible}
+  )`;
+  const binds = [JSON.stringify(ids), cutoff, candidate.user_id, candidate.user_id, candidate.workspace_id];
+  const statements = [
+    env.DB.prepare(`UPDATE notifications SET ${column}=? WHERE id IN (SELECT value FROM json_each(?))`).bind(
+      timestamp,
+      JSON.stringify(ids),
+    ),
+  ];
+  if (env.DIFF_DIGESTS_ENABLED === "true" && ids.some((id) => id.startsWith("change:")))
+    statements.push(
+      env.DB.prepare(`${covered} UPDATE page_change_recipients SET ${column}=?
+      WHERE id IN (SELECT recipient_id FROM covered)`).bind(...binds, timestamp),
+      env.DB.prepare(`${covered} UPDATE notifications SET ${column}=?
+      WHERE id IN (SELECT 'page_edit:'||id||':'||user_id FROM covered)`).bind(...binds, timestamp),
+    );
+  await env.DB.batch(statements);
 }
 
 async function sendDueEmailDigests(env: Env, timestamp: number) {
@@ -999,89 +1030,86 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
       Math.floor(remainingStatements / DIGEST_STATEMENTS_PER_CANDIDATE),
     );
     const candidates = await digestCandidates(env, "email", window.timezone, candidateLimit, readCandidates);
-    for (const candidate of candidates) {
-      const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
-      if (remainingStatements < candidateCost) continue;
-      remainingStatements -= candidateCost;
-      const ids = await env.DB.prepare(digestIdsSql(env, "email"))
-        .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
-        .all<{ id: string }>();
-      const { rows, suppressed } = await accessibleNotifications(
-        env,
-        candidate.user_id,
-        candidate.workspace_id,
-        ids.results.map((row) => row.id),
-      );
-      if (suppressed.length) {
-        await env.DB.prepare(`UPDATE notifications SET emailed_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-          .bind(timestamp, JSON.stringify(suppressed))
-          .run();
-        await env.DB.prepare(
-          `UPDATE page_change_recipients SET emailed_at=? WHERE id IN (SELECT value FROM json_each(?))`,
-        )
-          .bind(timestamp, JSON.stringify(suppressed))
-          .run();
-      }
-      const claim = await claimDeliveries(
-        env,
-        rows.map((row) => `outbox:${row.id}`),
-        "email",
-      );
-      const claimedIds = new Set(claim.outboxIds);
-      const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
-      if (!claimed.length) continue;
-      const lines = claimed.map((row) => `• ${notificationCopy(row)}`);
-      try {
-        const composed =
-          env.DIFF_DIGESTS_ENABLED === "true"
-            ? await composePersonalDigest(
-                env,
-                claimed,
-                "email",
-                claim.token,
-                (row) => notificationCopy(claimed.find((item) => item.id === row.id)!),
-                window.cutoff,
-              )
-            : null;
-        if (composed?.empty) {
-          await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent", null, "emailed_at");
-          continue;
-        }
-        await env.SEND_EMAIL.send({
-          from: env.EMAIL_FROM,
-          to: candidate.email,
-          subject: `${claimed.length} NoteFlare update${claimed.length === 1 ? "" : "s"}`,
-          text: composed?.text ?? `Your daily NoteFlare digest:\n\n${lines.join("\n")}`,
-          html:
-            composed?.html ??
-            `<p>Your daily NoteFlare digest:</p><ul>${claimed
-              .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
-              .join("")}</ul>`,
-        });
-        await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent", null, "emailed_at");
-      } catch (error) {
-        await finishClaimedDeliveries(
+    let processed: DigestCursor | undefined;
+    try {
+      for (const candidate of candidates) {
+        const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
+        if (remainingStatements < candidateCost) break;
+        processed = digestCursor(candidate);
+        remainingStatements -= candidateCost;
+        const ids = await env.DB.prepare(digestIdsSql(env, "email"))
+          .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
+          .all<{ id: string }>();
+        const { rows, suppressed } = await accessibleNotifications(
           env,
-          claim.outboxIds,
+          candidate.user_id,
+          candidate.workspace_id,
+          ids.results.map((row) => row.id),
+        );
+        await suppressDigestRows(env, "email", suppressed, candidate, timestamp, window.cutoff);
+        const claim = await claimDeliveries(
+          env,
+          rows.map((row) => `outbox:${row.id}`),
           "email",
-          claim.token,
-          "failed",
-          safeTelemetryErrorMessage(error, "Digest delivery failed."),
         );
-        logger.error(
-          "notification.digest_email.failed",
-          "notifications",
-          "Notification digest email failed.",
-          {},
-          error,
-        );
-        recordMetric(env, {
-          event: "integration.call",
-          component: "notifications",
-          operation: "email",
-          outcome: "failure",
-        });
+        const claimedIds = new Set(claim.outboxIds);
+        const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
+        if (!claimed.length) continue;
+        const lines = claimed.map((row) => `• ${notificationCopy(row)}`);
+        try {
+          const composed =
+            env.DIFF_DIGESTS_ENABLED === "true"
+              ? await composePersonalDigest(
+                  env,
+                  claimed,
+                  "email",
+                  claim.token,
+                  (row) => notificationCopy(claimed.find((item) => item.id === row.id)!),
+                  window.cutoff,
+                )
+              : null;
+          if (composed?.empty) {
+            await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent", null, "emailed_at");
+            continue;
+          }
+          await env.SEND_EMAIL.send({
+            from: env.EMAIL_FROM,
+            to: candidate.email,
+            subject: `${claimed.length} NoteFlare update${claimed.length === 1 ? "" : "s"}`,
+            text: composed?.text ?? `Your daily NoteFlare digest:\n\n${lines.join("\n")}`,
+            html:
+              composed?.html ??
+              `<p>Your daily NoteFlare digest:</p><ul>${claimed
+                .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
+                .join("")}</ul>`,
+          });
+          await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent", null, "emailed_at");
+        } catch (error) {
+          await finishClaimedDeliveries(
+            env,
+            claim.outboxIds,
+            "email",
+            claim.token,
+            "failed",
+            safeTelemetryErrorMessage(error, "Digest delivery failed."),
+          );
+          logger.error(
+            "notification.digest_email.failed",
+            "notifications",
+            "Notification digest email failed.",
+            {},
+            error,
+          );
+          recordMetric(env, {
+            event: "integration.call",
+            component: "notifications",
+            operation: "email",
+            outcome: "failure",
+          });
+        }
       }
+    } finally {
+      await saveDigestCursor(env, "email", window.timezone, processed);
     }
   }
 }
@@ -1121,100 +1149,100 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
       Math.floor(remainingStatements / DIGEST_STATEMENTS_PER_CANDIDATE),
     );
     const candidates = await digestCandidates(env, "slack", window.timezone, candidateLimit, readCandidates);
-    for (const candidate of candidates) {
-      if (rateLimitedWorkspaces.has(candidate.workspace_id)) continue;
-      const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
-      if (remainingStatements < candidateCost) continue;
-      remainingStatements -= candidateCost;
-      const ids = await env.DB.prepare(digestIdsSql(env, "slack"))
-        .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
-        .all<{ id: string }>();
-      const { rows, suppressed } = await accessibleNotifications(
-        env,
-        candidate.user_id,
-        candidate.workspace_id,
-        ids.results.map((row) => row.id),
-      );
-      if (suppressed.length) {
-        await env.DB.prepare(`UPDATE notifications SET slack_at = ? WHERE id IN (SELECT value FROM json_each(?))`)
-          .bind(timestamp, JSON.stringify(suppressed))
-          .run();
-        await env.DB.prepare(
-          `UPDATE page_change_recipients SET slack_at=? WHERE id IN (SELECT value FROM json_each(?))`,
-        )
-          .bind(timestamp, JSON.stringify(suppressed))
-          .run();
-      }
-      if (!rows.length) continue;
-      const claim = await claimDeliveries(
-        env,
-        rows.map((row) => `outbox:${row.id}`),
-        "slack",
-      );
-      const claimedIds = new Set(claim.outboxIds);
-      const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
-      if (!claimed.length) continue;
-      try {
-        const composed =
-          env.DIFF_DIGESTS_ENABLED === "true"
-            ? await composePersonalDigest(
-                env,
-                claimed,
-                "slack",
-                claim.token,
-                (row) => notificationCopy(claimed.find((item) => item.id === row.id)!),
-                window.cutoff,
-              )
-            : null;
-        if (composed?.empty) {
-          await finishClaimedDeliveries(env, claim.outboxIds, "slack", claim.token, "sent", null, "slack_at");
+    let processed: DigestCursor | undefined;
+    try {
+      for (const candidate of candidates) {
+        if (rateLimitedWorkspaces.has(candidate.workspace_id)) {
+          processed = digestCursor(candidate);
           continue;
         }
-        const sent = await sendPersonalSlackNotification(
+        const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
+        if (remainingStatements < candidateCost) break;
+        processed = digestCursor(candidate);
+        remainingStatements -= candidateCost;
+        const ids = await env.DB.prepare(digestIdsSql(env, "slack"))
+          .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
+          .all<{ id: string }>();
+        const { rows, suppressed } = await accessibleNotifications(
           env,
           candidate.user_id,
           candidate.workspace_id,
-          composed?.text ??
-            `Your daily NoteFlare digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
-          composed?.pageId ?? claimed[0]!.page_id,
-          composed
-            ? { escaped: true, ...(composed.slackSections ? { sections: composed.slackSections } : {}) }
-            : undefined,
+          ids.results.map((row) => row.id),
         );
-        await finishClaimedDeliveries(
+        await suppressDigestRows(env, "slack", suppressed, candidate, timestamp, window.cutoff);
+        if (!rows.length) continue;
+        const claim = await claimDeliveries(
           env,
-          claim.outboxIds,
+          rows.map((row) => `outbox:${row.id}`),
           "slack",
-          claim.token,
-          sent ? "sent" : "failed",
-          sent ? null : "unavailable",
-          sent ? "slack_at" : null,
         );
-      } catch (error) {
-        await finishClaimedDeliveries(
-          env,
-          claim.outboxIds,
-          "slack",
-          claim.token,
-          "failed",
-          safeTelemetryErrorMessage(error, "Slack digest failed."),
-        );
-        if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
-        // One unreachable recipient must not starve the digests queued behind it.
-        logger.error(
-          "notification.digest_slack.failed",
-          "notifications",
-          "Notification digest Slack message failed.",
-          {},
-          error,
-        );
-        recordMetric(env, {
-          event: "integration.call",
-          component: "notifications",
-          operation: "slack",
-          outcome: "failure",
-        });
+        const claimedIds = new Set(claim.outboxIds);
+        const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
+        if (!claimed.length) continue;
+        try {
+          const composed =
+            env.DIFF_DIGESTS_ENABLED === "true"
+              ? await composePersonalDigest(
+                  env,
+                  claimed,
+                  "slack",
+                  claim.token,
+                  (row) => notificationCopy(claimed.find((item) => item.id === row.id)!),
+                  window.cutoff,
+                )
+              : null;
+          if (composed?.empty) {
+            await finishClaimedDeliveries(env, claim.outboxIds, "slack", claim.token, "sent", null, "slack_at");
+            continue;
+          }
+          const sent = await sendPersonalSlackNotification(
+            env,
+            candidate.user_id,
+            candidate.workspace_id,
+            composed?.text ??
+              `Your daily NoteFlare digest:\n${claimed.map((row) => `• ${notificationCopy(row)}`).join("\n")}`,
+            composed?.pageId ?? claimed[0]!.page_id,
+            composed
+              ? { escaped: true, ...(composed.slackSections ? { sections: composed.slackSections } : {}) }
+              : undefined,
+          );
+          await finishClaimedDeliveries(
+            env,
+            claim.outboxIds,
+            "slack",
+            claim.token,
+            sent ? "sent" : "failed",
+            sent ? null : "unavailable",
+            sent ? "slack_at" : null,
+          );
+        } catch (error) {
+          await finishClaimedDeliveries(
+            env,
+            claim.outboxIds,
+            "slack",
+            claim.token,
+            "failed",
+            safeTelemetryErrorMessage(error, "Slack digest failed."),
+          );
+          if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
+          // One unreachable recipient must not starve the digests queued behind it.
+          logger.error(
+            "notification.digest_slack.failed",
+            "notifications",
+            "Notification digest Slack message failed.",
+            {},
+            error,
+          );
+          recordMetric(env, {
+            event: "integration.call",
+            component: "notifications",
+            operation: "slack",
+            outcome: "failure",
+          });
+        }
       }
+    } finally {
+      await saveDigestCursor(env, "slack", window.timezone, processed);
     }
   }
 }

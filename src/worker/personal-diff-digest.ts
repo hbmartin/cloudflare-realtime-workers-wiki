@@ -1,3 +1,5 @@
+import { escapeHtml as escape } from "./html";
+import { digestText, digestLink } from "./slack-blocks";
 import { comparisonLines, comparisonUrl, digestComparison, type ChangeCheckpoint } from "./document-changes";
 import { digestExcerpts } from "../shared/block-diff";
 import type { Env } from "./env";
@@ -12,21 +14,24 @@ export type DigestRow = {
   data_json: string;
   actor_name: string | null;
 };
-const escape = (value: string) =>
-  value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]!);
-const slackEscape = (value: string) =>
-  value.replace(
-    /[&<>|*_~`]/g,
-    (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "|": "¦", "*": "∗", _: "＿", "~": "～", "`": "ˋ" })[char]!,
-  );
-function boundedSlack(value: string, max: number) {
-  let output = "";
-  for (const char of value) {
-    const escaped = slackEscape(char);
-    if (output.length + escaped.length > max) break;
-    output += escaped;
+type ComparisonPair = { first: string; last: string };
+function comparisonPair(value: string | null | undefined): ComparisonPair | null {
+  try {
+    const pair: unknown = JSON.parse(value ?? "null");
+    if (
+      pair &&
+      typeof pair === "object" &&
+      "first" in pair &&
+      "last" in pair &&
+      typeof pair.first === "string" &&
+      typeof pair.last === "string" &&
+      Boolean(pair.first) === Boolean(pair.last)
+    )
+      return { first: pair.first, last: pair.last };
+  } catch {
+    /* Recompute and replace a malformed frozen receipt under the claim fence. */
   }
-  return output;
+  return null;
 }
 export async function composePersonalDigest(
   env: Env,
@@ -46,7 +51,7 @@ export async function composePersonalDigest(
   for (const row of rows) {
     const key =
       row.event_type === "page_edit" && row.id.startsWith("change:")
-        ? `${row.page_id}:${frozen.get(row.id) ?? "new"}`
+        ? `${row.page_id}:${JSON.stringify(comparisonPair(frozen.get(row.id)))}`
         : row.id;
     const group = groups.get(key) ?? [];
     group.push(row);
@@ -65,8 +70,8 @@ export async function composePersonalDigest(
     const links: { label: string; href: string }[] = [];
     let isComparison = false;
     let href = `${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(row.page_id)}`;
-    if (row.event_type === "page_edit") {
-      let pair: { first: string; last: string } | null = frozen.get(row.id) ? JSON.parse(frozen.get(row.id)!) : null;
+    if (row.event_type === "page_edit" && row.id.startsWith("change:")) {
+      let pair = comparisonPair(frozen.get(row.id));
       if (!pair) {
         const ids = group.flatMap((item) => {
           try {
@@ -92,10 +97,20 @@ export async function composePersonalDigest(
                 .bind(row.page_id, JSON.stringify(ids))
                 .all<ChangeCheckpoint>();
         pair = { first: checkpoints.results[0]?.id ?? "", last: checkpoints.results.at(-1)?.id ?? "" };
-        await env.DB.prepare(`UPDATE deliveries SET comparison_json=COALESCE(comparison_json,?)
-          WHERE outbox_id IN (SELECT value FROM json_each(?)) AND channel=? AND status='pending' AND claim_token=?`)
-          .bind(JSON.stringify(pair), JSON.stringify(group.map((item) => `outbox:${item.id}`)), channel, token)
-          .run();
+        const outboxId = `outbox:${row.id}`;
+        const saved = await env.DB.prepare(`UPDATE deliveries SET comparison_json=?
+          WHERE outbox_id=? AND channel=? AND status='pending' AND claim_token=? AND comparison_json IS ?
+          RETURNING comparison_json`)
+          .bind(JSON.stringify(pair), outboxId, channel, token, frozen.get(row.id) ?? null)
+          .first<{ comparison_json: string }>();
+        if (!saved) {
+          const current = await env.DB.prepare(`SELECT comparison_json FROM deliveries
+            WHERE outbox_id=? AND channel=? AND status='pending' AND claim_token=?`)
+            .bind(outboxId, channel, token)
+            .first<{ comparison_json: string | null }>();
+          pair = comparisonPair(current?.comparison_json);
+          if (!pair) throw new Error("Digest comparison claim changed.");
+        }
       }
       if (pair.first && pair.last) {
         const comparison = await digestComparison(env, row.page_id, pair.first, pair.last);
@@ -139,15 +154,14 @@ export async function composePersonalDigest(
     firstPageId ??= row.page_id;
     let section = `${Array.from(available.title).slice(0, 120).join("")}\n${lines.join("\n")}\n${href}\n${links.map((link) => link.href).join("\n")}`;
     if (channel === "slack") {
-      section = slackEscape(section);
-      if (section.length > budget) {
-        const title = boundedSlack(available.title, 120),
-          url = slackEscape(href);
-        const summary = boundedSlack(
-          lines[0] ?? "Updated this page.",
-          Math.max(0, budget - title.length - url.length - 3),
-        );
-        section = `${title}\n${summary}\n${url}`;
+      const title = digestText(available.title, 120);
+      const primary = digestLink(href, comparison ? "Open comparison" : "Open page");
+      const summary = digestText(lines.join("\n"), Math.max(0, budget - title.length - primary.length - 2));
+      section = `${title}\n${summary}\n${primary}`;
+      for (const link of links) {
+        const formatted = digestLink(link.href, link.label);
+        if (section.length + formatted.length + 1 > budget) break;
+        section += `\n${formatted}`;
       }
     }
     text.push(section);

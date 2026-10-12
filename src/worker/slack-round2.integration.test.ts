@@ -6571,7 +6571,7 @@ describe("Slack recovery repairs", () => {
         ...runtime(),
         SLACK_CHANNEL_VALIDATION_ENABLED: String(validation) as "true" | "false",
         SLACK_RICH_DIGESTS_ENABLED: String(rich) as "true" | "false",
-        WORKSPACE_ACTIVITY_ENABLED: String(activity) as "true" | "false",
+        WORKSPACE_ACTIVITY_ENABLED: activity ? "true" : ("false" as "true" | "false"),
       };
       await env.DB.prepare("DELETE FROM outbox").run();
       await env.DB.prepare(
@@ -7898,8 +7898,11 @@ it.each([false, true])("freezes channel comparison coverage, including legacy in
     .bind(r.window_end - 10)
     .run();
   await event(m.id, "page", r.window_end - 10, "page_edit", `page_edit:page:1:1:${m.id}`);
+  await event(m.id, "page", r.window_end - 10, "page_edit", `activity:page_edit:page:1:1:${m.id}`);
   if (legacy) await event(m.id, "page", r.window_end - 20, "page_edit", "legacy-edit-without-checkpoint");
+  const get = vi.spyOn(env.BUCKET, "get");
   await deliverDigest(runtime(), r.id);
+  expect(get).toHaveBeenCalledTimes(legacy ? 0 : 2);
   const message = await env.DB.prepare("SELECT comparison_refs_json FROM slack_digest_messages WHERE receipt_id=?")
     .bind(r.id)
     .first<{ comparison_refs_json: string }>();
@@ -7911,4 +7914,44 @@ it.each([false, true])("freezes channel comparison coverage, including legacy in
   expect(posted.includes("Before: Old &lt;message&gt;")).toBe(!legacy);
   expect(posted.includes("After: New")).toBe(!legacy);
   expect(posted.includes("compareFrom=page%3A1%3A1")).toBe(!legacy);
+});
+
+it.each([
+  [false, false],
+  [false, true],
+  [true, false],
+  [true, true],
+])("uses one channel event source with activity=%s and diff digests=%s", async (activity, diffs) => {
+  const m = await mapping();
+  await page();
+  await syncRound2Configuration({
+    ...runtime(),
+    WORKSPACE_ACTIVITY_ENABLED: activity ? "true" : "false",
+    DIFF_DIGESTS_ENABLED: diffs ? "true" : "false",
+  });
+  for (let sequence = 1; sequence <= 2; sequence++)
+    await env.DB.batch(
+      notificationFanoutStatements(env.DB, {
+        workspaceId: "workspace",
+        spaceId: "workspace-general",
+        pageId: "page",
+        actorId: "owner",
+        eventType: "page_edit",
+        sourceId: `page:1:${sequence}`,
+        recipientIds: [],
+        emitSlackChannel: true,
+        retainDigestChanges: diffs,
+        threadId: null,
+        createdAt: Date.now() - 60000 + sequence * 30000,
+      }),
+    );
+  const events = await env.DB.prepare(
+    "SELECT id FROM slack_channel_events WHERE subscription_id=? AND event_type='page_edit' ORDER BY id",
+  )
+    .bind(m.id)
+    .all<{ id: string }>();
+  expect(events.results).toHaveLength(activity || diffs ? 2 : 1);
+  expect(events.results.every((item) => item.id.startsWith(activity ? "activity:page_edit:" : "page_edit:"))).toBe(
+    true,
+  );
 });

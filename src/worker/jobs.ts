@@ -1,3 +1,4 @@
+import { pruneDocumentChanges } from "./document-changes";
 import {
   slackOutboxSnapshotFields,
   slackConsumerOutboxFence,
@@ -97,7 +98,8 @@ const UNDETERMINED_WORKFLOW_STATUS = "unknown";
 export type JobWorkflowParams = { jobId: string; attempt?: number; correlationId?: string };
 export type DeliveryQueueMessage =
   | { outboxId: string; correlationId?: string }
-  | { sweep: true; correlationId?: string };
+  | { sweep: true; correlationId?: string }
+  | { documentChangesCleanup: true; correlationId?: string };
 export type DeliveryMessageOutcome = "acknowledged" | "retried" | "discarded";
 export type OutboxSweepResult = "completed" | "contended" | "lease-lost";
 
@@ -110,6 +112,8 @@ export function deliveryQueueMessageBody(value: unknown): DeliveryQueueMessage |
   try {
     const body = value as Record<string, unknown>;
     const correlationId = deliveryQueueIdentifier(body.correlationId);
+    if (body.documentChangesCleanup === true)
+      return { documentChangesCleanup: true, ...(correlationId ? { correlationId } : {}) };
     if (body.sweep === true) return { sweep: true, ...(correlationId ? { correlationId } : {}) };
     const outboxId = deliveryQueueIdentifier(body.outboxId);
     if (outboxId) {
@@ -2231,8 +2235,9 @@ export async function consumeDeliveryMessage(
     message.ack();
     return "discarded";
   }
-  if ("sweep" in body) {
-    if ((await sweepOutbox(env, true)) === "completed") {
+  if ("sweep" in body || "documentChangesCleanup" in body) {
+    const result = "sweep" in body ? await sweepOutbox(env, true) : await pruneDocumentChanges(env);
+    if (result === "completed") {
       message.ack();
       return "acknowledged";
     }
