@@ -10,6 +10,9 @@ flag; any other value or an unset variable disables it.
 
 | Flag                               | Local / E2E  | Production | When off                                                                                                                                                                                                                                                                                                                                                                                                |
 | ---------------------------------- | ------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BLOCK_LINKS_ENABLED`              | `true`       | `false`    | Block actions omit private deep links and navigation highlighting.                                                                                                                                                                                                                                                                                                                                      |
+| `LIVE_DIAGRAM_EMBEDS_ENABLED`      | `true`       | `false`    | Linked diagrams retain their authorized static thumbnail.                                                                                                                                                                                                                                                                                                                                               |
+| `DIFF_DIGESTS_ENABLED`             | `true`       | `false`    | Digests retain activity summaries; no new comparison checkpoints or eligibility rows are recorded. Retention cleanup still runs.                                                                                                                                                                                                                                                                        |
 | `EXPANDED_EMBEDS_ENABLED`          | `true`       | `false`    | Only YouTube, Vimeo, and Figma frame; other provider URLs render as links. `POST /api/link-previews` and `GET /api/link-previews/:id/image` return 404 `preview_disabled`. Stored URLs are unchanged, and preview cache cleanup still runs.                                                                                                                                                             |
 | `OFFLINE_EDITING_ENABLED`          | `true`       | `false`    | The service worker, installable shell, and offline catalog still work, but cached documents open read-only while offline.                                                                                                                                                                                                                                                                               |
 | `NOTION_MARKDOWN_WRITES_ENABLED`   | `true`       | `false`    | `PATCH /v1/pages/:id/markdown` returns 404 `object_not_found`, and queued async Markdown tasks are neither run nor recovered. New MCP create/update writes and staged-create resumption return retryable `markdown_writes_disabled`; the plugin UI is read-only. Completed MCP operation receipts remain replayable after current authorization checks. Markdown reads and MCP comments are unaffected. |
@@ -19,9 +22,9 @@ flag; any other value or an unset variable disables it.
 | `SLACK_SHARE_REFRESH_ENABLED`      | `false`      | `false`    | Stops queued attachment refresh effects and new lifecycle hooks; preserves recovery markers for paused queued work.                                                                                                                                                                                                                                                                                     |
 | `SLACK_RICH_DIGESTS_ENABLED`       | `false`      | `false`    | Sends grouped text without images; saved scheduling, validation and receipts continue when strict validation is enabled.                                                                                                                                                                                                                                                                                |
 
-The Worker reports `EXPANDED_EMBEDS_ENABLED` and `OFFLINE_EDITING_ENABLED` to the client as
-`features.expandedEmbeds` and `features.offlineEditing` in `GET /api/me`. Open tabs keep the old values until they
-reload.
+The Worker reports these controls through `GET /api/me`: `features.expandedEmbeds`, `features.offlineEditing`,
+`features.blockLinks`, `features.liveDiagramEmbeds`, and `features.diffDigests`. Open tabs keep the old values until
+they reload.
 
 To change a flag:
 
@@ -98,3 +101,15 @@ Owner verification counts obsolete-generation attempted receipts as blocked whil
 They are traversed once per bounded pass and do not keep continuation verification pending or invoke Slack under the new
 installation generation. A rejected generation-bound cursor clears only that mapping's Settings progress; the next Verify
 starts a fresh pass. Ordinary transient errors retain the continuation.
+
+## Document ideas activation
+
+Release block links, then live diagrams, then document diff digests independently. Apply `0081_document_changes.sql`
+before running the new Worker. Existing block serialization, picker behavior, subscriptions, and digest schedules stay
+compatible. A block link conveys no permission; `mode=read` only reduces a normally authorized diagram grant.
+Turning diff capture on starts exact coverage from the current projection. Old roll-ups and absent baselines show an
+explicit comparison-unavailable summary. Turning the flag off does not delete checkpoints immediately; cleanup
+expires them after 30 days. Frozen delivery references remain frozen across retries and flag changes.
+
+Complete the deployed exit matrix in [Phase 11](roadmap/11-document-ideas.md) before marking any feature shipped.
+Email and Slack pilots need a user-approved real recipient and test destination; do not send unsolicited test messages.

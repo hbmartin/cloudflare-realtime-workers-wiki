@@ -1841,6 +1841,7 @@ export function slackChannelFanoutStatements(
     // When set, a subscription that already recorded this event type for the page and actor
     // after this timestamp is skipped so continuous editing does not flood the channel.
     coalesceAfter?: number | null;
+    retainDigestChanges?: boolean;
   },
 ) {
   const eventId = `${fanout.eventType}:${fanout.sourceId}`;
@@ -1860,14 +1861,14 @@ export function slackChannelFanoutStatements(
               AND p.is_template=0 AND (? IS NULL OR p.content_epoch = ?))
             AND subscription.space_id = ? AND (subscription.page_id IS NULL OR subscription.page_id = ?)
             AND subscription.notification_blocked_at IS NULL
-            AND NOT EXISTS(SELECT 1 FROM round2_runtime WHERE activity_enabled=1)
+            AND (NOT EXISTS(SELECT 1 FROM round2_runtime WHERE activity_enabled=1) OR (?=1 AND subscription.cadence='digest'))
             AND subscription.muted_at IS NULL AND (subscription.snoozed_until IS NULL OR subscription.snoozed_until <= ?)
             AND NOT EXISTS (SELECT 1 FROM slack_thread_links mirror WHERE mirror.installation_id = installation.id
               AND mirror.thread_id = ? AND mirror.channel_id = subscription.channel_id AND mirror.state IN ('pending', 'active'))
             AND EXISTS (SELECT 1 FROM json_each(subscription.event_types_json) WHERE value = ?)
             AND NOT EXISTS (
               SELECT 1 FROM slack_channel_events recent
-               WHERE ? IS NOT NULL AND recent.subscription_id = subscription.id AND recent.page_id = ?
+               WHERE ? IS NOT NULL AND NOT (?=1 AND subscription.cadence='digest') AND recent.subscription_id = subscription.id AND recent.page_id = ?
                  AND recent.event_type = ? AND recent.actor_id = ? AND recent.created_at > ?)`,
       )
       .bind(
@@ -1885,10 +1886,12 @@ export function slackChannelFanoutStatements(
         fanout.contentEpoch ?? null,
         fanout.spaceId,
         fanout.pageId,
+        fanout.retainDigestChanges ? 1 : 0,
         fanout.createdAt,
         fanout.threadId,
         fanout.eventType,
         coalesceAfter,
+        fanout.retainDigestChanges ? 1 : 0,
         fanout.pageId,
         fanout.eventType,
         fanout.actorId,
@@ -2004,6 +2007,7 @@ export async function sendPersonalSlackNotification(
   workspaceId: string,
   text: string,
   pageId: string,
+  presentation?: { escaped: boolean; sections?: string[] },
 ) {
   // A user linked in several workspaces must only hear about a workspace through that workspace's installation.
   const row = await env.DB.prepare(
@@ -2022,7 +2026,7 @@ export async function sendPersonalSlackNotification(
       }
     >();
   if (!row) return false;
-  const safeText = escapeSlackMrkdwn(text);
+  const safeText = presentation?.escaped ? text : escapeSlackMrkdwn(text);
   await slackApi(
     env,
     row,
@@ -2030,15 +2034,20 @@ export async function sendPersonalSlackNotification(
     {
       channel: row.slack_user_id,
       text: safeText,
-      blocks: [
-        {
-          type: "section",
-          text: {
-            type: "mrkdwn",
-            text: `${safeText}\n<${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(pageId)}|Open in NoteFlare>`,
-          },
-        },
-      ],
+      blocks: presentation?.sections
+        ? presentation.sections.map((section) => ({
+            type: "section",
+            text: { type: "mrkdwn", verbatim: true, text: section },
+          }))
+        : [
+            {
+              type: "section",
+              text: {
+                type: "mrkdwn",
+                text: `${safeText}\n<${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(pageId)}|Open in NoteFlare>`,
+              },
+            },
+          ],
     },
     {
       beforeDispatch: slackAccessAuthorization(env, row, {

@@ -9262,3 +9262,78 @@ describe("calm workspace task lists", () => {
     expect(await counts()).toEqual([30, 30]);
   });
 });
+
+it("authorizes checkpoint comparisons and rejects cross-page, reversed and expired pairs", async () => {
+  const installed = await bootstrap();
+  const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+  await stub.fetch(internalWarmupRequest());
+  for (const value of ["Before", "After"]) {
+    await runInDurableObject(stub, async (instance) => {
+      const document = (instance as unknown as TestDocument).document;
+      document.transact(() => installDocumentBlocks(document, documentBlock("linked-target", value).container), {
+        state: { userId: installed.userId },
+      });
+    });
+    await SELF.fetch(authenticatedRequest(installed.cookie, `/api/pages/${installed.pageId}/content`));
+  }
+  const checkpoints = await env.DB.prepare("SELECT id FROM page_change_checkpoints WHERE page_id=? ORDER BY sequence")
+    .bind(installed.pageId)
+    .all<{ id: string }>();
+  const first = checkpoints.results[0]!.id,
+    last = checkpoints.results.at(-1)!.id;
+  const compare = (page: string, a: string, b: string) =>
+    SELF.fetch(
+      authenticatedRequest(
+        installed.cookie,
+        `/api/pages/${page}/comparison?first=${encodeURIComponent(a)}&last=${encodeURIComponent(b)}`,
+      ),
+    );
+  const response = await compare(installed.pageId, last, last);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ comparison: { diff: { counts: { modified: 1 } } } });
+  expect((await compare(installed.pageId, last, first)).status).toBe(422);
+  const other = await createPage(installed.cookie);
+  expect((await compare(other.id, last, last)).status).toBe(410);
+  await env.DB.prepare("UPDATE page_change_checkpoints SET created_at=1 WHERE id=?").bind(last).run();
+  expect((await compare(installed.pageId, last, last)).status).toBe(410);
+});
+
+it("downgrades an owner's embedded diagram connection to a read-only grant", async () => {
+  const installed = await bootstrap();
+  const page = await createPage(installed.cookie, "diagram");
+  const response = await SELF.fetch(
+    authenticatedRequest(installed.cookie, `/parties/document/${page.id}~1?mode=read`, {
+      headers: { Upgrade: "websocket" },
+    }),
+  );
+  expect(response.status).toBe(101);
+  const socket = response.webSocket!;
+  socket.accept();
+  const stub = env.DOCUMENT.getByName(`${page.id}~1`);
+  await runInDurableObject(stub, async (instance) => {
+    const document = instance as unknown as {
+      getConnections(): Iterable<{ state: { role: string } }>;
+      isReadOnly(connection: unknown): boolean;
+      document: Y.Doc;
+      onMessage(connection: unknown, message: ArrayBuffer): Promise<void>;
+    };
+    const connections = Array.from(document.getConnections());
+    expect(connections).toHaveLength(1);
+    expect(connections[0]!.state.role).toBe("viewer");
+    expect(document.isReadOnly(connections[0])).toBe(true);
+    const attacker = new Y.Doc();
+    attacker.getMap("diagram:nodes").set("forbidden", new Y.Map());
+    const update = Y.encodeStateAsUpdate(attacker),
+      length: number[] = [];
+    let size = update.length;
+    while (size > 127) {
+      length.push((size & 127) | 128);
+      size >>>= 7;
+    }
+    length.push(size);
+    await document.onMessage(connections[0], new Uint8Array([0, 2, ...length, ...update]).buffer);
+    expect(document.document.getMap("diagram:nodes").has("forbidden")).toBe(false);
+    attacker.destroy();
+  });
+  socket.close();
+});

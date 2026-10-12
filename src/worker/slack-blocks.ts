@@ -1,3 +1,5 @@
+import { comparisonLines, comparisonUrl } from "./document-changes";
+import { digestExcerpts, type DigestComparison } from "../shared/block-diff";
 import type { Task } from "../shared/tasks";
 
 import type { Notification } from "../shared/types";
@@ -20,6 +22,7 @@ export type DigestPage = {
   departure: boolean;
   available: boolean;
   fileId?: string;
+  comparison?: DigestComparison;
 };
 export function digestBlocks(pages: DigestPage[], origin: string, mappingId: string, rich = true) {
   const blocks: unknown[] = [{ type: "header", text: { type: "plain_text", text: "NoteFlare daily digest" } }];
@@ -49,12 +52,36 @@ export function digestBlocks(pages: DigestPage[], origin: string, mappingId: str
     ]
       .filter(Boolean)
       .join(" · ");
+    const comparison = page.comparison && !page.departure && page.available ? page.comparison : null;
+    const full =
+      comparison?.first && comparison.last
+        ? `\n<${comparisonUrl(origin, page.pageId, comparison)}|Open full comparison>`
+        : "";
+    let section = `${heading}\n${metadata}`;
+    if (comparison) {
+      section += `\n${digestText(comparisonLines(comparison)[0]!, 300)}`;
+      for (const change of comparison.diff ? digestExcerpts(comparison.diff) : []) {
+        const labels =
+          change.kind === "added"
+            ? [`Added: ${change.after}`]
+            : change.kind === "removed"
+              ? [`Removed: ${change.before}`]
+              : [`Before: ${change.before}`, `After: ${change.after}`];
+        let excerpt = `\n${labels.map((line) => digestText(line, 600)).join("\n")}`;
+        if (change.kind !== "removed")
+          excerpt += `\n<${origin}/?page=${encodeURIComponent(page.pageId)}#block=${encodeURIComponent(change.id)}|Open ${change.kind} block>`;
+        if (section.length + excerpt.length + full.length > 3000) break;
+        section += excerpt;
+      }
+    }
+    if (!comparison?.diff && page.excerpt && !page.departure) section += `\n${digestText(page.excerpt, 300)}`;
+    section += full;
     blocks.push({
       type: "section",
       text: {
         type: "mrkdwn",
         verbatim: true,
-        text: `${heading}\n${metadata}${page.excerpt && !page.departure ? `\n${digestText(Array.from(page.excerpt).slice(0, 240).join(""), 600)}` : ""}`,
+        text: section,
       },
     });
     if (rich && page.fileId && !page.departure && page.available)

@@ -7034,7 +7034,12 @@ describe("App error handling", () => {
 
     const switcher = await screen.findByLabelText("Current space");
     await waitFor(() => expect(switcher).toBeEnabled());
-    fireEvent.click(screen.getByRole("button", { name: "Favorite" }));
+    // JSDOM does not apply the responsive CSS that hides the mobile menu action.
+    fireEvent.click(
+      screen
+        .getAllByRole("button", { name: "Favorite" })
+        .find((button) => button.classList.contains("favorite-action"))!,
+    );
     const favoritesSection = await screen.findByLabelText("Favorites");
     expect(await within(favoritesSection).findByText("Roadmap")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Page actions" }));
@@ -7066,7 +7071,11 @@ describe("App error handling", () => {
     // the restriction assertions below would pass even with the viewer checks removed.
     const secretsNode = screen.getByRole("treeitem", { name: "Secrets" });
     fireEvent.click(secretsNode);
-    expect(await screen.findByRole("button", { name: "Favorite" })).toBeInTheDocument();
+    expect(
+      (await screen.findAllByRole("button", { name: "Favorite" })).find((button) =>
+        button.classList.contains("favorite-action"),
+      ),
+    ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Pin" })).not.toBeInTheDocument();
     expect(queryArchive("Archive Secrets")).not.toBeInTheDocument();
   });

@@ -1,3 +1,4 @@
+import { checkpointStatements } from "./document-changes";
 import type { Connection, ConnectionContext, WSMessage } from "partyserver";
 import { SLACK_PRODUCT_SESSION_ACCESS_SQL } from "./slack-identity";
 import { tracing } from "cloudflare:workers";
@@ -1694,10 +1695,10 @@ export class Document extends YServer {
       // Every compaction writes a new projection object; without this the superseded
       // ones accumulate in R2 for the life of the page.
       const supersededProjection = await this.bindings.DB.prepare(
-        `SELECT r2_key FROM document_projections WHERE page_id = ?`,
+        `SELECT r2_key,content_epoch,sequence FROM document_projections WHERE page_id = ?`,
       )
         .bind(pageId)
-        .first<{ r2_key: string }>();
+        .first<{ r2_key: string; content_epoch: number; sequence: number }>();
       let versionAt = metadataAtStart.last_version_at;
       let versionKey: string | null = null;
       let versionStatementIndex = -1;
@@ -1965,6 +1966,7 @@ export class Document extends YServer {
                 contentEpoch: epoch,
                 threadId: null,
                 actorId: metadataAtStart.last_editor_id ?? "",
+                retainDigestChanges: this.bindings.DIFF_DIGESTS_ENABLED === "true",
                 eventType: "page_edit",
                 sourceId: `${pageId}:${epoch}:${maximum}`,
                 recipientIds: metadataAtStart.notify_edit ? watcherIds : [],
@@ -2017,12 +2019,34 @@ export class Document extends YServer {
           );
         }
 
+        if (!effectsSuppressed)
+          statements.push(
+            ...checkpointStatements(this.bindings, {
+              pageId,
+              epoch,
+              sequence: maximum,
+              afterKey: structuredKey,
+              before: supersededProjection,
+              actorId: metadataAtStart.last_editor_id,
+              recipients: metadataAtStart.notify_edit ? watcherIds : [],
+              timestamp,
+            }),
+          );
         const results = await this.bindings.DB.batch(statements);
         pageProjected = Boolean(results[0]?.meta.changes);
         if (pageProjected && (this.priorDateBlocks || structuredJson.includes('"dateMention"')))
           this.priorDateBlocks = dateTokenBlocks(json);
         const superseded = supersededProjection?.r2_key;
-        if (pageProjected && superseded && superseded !== structuredKey) {
+        if (
+          pageProjected &&
+          superseded &&
+          superseded !== structuredKey &&
+          !(await this.bindings.DB.prepare(
+            "SELECT 1 FROM page_change_checkpoints WHERE before_key=? OR after_key=? LIMIT 1",
+          )
+            .bind(superseded, superseded)
+            .first())
+        ) {
           this.state.waitUntil(
             this.bindings.BUCKET.delete(superseded).catch((error: unknown) => {
               logger.error(

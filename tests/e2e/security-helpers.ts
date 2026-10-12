@@ -6,6 +6,17 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 const ownerCookies = process.env.NOTES_E2E_COOKIES ?? ".wrangler/e2e/owner-cookies.json";
 const WORKSPACE_READY_TIMEOUT_MS = 20_000;
 
+export async function openNavigation(page: Page) {
+  const toggle = page.getByRole("button", { name: "Open navigation" });
+  if (!(await toggle.isVisible())) return;
+  const scrim = page.locator(".sidebar-scrim");
+  if (!(await scrim.isVisible())) await toggle.click();
+  await expect(scrim).toBeVisible();
+  await expect
+    .poll(async () => (await page.getByLabel("Workspace navigation").boundingBox())?.x ?? -1)
+    .toBeGreaterThanOrEqual(0);
+}
+
 export async function completeEnrollment(page: Page, trust = false) {
   await expect(page.getByRole("heading", { name: "Protect your account" })).toBeVisible();
   await page.getByLabel("Account password", { exact: true }).fill("password123");
@@ -56,7 +67,7 @@ export async function signInOwner(page: Page) {
   if (await page.getByRole("heading", { name: "Home", exact: true }).isVisible()) {
     const navigation = page.getByRole("button", { name: "Open navigation" });
     if (await navigation.isVisible()) await navigation.click();
-    await page.getByRole("treeitem").first().click();
+    await page.getByRole("treeitem").first().press("Enter");
   }
   await expect(page.getByLabel("Page title")).toBeVisible({ timeout: WORKSPACE_READY_TIMEOUT_MS });
   writeFileSync(ownerCookies, JSON.stringify(await page.context().cookies()), { mode: 0o600 });

@@ -53,7 +53,14 @@ export type MemberContext = {
 };
 
 export type ClientMemberContext = Omit<MemberContext, "session"> & {
-  features?: { expandedEmbeds: boolean; offlineEditing?: boolean; workspaceActivity?: boolean };
+  features?: {
+    expandedEmbeds: boolean;
+    offlineEditing?: boolean;
+    workspaceActivity?: boolean;
+    blockLinks?: boolean;
+    liveDiagramEmbeds?: boolean;
+    diffDigests?: boolean;
+  };
 };
 
 export type Page = {

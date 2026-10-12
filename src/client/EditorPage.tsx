@@ -18,8 +18,11 @@ import {
   FormattingToolbarController,
   FormattingToolbar,
   getFormattingToolbarItems,
+  SideMenuController,
 } from "@blocknote/react";
 import { createContext, useContext, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DiagramEmbedContext } from "./diagram-embed-context";
+import { BlockLinkControls, BlockLinkSideMenu } from "./block-links";
 import { WritingPanel } from "./WritingPanel";
 import {
   applyWriting,
@@ -34,7 +37,7 @@ import * as Y from "yjs";
 import type { ClientMemberContext, Space } from "../shared/types";
 import type { MentionSuggestion, Page } from "../shared/types";
 import { projectDocument, type ProseMirrorJson } from "../shared/document-projection";
-import { diffBlockIds } from "../shared/block-diff";
+import { diffDocuments } from "../shared/block-diff";
 import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import { BacklinksPanel } from "./BacklinksPanel";
 import {
@@ -225,7 +228,23 @@ export function EditorPage({
     typeof ClipboardItem !== "undefined" && Boolean(navigator.clipboard && "write" in navigator.clipboard);
   const [accessQuarantine, setAccessQuarantine] = useState(false);
   const [commentsOpen, setCommentsOpen] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(() =>
+    Boolean(member.features?.diffDigests && new URLSearchParams(window.location.search).get("compareFrom")),
+  );
+  useEffect(() => {
+    const openComparison = () => {
+      const params = new URLSearchParams(window.location.search);
+      if (
+        member.features?.diffDigests &&
+        params.get("page") === page.id &&
+        params.get("compareFrom") &&
+        params.get("compareTo")
+      )
+        setHistoryOpen(true);
+    };
+    window.addEventListener("popstate", openComparison);
+    return () => window.removeEventListener("popstate", openComparison);
+  }, [member.features?.diffDigests, page.id]);
   const [attachmentsOpen, setAttachmentsOpen] = useState(false);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
@@ -1253,6 +1272,7 @@ export function EditorPage({
               bundle={bundle}
               member={member}
               editable={editable}
+              offline={status === "offline"}
               panelTarget={panelTarget}
               commentsOpen={commentsVisible}
               pageId={page.id}
@@ -1455,6 +1475,7 @@ function CollaborativeEditor({
   bundle,
   member,
   editable,
+  offline,
   commentsOpen,
   panelTarget,
   pageId,
@@ -1473,6 +1494,7 @@ function CollaborativeEditor({
   member: ClientMemberContext;
   editable: boolean;
   commentsOpen: boolean;
+  offline: boolean;
   panelTarget: HTMLDivElement | null;
   pageId: string;
   isTemplate: boolean;
@@ -1842,146 +1864,160 @@ function CollaborativeEditor({
   };
   return (
     <DateMentionContext.Provider value={dateMentionContext}>
-      <EmbedFeatureContext.Provider value={member.features?.expandedEmbeds ?? false}>
-        <div
-          ref={editorShellRef}
-          onPasteCapture={(event) => {
-            if (!editable || event.clipboardData.files.length || event.isDefaultPrevented()) return;
-            if (
-              !(event.target instanceof Element) ||
-              !editorShellRef.current?.contains(event.target) ||
-              !event.target.closest('.bn-editor[contenteditable="true"]')
-            )
-              return;
-            const value = event.clipboardData.getData("text/plain").trim();
-            if (!safeBookmarkUrl(value) || /\s/.test(value)) return;
-            if (
-              !(
-                (member.features?.expandedEmbeds && value.startsWith("https://")) ||
-                resolveEmbed(value, member.features?.expandedEmbeds)
+      <DiagramEmbedContext.Provider
+        value={member.features?.liveDiagramEmbeds ? `${member.user.id}:${member.workspace.id}` : null}
+      >
+        <EmbedFeatureContext.Provider value={member.features?.expandedEmbeds ?? false}>
+          <div
+            ref={editorShellRef}
+            data-block-link-document={member.features?.blockLinks ? pageId : undefined}
+            onPasteCapture={(event) => {
+              if (!editable || event.clipboardData.files.length || event.isDefaultPrevented()) return;
+              if (
+                !(event.target instanceof Element) ||
+                !editorShellRef.current?.contains(event.target) ||
+                !event.target.closest('.bn-editor[contenteditable="true"]')
               )
-            )
-              return;
-            const block = editor.getTextCursorPosition().block;
-            if (block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) return;
-            event.preventDefault();
-            event.stopPropagation();
-            setPasteNotice("");
-            setPasteChoice({ url: value, blockId: block.id });
-          }}
-        >
-          <BlockNoteView
-            editor={editor}
-            editable={editable}
-            className="notes-editor"
-            theme={colorScheme}
-            slashMenu={false}
-            formattingToolbar={false}
+                return;
+              const value = event.clipboardData.getData("text/plain").trim();
+              if (!safeBookmarkUrl(value) || /\s/.test(value)) return;
+              if (
+                !(
+                  (member.features?.expandedEmbeds && value.startsWith("https://")) ||
+                  resolveEmbed(value, member.features?.expandedEmbeds)
+                )
+              )
+                return;
+              const block = editor.getTextCursorPosition().block;
+              if (block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) return;
+              event.preventDefault();
+              event.stopPropagation();
+              setPasteNotice("");
+              setPasteChoice({ url: value, blockId: block.id });
+            }}
           >
-            <WritingLaunchContext.Provider value={launchWriting}>
-              <FormattingToolbarController formattingToolbar={WritingFormattingToolbar} />
-            </WritingLaunchContext.Provider>
-            {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
-            {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
-            {commentsOpen &&
+            <BlockNoteView
+              editor={editor}
+              editable={editable}
+              className="notes-editor"
+              theme={colorScheme}
+              slashMenu={false}
+              formattingToolbar={false}
+              sideMenu={member.features?.blockLinks ? false : undefined}
+            >
+              {member.features?.blockLinks && <SideMenuController sideMenu={BlockLinkSideMenu} />}
+              <WritingLaunchContext.Provider value={launchWriting}>
+                <FormattingToolbarController formattingToolbar={WritingFormattingToolbar} />
+              </WritingLaunchContext.Provider>
+              {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
+              {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
+              {commentsOpen &&
+                panelTarget &&
+                createPortal(
+                  <div ref={commentsPanel} className="comments-panel">
+                    <h2>Comments</h2>
+                    <p className="muted">
+                      {editable
+                        ? "Select text and use the formatting toolbar to start a thread."
+                        : "You can comment and reply even while the document is read-only."}
+                    </p>
+                    {commentError && <p className="form-error">{commentError}</p>}
+                    <ThreadsSidebar filter="all" sort="position" />
+                  </div>,
+                  panelTarget,
+                )}
+            </BlockNoteView>
+            {writingTarget &&
               panelTarget &&
               createPortal(
-                <div ref={commentsPanel} className="comments-panel">
-                  <h2>Comments</h2>
-                  <p className="muted">
-                    {editable
-                      ? "Select text and use the formatting toolbar to start a thread."
-                      : "You can comment and reply even while the document is read-only."}
-                  </p>
-                  {commentError && <p className="form-error">{commentError}</p>}
-                  <ThreadsSidebar filter="all" sort="position" />
+                <div hidden={!writingOpen}>
+                  <WritingPanel
+                    pageId={pageId}
+                    initialTarget={writingTarget}
+                    launchRequest={panelLaunch}
+                    visible={writingOpen}
+                    onBusyChange={writingBusyChanged}
+                    editable={editable}
+                    ready={writingReady}
+                    subscribeReadiness={subscribeWritingReadiness}
+                    onCapture={captureWriting}
+                    onApply={(target, markdown, mode, epoch, protectedIds) => {
+                      if (!editable || !editor.isEditable)
+                        throw new WritingTargetError("This document is read-only. You can copy the result.");
+                      if (epoch !== contentEpoch)
+                        throw new WritingTargetError(
+                          "The page was restored. Reopen its current document before inserting.",
+                        );
+                      const undo = yUndoPluginKey.getState(editor.prosemirrorState)?.undoManager;
+                      undo?.stopCapturing();
+                      editor.transact((tr) => applyWriting(tr, target, epoch, markdown, mode, protectedIds));
+                      undo?.stopCapturing();
+                      editor.focus();
+                    }}
+                    onClose={onWritingClose}
+                  />
                 </div>,
                 panelTarget,
               )}
-          </BlockNoteView>
-          {writingTarget &&
-            panelTarget &&
-            createPortal(
-              <div hidden={!writingOpen}>
-                <WritingPanel
-                  pageId={pageId}
-                  initialTarget={writingTarget}
-                  launchRequest={panelLaunch}
-                  visible={writingOpen}
-                  onBusyChange={writingBusyChanged}
-                  editable={editable}
-                  ready={writingReady}
-                  subscribeReadiness={subscribeWritingReadiness}
-                  onCapture={captureWriting}
-                  onApply={(target, markdown, mode, epoch, protectedIds) => {
-                    if (!editable || !editor.isEditable)
-                      throw new WritingTargetError("This document is read-only. You can copy the result.");
-                    if (epoch !== contentEpoch)
-                      throw new WritingTargetError(
-                        "The page was restored. Reopen its current document before inserting.",
-                      );
-                    const undo = yUndoPluginKey.getState(editor.prosemirrorState)?.undoManager;
-                    undo?.stopCapturing();
-                    editor.transact((tr) => applyWriting(tr, target, epoch, markdown, mode, protectedIds));
-                    undo?.stopCapturing();
+            {pasteChoice && (
+              <fieldset ref={pasteChoiceRef} className="paste-url-choice">
+                <legend>Paste as</legend>
+                <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("link")}>
+                  Link
+                </button>
+                {member.features?.expandedEmbeds && pasteChoice.url.startsWith("https://") && (
+                  <button
+                    type="button"
+                    disabled={!editable || !editor.isEditable}
+                    onClick={() => choosePaste("preview")}
+                  >
+                    Preview card
+                  </button>
+                )}
+                {resolveEmbed(pasteChoice.url, member.features?.expandedEmbeds) && (
+                  <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("embed")}>
+                    Embed
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPasteChoice(null);
+                    setPasteNotice("");
                     editor.focus();
                   }}
-                  onClose={onWritingClose}
-                />
-              </div>,
-              panelTarget,
+                >
+                  Cancel
+                </button>
+              </fieldset>
             )}
-          {pasteChoice && (
-            <fieldset ref={pasteChoiceRef} className="paste-url-choice">
-              <legend>Paste as</legend>
-              <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("link")}>
-                Link
-              </button>
-              {member.features?.expandedEmbeds && pasteChoice.url.startsWith("https://") && (
-                <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("preview")}>
-                  Preview card
-                </button>
-              )}
-              {resolveEmbed(pasteChoice.url, member.features?.expandedEmbeds) && (
-                <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("embed")}>
-                  Embed
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => {
-                  setPasteChoice(null);
-                  setPasteNotice("");
+            {member.features?.blockLinks && (
+              <BlockLinkControls root={editorShellRef} pageId={pageId} bundle={bundle} offline={offline} />
+            )}
+            <output className="muted" aria-live="polite" aria-label="Paste status">
+              {pasteNotice}
+            </output>
+            {dateInsert && (
+              <DateMentionPicker
+                key={dateInsert.tokenId}
+                initial={dateInsert}
+                label="Insert date mention"
+                onSave={(next) => {
+                  if (!editable || !editor.isEditable) return "This document is read only.";
+                  editor.insertInlineContent([{ type: "dateMention", props: dateMentionWireProps(next) }, " "], {
+                    updateSelection: true,
+                  });
+                  return null;
+                }}
+                onClose={() => {
+                  setDateInsert(null);
                   editor.focus();
                 }}
-              >
-                Cancel
-              </button>
-            </fieldset>
-          )}
-          <output className="muted" aria-live="polite" aria-label="Paste status">
-            {pasteNotice}
-          </output>
-          {dateInsert && (
-            <DateMentionPicker
-              key={dateInsert.tokenId}
-              initial={dateInsert}
-              label="Insert date mention"
-              onSave={(next) => {
-                if (!editable || !editor.isEditable) return "This document is read only.";
-                editor.insertInlineContent([{ type: "dateMention", props: dateMentionWireProps(next) }, " "], {
-                  updateSelection: true,
-                });
-                return null;
-              }}
-              onClose={() => {
-                setDateInsert(null);
-                editor.focus();
-              }}
-            />
-          )}
-        </div>
-      </EmbedFeatureContext.Provider>
+              />
+            )}
+          </div>
+        </EmbedFeatureContext.Provider>
+      </DiagramEmbedContext.Provider>
     </DateMentionContext.Provider>
   );
 }
@@ -2038,6 +2074,7 @@ function HistoryPanel({
   return (
     <aside className="side-panel history-panel">
       <h2>History</h2>
+      {member.features?.diffDigests && <SavedComparison pageId={page.id} />}
       <p className="muted">Automatic snapshots are kept for 30 days, up to 200.</p>
       <div className="version-list">
         {versions.map((version) => (
@@ -2064,19 +2101,108 @@ function HistoryPanel({
   );
 }
 
+function SavedComparison({ pageId }: { pageId: string }) {
+  const query = useCallback(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("page") === pageId && params.get("compareFrom") && params.get("compareTo")
+      ? new URLSearchParams({ first: params.get("compareFrom")!, last: params.get("compareTo")! }).toString()
+      : "";
+  }, [pageId]);
+  const [pair, setPair] = useState(query);
+  const [loaded, setLoaded] = useState<{
+    key: string;
+    result: { diff: import("../shared/block-diff").DocumentDiff | null } | null;
+    error: string;
+  }>({ key: "", result: null, error: "" });
+  const result = loaded.key === pair ? loaded.result : null;
+  const error = loaded.key === pair ? loaded.error : "";
+  useEffect(() => {
+    const change = () => setPair(query());
+    window.addEventListener("popstate", change);
+    return () => window.removeEventListener("popstate", change);
+  }, [query]);
+  useEffect(() => {
+    if (!pair) return undefined;
+    let active = true;
+    void api<{ comparison: { diff: import("../shared/block-diff").DocumentDiff | null } }>(
+      `/api/pages/${encodeURIComponent(pageId)}/comparison?${pair}`,
+    )
+      .then((response) => {
+        if (active) setLoaded({ key: pair, result: response.comparison, error: "" });
+      })
+      .catch((failure: unknown) => {
+        if (active)
+          setLoaded({
+            key: pair,
+            result: null,
+            error: apiErrorMessage(failure, "This comparison is no longer available."),
+          });
+      });
+    return () => {
+      active = false;
+    };
+  }, [pageId, pair]);
+  if (!pair) return null;
+  return (
+    <section aria-label="Digest comparison">
+      <h3>Digest comparison</h3>
+      {error ? (
+        <output>{error}</output>
+      ) : result ? (
+        result.diff ? (
+          <DocumentComparison diff={result.diff} pageId={pageId} />
+        ) : (
+          <p>Comparison unavailable. Its original snapshots may be missing or too large.</p>
+        )
+      ) : (
+        <output>Loading comparison…</output>
+      )}
+    </section>
+  );
+}
+
 function BlockDiff({ oldDoc, currentDoc }: { oldDoc: Y.Doc; currentDoc: Y.Doc }) {
-  const oldXml = oldDoc.getXmlFragment("document-store").toString();
-  const currentXml = currentDoc.getXmlFragment("document-store").toString();
-  const diff = diffBlockIds(oldXml, currentXml);
+  const before = yXmlFragmentToProsemirrorJSON(oldDoc.getXmlFragment("document-store")) as ProseMirrorJson;
+  const after = yXmlFragmentToProsemirrorJSON(currentDoc.getXmlFragment("document-store")) as ProseMirrorJson;
+  return <DocumentComparison diff={diffDocuments(before, after)} />;
+}
+
+function DocumentComparison({ diff, pageId }: { diff: import("../shared/block-diff").DocumentDiff; pageId?: string }) {
   return (
     <div className="block-diff" aria-label="Block-level version comparison">
-      <span className="diff-added">+{diff.added.length} blocks</span>
-      <span className="diff-removed">−{diff.removed.length} blocks</span>
-      <span>{diff.identical ? "No content changes" : "Changed blocks are shown by stable block ID"}</span>
-      <div className="diff-columns">
-        <pre>{plainYDoc(oldDoc)}</pre>
-        <pre>{plainYDoc(currentDoc)}</pre>
-      </div>
+      <p>
+        +{diff.counts.added} added · −{diff.counts.removed} removed · {diff.counts.modified} modified ·{" "}
+        {diff.counts.moved} moved
+      </p>
+      {diff.identical && <p>No content changes</p>}
+      {diff.changes.map((change) => (
+        <section key={`${change.id}:${change.kind}`} className={`diff-${change.kind}`}>
+          <strong>
+            {change.kind === "modified"
+              ? "Changed"
+              : change.kind === "added"
+                ? "Added"
+                : change.kind === "removed"
+                  ? "Removed"
+                  : "Moved"}
+          </strong>
+          {pageId && change.kind !== "removed" && (
+            <a href={`/?page=${encodeURIComponent(pageId)}#block=${encodeURIComponent(change.id)}`}>Open block</a>
+          )}
+          {change.before && (
+            <div>
+              <span>Before</span>
+              <pre>{change.before}</pre>
+            </div>
+          )}
+          {change.after && (
+            <div>
+              <span>After</span>
+              <pre>{change.after}</pre>
+            </div>
+          )}
+        </section>
+      ))}
     </div>
   );
 }

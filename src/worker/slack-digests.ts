@@ -1,3 +1,4 @@
+import { digestComparison, type ChangeCheckpoint } from "./document-changes";
 import { withSlackPrimaryError } from "./slack-delivery";
 import { verifyHistoryPage as reconcileBotPost, type HistoryVerificationOptions } from "./slack-history";
 import {
@@ -333,7 +334,7 @@ export async function digestPages(
   mapping: Mapping,
   receipt: DigestReceipt,
   installation: SlackInstallation,
-  message?: { page_ids_json: string; event_ids_json: string; sequence?: number },
+  message?: { page_ids_json: string; event_ids_json: string; sequence?: number; comparison_refs_json?: string },
 ): Promise<DigestPage[]> {
   const threads = OPEN_THREAD_COUNT_SQL.replaceAll("p.", "page.");
   const status = TASK_STATUS_SQL.replaceAll("p.", "page.");
@@ -386,6 +387,39 @@ export async function digestPages(
       departure,
       available,
     };
+    if (
+      env.DIFF_DIGESTS_ENABLED === "true" &&
+      row.kind === "document" &&
+      available &&
+      !departure &&
+      item.eventTypes.includes("page_edit")
+    ) {
+      let pair: { first: string; last: string } | undefined;
+      if (message)
+        pair = (JSON.parse(message.comparison_refs_json ?? "{}") as Record<string, { first: string; last: string }>)[
+          row.id
+        ];
+      else {
+        const checkpoints = await env.DB.prepare(
+          "SELECT * FROM page_change_checkpoints WHERE page_id=? AND created_at>=? AND created_at<? ORDER BY created_at,content_epoch,sequence",
+        )
+          .bind(row.id, receipt.window_start, receipt.window_end)
+          .all<ChangeCheckpoint>();
+        const qualifying = checkpoints.results.filter((checkpoint) =>
+          events.some((event) => event.eventId.startsWith(`page_edit:${checkpoint.id}:`)),
+        );
+        const covered = events
+          .filter((event) => event.type === "page_edit")
+          .every((event) => qualifying.some((checkpoint) => event.eventId.startsWith(`page_edit:${checkpoint.id}:`)));
+        pair = {
+          first: covered ? (qualifying[0]?.id ?? "") : "",
+          last: covered ? (qualifying.at(-1)?.id ?? "") : "",
+        };
+      }
+      item.comparison = pair
+        ? await digestComparison(env, row.id, pair.first, pair.last)
+        : { first: "", last: "", diff: null };
+    }
     if (row.kind === "diagram" && available && !departure)
       await attachThumbnail(env, item, installation, row.content_epoch);
     result.push(item);
@@ -494,6 +528,7 @@ type DigestMessage = {
   page_ids_json: string;
   event_ids_json: string;
   attempted_at: number | null;
+  comparison_refs_json: string;
 };
 
 async function nextMessage(
@@ -524,16 +559,24 @@ async function nextMessage(
     page_ids_json: JSON.stringify(pages.map((p) => p.pageId)),
     event_ids_json: JSON.stringify(pages.flatMap((p) => p.eventIds ?? [])),
     attempted_at: null,
+    comparison_refs_json: JSON.stringify(
+      Object.fromEntries(
+        pages
+          .filter((page) => page.comparison)
+          .map((page) => [page.pageId, { first: page.comparison!.first, last: page.comparison!.last }]),
+      ),
+    ),
   };
   await env.DB.batch([
-    env.DB.prepare(`INSERT INTO slack_digest_messages(id,receipt_id,sequence,page_ids_json,event_ids_json,claim_token)
-      SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
+    env.DB.prepare(`INSERT INTO slack_digest_messages(id,receipt_id,sequence,page_ids_json,event_ids_json,claim_token,comparison_refs_json)
+      SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
       message.id,
       receipt.id,
       sequence,
       message.page_ids_json,
       message.event_ids_json,
       token,
+      message.comparison_refs_json,
       receipt.id,
       token,
     ),

@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { signInOwner } from "./security-helpers";
+import { openNavigation, signInOwner } from "./security-helpers";
 import type { AiConversation, AiGenerate, AiStatus } from "../../src/shared/ai";
 import type { Page } from "../../src/shared/types";
 
@@ -202,8 +202,7 @@ test("writing streams into a read-only preview, applies with undo, preserves con
   const accessibility = await new AxeBuilder({ page }).include(".writing-panel").analyze();
   expect(accessibility.violations).toEqual([]);
   await writing.getByRole("button", { name: "Close writing" }).click();
-  const navigation = page.getByRole("button", { name: "Open navigation" });
-  if (await navigation.isVisible()) await navigation.click();
+  await openNavigation(page);
   await page.getByRole("button", { name: "My writing", exact: true }).click();
   await expect(page.getByRole("heading", { name: "My writing library" })).toBeVisible();
   await page.getByRole("button", { name: "Browser writing", exact: true }).click();
@@ -212,11 +211,11 @@ test("writing streams into a read-only preview, applies with undo, preserves con
   expect(explicitOpens).toBe(1);
   await writing.getByRole("button", { name: "Close writing" }).click();
   const otherDocument = tree.pages.find((item) => item.kind === "document" && item.id !== document.id)!;
-  if (await navigation.isVisible()) await navigation.click();
-  await page.getByRole("treeitem", { name: otherDocument.title, exact: true }).click();
+  await openNavigation(page);
+  await page.locator(`[data-tree-page="${otherDocument.id}"]`).press("Enter");
   await expect(page).toHaveURL(new RegExp(`page=${otherDocument.id}`));
-  if (await navigation.isVisible()) await navigation.click();
-  await page.getByRole("treeitem", { name: document.title, exact: true }).click();
+  await openNavigation(page);
+  await page.getByRole("treeitem", { name: document.title, exact: true }).press("Enter");
   await expect(editor).toBeVisible();
   await expect(editor).toContainText("Collaborator changed this source.");
   await expect(editor).toContainText("Clear writing result.");
@@ -226,7 +225,7 @@ test("writing streams into a read-only preview, applies with undo, preserves con
   await page.keyboard.press(
     await page.evaluate(() => (/Mac|iPhone|iPad/.test(navigator.platform) ? "Meta+a" : "Control+a")),
   );
-  await page.getByRole("button", { name: "Writing with selection", exact: true }).click();
+  await page.getByRole("button", { name: "Writing with selection", exact: true }).press("Enter");
   await expect(writing.getByText("Selected text", { exact: true })).toBeVisible();
   expect(explicitOpens).toBe(1);
   await expect(writing.getByRole("button", { name: /^Generate/ })).toBeVisible();

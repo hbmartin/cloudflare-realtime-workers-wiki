@@ -10,6 +10,7 @@ export const SCHEDULED_TASK_NAMES = [
   "slack_redrive",
   "job_artifacts",
   "notification_digests",
+  "document_changes",
   "date_reminders",
   "slack_digests",
   "slack_security_records",
