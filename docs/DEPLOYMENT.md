@@ -9,6 +9,87 @@ named here.
 Existing installations intentionally retain their `cloudflare-realtime-notes` Worker and resource
 identifiers. These deployment names are compatibility details; the product presented to users is NoteFlare.
 
+## Browser deployment
+
+For a new installation, use Cloudflare's native
+[Deploy to Cloudflare flow](https://developers.cloudflare.com/workers/platform/deploy-buttons/).
+Account authorization, Workers Paid activation, and R2 activation are user steps. The application
+requires no terminal commands or manual resource-ID editing in this flow.
+
+1. Connect GitHub and Cloudflare and choose a repository, Worker name, D1 database, R2 bucket,
+   delivery queue, and dead-letter queue in the deployment form. Cloudflare provisions the resources.
+2. Leave `BETTER_AUTH_URL` as `auto`. Supply only `BOOTSTRAP_TOKEN`, labeled as the private **setup
+   key**, with at least 32 random characters. Keep this key in a password manager.
+3. Keep the detected `pnpm run build` and `pnpm run deploy` commands. Preparation resolves the
+   authenticated account and Worker settings before Vite captures the configuration. It uses an
+   existing exact HTTPS origin or derives `https://<worker>.<account-subdomain>.workers.dev` from
+   Cloudflare's authenticated account API. Incoming request hosts never determine the auth origin.
+4. Deployment applies migrations before uploading code, verifies `/api/health` and `/api/install`,
+   and prints the installation URL. Open it, enter the setup key, create the owner, enroll an
+   authenticator or passkey, and save recovery codes.
+5. Delete `BOOTSTRAP_TOKEN` in the Worker's **Settings → Variables and Secrets** after owner setup.
+   Redeployment does not recreate a removed setup key after initialization.
+
+An uninitialized installation receives independent 32-byte `BETTER_AUTH_SECRET`,
+`WEBHOOK_ENCRYPTION_KEY`, and `OBSERVABILITY_PROBE_TOKEN` values only when those secrets are missing.
+Generated values travel with the Worker upload in an owner-readable temporary secrets file that is
+removed after success or failure. They are never written to generated configuration or build metadata.
+Existing secrets are preserved without reading their values. If an initialized installation is missing
+`BETTER_AUTH_SECRET`, deployment stops: restore its original value from your secret backup before
+retrying. Automatic replacement would invalidate sessions and internal authentication.
+
+New portable installations enable expanded embeds, offline editing, block links, live diagram embeds,
+and diff digests. Notion Markdown, workspace activity, Slack rollout flags, permissions, and owner
+settings retain their existing defaults. Slack, AI connections, and custom domains can be configured
+later.
+
+### Portable updates and custom domains
+
+Push an update to the repository Cloudflare created, or use **Retry deployment** after correcting a
+failed build. Workers Builds prepares once, builds once, then verifies the build UUID, revision,
+source, target, and generated configuration before migrating and uploading. Its ignored
+`.wrangler/noteflare-build.json` metadata must belong to the current run. Retry reuses resource bindings
+and already-applied migrations. Saved dashboard variables, including feature settings, are retained.
+
+For a custom domain, attach it under **Settings → Domains & Routes** and set the Worker's
+`BETTER_AUTH_URL` plaintext variable to that exact HTTPS origin (no path or trailing slash), then
+redeploy. The portable template's `auto` value preserves this saved origin. An explicit HTTPS origin
+in the repository overrides `auto`; keep the repository and dashboard in agreement. Secrets remain
+Worker secrets and do not need to be copied into the repository or build settings.
+
+Operators redeploying a portable installation from a local checkout use `pnpm deploy:one-click`;
+ordinary local `pnpm build`, `pnpm deploy`, and `pnpm deploy:production` still select the named legacy
+`production` environment. In Workers Builds, an explicit `CLOUDFLARE_ENV` takes precedence; otherwise
+an existing Worker is recognized as legacy production only when its Worker identity and D1 binding
+both match that environment. `WRANGLER_CI_OVERRIDE_NAME` selects the actual Worker name. Do not enable
+both GitHub Actions and Workers Builds as independent production release systems.
+
+### Fresh installs and upgrade safeguards
+
+The migration wrapper accepts `--config` so migration and upload use the same Vite-generated
+configuration. It skips upgrade-only quiescence confirmations only if `0001_initial.sql` is pending,
+there are no application tables, and no migrations have been recorded. Only known D1/SQLite internal
+tables are ignored. Unexpected tables, applied history with a pending baseline, malformed query
+results, and failed queries stop deployment before upload.
+
+Every other database retains page-move and Slack migration confirmations and digest-collision
+preflights. No deployment helper sets those confirmations automatically. SQL files and ordering are
+unchanged; follow the upgrade procedures below before retrying a guarded upgrade.
+
+### Native-button release checklist
+
+Publish the README deploy button only after testing a disposable deployment with Cloudflare's default
+authorization and package-manager launcher. Verify owner creation, MFA, collaborative editing,
+attachment upload, export, and each of the five enabled editor features. Then remove the setup key,
+create content, change a feature setting, and redeploy. Confirm the resource bindings, origin, secret
+names, owner, content, and saved feature settings persist. Validate the existing GitHub Actions
+production selection and release gate separately. Dry runs alone do not satisfy this release check.
+
+## Existing production deployment
+
+The following manual path and GitHub Actions release gate continue using the named `production`
+environment and its original resources, URL, flags, and Durable Object migration tags.
+
 ## 0. Prerequisites
 
 - Node.js 22.22.2+ in the Node 22 release line, 24.15+ in the Node 24 release line, or 26+; and pnpm 11.18.0.
@@ -40,8 +121,9 @@ Bucket names may be changed as long as the binding remains `BUCKET`.
 
 ## 2. Configure the production environment
 
-The top-level bindings in `wrangler.jsonc` are local-safe defaults. Remote commands and deployment use
-the named `production` environment, which keeps account-specific values out of local development.
+The top-level bindings in `wrangler.jsonc` are portable installation defaults; Vite supplies a localhost
+origin during local development. Ordinary local deployment commands use the named `production`
+environment, which retains its account-specific resources.
 
 Set the production **`database_id`** to the ID returned by `d1 create`:
 
@@ -190,8 +272,9 @@ new schema. `pnpm db:remote` remains available for a deliberate migration-only o
 
 Remote releases with pending Slack migrations `0069`, `0070`, `0071`, `0072`, `0073`, `0074`, `0075`, `0076`, `0077`, or `0078` require
 `SLACK_REVIEW_MIGRATION_SAFE=true` after the [Slack rollout pause](#slack-review-follow-up-migration).
-This guard applies to both `pnpm db:remote` and `pnpm run deploy`; local database migrations do not
-require confirmation. The confirmation acknowledges an operator-completed pause and drain, rather
+This guard applies to both `pnpm db:remote` and `pnpm run deploy`; verified fresh databases and local
+database migrations do not require upgrade confirmation. Pending remote `0011` also requires
+`PAGE_MOVE_RECEIPT_MIGRATION_SAFE=true` after the page-move compatibility or quiescence check below. The confirmation acknowledges an operator-completed pause and drain, rather
 than pausing consumers automatically.
 
 Before an older database applies `0067_review_delivery.sql`, quiesce legacy digest scheduling and keep it
@@ -291,7 +374,8 @@ Open the deployment and complete the first-run screen, or call the API directly:
 curl -s https://notes.example.com/api/install          # {"initialized":false}
 ```
 
-Submit the workspace name, owner name, email, password, and `BOOTSTRAP_TOKEN` on the install screen.
+Submit the workspace name, owner name, email, password, and setup key (`BOOTSTRAP_TOKEN`) on the install screen.
+Enroll an authenticator or passkey and save recovery codes before entering the workspace.
 Passwords must be at least 8 characters. There is no email verification and no password reset by
 design; recovery means an owner revokes and reinvites the account.
 

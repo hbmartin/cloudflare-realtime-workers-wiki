@@ -1,3 +1,4 @@
+import { escapeHtml } from "./html";
 import { DOCX_MIME } from "../shared/docx-metadata";
 import { EXPORT_CAPABILITIES } from "../shared/export-format";
 import type { WorkflowStep } from "cloudflare:workers";
@@ -71,10 +72,6 @@ function exportOptions(job: JobRow): ExportOptions {
     throw new Error("Export options are invalid.");
   }
   return options as ExportOptions;
-}
-
-function escapeHtml(value: string) {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 
 function escapeMarkdownCell(value: string) {

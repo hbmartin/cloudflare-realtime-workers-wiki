@@ -2044,6 +2044,7 @@ function HistoryPanel({
   const [versions, setVersions] = useState<Version[]>([]);
   const [selected, setSelected] = useState<Version | null>(null);
   const [snapshot, setSnapshot] = useState<Y.Doc | null>(null);
+  const snapshotPreview = useMemo(() => (snapshot ? plainYDoc(snapshot) : ""), [snapshot]);
   const [snapshotError, setSnapshotError] = useState("");
   const selectionRequest = useRef(0);
   const [busy, setBusy] = useState(false);
@@ -2127,7 +2128,7 @@ function HistoryPanel({
       {snapshot && (
         <section aria-label="Saved version preview">
           <h3>Saved version preview</h3>
-          <pre>{plainYDoc(snapshot)}</pre>
+          <pre>{snapshotPreview}</pre>
         </section>
       )}
       {member.role === "owner" && selected && snapshot && (

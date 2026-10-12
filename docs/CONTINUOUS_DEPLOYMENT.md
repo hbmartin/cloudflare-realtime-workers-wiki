@@ -172,12 +172,12 @@ environment exists.
 GitHub Actions is one of four workable shapes. The others are not wrong; they trade differently, and
 two of them are constrained by this Worker's Durable Objects in ways worth knowing before choosing.
 
-| Approach                     | Gates on the full suite | Orders D1 migrations | Manual approval | Per-commit preview  | Extra Cloudflare resources  |
-| ---------------------------- | ----------------------- | -------------------- | --------------- | ------------------- | --------------------------- |
-| GitHub Actions (current)     | Yes                     | Yes                  | Optional        | No                  | None                        |
-| Workers Builds               | Not within 20 min       | With a custom token  | No              | Not for this Worker | None                        |
-| Gradual deployments          | Inherits its caller     | Caller's job         | Inherent        | Not for this Worker | None                        |
-| Staging Wrangler environment | Yes                     | Yes                  | Optional        | A full environment  | A second D1, R2, and DO set |
+| Approach                     | Gates on the full suite | Orders D1 migrations  | Manual approval | Per-commit preview  | Extra Cloudflare resources  |
+| ---------------------------- | ----------------------- | --------------------- | --------------- | ------------------- | --------------------------- |
+| GitHub Actions (current)     | Yes                     | Yes                   | Optional        | No                  | None                        |
+| Workers Builds               | Not within 20 min       | Guarded deploy helper | No              | Not for this Worker | None                        |
+| Gradual deployments          | Inherits its caller     | Caller's job          | Inherent        | Not for this Worker | None                        |
+| Staging Wrangler environment | Yes                     | Yes                   | Optional        | A full environment  | A second D1, R2, and DO set |
 
 ### Workers Builds
 
@@ -187,37 +187,25 @@ infrastructure with no GitHub Actions involved. The default deploy command is `n
 pushes to non-production branches run `npx wrangler versions upload` instead, creating a version
 without promoting it.
 
-Configured for this repository it would need three changes from the defaults:
+The native deploy flow detects `pnpm run build` and `pnpm run deploy`. The helper resolves the
+installation target before Vite builds, applies guarded D1 migrations, uploads the same generated
+configuration and missing internal secrets, and verifies health and install status. Workers Builds
+reuses the build only when its UUID, revision, source, target, and generated configuration match.
+An explicit `CLOUDFLARE_ENV` wins; otherwise a Worker whose deployed name and D1 binding both match the
+named `production` environment keeps the legacy target. New installations use the portable template.
+See [Browser deployment](DEPLOYMENT.md#browser-deployment).
 
-- A build command that gates the release, since a build only fails on its own command's exit code.
-- A deploy command that orders the migration ahead of the deploy:
+Workers Builds remains separate from the existing GitHub Actions release gate. It has a hard
+20-minute build timeout, and the complete test suite does not fit that budget. Keep the existing
+Actions gate for the legacy production installation; do not enable two independent automatic
+release systems for one Worker. Migration confirmation variables are never inferred or enabled by
+the helper.
 
-  ```sh
-  pnpm run deploy
-  ```
-
-  This repository command builds, applies pending D1 migrations, and uploads the Worker in order.
-  A failed build or migration prevents the upload.
-
-- **A custom API token.** The token Cloudflare generates for builds carries Workers Scripts, Workers
-  KV, Workers R2, and Workers Routes edit, plus account and user reads — but no D1 permission at
-  all. The migration step fails under the default token. Supply a token carrying D1 Edit under the
-  same Builds settings.
-
-What it cannot do here is the gate. Builds are a single container with a hard **20-minute timeout**,
-so the suite runs serially where CI runs five jobs in parallel — the Chromium e2e job alone is
-allowed 25 minutes. The build image ships no browsers, so Playwright would have to install them
-inside that same budget. It also has no equivalent of required reviewers, no post-deploy health
-probe, and no way to refuse a commit because a _different_ system's checks failed.
-
-Two version details need attention: the build image defaults to Node 24, which must resolve to 24.15 or
-newer to satisfy this repository's engine range, and it ships pnpm 10.11.1 rather than the
-`packageManager` pin of pnpm 11.18.0. Node pins cleanly with a `NODE_VERSION` build variable or an
-`.nvmrc`; confirm which pnpm the install step actually resolves before trusting a `--frozen-lockfile`
-install.
-
-Workers Builds is the better choice for a Worker whose entire test suite finishes in twenty minutes.
-This one does not.
+`.node-version` pins Node 24.18.0 and `packageManager` pins pnpm 11.18.0. The build image's default
+package-manager launcher must delegate to that version and complete `pnpm install --frozen-lockfile`.
+Before publishing the README button, exercise its default account authorization in a disposable
+installation. Ordinary Workers Builds tokens may need additional product permissions for D1 queries
+and migrations; a dry run or an OAuth-authenticated local deploy does not verify the native token.
 
 ### Preview URLs do not exist for this Worker
 

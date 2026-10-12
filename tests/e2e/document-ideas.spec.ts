@@ -25,6 +25,11 @@ test("block links remain usable through fragment history and clipboard denial", 
   const block = editor.locator("[data-id]").filter({ hasText: "Linked target" }).first();
   const id = await block.getAttribute("data-id");
   expect(id).toBeTruthy();
+  await page.getByRole("button", { name: "Block actions", exact: true }).click();
+  await editor.click();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Block actions" })).toBeHidden();
+  await expect(page.getByRole("button", { name: "Block actions", exact: true })).toBeFocused();
   await page.getByRole("button", { name: "Block actions", exact: true }).focus();
   await page.keyboard.press("Shift+F10");
   await page.getByRole("menuitem", { name: "Copy link to block" }).click();

@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "pnpm build:plugin-ui && vite",
     "dev:e2e": "pnpm build:plugin-ui && node scripts/e2e-server.mjs",
-    "build": "pnpm build:plugin-ui && pnpm typecheck && vite build && node scripts/build-offline-worker.mjs",
+    "build": "node scripts/deploy.mjs build",
     "build:worker": "wrangler deploy --env production --dry-run --outdir .wrangler/dry-run",
     "preview": "vite preview",
     "test": "pnpm test:unit && pnpm test:worker",
@@ -45,13 +45,16 @@
     "db:remote": "node scripts/migrate-d1.mjs --env production --remote",
     "db:export": "node scripts/d1-export.mjs",
     "check": "pnpm format:check && pnpm lint && pnpm check:middleware && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker",
-    "deploy": "pnpm build && pnpm db:remote && wrangler deploy --env production",
+    "deploy": "node scripts/deploy.mjs deploy",
     "security:reset": "node scripts/security-reset.mjs",
     "observability:report": "node scripts/observability.mjs report",
     "observability:check": "node scripts/observability.mjs check",
     "build:plugin-ui": "node scripts/build-plugin-ui.mjs",
     "plugin:link": "node scripts/link-plugin.mjs",
-    "plugin:eval": "node scripts/evaluate-plugin.mjs"
+    "plugin:eval": "node scripts/evaluate-plugin.mjs",
+    "build:app": "pnpm build:plugin-ui && pnpm typecheck && vite build && node scripts/build-offline-worker.mjs",
+    "deploy:one-click": "node scripts/deploy.mjs deploy --one-click",
+    "deploy:production": "node scripts/deploy.mjs deploy --production"
   },
   "dependencies": {
     "@better-auth/core": "1.7.7",
@@ -121,5 +124,15 @@
     "vitest": "5.0.3",
     "wrangler": "4.148.0",
     "ws": "8.22.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "BOOTSTRAP_TOKEN": {
+        "description": "Your private **setup key**. Generate at least 32 random characters with a password manager. Enter the same key on the first-run screen to create the owner. Keep it private; you can delete this secret after setup."
+      },
+      "BETTER_AUTH_URL": {
+        "description": "Leave **auto** to use the installation\u2019s workers.dev URL. Set an exact HTTPS origin only when using your own domain."
+      }
+    }
   }
 }

@@ -8,11 +8,11 @@ be confirmed rather than trusted.
 Set in the environment's `vars` block of `wrangler.jsonc`. Plaintext; visible in the dashboard and in
 the repository.
 
-| Name                            | Default                              | Notes                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BETTER_AUTH_URL`               | `http://localhost:5173`              | The exact origin the installation is served from. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **The production environment must use its deployed HTTPS origin.**                                          |
-| `EXPANDED_EMBEDS_ENABLED`       | local/E2E `true`, production `false` | Set to `true` to enable Loom, Google, Miro, Spotify, and CodePen frames and the link-preview action. The Worker exposes the flag in `/api/me`. Disabling it preserves stored links and the original YouTube, Vimeo, and Figma frames; `/v1` can round-trip expanded URLs as content while the client renders them as links. Regenerate binding types with `pnpm cf-typegen` after changing the committed value. |
-| `SLACK_DIGEST_DEFAULT_TIMEZONE` | `America/Los_Angeles`                | IANA timezone used for new digest mappings at 09:00. Later deployment-default changes affect new mappings only. Existing mappings retain their saved schedules.                                                                                                                                                                                                                                                 |
+| Name                            | Default                                              | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `BETTER_AUTH_URL`               | portable `auto`; dev localhost                       | The exact origin the installation is served from. Portable deployment resolves `auto` before Vite builds; development uses `http://localhost:5173`. Sets the Better Auth cookie origin, and is the allowlist the `Origin` header is compared against on bootstrap, invite acceptance, and WebSocket upgrades. A request carrying no `Origin` header is not rejected; it is left to the session check. **The production environment must use its deployed HTTPS origin.** |
+| `EXPANDED_EMBEDS_ENABLED`       | portable/local/E2E `true`, legacy production `false` | Set to `true` to enable Loom, Google, Miro, Spotify, and CodePen frames and the link-preview action. The Worker exposes the flag in `/api/me`. Disabling it preserves stored links and the original YouTube, Vimeo, and Figma frames; `/v1` can round-trip expanded URLs as content while the client renders them as links. Regenerate binding types with `pnpm cf-typegen` after changing the committed value.                                                          |
+| `SLACK_DIGEST_DEFAULT_TIMEZONE` | `America/Los_Angeles`                                | IANA timezone used for new digest mappings at 09:00. Later deployment-default changes affect new mappings only. Existing mappings retain their saved schedules.                                                                                                                                                                                                                                                                                                          |
 
 Release flags (`OFFLINE_EDITING_ENABLED`, `NOTION_MARKDOWN_WRITES_ENABLED`, `WORKFLOW_INLINE`) and owner settings are
 listed in [Flags and release controls](FLAGS.md).
@@ -38,13 +38,18 @@ Changing the secret later has no effect on an existing workspace. It influences 
 placement only; it is an optimization, not a data-residency boundary. D1 and other Cloudflare metadata
 are not constrained by it.
 
-For local development these live in `.dev.vars`; see `.dev.vars.example`.
+For local development these live in `.dev.vars`; copy `.dev.vars.local.example`. The auto-discovered
+`.dev.vars.example` contains only the private setup key for browser deployment. Portable deployments
+generate missing internal secrets before owner initialization and preserve all existing secrets; see
+[Browser deployment](DEPLOYMENT.md#browser-deployment).
 
 ## Bindings
 
 Declared in `wrangler.jsonc`, typed in `src/worker/env.ts`.
-The existing `cloudflare-realtime-notes` resource names are intentionally retained so the NoteFlare
-rebrand does not replace production data or deployment infrastructure.
+Portable top-level defaults use `noteflare`; Cloudflare-selected names and provisioned IDs are reused.
+The named legacy `production` environment retains the `cloudflare-realtime-notes` targets below so
+existing data and infrastructure remain in place. The portable template also binds
+`DELIVERY_DEAD_LETTER_QUEUE` so the native form provisions the consumer's dead-letter queue.
 
 | Binding                          | Kind           | Target                                                                                      |
 | -------------------------------- | -------------- | ------------------------------------------------------------------------------------------- |

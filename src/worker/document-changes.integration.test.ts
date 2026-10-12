@@ -1,12 +1,22 @@
 import { abortAllDurableObjects, applyD1Migrations, env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
-import { CHANGE_RETENTION_MS, checkpointStatements, readComparison, pruneDocumentChanges } from "./document-changes";
+import {
+  CHANGE_RETENTION_MS,
+  checkpointStatements,
+  readComparison,
+  digestComparison,
+  pruneDocumentChanges,
+} from "./document-changes";
 import { notificationFanoutStatements, sendDueNotificationDigests } from "./notifications";
 import { composePersonalDigest } from "./personal-diff-digest";
 import { consumeDeliveryMessage, type DeliveryQueueMessage } from "./jobs";
 import type { Env } from "./env";
 import type { DocumentContentEnvelope } from "../shared/types";
+import { logger } from "./observability";
+import { DELIVERY_CLAIM_STALE_MS } from "./delivery-claim";
+import { encryptSlackToken } from "./slack";
+import { protectSlackFixtureUsers } from "../../tests/helpers/security";
 const bindings = env as unknown as Env;
 function emailRuntime(send = vi.fn(async (_message: unknown) => ({ messageId: "digest" }))) {
   return {
@@ -25,6 +35,67 @@ function digestTimestamp() {
   date.setUTCHours(9, 1, 0, 0);
   return date.getTime();
 }
+function withDatabaseHook(configured: Env, hook: (query: string) => void) {
+  const db = new Proxy(configured.DB, {
+    get(target, property) {
+      if (property === "prepare")
+        return (query: string) => {
+          hook(query);
+          return target.prepare(query);
+        };
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return new Proxy(configured, {
+    get(target, property, receiver) {
+      return property === "DB" ? db : Reflect.get(target, property, receiver);
+    },
+  });
+}
+async function digestRuntime(
+  channel: "email" | "slack",
+  users = ["changes-viewer"],
+  send = vi.fn(async (_message: unknown) => ({ messageId: "digest" })),
+) {
+  const configured = new Proxy(emailRuntime(send).configured, {
+    get(target, property, receiver) {
+      if (property === "DIFF_DIGESTS_ENABLED") return "true";
+      if (property === "EMAIL_FROM" && channel === "slack") return undefined;
+      if (property === "SLACK_TOKEN_ENCRYPTION_KEY") return "digest-test-key-with-enough-entropy";
+      if (["SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET", "SLACK_SIGNING_SECRET"].includes(String(property)))
+        return "digest-slack-fixture";
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  if (channel === "slack") {
+    await protectSlackFixtureUsers(users);
+    const token = await encryptSlackToken(configured, "xoxb-digest");
+    await env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at,generation)
+      VALUES('digest-installation','changes-workspace','TDIGEST','Digest','BDIGEST',?,'chat:write','changes-owner',1,1,1)`)
+      .bind(token)
+      .run();
+    for (const user of users)
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO account(id,userId,providerId,accountId,createdAt,updatedAt) VALUES(? ,?,'slack',?,1,1)`,
+        ).bind(`digest-account:${user}`, user, `TDIGEST:U${user}`),
+        env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,verification_method,verified_at,better_auth_account_id,authorization_started_at,security_generation,installation_generation)
+        SELECT 'digest-installation',?,?,1,'slack_openid',1,?,1,generation,1 FROM slack_protected_accounts WHERE user_id=?`).bind(
+          user,
+          `U${user}`,
+          `digest-account:${user}`,
+          user,
+        ),
+      ]);
+    vi.stubGlobal("fetch", async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as { channel: string };
+      await send({ ...body, to: body.channel });
+      return Response.json({ ok: true });
+    });
+  }
+  return { configured, send };
+}
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
@@ -32,10 +103,13 @@ beforeEach(async () => {
     env.DB.prepare("DELETE FROM workspaces"),
     env.DB.prepare("DELETE FROM user"),
     env.DB.prepare("DELETE FROM page_change_projection_gc"),
+    env.DB.prepare("DELETE FROM digest_delivery_cursors"),
+    env.DB.prepare("UPDATE document_changes_cleanup_state SET lease_token=NULL,lease_until=0 WHERE id=1"),
   ]);
 });
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   await abortAllDurableObjects();
   await reset();
 });
@@ -79,6 +153,38 @@ function envelope(pageId: string, sequence: number, text: string, epoch = 1): Do
       ],
     },
   };
+}
+async function digestFailureFixture(channel: "email" | "slack") {
+  const page = await fixture();
+  const due = digestTimestamp();
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('changes-a','First','first@example.test',1,1)",
+    ),
+    env.DB.prepare(
+      "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES('changes-workspace','changes-a','viewer',1)",
+    ),
+    env.DB
+      .prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,archived_at)
+      VALUES('denied-page','changes-workspace','changes-workspace-general','document','a1','Denied','changes-owner',1,1,1)`),
+    env.DB.prepare(`INSERT INTO notification_preferences(user_id,event_type,email,slack,timezone)
+      VALUES('changes-a','mention',?,?,'UTC'),('changes-viewer','mention',?,?,'UTC')`).bind(
+      channel === "email" ? "digest" : "off",
+      channel === "slack" ? "digest" : "off",
+      channel === "email" ? "digest" : "off",
+      channel === "slack" ? "digest" : "off",
+    ),
+    env.DB.prepare(`INSERT INTO notifications(id,workspace_id,user_id,event_type,page_id,space_id,data_json,dedupe_key,created_at)
+      VALUES('failure-first','changes-workspace','changes-a','mention',?,'changes-workspace-general','{}','failure-first',1),
+        ('failure-denied','changes-workspace','changes-a','mention','denied-page','changes-workspace-general','{}','failure-denied',2),
+        ('failure-second','changes-workspace','changes-viewer','mention',?,'changes-workspace-general','{}','failure-second',1)`).bind(
+      page,
+      page,
+    ),
+    env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
+      SELECT 'outbox:'||id,workspace_id,'notification','{}',1,1 FROM notifications`),
+  ]);
+  return { ...(await digestRuntime(channel, ["changes-a", "changes-viewer"])), due };
 }
 async function checkpoint(
   pageId: string,
@@ -513,24 +619,54 @@ it("does not acknowledge GC keys or release a replacement lease after lease loss
   });
 });
 
-it("suppresses all 2,000 inaccessible page recipients while preserving other channels and later edits", async () => {
-  const page = await fixture();
-  const due = digestTimestamp();
-  await seedCheckpointRows(page, 2001, Date.now());
-  await env.DB.prepare(`INSERT INTO page_change_recipients(id,checkpoint_id,user_id)
+it.each(["email", "slack"] as const)(
+  "suppresses inaccessible recipients and legacy notifications for %s only",
+  async (channel) => {
+    const page = await fixture();
+    const due = digestTimestamp();
+    await seedCheckpointRows(page, 2001, Date.now());
+    await env.DB.prepare(`INSERT INTO page_change_recipients(id,checkpoint_id,user_id)
     SELECT 'change:'||id||':changes-viewer',id,'changes-viewer' FROM page_change_checkpoints`).run();
-  await env.DB.prepare("UPDATE page_change_checkpoints SET created_at=? WHERE sequence=2001").bind(due).run();
-  await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(page).run();
-  const { configured, send } = emailRuntime();
-  await sendDueNotificationDigests(configured, due);
-  expect(send).not.toHaveBeenCalled();
-  expect(
-    await env.DB.prepare("SELECT count(*) count FROM page_change_recipients WHERE emailed_at IS NOT NULL").first(),
-  ).toEqual({ count: 2000 });
-  expect(
-    await env.DB.prepare("SELECT count(*) count FROM page_change_recipients WHERE slack_at IS NULL").first(),
-  ).toEqual({ count: 2001 });
-});
+    await env.DB.prepare(`INSERT INTO notifications(id,workspace_id,user_id,event_type,page_id,space_id,data_json,dedupe_key,created_at)
+    SELECT 'page_edit:'||id||':changes-viewer','changes-workspace','changes-viewer','page_edit',page_id,'changes-workspace-general','{}',id,created_at FROM page_change_checkpoints`).run();
+    await env.DB.prepare("UPDATE page_change_checkpoints SET created_at=? WHERE sequence=2001").bind(due).run();
+    await env.DB.prepare("UPDATE notifications SET created_at=? WHERE id LIKE 'page_edit:%:2001:changes-viewer'")
+      .bind(due)
+      .run();
+    await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(page).run();
+    await env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+    VALUES('accessible-page','changes-workspace','changes-workspace-general','document','a1','Accessible','changes-owner',1,1)`).run();
+    const accessible = await checkpoint("accessible-page", 1, "Still accessible", null);
+    await env.DB.prepare(
+      `INSERT INTO notification_preferences(user_id,event_type,email,slack,timezone) VALUES('changes-viewer','page_edit',?,?,'UTC')`,
+    )
+      .bind(channel === "email" ? "digest" : "off", channel === "slack" ? "digest" : "off")
+      .run();
+    const { configured, send } = await digestRuntime(channel);
+    await sendDueNotificationDigests(configured, due);
+    expect(send).toHaveBeenCalledOnce();
+    const column = channel === "email" ? "emailed_at" : "slack_at";
+    const other = channel === "email" ? "slack_at" : "emailed_at";
+    expect(
+      await env.DB.prepare(
+        `SELECT count(*) count FROM page_change_recipients r JOIN page_change_checkpoints c ON c.id=r.checkpoint_id WHERE c.page_id=? AND r.${column} IS NOT NULL`,
+      )
+        .bind(page)
+        .first(),
+    ).toEqual({ count: 2000 });
+    expect(
+      await env.DB.prepare(`SELECT count(*) count FROM notifications WHERE ${column} IS NOT NULL`).first(),
+    ).toEqual({ count: 2000 });
+    expect(
+      await env.DB.prepare(`SELECT count(*) count FROM page_change_recipients WHERE ${other} IS NULL`).first(),
+    ).toEqual({ count: 2002 });
+    expect(
+      await env.DB.prepare(`SELECT ${column} delivered FROM page_change_recipients WHERE checkpoint_id=?`)
+        .bind(accessible.id)
+        .first(),
+    ).toEqual({ delivered: expect.any(Number) });
+  },
+);
 
 it("keeps forty ordinary items while limiting comparisons to ten pages", async () => {
   await fixture();
@@ -574,56 +710,67 @@ it("keeps forty ordinary items while limiting comparisons to ten pages", async (
   );
 });
 
-it("persists only processed candidates when comparison costs exhaust the tick budget", async () => {
-  await fixture();
-  await env.DB.batch([
-    env.DB.prepare(`WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<8)
+it.each([false, true])(
+  "preserves budget-deferred candidates across ticks with multiple timezones=%s",
+  async (multipleTimezones) => {
+    await fixture();
+    await env.DB.batch([
+      env.DB.prepare(`WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<8)
       INSERT INTO user(id,name,email,createdAt,updatedAt)
       SELECT printf('cost-user-%02d',n),'Viewer',printf('cost-%02d@example.test',n),1,1 FROM numbers`),
-    env.DB.prepare(`INSERT INTO workspace_members(workspace_id,user_id,role,created_at)
+      env.DB.prepare(`INSERT INTO workspace_members(workspace_id,user_id,role,created_at)
       SELECT 'changes-workspace',id,'viewer',1 FROM user WHERE id LIKE 'cost-user-%'`),
-    env.DB.prepare(`WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<10)
+      env.DB.prepare(`WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<10)
       INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
       SELECT 'cost-page-'||n,'changes-workspace','changes-workspace-general','document','a0','Page '||n,'changes-owner',1,1 FROM numbers`),
-    env.DB.prepare(`INSERT INTO page_change_checkpoints(id,page_id,workspace_id,content_epoch,sequence,after_key,created_at)
+      env.DB.prepare(`INSERT INTO page_change_checkpoints(id,page_id,workspace_id,content_epoch,sequence,after_key,created_at)
       SELECT id||':1:1',id,workspace_id,1,1,'missing',? FROM pages WHERE id LIKE 'cost-page-%'`).bind(Date.now()),
-    env.DB.prepare(`INSERT INTO page_change_recipients(id,checkpoint_id,user_id)
+      env.DB.prepare(`INSERT INTO page_change_recipients(id,checkpoint_id,user_id)
       SELECT 'change:'||c.id||':'||u.id,c.id,u.id FROM page_change_checkpoints c JOIN user u WHERE u.id LIKE 'cost-user-%'`),
-    env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
+      env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
       SELECT 'outbox:'||r.id,c.workspace_id,'notification_digest_change','{}',9007199254740991,c.created_at
       FROM page_change_recipients r JOIN page_change_checkpoints c ON c.id=r.checkpoint_id`),
-  ]);
-  let statements = 0;
-  const db = new Proxy(bindings.DB, {
-    get(target, property) {
-      if (property === "prepare")
-        return (query: string) => {
-          statements++;
-          return target.prepare(query);
-        };
-      const value: unknown = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-  const { configured, send } = emailRuntime();
-  const counted = new Proxy(configured, {
-    get(target, property, receiver) {
-      return property === "DB" ? db : Reflect.get(target, property, receiver);
-    },
-  });
-  for (let tick = 1; tick <= 4; tick++) {
-    statements = 0;
-    await sendDueNotificationDigests(counted, digestTimestamp());
-    expect(send).toHaveBeenCalledTimes(tick * 2);
-    expect(statements).toBeLessThanOrEqual(120);
-    expect(await env.DB.prepare("SELECT user_id FROM digest_delivery_cursors WHERE channel='email'").first()).toEqual({
-      user_id: `cost-user-${String(tick * 2).padStart(2, "0")}`,
+    ]);
+    if (multipleTimezones)
+      await env.DB.prepare(`INSERT INTO notification_preferences(user_id,event_type,email,slack,timezone)
+    SELECT id,'page_edit','digest','off',CASE WHEN id<='cost-user-04' THEN 'Africa/Abidjan' ELSE 'UTC' END FROM user WHERE id LIKE 'cost-user-%'`).run();
+    let statements = 0;
+    const db = new Proxy(bindings.DB, {
+      get(target, property) {
+        if (property === "prepare")
+          return (query: string) => {
+            statements++;
+            return target.prepare(query);
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
     });
-  }
-  expect(
-    await env.DB.prepare("SELECT count(*) count FROM page_change_recipients WHERE emailed_at IS NULL").first(),
-  ).toEqual({ count: 0 });
-});
+    const { configured, send } = emailRuntime();
+    const counted = new Proxy(configured, {
+      get(target, property, receiver) {
+        return property === "DB" ? db : Reflect.get(target, property, receiver);
+      },
+    });
+    for (let tick = 1; tick <= 4; tick++) {
+      statements = 0;
+      await sendDueNotificationDigests(counted, digestTimestamp());
+      expect(send).toHaveBeenCalledTimes(tick * 2);
+      expect(statements).toBeLessThanOrEqual(120);
+      const timezone = multipleTimezones && tick % 2 ? "Africa/Abidjan" : "UTC";
+      expect(
+        await env.DB.prepare("SELECT user_id FROM digest_delivery_cursors WHERE channel='email' AND timezone=?")
+          .bind(timezone)
+          .first(),
+      ).toEqual({
+        user_id: `cost-user-${String(multipleTimezones ? [2, 6, 4, 8][tick - 1] : tick * 2).padStart(2, "0")}`,
+      });
+    }
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM page_change_recipients WHERE emailed_at IS NULL").first(),
+    ).toEqual({ count: 0 });
+  },
+);
 
 it("does not finalize recipients after a delivery claim is replaced", async () => {
   const page = await fixture();
@@ -690,4 +837,310 @@ it("finalizes checkpoint ranges by index without changing unrelated notification
   expect(
     await env.DB.prepare("SELECT emailed_at FROM page_change_recipients WHERE checkpoint_id=?").bind(before.id).first(),
   ).toEqual({ emailed_at: 1 });
+});
+
+it.each(
+  (["email", "slack"] as const).flatMap((channel) =>
+    ["ids", "access", "suppression", "claim", "partial-claim", "finalization"].map((stage) => ({ channel, stage })),
+  ),
+)(
+  "continues after a $channel candidate fails during $stage and retries its pending work",
+  async ({ channel, stage }) => {
+    const { configured, send, due } = await digestFailureFixture(channel);
+    const failure = new Error(`Injected ${stage} failure`);
+    const log = vi.spyOn(logger, "error");
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let failed = false;
+    const matches: Record<string, (query: string) => boolean> = {
+      ids: (query) => query.startsWith("WITH eligible AS"),
+      access: (query) => query.includes("recipient.name recipient_name"),
+      suppression: (query) => query.startsWith("UPDATE notifications SET"),
+      claim: (query) => query.includes("INSERT OR IGNORE INTO deliveries"),
+      "partial-claim": (query) => query.startsWith("SELECT outbox_id FROM deliveries"),
+      finalization: (query) =>
+        query.startsWith("UPDATE deliveries SET status =") && query.includes("RETURNING outbox_id"),
+    };
+    const failing = withDatabaseHook(configured, (query) => {
+      if (!failed && matches[stage]!(query)) {
+        failed = true;
+        throw failure;
+      }
+    });
+    await sendDueNotificationDigests(failing, due);
+    expect(failed).toBe(true);
+    expect(send).toHaveBeenCalledTimes(stage === "finalization" ? 2 : 1);
+    expect(log).toHaveBeenCalledWith(
+      `notification.digest_${channel}.failed`,
+      "notifications",
+      expect.any(String),
+      expect.objectContaining({ userId: "changes-a" }),
+      failure,
+    );
+    const column = channel === "email" ? "emailed_at" : "slack_at";
+    expect(
+      await env.DB.prepare(
+        `SELECT id,${column} delivered FROM notifications WHERE id IN ('failure-first','failure-second') ORDER BY id`,
+      ).all(),
+    ).toMatchObject({
+      results: [
+        { id: "failure-first", delivered: null },
+        { id: "failure-second", delivered: expect.any(Number) },
+      ],
+    });
+    expect(
+      await env.DB.prepare("SELECT user_id FROM digest_delivery_cursors WHERE channel=?").bind(channel).first(),
+    ).toEqual({ user_id: "changes-viewer" });
+    const delivery = await env.DB.prepare(
+      "SELECT status FROM deliveries WHERE outbox_id='outbox:failure-first'",
+    ).first<{ status: string }>();
+    expect(delivery?.status ?? null).toBe(
+      stage === "partial-claim" ? "pending" : stage === "finalization" ? "failed" : null,
+    );
+    if (stage === "partial-claim") {
+      await env.DB.prepare("UPDATE deliveries SET updated_at=? WHERE outbox_id='outbox:failure-first'")
+        .bind(Date.now() - DELIVERY_CLAIM_STALE_MS - 1)
+        .run();
+    }
+    await sendDueNotificationDigests(configured, due);
+    expect(
+      await env.DB.prepare(`SELECT ${column} delivered FROM notifications WHERE id='failure-first'`).first(),
+    ).toEqual({ delivered: expect.any(Number) });
+  },
+);
+
+it("retains the primary delivery error when recording failure also throws", async () => {
+  const { configured, send, due } = await digestFailureFixture("email");
+  const primary = new Error("Mailbox failed");
+  const secondary = new Error("Failure recording failed");
+  send.mockRejectedValueOnce(primary);
+  const log = vi.spyOn(logger, "error");
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let failed = false;
+  await sendDueNotificationDigests(
+    withDatabaseHook(configured, (query) => {
+      if (!failed && query.startsWith("UPDATE deliveries SET status =") && query.includes("RETURNING outbox_id")) {
+        failed = true;
+        throw secondary;
+      }
+    }),
+    due,
+  );
+  expect(send).toHaveBeenCalledTimes(2);
+  expect(log.mock.calls.map((call) => call[4])).toEqual([primary, secondary]);
+  expect(
+    await env.DB.prepare("SELECT emailed_at delivered FROM notifications WHERE id='failure-second'").first(),
+  ).toEqual({ delivered: expect.any(Number) });
+});
+
+it("does not overwrite a replacement claim while recording a delivery failure", async () => {
+  const page = await fixture();
+  await checkpoint(page, 1, "Edit", null);
+  const failure = new Error("Send failed after claim replacement");
+  const send = vi.fn(async (_message: unknown) => {
+    await env.DB.prepare("UPDATE deliveries SET claim_token='replacement'").run();
+    throw failure;
+  });
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  await sendDueNotificationDigests(emailRuntime(send).configured, digestTimestamp());
+  expect(await env.DB.prepare("SELECT status,claim_token FROM deliveries").first()).toEqual({
+    status: "pending",
+    claim_token: "replacement",
+  });
+});
+
+it.each(["discovery", "cursor", "scan-and-save"])("still sends Slack after email %s fails", async (stage) => {
+  const { configured, send, due } = await digestFailureFixture("slack");
+  await env.DB.prepare("UPDATE notification_preferences SET email='digest'").run();
+  const both = new Proxy(configured, {
+    get(target, property, receiver) {
+      return property === "EMAIL_FROM" ? "notes@example.test" : Reflect.get(target, property, receiver);
+    },
+  });
+  const primary = new Error(`Email ${stage} failed`);
+  const secondary = new Error("Email cursor save failed too");
+  const log = vi.spyOn(logger, "error");
+  vi.spyOn(console, "error").mockImplementation(() => undefined);
+  let cursorWrites = 0;
+  const failing = withDatabaseHook(both, (query) => {
+    if (stage === "discovery" && query.includes("cursor_updated_at") && query.includes("n.emailed_at")) throw primary;
+    if (stage === "scan-and-save" && query.includes("recipient.name, recipient.email")) throw primary;
+    if (query.startsWith("INSERT INTO digest_delivery_cursors") && cursorWrites++ === 0) {
+      if (stage === "cursor") throw primary;
+      if (stage === "scan-and-save") throw secondary;
+    }
+  });
+  await expect(sendDueNotificationDigests(failing, due)).rejects.toBe(primary);
+  expect(send.mock.calls.filter(([message]) => String((message as { to: string }).to).startsWith("U"))).toHaveLength(2);
+  expect(
+    log.mock.calls.some((call) => call[0] === "notification.digest_email.secondary_failed" && call[4] === secondary),
+  ).toBe(stage === "scan-and-save");
+});
+
+it("reports both independent digest channel failures", async () => {
+  const { configured, due } = await digestFailureFixture("slack");
+  const both = new Proxy(configured, {
+    get(target, property, receiver) {
+      return property === "EMAIL_FROM" ? "notes@example.test" : Reflect.get(target, property, receiver);
+    },
+  });
+  const email = new Error("Email discovery failed"),
+    slack = new Error("Slack discovery failed");
+  const failing = withDatabaseHook(both, (query) => {
+    if (query.includes("cursor_updated_at")) throw query.includes("n.emailed_at") ? email : slack;
+  });
+  await expect(sendDueNotificationDigests(failing, due)).rejects.toMatchObject({ errors: [email, slack] });
+});
+
+it.each((["email", "slack"] as const).flatMap((channel) => ["D1", "R2", "body"].map((stage) => ({ channel, stage }))))(
+  "retries $channel comparisons after temporary $stage errors without changing frozen references",
+  async ({ channel, stage }) => {
+    const page = await fixture();
+    const baseline = await checkpoint(page, 1, "Before", null);
+    const first = await checkpoint(page, 2, "Original after", baseline);
+    const column = channel === "email" ? "emailed_at" : "slack_at";
+    await env.DB.prepare(`UPDATE page_change_recipients SET ${column}=1 WHERE checkpoint_id=?`).bind(baseline.id).run();
+    await env.DB.prepare(`INSERT INTO notification_preferences(user_id,event_type,email,slack,timezone)
+      VALUES('changes-viewer','page_edit',?,?,'UTC')`)
+      .bind(channel === "email" ? "digest" : "off", channel === "slack" ? "digest" : "off")
+      .run();
+    const { configured, send } = await digestRuntime(channel);
+    const failure = new Error(`${stage} temporarily unavailable`);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let failed = false;
+    const bucket = new Proxy(configured.BUCKET, {
+      get(target, property) {
+        if (property === "get")
+          return async (key: string) => {
+            if (stage === "R2" && !failed) {
+              failed = true;
+              throw failure;
+            }
+            const object = await target.get(key);
+            if (stage === "body" && object && !failed) {
+              failed = true;
+              return new Proxy(object, {
+                get(value, name) {
+                  if (name === "text")
+                    return async () => {
+                      throw failure;
+                    };
+                  const member: unknown = Reflect.get(value, name, value);
+                  return typeof member === "function" ? member.bind(value) : member;
+                },
+              });
+            }
+            return object;
+          };
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const failing = withDatabaseHook(
+      new Proxy(configured, {
+        get(target, property, receiver) {
+          return property === "BUCKET" ? bucket : Reflect.get(target, property, receiver);
+        },
+      }),
+      (query) => {
+        if (stage === "D1" && !failed && query.includes("WHERE page_id=? AND id IN (?,?)")) {
+          failed = true;
+          throw failure;
+        }
+      },
+    );
+    await sendDueNotificationDigests(failing, digestTimestamp());
+    expect(failed).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+    const frozen = await env.DB.prepare("SELECT comparison_json,status FROM deliveries").first<{
+      comparison_json: string;
+      status: string;
+    }>();
+    expect(frozen!.status).toBe("failed");
+    expect(JSON.parse(frozen!.comparison_json)).toEqual({ first: first.id, last: first.id });
+    const later = await checkpoint(page, 3, "Later edit", first);
+    await sendDueNotificationDigests(configured, digestTimestamp());
+    expect(send).toHaveBeenCalledOnce();
+    const text = (send.mock.calls[0]![0] as { text: string }).text;
+    expect(text).toContain("Before: Before");
+    expect(text).toContain("After: Original after");
+    expect(text).not.toContain("Later edit");
+    expect(await env.DB.prepare("SELECT comparison_json,status FROM deliveries").first()).toEqual({
+      comparison_json: frozen!.comparison_json,
+      status: "sent",
+    });
+    expect(
+      await env.DB.prepare(`SELECT ${column} delivered FROM page_change_recipients WHERE checkpoint_id=?`)
+        .bind(later.id)
+        .first(),
+    ).toEqual({ delivered: null });
+  },
+);
+
+it.each(["missing", "malformed", "expired", "invalid"])(
+  "keeps the digest summary fallback for %s comparison inputs",
+  async (kind) => {
+    const page = await fixture();
+    const before = await checkpoint(page, 1, "Before", null);
+    const after = await checkpoint(page, 2, "After", before);
+    if (kind === "missing") await env.BUCKET.delete(before.r2_key);
+    if (kind === "malformed") await env.BUCKET.put(before.r2_key, "{broken");
+    if (kind === "expired")
+      await env.DB.prepare("UPDATE page_change_checkpoints SET created_at=?")
+        .bind(Date.now() - CHANGE_RETENTION_MS - 1)
+        .run();
+    const comparison =
+      kind === "invalid"
+        ? await digestComparison(bindings, page, after.id, before.id)
+        : await digestComparison(bindings, page, after.id, after.id);
+    expect(comparison.diff).toBeNull();
+  },
+);
+
+it("releases the cleanup lease before an immediately consumed continuation", async () => {
+  const page = await fixture();
+  await seedCheckpointRows(page, 501, Date.now() - CHANGE_RETENTION_MS - 1);
+  const ack = vi.fn(),
+    retry = vi.fn();
+  const configured: Env = new Proxy(bindings, {
+    get(target, property, receiver) {
+      if (property === "DELIVERY_QUEUE")
+        return {
+          send: async (body: DeliveryQueueMessage) => {
+            expect(
+              await env.DB.prepare("SELECT lease_token,lease_until FROM document_changes_cleanup_state").first(),
+            ).toEqual({ lease_token: null, lease_until: 0 });
+            await consumeDeliveryMessage(configured, {
+              body,
+              ack,
+              retry,
+              attempts: 1,
+            } as unknown as Message<DeliveryQueueMessage>);
+          },
+        };
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  expect(await pruneDocumentChanges(configured)).toBe("completed");
+  expect(ack).toHaveBeenCalledOnce();
+  expect(retry).not.toHaveBeenCalled();
+  expect(await env.DB.prepare("SELECT count(*) count FROM page_change_checkpoints").first()).toEqual({ count: 0 });
+});
+
+it("does not enqueue a continuation when releasing the cleanup lease fails", async () => {
+  const page = await fixture();
+  await seedCheckpointRows(page, 501, Date.now() - CHANGE_RETENTION_MS - 1);
+  const send = vi.fn();
+  const failure = new Error("Lease release failed");
+  const configured = withDatabaseHook(
+    new Proxy(bindings, {
+      get(target, property, receiver) {
+        return property === "DELIVERY_QUEUE" ? { send } : Reflect.get(target, property, receiver);
+      },
+    }),
+    (query) => {
+      if (query.includes("SET lease_token=NULL,lease_until=0")) throw failure;
+    },
+  );
+  await expect(pruneDocumentChanges(configured)).rejects.toBe(failure);
+  expect(send).not.toHaveBeenCalled();
 });

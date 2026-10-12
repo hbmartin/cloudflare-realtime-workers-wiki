@@ -432,7 +432,10 @@ export async function digestPages(
         const key = JSON.stringify([row.id, pair.first, pair.last]);
         let comparison = comparisons.get(key);
         if (!comparison) {
-          comparison = digestComparison(env, row.id, pair.first, pair.last);
+          comparison = digestComparison(env, row.id, pair.first, pair.last).catch((error: unknown) => {
+            comparisons.delete(key);
+            throw error;
+          });
           comparisons.set(key, comparison);
         }
         item.comparison = await comparison;

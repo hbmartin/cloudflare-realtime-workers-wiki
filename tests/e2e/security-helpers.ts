@@ -42,7 +42,7 @@ export async function signInOwner(page: Page) {
     await page.getByLabel("Your name").fill("E2E Owner");
     await page.getByLabel("Email", { exact: true }).fill("owner@example.test");
     await page.getByLabel("Password", { exact: true }).fill("password123");
-    await page.getByLabel("Bootstrap token").fill("e2e-bootstrap-token");
+    await page.getByLabel("Setup key").fill("e2e-bootstrap-token");
     await page.getByRole("button", { name: "Create workspace" }).click();
     await completeEnrollment(page, true);
   } else {

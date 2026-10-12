@@ -30,6 +30,15 @@ export default defineConfig(({ command }) => {
         },
       },
       cloudflare({
+        ...(process.env.NOTES_DEPLOY_OVERRIDES
+          ? {
+              config: (config) => {
+                Object.assign(config, JSON.parse(process.env.NOTES_DEPLOY_OVERRIDES!));
+              },
+            }
+          : command === "serve" && !isE2E
+            ? { config: { vars: { BETTER_AUTH_URL: "http://localhost:5173", NOTION_MARKDOWN_WRITES_ENABLED: "true" } } }
+            : {}),
         persistState: process.env.NOTES_E2E_STATE
           ? { path: process.env.NOTES_E2E_STATE }
           : isE2E

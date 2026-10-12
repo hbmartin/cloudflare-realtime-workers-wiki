@@ -121,14 +121,17 @@ export function BlockLinkControls({
         observer.disconnect();
         setMessage("");
       } else if (bundle.provider.synced || offlineRef.current || !navigator.onLine) {
-        observer.disconnect();
         const disconnected = offlineRef.current || !navigator.onLine;
         setMessage(
           disconnected
             ? "This block is not in the cached copy. Reconnect to locate it."
             : "This block is no longer available.",
         );
-        if (!disconnected) target = null;
+        if (disconnected) observer.observe(shell, { childList: true, subtree: true });
+        else {
+          observer.disconnect();
+          target = null;
+        }
       } else {
         observer.observe(shell, { childList: true, subtree: true });
       }
@@ -194,7 +197,18 @@ export function BlockLinkControls({
   }, [bundle, pageId, root]);
   const menuOpen = Boolean(menu);
   useEffect(() => {
-    if (menuOpen) menuButton.current?.focus();
+    if (!menuOpen) return undefined;
+    menuButton.current?.focus();
+    const close = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        setMenu(null);
+        menuTrigger.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", close, true);
+    return () => window.removeEventListener("keydown", close, true);
   }, [menuOpen]);
   return (
     <>
@@ -240,10 +254,7 @@ export function BlockLinkControls({
           className="block-link-menu"
           style={{ left: menu.x, top: menu.y }}
           onKeyDown={(event) => {
-            if (event.key === "Escape") {
-              setMenu(null);
-              menuTrigger.current?.focus();
-            } else if (
+            if (
               event.key === "Tab" &&
               ((!event.shiftKey && event.target === menuSelect.current) ||
                 (event.shiftKey && event.target === menuButton.current))

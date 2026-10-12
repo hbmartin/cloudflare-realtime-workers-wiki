@@ -74,9 +74,10 @@ async function projection(env: Env, key: string | null, pageId: string, epoch: n
   if (!key) return null;
   const object = await env.BUCKET.get(key);
   if (!object || object.size > MAX_COMPARISON_BYTES) return null;
+  const body = await object.text();
   let envelope: DocumentContentEnvelope;
   try {
-    envelope = await object.json<DocumentContentEnvelope>();
+    envelope = JSON.parse(body) as DocumentContentEnvelope;
   } catch {
     return null;
   }
@@ -137,6 +138,11 @@ export async function digestComparison(
       });
     return { first, last, diff };
   } catch (error) {
+    if (
+      !(error instanceof HttpError) ||
+      !["comparison_unavailable", "comparison_expired", "invalid_comparison"].includes(error.code)
+    )
+      throw error;
     logger.warn(
       "document.comparison.unavailable",
       "document",
@@ -188,6 +194,7 @@ export async function pruneDocumentChanges(
   let removed = 0,
     examined = 0,
     deleted = 0;
+  let continued = false;
   const fence = `EXISTS(SELECT 1 FROM document_changes_cleanup_state WHERE id=1 AND lease_token=? AND lease_until>?)`;
   const renew = async () => {
     const now = Date.now();
@@ -232,12 +239,8 @@ export async function pruneDocumentChanges(
       .bind(cutoff)
       .first<{ created_at: number }>();
     const projections = await env.DB.prepare("SELECT 1 FROM page_change_projection_gc LIMIT 1").first();
-    const continued = Boolean(oldest || projections);
-    if (continued) {
-      if (!(await renew())) return "lease-lost";
-      const correlationId = currentObservabilityContext()?.correlationId;
-      await env.DELIVERY_QUEUE.send({ documentChangesCleanup: true, ...(correlationId ? { correlationId } : {}) });
-    }
+    continued = Boolean(oldest || projections);
+    if (continued && !(await renew())) return "lease-lost";
     logger.info("document.comparison.pruned", "document", "Expired comparison history pruned.", {
       count: removed,
       examinedProjections: examined,
@@ -245,11 +248,15 @@ export async function pruneDocumentChanges(
       continued,
       oldestExpiredAt: oldest?.created_at ?? null,
     });
-    return "completed";
   } finally {
     await env.DB.prepare(`UPDATE document_changes_cleanup_state SET lease_token=NULL,lease_until=0,updated_at=?
       WHERE id=1 AND lease_token=?`)
       .bind(Date.now(), token)
       .run();
   }
+  if (continued) {
+    const correlationId = currentObservabilityContext()?.correlationId;
+    await env.DELIVERY_QUEUE.send({ documentChangesCleanup: true, ...(correlationId ? { correlationId } : {}) });
+  }
+  return "completed";
 }

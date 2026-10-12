@@ -1,10 +1,70 @@
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { digestCollisionSql, main } from "./migrate-d1.mjs";
+import { digestCollisionSql, freshDatabase, main } from "./migrate-d1.mjs";
 
 const pending = "Migrations to be applied:\n0067_review_delivery.sql\n";
 const result = (rows) => ({ status: 0, stdout: JSON.stringify([{ success: true, results: rows }]) });
 afterEach(() => vi.restoreAllMocks());
+
+describe("fresh-install migration safety", () => {
+  const listing =
+    "Migrations to be applied:\n0001_initial.sql\n0011_page_move_receipt_envelopes.sql\n0067_review_delivery.sql\n0069_slack_file_cleanup.sql\n";
+  it("applies a verified fresh remote database without upgrade confirmations", () => {
+    const execute = vi
+      .fn()
+      .mockReturnValueOnce({ status: 0, stdout: listing })
+      .mockReturnValueOnce(
+        result([{ name: "_cf_KV" }, { name: "_cf_METADATA" }, { name: "d1_migrations" }, { name: "sqlite_sequence" }]),
+      )
+      .mockReturnValueOnce(result([{ applied: 0 }]))
+      .mockReturnValueOnce({ status: 0 });
+    expect(main(["--remote", "--config", "/build/wrangler.json"], execute)).toBe(0);
+    expect(execute.mock.calls.at(-1)[0]).toEqual([
+      "d1",
+      "migrations",
+      "apply",
+      "DB",
+      "--remote",
+      "--config",
+      "/build/wrangler.json",
+    ]);
+    expect(execute.mock.calls.some(([args]) => args.includes(digestCollisionSql))).toBe(false);
+  });
+  it.each(["workspaces", "install_state", "_cf_UNKNOWN", "unrelated_application"])(
+    "rejects unexpected table %s when the baseline is pending",
+    (name) => {
+      const query = vi.fn().mockReturnValue([{ name }]);
+      expect(() => freshDatabase(["0001_initial.sql"], query)).toThrow("nonempty database");
+    },
+  );
+  it.each([1, -1, "0", undefined])("rejects applied or invalid migration history: %s", (applied) => {
+    const query = vi
+      .fn()
+      .mockReturnValueOnce([{ name: "d1_migrations" }])
+      .mockReturnValueOnce([{ applied }]);
+    expect(() => freshDatabase(["0001_initial.sql"], query)).toThrow(/migration history|other migrations/);
+  });
+  it("does not classify an initialized-but-empty or partial schema as fresh", () => {
+    const query = vi.fn();
+    expect(freshDatabase(["0069_slack_file_cleanup.sql"], query)).toBe(false);
+    expect(query).not.toHaveBeenCalled();
+    const execute = vi
+      .fn()
+      .mockReturnValue({ status: 0, stdout: "Migrations to be applied:\n0011_page_move_receipt_envelopes.sql\n" });
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect(main(["--remote"], execute)).toBe(1);
+    expect(execute).toHaveBeenCalledOnce();
+  });
+  it.each([{ status: 1 }, { status: 0, stdout: "invalid" }, result([{ name: null }])])(
+    "fails closed on fresh schema query errors %#",
+    (failure) => {
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const execute = vi.fn().mockReturnValueOnce({ status: 0, stdout: listing }).mockReturnValueOnce(failure);
+      expect(main(["--remote"], execute)).toBe(1);
+      expect(execute.mock.calls.some(([args]) => args[2] === "apply")).toBe(false);
+    },
+  );
+});
 
 describe("Slack migration safety in the deployment wrapper", () => {
   it.each([
