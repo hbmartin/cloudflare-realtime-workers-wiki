@@ -1281,7 +1281,7 @@ function BootstrapScreen({ onComplete }: { onComplete: () => Promise<void> }) {
           <input name="password" type="password" required minLength={8} />
         </label>
         <label>
-          Bootstrap token
+          Setup key
           <input name="bootstrapToken" type="password" required />
         </label>
         {error && <p className="form-error">{error}</p>}

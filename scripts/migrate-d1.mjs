@@ -1,7 +1,17 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
-import { parsePendingMigrations } from "./check-page-move-migration.mjs";
+import { checkPageMoveMigration, parsePendingMigrations } from "./check-page-move-migration.mjs";
 import { checkSlackReviewMigration } from "./check-slack-review-migration.mjs";
+
+// D1's reserved storage table is documented at /d1/best-practices/import-export-data/.
+export const internalTables = new Set([
+  "d1_migrations",
+  "_cf_KV",
+  "_cf_METADATA",
+  "sqlite_sequence",
+  "sqlite_stat1",
+  "sqlite_stat4",
+]);
 
 // Match 0067's backfill exactly: only each receipt's first ten changed pages.
 export const digestCollisionSql = `WITH selected_pages AS (
@@ -32,7 +42,7 @@ function checkResult(result, stage) {
     throw new Error(`Wrangler ${stage} failed.${result.stderr?.trim() ? ` ${result.stderr.trim()}` : ""}`);
 }
 
-function queryRows(result, stage) {
+export function queryRows(result, stage) {
   checkResult(result, stage);
   let value;
   try {
@@ -49,7 +59,22 @@ function queryRows(result, stage) {
   return value.flatMap((entry) => entry.results);
 }
 
-export function main(argv, execute, { slackReviewMigrationSafe = false } = {}) {
+export function freshDatabase(pending, query) {
+  if (!pending.includes("0001_initial.sql")) return false;
+  const tables = query("SELECT name FROM sqlite_master WHERE type='table';", "fresh database schema preflight");
+  if (tables.some((row) => !row || typeof row.name !== "string")) throw new Error("Invalid database schema result.");
+  if (tables.some((row) => !internalTables.has(row.name)))
+    throw new Error("Initial migration is pending on a nonempty database. Refusing to treat it as a fresh install.");
+  if (tables.some((row) => row.name === "d1_migrations")) {
+    const rows = query("SELECT count(*) applied FROM d1_migrations;", "fresh database history preflight");
+    if (rows.length !== 1 || !Number.isSafeInteger(rows[0]?.applied) || rows[0].applied < 0)
+      throw new Error("Invalid migration history result.");
+    if (rows[0].applied !== 0) throw new Error("Initial migration is pending after other migrations were applied.");
+  }
+  return true;
+}
+
+export function main(argv, execute, { slackReviewMigrationSafe = false, pageMoveMigrationSafe = false } = {}) {
   try {
     const args = [...argv];
     let preflightTimeoutMs = 300_000;
@@ -64,23 +89,27 @@ export function main(argv, execute, { slackReviewMigrationSafe = false } = {}) {
     if (args.filter((arg) => arg === "--local" || arg === "--remote").length !== 1)
       throw new Error("Choose --local or --remote.");
     for (let i = 0; i < args.length; i++) {
-      if (["--env", "--persist-to"].includes(args[i])) {
+      if (["--env", "--persist-to", "--config"].includes(args[i])) {
         if (!args[++i] || args[i].startsWith("--")) throw new Error("Missing migration option value.");
       } else if (!["--local", "--remote"].includes(args[i])) throw new Error(`Unknown migration option: ${args[i]}`);
     }
     const listing = execute(["d1", "migrations", "list", "DB", ...args], { timeout: 60_000, stdio: "pipe" });
     checkResult(listing, "migration listing");
     const pending = parsePendingMigrations(listing.stdout);
-    if (args.includes("--remote")) checkSlackReviewMigration(listing.stdout, slackReviewMigrationSafe);
-    if (pending.includes("0067_review_delivery.sql")) {
-      const query = (sql, stage) =>
-        queryRows(
-          execute(["d1", "execute", "DB", ...args, "--json", "--command", sql], {
-            timeout: preflightTimeoutMs,
-            stdio: "pipe",
-          }),
-          stage,
-        );
+    const query = (sql, stage) =>
+      queryRows(
+        execute(["d1", "execute", "DB", ...args, "--json", "--command", sql], {
+          timeout: preflightTimeoutMs,
+          stdio: "pipe",
+        }),
+        stage,
+      );
+    const fresh = freshDatabase(pending, query);
+    if (args.includes("--remote") && !fresh) {
+      checkPageMoveMigration(listing.stdout, pageMoveMigrationSafe);
+      checkSlackReviewMigration(listing.stdout, slackReviewMigrationSafe);
+    }
+    if (!fresh && pending.includes("0067_review_delivery.sql")) {
       const schema = query(
         "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('slack_digest_receipts','slack_channel_events');",
         "migration schema preflight",
@@ -153,6 +182,9 @@ if (import.meta.main) {
         encoding: "utf8",
         ...options,
       }),
-    { slackReviewMigrationSafe: process.env.SLACK_REVIEW_MIGRATION_SAFE === "true" },
+    {
+      slackReviewMigrationSafe: process.env.SLACK_REVIEW_MIGRATION_SAFE === "true",
+      pageMoveMigrationSafe: process.env.PAGE_MOVE_RECEIPT_MIGRATION_SAFE === "true",
+    },
   );
 }

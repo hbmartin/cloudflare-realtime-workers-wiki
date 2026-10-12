@@ -22,6 +22,12 @@ flag; any other value or an unset variable disables it.
 | `SLACK_SHARE_REFRESH_ENABLED`      | `false`      | `false`    | Stops queued attachment refresh effects and new lifecycle hooks; preserves recovery markers for paused queued work.                                                                                                                                                                                                                                                                                     |
 | `SLACK_RICH_DIGESTS_ENABLED`       | `false`      | `false`    | Sends grouped text without images; saved scheduling, validation and receipts continue when strict validation is enabled.                                                                                                                                                                                                                                                                                |
 
+The five editor flags above also default to `true` for a new portable installation. The table's
+Production column describes the existing named legacy environment. Portable redeployment reads saved
+Worker variables so existing feature settings are retained; adjust those in Cloudflare's dashboard
+for an existing portable installation. Local development keeps Notion Markdown enabled, while new
+portable installations keep it disabled. Owner settings below are unchanged.
+
 The Worker reports these controls through `GET /api/me`: `features.expandedEmbeds`, `features.offlineEditing`,
 `features.blockLinks`, `features.liveDiagramEmbeds`, and `features.diffDigests`. Open tabs keep the old values until
 they reload.

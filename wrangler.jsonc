@@ -2,8 +2,8 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   // Preserve variables configured in the Cloudflare dashboard across deployments.
   "keep_vars": true,
-  // Deployment resource identifiers intentionally remain stable through the NoteFlare rebrand.
-  "name": "cloudflare-realtime-notes",
+  // Portable installation defaults. Named environments preserve existing deployment identities.
+  "name": "noteflare",
   "main": "src/worker/index.ts",
   "compatibility_date": "2026-08-14",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
@@ -15,7 +15,7 @@
     "traces": { "enabled": true, "head_sampling_rate": 1 },
   },
   "version_metadata": { "binding": "CF_VERSION_METADATA" },
-  "analytics_engine_datasets": [{ "binding": "OBSERVABILITY", "dataset": "cloudflare_realtime_notes_local" }],
+  "analytics_engine_datasets": [{ "binding": "OBSERVABILITY", "dataset": "noteflare" }],
   "assets": {
     "not_found_handling": "single-page-application",
     "run_worker_first": ["/api/*", "/parties/*", "/v1/*", "/share/*", "/mcp", "/oauth/*", "/.well-known/oauth-*"],
@@ -23,7 +23,7 @@
   "d1_databases": [
     {
       "binding": "DB",
-      "database_name": "cloudflare-realtime-notes",
+      "database_name": "noteflare",
       "database_id": "00000000-0000-0000-0000-000000000000",
       "migrations_dir": "migrations",
     },
@@ -31,8 +31,7 @@
   "r2_buckets": [
     {
       "binding": "BUCKET",
-      "bucket_name": "cloudflare-realtime-notes",
-      "preview_bucket_name": "cloudflare-realtime-notes-preview",
+      "bucket_name": "noteflare",
     },
   ],
   "browser": { "binding": "BROWSER" },
@@ -44,20 +43,24 @@
   },
   "workflows": [
     {
-      "name": "cloudflare-realtime-notes-jobs-local",
+      "name": "noteflare-jobs",
       "binding": "NOTES_WORKFLOW",
       "class_name": "NotesJobWorkflow",
     },
   ],
   "queues": {
-    "producers": [{ "binding": "DELIVERY_QUEUE", "queue": "cloudflare-realtime-notes-delivery-local" }],
+    // The second producer lets Cloudflare provision the consumer's dead-letter queue.
+    "producers": [
+      { "binding": "DELIVERY_QUEUE", "queue": "noteflare-delivery" },
+      { "binding": "DELIVERY_DEAD_LETTER_QUEUE", "queue": "noteflare-delivery-dlq" },
+    ],
     "consumers": [
       {
-        "queue": "cloudflare-realtime-notes-delivery-local",
+        "queue": "noteflare-delivery",
         "max_batch_size": 10,
         "max_batch_timeout": 5,
         "max_retries": 5,
-        "dead_letter_queue": "cloudflare-realtime-notes-delivery-dlq-local",
+        "dead_letter_queue": "noteflare-delivery-dlq",
       },
     ],
   },
@@ -75,10 +78,10 @@
   ],
   "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
-    "BETTER_AUTH_URL": "http://localhost:5173",
+    "BETTER_AUTH_URL": "auto",
     "CHATGPT_CONNECTION_ENABLED": "false",
     "EXPANDED_EMBEDS_ENABLED": "true",
-    "NOTION_MARKDOWN_WRITES_ENABLED": "true",
+    "NOTION_MARKDOWN_WRITES_ENABLED": "false",
     "OFFLINE_EDITING_ENABLED": "true",
     "BLOCK_LINKS_ENABLED": "true",
     "LIVE_DIAGRAM_EMBEDS_ENABLED": "true",

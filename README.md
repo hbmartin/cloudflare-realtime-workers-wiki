@@ -31,6 +31,32 @@ The production client supports Chrome and Edge 116+, Firefox 124+, and Safari 17
 CSS builds target that same matrix. Because build targets do not polyfill runtime APIs, the client checks its required
 `AbortSignal` cancellation features at startup and shows an upgrade message instead of mounting in an unsupported browser.
 
+## Deploy your own installation
+
+The browser deployment flow uses Cloudflare's native Deploy to Cloudflare integration. Connect your
+GitHub and Cloudflare accounts, use a Workers Paid account with R2 activated, and choose the Worker
+and resource names offered by Cloudflare. Keep the detected build and deploy commands and leave
+`BETTER_AUTH_URL` as `auto`. Supply one private **setup key** of at least 32 random characters from
+your password manager. Internal secrets, the installation URL, and fresh database migrations are
+configured automatically.
+
+Open the URL printed after deployment, enter the same setup key, and create the workspace owner.
+Enroll an authenticator or passkey and save the recovery codes to enter the workspace. You can then
+remove `BOOTSTRAP_TOKEN` from the Worker's secrets in Cloudflare; redeployment preserves existing
+secrets and never recreates that key after setup.
+
+New installations enable expanded embeds, offline document editing, block links, live diagram
+embeds, and diff digests. Existing installations keep their feature settings. Slack, AI integrations,
+and custom domains are optional follow-up configuration. See [portable deployment and updates](docs/DEPLOYMENT.md#browser-deployment)
+for redeployment, custom domains, and migration safeguards.
+
+<!-- Release gate: uncomment this button only after a disposable native-button
+deployment and redeployment pass the live checklist in docs/DEPLOYMENT.md.
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https%3A%2F%2Fgithub.com%2Fhbmartin%2Fnoteflare)
+
+-->
+
 ## Local development
 
 Requires Node.js 22.22.2+ in the Node 22 release line, 24.15+ in the Node 24 release line, or 26+; pnpm 11.18.0; and
@@ -41,12 +67,12 @@ uv venv --python 3.13.15 --seed .venv
 source .venv/bin/activate
 python -m pip install --disable-pip-version-check --require-hashes -r requirements-semgrep.txt
 pnpm install
-cp .dev.vars.example .dev.vars
+cp .dev.vars.local.example .dev.vars
 pnpm db:local
 pnpm dev
 ```
 
-Set a strong local `BETTER_AUTH_SECRET` and choose a `BOOTSTRAP_TOKEN` in `.dev.vars`. Open `http://localhost:5173`, enter that token on the first-run screen, and create the owner.
+Set a strong local `BETTER_AUTH_SECRET` and choose a private setup key (`BOOTSTRAP_TOKEN`) in `.dev.vars`. Open `http://localhost:5173`, enter the setup key on the first-run screen, and create the owner. The Vite development server supplies the localhost auth origin; remote builds resolve an HTTPS origin before bundling.
 
 Every account must enroll an authenticator or passkey and save recovery codes before entering the workspace. See [account protection, recovery, and rollout](docs/ACCOUNT_SECURITY.md). Migration 0028 invalidates existing sessions.
 
