@@ -13,7 +13,12 @@ import { DELIVERY_CLAIM_STALE_MS, DeliveryInProgressError } from "./delivery-cla
 export { DeliveryInProgressError } from "./delivery-claim";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
-import { sendPersonalSlackNotification, SlackRateLimitError, slackChannelFanoutStatements } from "./slack";
+import {
+  sendPersonalSlackNotification,
+  SlackApiError,
+  SlackRateLimitError,
+  slackChannelFanoutStatements,
+} from "./slack";
 import { currentObservabilityContext, logger, recordMetric, safeTelemetryErrorMessage, traced } from "./observability";
 
 export const NOTIFICATION_EVENT_TYPES = [
@@ -546,34 +551,59 @@ async function finishClaimedDelivery(
     .run();
 }
 
-async function claimDeliveries(env: Env, outboxIds: readonly string[], channel: "email" | "slack") {
-  if (!outboxIds.length) return { token: "", outboxIds: [] as string[] };
+type DigestClaim = { token: string; outboxIds: string[] };
+
+async function claimDeliveries(env: Env, outboxIds: readonly string[], channel: "email" | "slack", token: string) {
+  if (!outboxIds.length) return [] as string[];
   const ids = JSON.stringify(uniqueIds([...outboxIds]));
   const timestamp = Date.now();
-  const token = crypto.randomUUID();
-  await env.DB.prepare(
+  const insert = env.DB.prepare(
     `INSERT OR IGNORE INTO deliveries
       (idempotency_key, outbox_id, channel, status, attempts, updated_at, claim_token)
      SELECT value || ':' || ?, value, ?, 'pending', 1, ?, ? FROM json_each(?)`,
-  )
-    .bind(channel, channel, timestamp, token, ids)
-    .run();
-  await env.DB.prepare(
+  ).bind(channel, channel, timestamp, token, ids);
+  const reclaim = env.DB.prepare(
     `UPDATE deliveries SET status = 'pending', attempts = attempts + 1, last_error = NULL,
        updated_at = ?, claim_token = ?
       WHERE outbox_id IN (SELECT value FROM json_each(?)) AND channel = ?
         AND (status = 'failed' OR (status = 'pending' AND updated_at <= ?))`,
-  )
-    .bind(timestamp, token, ids, channel, timestamp - DELIVERY_CLAIM_STALE_MS)
-    .run();
-  const claimed = await env.DB.prepare(
+  ).bind(timestamp, token, ids, channel, timestamp - DELIVERY_CLAIM_STALE_MS);
+  const select = env.DB.prepare(
     `SELECT outbox_id FROM deliveries
       WHERE outbox_id IN (SELECT value FROM json_each(?)) AND channel = ?
         AND status = 'pending' AND claim_token = ?`,
-  )
-    .bind(ids, channel, token)
-    .all<{ outbox_id: string }>();
-  return { token, outboxIds: claimed.results.map((row) => row.outbox_id) };
+  ).bind(ids, channel, token);
+  const [, , claimed] = await env.DB.batch<{ outbox_id: string }>([insert, reclaim, select]);
+  return claimed!.results.map((row) => row.outbox_id);
+}
+
+async function cleanupDigestClaim(
+  env: Env,
+  channel: "email" | "slack",
+  claim: DigestClaim | undefined,
+  error: unknown,
+) {
+  if (!claim) return [];
+  try {
+    await finishClaimedDeliveries(
+      env,
+      claim.outboxIds,
+      channel,
+      claim.token,
+      "failed",
+      safeTelemetryErrorMessage(error, "Digest delivery failed."),
+    );
+    return [];
+  } catch (secondary) {
+    logger.error(
+      `notification.digest_${channel}.secondary_failed`,
+      "notifications",
+      "Digest failure recording failed.",
+      {},
+      secondary,
+    );
+    return [secondary];
+  }
 }
 
 async function finishClaimedDeliveries(
@@ -995,6 +1025,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
   if (!env.SEND_EMAIL || !env.EMAIL_FROM) return;
   const dueTimezones = await dueDigestTimezones(env, "email", timestamp, DIGEST_WINDOW_MAX);
   if (!dueTimezones.length) return;
+  const failures: unknown[] = [];
   let remainingStatements = DIGEST_CHANNEL_STATEMENT_BUDGET - DIGEST_DISCOVERY_STATEMENTS;
   for (const window of dueTimezones) {
     if (remainingStatements < DIGEST_STATEMENTS_PER_WINDOW + DIGEST_STATEMENTS_PER_CANDIDATE) break;
@@ -1037,7 +1068,8 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
         const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
         if (remainingStatements < candidateCost) break;
         remainingStatements -= candidateCost;
-        let claim: Awaited<ReturnType<typeof claimDeliveries>> | undefined;
+        let claim: DigestClaim | undefined;
+        let phase: "preparation" | "provider" | "finalization" = "preparation";
         try {
           const ids = await env.DB.prepare(digestIdsSql(env, "email"))
             .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
@@ -1049,11 +1081,9 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
             ids.results.map((row) => row.id),
           );
           await suppressDigestRows(env, "email", suppressed, candidate, timestamp, window.cutoff);
-          claim = await claimDeliveries(
-            env,
-            rows.map((row) => `outbox:${row.id}`),
-            "email",
-          );
+          claim = { token: crypto.randomUUID(), outboxIds: rows.map((row) => `outbox:${row.id}`) };
+          // Retain the token and requested IDs if D1 commits but its response fails.
+          claim.outboxIds = await claimDeliveries(env, claim.outboxIds, "email", claim.token);
           const claimedIds = new Set(claim.outboxIds);
           const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
           if (!claimed.length) continue;
@@ -1070,10 +1100,11 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
                 )
               : null;
           if (composed?.empty) {
+            phase = "finalization";
             await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent", null, "emailed_at");
             continue;
           }
-          await env.SEND_EMAIL.send({
+          const message = {
             from: env.EMAIL_FROM,
             to: candidate.email,
             subject: `${claimed.length} NoteFlare update${claimed.length === 1 ? "" : "s"}`,
@@ -1083,66 +1114,50 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
               `<p>Your daily NoteFlare digest:</p><ul>${claimed
                 .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
                 .join("")}</ul>`,
-          });
+          };
+          phase = "provider";
+          await env.SEND_EMAIL.send(message);
+          phase = "finalization";
           await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent", null, "emailed_at");
         } catch (error) {
+          const providerFailure = phase === "provider";
           logger.error(
-            "notification.digest_email.failed",
+            providerFailure ? "notification.digest_email.failed" : "notification.digest_email.infrastructure_failed",
             "notifications",
             "Notification digest email failed.",
-            { userId: candidate.user_id, workspaceId: candidate.workspace_id, timezone: candidate.timezone },
+            { userId: candidate.user_id, workspaceId: candidate.workspace_id, timezone: candidate.timezone, phase },
             error,
           );
-          try {
-            if (claim)
-              await finishClaimedDeliveries(
-                env,
-                claim.outboxIds,
-                "email",
-                claim.token,
-                "failed",
-                safeTelemetryErrorMessage(error, "Digest delivery failed."),
-              );
-          } catch (secondary) {
-            logger.error(
-              "notification.digest_email.secondary_failed",
-              "notifications",
-              "Digest failure recording failed.",
-              {},
-              secondary,
-            );
-          }
-          recordMetric(env, {
-            event: "integration.call",
-            component: "notifications",
-            operation: "email",
-            outcome: "failure",
-          });
+          failures.push(...(await cleanupDigestClaim(env, "email", claim, error)));
+          if (!providerFailure) failures.push(error);
+          if (providerFailure)
+            recordMetric(env, {
+              event: "integration.call",
+              component: "notifications",
+              operation: "email",
+              outcome: "failure",
+            });
         } finally {
           lastAttempted = digestCursor(candidate);
         }
       }
     } catch (error) {
-      try {
-        await saveDigestCursor(env, "email", window.timezone, lastAttempted);
-      } catch (secondary) {
-        logger.error(
-          "notification.digest_email.secondary_failed",
-          "notifications",
-          "Digest cursor save failed.",
-          { timezone: window.timezone },
-          secondary,
-        );
-      }
-      throw error;
+      failures.push(error);
     }
-    await saveDigestCursor(env, "email", window.timezone, lastAttempted);
+    try {
+      await saveDigestCursor(env, "email", window.timezone, lastAttempted);
+    } catch (error) {
+      failures.push(error);
+    }
   }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "Email digest infrastructure failed.");
 }
 
 async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
   const dueTimezones = await dueDigestTimezones(env, "slack", timestamp, DIGEST_WINDOW_MAX);
   if (!dueTimezones.length) return;
+  const failures: unknown[] = [];
   let remainingStatements = DIGEST_CHANNEL_STATEMENT_BUDGET - DIGEST_DISCOVERY_STATEMENTS;
   const rateLimitedWorkspaces = new Set<string>();
   for (const window of dueTimezones) {
@@ -1185,7 +1200,8 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
         const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
         if (remainingStatements < candidateCost) break;
         remainingStatements -= candidateCost;
-        let claim: Awaited<ReturnType<typeof claimDeliveries>> | undefined;
+        let claim: DigestClaim | undefined;
+        let phase: "preparation" | "provider" | "finalization" = "preparation";
         try {
           const ids = await env.DB.prepare(digestIdsSql(env, "slack"))
             .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
@@ -1198,11 +1214,8 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           );
           await suppressDigestRows(env, "slack", suppressed, candidate, timestamp, window.cutoff);
           if (!rows.length) continue;
-          claim = await claimDeliveries(
-            env,
-            rows.map((row) => `outbox:${row.id}`),
-            "slack",
-          );
+          claim = { token: crypto.randomUUID(), outboxIds: rows.map((row) => `outbox:${row.id}`) };
+          claim.outboxIds = await claimDeliveries(env, claim.outboxIds, "slack", claim.token);
           const claimedIds = new Set(claim.outboxIds);
           const claimed = rows.filter((row) => claimedIds.has(`outbox:${row.id}`));
           if (!claimed.length) continue;
@@ -1218,9 +1231,11 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
                 )
               : null;
           if (composed?.empty) {
+            phase = "finalization";
             await finishClaimedDeliveries(env, claim.outboxIds, "slack", claim.token, "sent", null, "slack_at");
             continue;
           }
+          phase = "provider";
           const sent = await sendPersonalSlackNotification(
             env,
             candidate.user_id,
@@ -1232,6 +1247,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
               ? { escaped: true, ...(composed.slackSections ? { sections: composed.slackSections } : {}) }
               : undefined,
           );
+          phase = "finalization";
           await finishClaimedDeliveries(
             env,
             claim.outboxIds,
@@ -1242,60 +1258,41 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
             sent ? "slack_at" : null,
           );
         } catch (error) {
+          const providerFailure =
+            phase === "provider" && (error instanceof SlackApiError || error instanceof SlackRateLimitError);
           if (error instanceof SlackRateLimitError) rateLimitedWorkspaces.add(candidate.workspace_id);
           // One unreachable recipient must not starve the digests queued behind it.
           logger.error(
-            "notification.digest_slack.failed",
+            providerFailure ? "notification.digest_slack.failed" : "notification.digest_slack.infrastructure_failed",
             "notifications",
             "Notification digest Slack message failed.",
-            { userId: candidate.user_id, workspaceId: candidate.workspace_id, timezone: candidate.timezone },
+            { userId: candidate.user_id, workspaceId: candidate.workspace_id, timezone: candidate.timezone, phase },
             error,
           );
-          try {
-            if (claim)
-              await finishClaimedDeliveries(
-                env,
-                claim.outboxIds,
-                "slack",
-                claim.token,
-                "failed",
-                safeTelemetryErrorMessage(error, "Slack digest failed."),
-              );
-          } catch (secondary) {
-            logger.error(
-              "notification.digest_slack.secondary_failed",
-              "notifications",
-              "Digest failure recording failed.",
-              {},
-              secondary,
-            );
-          }
-          recordMetric(env, {
-            event: "integration.call",
-            component: "notifications",
-            operation: "slack",
-            outcome: "failure",
-          });
+          failures.push(...(await cleanupDigestClaim(env, "slack", claim, error)));
+          if (!providerFailure) failures.push(error);
+          if (providerFailure)
+            recordMetric(env, {
+              event: "integration.call",
+              component: "notifications",
+              operation: "slack",
+              outcome: "failure",
+            });
         } finally {
           lastAttempted = digestCursor(candidate);
         }
       }
     } catch (error) {
-      try {
-        await saveDigestCursor(env, "slack", window.timezone, lastAttempted);
-      } catch (secondary) {
-        logger.error(
-          "notification.digest_slack.secondary_failed",
-          "notifications",
-          "Digest cursor save failed.",
-          { timezone: window.timezone },
-          secondary,
-        );
-      }
-      throw error;
+      failures.push(error);
     }
-    await saveDigestCursor(env, "slack", window.timezone, lastAttempted);
+    try {
+      await saveDigestCursor(env, "slack", window.timezone, lastAttempted);
+    } catch (error) {
+      failures.push(error);
+    }
   }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) throw new AggregateError(failures, "Slack digest infrastructure failed.");
 }
 
 export async function sendDueNotificationDigests(env: Env, timestamp = Date.now()) {

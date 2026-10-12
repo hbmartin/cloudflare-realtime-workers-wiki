@@ -14,7 +14,6 @@ import { consumeDeliveryMessage, type DeliveryQueueMessage } from "./jobs";
 import type { Env } from "./env";
 import type { DocumentContentEnvelope } from "../shared/types";
 import { logger } from "./observability";
-import { DELIVERY_CLAIM_STALE_MS } from "./delivery-claim";
 import { encryptSlackToken } from "./slack";
 import { protectSlackFixtureUsers } from "../../tests/helpers/security";
 const bindings = env as unknown as Env;
@@ -841,7 +840,7 @@ it("finalizes checkpoint ranges by index without changing unrelated notification
 
 it.each(
   (["email", "slack"] as const).flatMap((channel) =>
-    ["ids", "access", "suppression", "claim", "partial-claim", "finalization"].map((stage) => ({ channel, stage })),
+    ["ids", "access", "suppression", "claim", "claim-selection", "finalization"].map((stage) => ({ channel, stage })),
   ),
 )(
   "continues after a $channel candidate fails during $stage and retries its pending work",
@@ -856,7 +855,7 @@ it.each(
       access: (query) => query.includes("recipient.name recipient_name"),
       suppression: (query) => query.startsWith("UPDATE notifications SET"),
       claim: (query) => query.includes("INSERT OR IGNORE INTO deliveries"),
-      "partial-claim": (query) => query.startsWith("SELECT outbox_id FROM deliveries"),
+      "claim-selection": (query) => query.startsWith("SELECT outbox_id FROM deliveries"),
       finalization: (query) =>
         query.startsWith("UPDATE deliveries SET status =") && query.includes("RETURNING outbox_id"),
     };
@@ -866,11 +865,11 @@ it.each(
         throw failure;
       }
     });
-    await sendDueNotificationDigests(failing, due);
+    await expect(sendDueNotificationDigests(failing, due)).rejects.toBe(failure);
     expect(failed).toBe(true);
     expect(send).toHaveBeenCalledTimes(stage === "finalization" ? 2 : 1);
     expect(log).toHaveBeenCalledWith(
-      `notification.digest_${channel}.failed`,
+      `notification.digest_${channel}.infrastructure_failed`,
       "notifications",
       expect.any(String),
       expect.objectContaining({ userId: "changes-a" }),
@@ -893,14 +892,7 @@ it.each(
     const delivery = await env.DB.prepare(
       "SELECT status FROM deliveries WHERE outbox_id='outbox:failure-first'",
     ).first<{ status: string }>();
-    expect(delivery?.status ?? null).toBe(
-      stage === "partial-claim" ? "pending" : stage === "finalization" ? "failed" : null,
-    );
-    if (stage === "partial-claim") {
-      await env.DB.prepare("UPDATE deliveries SET updated_at=? WHERE outbox_id='outbox:failure-first'")
-        .bind(Date.now() - DELIVERY_CLAIM_STALE_MS - 1)
-        .run();
-    }
+    expect(delivery?.status ?? null).toBe(stage === "finalization" ? "failed" : null);
     await sendDueNotificationDigests(configured, due);
     expect(
       await env.DB.prepare(`SELECT ${column} delivered FROM notifications WHERE id='failure-first'`).first(),
@@ -908,7 +900,7 @@ it.each(
   },
 );
 
-it("retains the primary delivery error when recording failure also throws", async () => {
+it("reports failure-recording errors while preserving the primary delivery log", async () => {
   const { configured, send, due } = await digestFailureFixture("email");
   const primary = new Error("Mailbox failed");
   const secondary = new Error("Failure recording failed");
@@ -916,15 +908,17 @@ it("retains the primary delivery error when recording failure also throws", asyn
   const log = vi.spyOn(logger, "error");
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   let failed = false;
-  await sendDueNotificationDigests(
-    withDatabaseHook(configured, (query) => {
-      if (!failed && query.startsWith("UPDATE deliveries SET status =") && query.includes("RETURNING outbox_id")) {
-        failed = true;
-        throw secondary;
-      }
-    }),
-    due,
-  );
+  await expect(
+    sendDueNotificationDigests(
+      withDatabaseHook(configured, (query) => {
+        if (!failed && query.startsWith("UPDATE deliveries SET status =") && query.includes("RETURNING outbox_id")) {
+          failed = true;
+          throw secondary;
+        }
+      }),
+      due,
+    ),
+  ).rejects.toBe(secondary);
   expect(send).toHaveBeenCalledTimes(2);
   expect(log.mock.calls.map((call) => call[4])).toEqual([primary, secondary]);
   expect(
@@ -958,7 +952,6 @@ it.each(["discovery", "cursor", "scan-and-save"])("still sends Slack after email
   });
   const primary = new Error(`Email ${stage} failed`);
   const secondary = new Error("Email cursor save failed too");
-  const log = vi.spyOn(logger, "error");
   vi.spyOn(console, "error").mockImplementation(() => undefined);
   let cursorWrites = 0;
   const failing = withDatabaseHook(both, (query) => {
@@ -969,11 +962,11 @@ it.each(["discovery", "cursor", "scan-and-save"])("still sends Slack after email
       if (stage === "scan-and-save") throw secondary;
     }
   });
-  await expect(sendDueNotificationDigests(failing, due)).rejects.toBe(primary);
+  const failure: unknown = await sendDueNotificationDigests(failing, due).catch((error: unknown) => error);
+  expect(failure instanceof AggregateError ? failure.errors : [failure]).toEqual(
+    stage === "scan-and-save" ? [primary, secondary] : [primary],
+  );
   expect(send.mock.calls.filter(([message]) => String((message as { to: string }).to).startsWith("U"))).toHaveLength(2);
-  expect(
-    log.mock.calls.some((call) => call[0] === "notification.digest_email.secondary_failed" && call[4] === secondary),
-  ).toBe(stage === "scan-and-save");
 });
 
 it("reports both independent digest channel failures", async () => {
@@ -1048,7 +1041,7 @@ it.each((["email", "slack"] as const).flatMap((channel) => ["D1", "R2", "body"].
         }
       },
     );
-    await sendDueNotificationDigests(failing, digestTimestamp());
+    await expect(sendDueNotificationDigests(failing, digestTimestamp())).rejects.toBe(failure);
     expect(failed).toBe(true);
     expect(send).not.toHaveBeenCalled();
     const frozen = await env.DB.prepare("SELECT comparison_json,status FROM deliveries").first<{

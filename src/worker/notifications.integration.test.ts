@@ -1,5 +1,13 @@
 import { enrollAccount, protectSlackFixtureUsers } from "../../tests/helpers/security";
-import { abortAllDurableObjects, applyD1Migrations, env, reset, runInDurableObject, SELF } from "cloudflare:test";
+import {
+  abortAllDurableObjects,
+  applyD1Migrations,
+  createExecutionContext,
+  env,
+  reset,
+  runInDurableObject,
+  SELF,
+} from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { DIAGRAM_NODES_ROOT } from "../shared/diagram";
@@ -14,6 +22,7 @@ import {
   sendDueNotificationDigests,
 } from "./notifications";
 import { encryptSlackToken } from "./slack";
+import { executeScheduledTasks } from "./index";
 import { webhookEventStatements } from "./webhooks";
 
 const SLACK_SECRETS = {
@@ -1477,6 +1486,226 @@ describe("notification feed and subscriptions", () => {
     ).toEqual({ delivered: 3 });
     log.mockRestore();
   });
+
+  it.each([
+    ...(["email", "slack"] as const).flatMap((channel) =>
+      (["preparation", "claim-response", "finalization", "finalization-response", "cleanup", "provider"] as const).map(
+        (failure) => ({ channel, failure }),
+      ),
+    ),
+    { channel: "slack" as const, failure: "dispatch-database" as const },
+  ])(
+    "reports $channel $failure failures after healthy recipients and the other channel progress",
+    async ({ channel, failure }) => {
+      const installed = await bootstrap();
+      const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+      const configured = slackEnv();
+      const token = await encryptSlackToken(configured, "xoxb-digest-recovery");
+      await env.DB.batch([
+        env.DB.prepare(`INSERT INTO user(id,name,email,emailVerified,createdAt,updatedAt) VALUES
+        ('recovery-a','A','recovery-a@example.test',1,?,?),
+        ('recovery-b','B','recovery-b@example.test',1,?,?),
+        ('recovery-c','C','recovery-c@example.test',1,?,?)`).bind(
+          timestamp,
+          timestamp,
+          timestamp,
+          timestamp,
+          timestamp,
+          timestamp,
+        ),
+        env.DB.prepare(`INSERT INTO workspace_members(workspace_id,user_id,role,created_at)
+        SELECT ?,id,'viewer',? FROM user WHERE id LIKE 'recovery-%'`).bind(installed.workspaceId, timestamp),
+        env.DB.prepare(`INSERT INTO notification_preferences(user_id,event_type,in_app,email,slack,timezone)
+        SELECT id,'mention',1,'digest','digest','UTC' FROM user WHERE id LIKE 'recovery-%'`),
+        env.DB.prepare(`INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at)
+        VALUES ('recovery-installation',?,'TRECOVERY','Recovery','BRECOVERY',?,'chat:write',?,?,?)`).bind(
+          installed.workspaceId,
+          token,
+          installed.userId,
+          timestamp,
+          timestamp,
+        ),
+        env.DB.prepare(`INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,security_generation)
+        SELECT 'recovery-installation',id,'U'||id,?,0 FROM user WHERE id LIKE 'recovery-%'`).bind(timestamp),
+        env.DB.prepare(`INSERT INTO notifications(id,workspace_id,user_id,event_type,actor_id,space_id,page_id,data_json,dedupe_key,created_at)
+        SELECT 'recovery-notification-'||id,?,id,'mention',?,?,?,'{}','recovery-'||id,? FROM user WHERE id LIKE 'recovery-%'`).bind(
+          installed.workspaceId,
+          installed.userId,
+          installed.page.spaceId,
+          installed.page.id,
+          timestamp - 600_000,
+        ),
+        env.DB.prepare(`INSERT INTO notifications(id,workspace_id,user_id,event_type,actor_id,space_id,page_id,data_json,dedupe_key,created_at)
+        VALUES ('competing-notification',?,'recovery-a','mention',?,?,?,'{}','competing',?)`).bind(
+          installed.workspaceId,
+          installed.userId,
+          installed.page.spaceId,
+          installed.page.id,
+          timestamp - 600_000,
+        ),
+        env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
+        SELECT 'outbox:'||id,workspace_id,'notification',json_object('notificationId',id),?,? FROM notifications WHERE id LIKE 'recovery-%' OR id='competing-notification'`).bind(
+          timestamp,
+          timestamp,
+        ),
+        env.DB.prepare(`INSERT INTO deliveries(idempotency_key,outbox_id,channel,status,attempts,updated_at,claim_token)
+        VALUES (?,'outbox:competing-notification',?,'pending',1,?,'competing-token')`).bind(
+          `outbox:competing-notification:${channel}`,
+          channel,
+          Date.now(),
+        ),
+      ]);
+      await verifySlackDigestRecipients(["recovery-a", "recovery-b", "recovery-c"]);
+      const injected = new Error(`injected ${failure}`);
+      let failed = false;
+      const metadata = new WeakMap<
+        D1PreparedStatement,
+        { statement: D1PreparedStatement; sql: string; values: unknown[] }
+      >();
+      const wrap = (statement: D1PreparedStatement, sql: string, values: unknown[] = []): D1PreparedStatement => {
+        const proxy = new Proxy(statement, {
+          get(target, property) {
+            if (property === "bind") return (...args: unknown[]) => wrap(target.bind(...args), sql, args);
+            if (
+              property === "all" &&
+              failure === "cleanup" &&
+              sql.includes("UPDATE deliveries SET status") &&
+              values[0] === "failed" &&
+              values[5] === channel
+            ) {
+              return async () => {
+                failed = true;
+                throw injected;
+              };
+            }
+            const value: unknown = Reflect.get(target, property, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        });
+        metadata.set(proxy, { statement, sql, values });
+        return proxy;
+      };
+      const database = new Proxy(env.DB, {
+        get(target, property) {
+          if (property === "prepare")
+            return (sql: string) => {
+              if (
+                !failed &&
+                ((failure === "preparation" &&
+                  sql.startsWith("WITH eligible") &&
+                  sql.includes(channel === "email" ? "n.emailed_at" : "n.slack_at")) ||
+                  (failure === "dispatch-database" && sql.includes("SELECT link.slack_user_id,link.linked_at")))
+              ) {
+                failed = true;
+                throw injected;
+              }
+              return wrap(target.prepare(sql), sql);
+            };
+          if (property === "batch")
+            return async (statements: D1PreparedStatement[]) => {
+              const first = metadata.get(statements[0]!);
+              const claim =
+                first?.sql.includes("INSERT OR IGNORE INTO deliveries") &&
+                first.values[0] === channel &&
+                String(first.values[4]).includes("recovery-a");
+              const finish =
+                first?.sql.includes("UPDATE deliveries SET status") &&
+                first.values[0] === "sent" &&
+                first.values[5] === channel &&
+                String(first.values[4]).includes("recovery-a");
+              const fail =
+                !failed &&
+                ((failure === "claim-response" && claim) ||
+                  ((failure === "finalization" || failure === "finalization-response") && finish));
+              if (fail && failure === "finalization") {
+                failed = true;
+                throw injected;
+              }
+              const result = await target.batch(
+                statements.map((statement) => metadata.get(statement)?.statement ?? statement),
+              );
+              if (fail) {
+                failed = true;
+                throw injected;
+              }
+              return result;
+            };
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const providerFails = failure === "provider" || failure === "cleanup";
+      const send = vi.fn(async (message: { to: string }) => {
+        if (channel === "email" && providerFails && message.to === "recovery-a@example.test")
+          throw new Error("mailbox unavailable");
+        return { messageId: "delivered" };
+      });
+      const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+        const payload = JSON.parse(String(init?.body)) as { channel: string };
+        if (channel === "slack" && providerFails && payload.channel === "Urecovery-a")
+          return Response.json({ ok: false, error: "channel_not_found" });
+        return Response.json({ ok: true });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const metric = vi.fn();
+      const bindings = new Proxy(configured, {
+        get(target, property, receiver) {
+          if (property === "DB") return database;
+          if (property === "SEND_EMAIL") return { send };
+          if (property === "EMAIL_FROM") return "notes@example.test";
+          if (property === "OBSERVABILITY") return { writeDataPoint: metric };
+          return Reflect.get(target, property, receiver);
+        },
+      });
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const scheduled = executeScheduledTasks(bindings, createExecutionContext(), [
+        { name: "notification_digests", run: () => sendDueNotificationDigests(bindings, timestamp) },
+      ]);
+      const result = await scheduled.then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(result instanceof Error ? result.message : result).toBe(
+        failure === "provider" ? null : "Scheduled tasks failed",
+      );
+      expect(failed || failure === "provider").toBe(true);
+      expect(
+        await env.DB.prepare(`SELECT user_id FROM digest_delivery_cursors WHERE channel=?`).bind(channel).first(),
+      ).toEqual({ user_id: "recovery-c" });
+      expect(
+        await env.DB.prepare(`SELECT COUNT(*) delivered FROM notifications
+      WHERE id IN ('recovery-notification-recovery-b','recovery-notification-recovery-c') AND emailed_at IS NOT NULL AND slack_at IS NOT NULL`).first(),
+      ).toEqual({ delivered: 2 });
+      expect(
+        await env.DB.prepare(`SELECT status,claim_token FROM deliveries WHERE idempotency_key=?`)
+          .bind(`outbox:competing-notification:${channel}`)
+          .first(),
+      ).toEqual({ status: "pending", claim_token: "competing-token" });
+      const first = await env.DB.prepare(`SELECT status FROM deliveries WHERE idempotency_key=?`)
+        .bind(`outbox:recovery-notification-recovery-a:${channel}`)
+        .first();
+      expect(first).toEqual(
+        failure === "preparation"
+          ? null
+          : { status: failure === "cleanup" ? "pending" : failure === "finalization-response" ? "sent" : "failed" },
+      );
+      const failures = metric.mock.calls
+        .map(([point]) => point as { indexes: string[]; blobs: string[] })
+        .filter(
+          (point) =>
+            point.indexes[0] === "integration.call" &&
+            point.blobs[1] === "notifications" &&
+            point.blobs[3] === "failure",
+        );
+      expect(failures).toHaveLength(providerFails ? 1 : 0);
+      expect(metric).toHaveBeenCalledWith(
+        expect.objectContaining({
+          indexes: ["scheduled.task"],
+          blobs: expect.arrayContaining([failure === "provider" ? "success" : "failure"]),
+        }),
+      );
+    },
+  );
 
   it("advances the persisted digest cursor past a failing leading cohort", async () => {
     const installed = await bootstrap();
