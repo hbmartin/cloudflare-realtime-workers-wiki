@@ -44,7 +44,7 @@
     "db:local": "node scripts/migrate-d1.mjs --local",
     "db:remote": "node scripts/migrate-d1.mjs --env production --remote",
     "db:export": "node scripts/d1-export.mjs",
-    "check": "pnpm format:check && pnpm lint && pnpm check:middleware && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker",
+    "check": "pnpm format:check && pnpm check:docs && pnpm lint && pnpm check:middleware && pnpm typecheck && pnpm test:coverage && pnpm test:worker:coverage && pnpm analyze && pnpm cf-typegen:check && pnpm build && pnpm build:worker",
     "deploy": "node scripts/deploy.mjs deploy",
     "security:reset": "node scripts/security-reset.mjs",
     "observability:report": "node scripts/observability.mjs report",
@@ -54,7 +54,8 @@
     "plugin:eval": "node scripts/evaluate-plugin.mjs",
     "build:app": "pnpm build:plugin-ui && pnpm typecheck && vite build && node scripts/build-offline-worker.mjs",
     "deploy:one-click": "node scripts/deploy.mjs deploy --one-click",
-    "deploy:production": "node scripts/deploy.mjs deploy --production"
+    "deploy:production": "node scripts/deploy.mjs deploy --production",
+    "check:docs": "node scripts/check-docs.mjs"
   },
   "dependencies": {
     "@better-auth/core": "1.7.7",
@@ -115,7 +116,9 @@
     "@vitest/coverage-v8": "5.0.3",
     "esbuild": "0.28.2",
     "fallow": "3.32.0",
+    "github-slugger": "2.0.0",
     "jsdom": "30.1.2",
+    "jsonc-parser": "3.3.1",
     "oxfmt": "0.72.0",
     "oxlint": "1.87.0",
     "oxlint-tsgolint": "7.0.2003",
