@@ -4,6 +4,7 @@ import {
   configurationHash,
   createGeneratedResources,
   deployPrepared,
+  deploymentErrorMessage,
   portableDatabase,
   portableOverrides,
   portablePreparation,
@@ -111,71 +112,96 @@ describe("portable resource intent", () => {
       dead_letter_queue: "wiki-delivery-dlq",
     });
   });
-  it.each(["missing", "existing", "malformed", "ambiguous", "unavailable"])(
-    "strictly validates consumer-only custom dead-letter queues (%s) before D1",
-    async (state) => {
+  it.each(
+    ["queue", "dead_letter_queue"].flatMap((role) =>
+      ["missing", "existing", "malformed", "ambiguous", "unavailable"].map((state) => ({ role, state })),
+    ),
+  )("strictly validates consumer-only custom $role queues ($state) before D1", async ({ role, state }) => {
+    const config = root();
+    config.queues.producers = config.queues.producers.filter(
+      (producer) => producer.binding !== (role === "queue" ? "DELIVERY_QUEUE" : "DELIVERY_DEAD_LETTER_QUEUE"),
+    );
+    config.queues.consumers[0][role] = "custom-dlq";
+    const api = vi.fn(async (path, options) => {
+      if (path.startsWith("/r2/")) return null;
+      if (path.startsWith("/queues?")) {
+        if (!path.includes("name=custom-dlq")) return pages();
+        if (state === "unavailable") throw new Error("lookup unavailable");
+        if (state === "malformed") return {};
+        const page = Number(new URL(`https://example.test${path}`).searchParams.get("page"));
+        if (page === 1) return pages([{ queue_id: "one", queue_name: "custom-dlq-near-match" }], 1, 2);
+        return pages(
+          state === "existing"
+            ? [{ queue_id: "two", queue_name: "custom-dlq" }]
+            : state === "ambiguous"
+              ? [
+                  { queue_id: "two", queue_name: "custom-dlq" },
+                  { queue_id: "three", queue_name: "custom-dlq" },
+                ]
+              : [],
+          2,
+          2,
+        );
+      }
+      if (path.startsWith("/d1/database?")) return [];
+      if (options?.method === "POST") return { uuid: databaseID };
+      throw new Error("Unexpected request");
+    });
+    const outcome = await portablePreparation(config, null, "worker", api).then(
+      (prepared) => ({
+        resource: prepared.resources.at(-1),
+        destination: portableOverrides(
+          config,
+          null,
+          "worker",
+          "https://example.test",
+          prepared.database,
+          prepared.resources,
+        ).queues.consumers[0][role],
+      }),
+      (error) => ({ error: error.message }),
+    );
+    const expectedResource = expect.objectContaining({
+      name: "custom-dlq",
+      provenance: "configured",
+      consumerOnly: true,
+      role,
+    });
+    const expectedError = expect.stringMatching(/does not exist|ambiguous|lookup unavailable/);
+    expect(outcome).toEqual(
+      state === "existing" ? { resource: expectedResource, destination: "custom-dlq" } : { error: expectedError },
+    );
+    expect(api.mock.calls.some(([path]) => path.startsWith("/d1/"))).toBe(state === "existing");
+  });
+  it.each(["DELIVERY_QUEUE", "DELIVERY_DEAD_LETTER_QUEUE"])(
+    "rejects missing template %s before API requests",
+    async (binding) => {
       const config = root();
-      config.queues.producers = config.queues.producers.slice(0, 1);
-      config.queues.consumers[0].dead_letter_queue = "custom-dlq";
-      const api = vi.fn(async (path, options) => {
-        if (path.startsWith("/r2/")) return null;
-        if (path.startsWith("/queues?")) {
-          if (!path.includes("name=custom-dlq")) return pages();
-          if (state === "unavailable") throw new Error("lookup unavailable");
-          if (state === "malformed") return {};
-          const page = Number(new URL(`https://example.test${path}`).searchParams.get("page"));
-          if (page === 1) return pages([{ queue_id: "one", queue_name: "custom-dlq-near-match" }], 1, 2);
-          return pages(
-            state === "existing"
-              ? [{ queue_id: "two", queue_name: "custom-dlq" }]
-              : state === "ambiguous"
-                ? [
-                    { queue_id: "two", queue_name: "custom-dlq" },
-                    { queue_id: "three", queue_name: "custom-dlq" },
-                  ]
-                : [],
-            2,
-            2,
-          );
-        }
-        if (path.startsWith("/d1/database?")) return [];
-        if (options?.method === "POST") return { uuid: databaseID };
-        throw new Error("Unexpected request");
-      });
-      const outcome = await portablePreparation(config, null, "worker", api).then(
-        (prepared) => ({
-          resource: prepared.resources.at(-1),
-          deadLetter: portableOverrides(
-            config,
-            null,
-            "worker",
-            "https://example.test",
-            prepared.database,
-            prepared.resources,
-          ).queues.consumers[0].dead_letter_queue,
-        }),
-        (error) => ({ error: error.message }),
-      );
-      const expectedResource = expect.objectContaining({
-        name: "custom-dlq",
-        provenance: "configured",
-        consumerOnly: true,
-      });
-      const expectedError = expect.stringMatching(/does not exist|ambiguous|lookup unavailable/);
-      expect(outcome).toEqual(
-        state === "existing" ? { resource: expectedResource, deadLetter: "custom-dlq" } : { error: expectedError },
-      );
-      expect(api.mock.calls.some(([path]) => path.startsWith("/d1/"))).toBe(state === "existing");
+      config.queues.producers = config.queues.producers.filter((producer) => producer.binding !== binding);
+      const api = vi.fn();
+      await expect(portablePreparation(config, null, "worker", api)).rejects.toThrow(`Restore ${binding}`);
+      expect(api).not.toHaveBeenCalled();
     },
   );
-  it("rejects missing template dead-letter producers before any API requests", async () => {
-    const config = root();
-    config.queues.producers = config.queues.producers.slice(0, 1);
-    const api = vi.fn();
-    await expect(portablePreparation(config, null, "worker", api)).rejects.toThrow(
-      "custom, existing dead-letter queue",
-    );
-    expect(api).not.toHaveBeenCalled();
+  it.each(["provision", "upload"])("prints the original %s failure together with adoption guidance", async (stage) => {
+    const cause = new Error("Cloudflare POST request failed (403). Check account permissions.");
+    const failure = await deployPrepared(
+      { target: "production", resources: [generated("bucket", "worker-attachments")] },
+      {
+        migrateDatabase: () => 0,
+        provisionResources: async () => {
+          if (stage === "provision") throw cause;
+        },
+        upload: async () => {
+          if (stage === "upload") throw cause;
+        },
+        health: vi.fn(),
+      },
+    ).catch((error) => error);
+    expect(failure.cause).toBe(cause);
+    expect(deploymentErrorMessage(failure)).toContain(cause.message);
+    expect(deploymentErrorMessage(failure)).toContain("explicitly configure");
+    expect(deploymentErrorMessage(cause)).toBe(cause.message);
   });
   it("fingerprints provenance and rejects obsolete manifests", () => {
     const context = { origin: "https://example.test", resources: [generated("bucket", "worker-attachments")] };
@@ -183,6 +209,12 @@ describe("portable resource intent", () => {
     expect(() => verifyBuild(manifest, context)).not.toThrow();
     expect(() =>
       verifyBuild(manifest, { ...context, resources: [{ ...context.resources[0], provenance: "configured" }] }),
+    ).toThrow("Run the build again");
+    const consumer = { ...generated("queue", "existing"), consumerOnly: true, role: "queue", provenance: "configured" };
+    const consumerContext = { origin: context.origin, resources: [consumer] };
+    const consumerManifest = { ...consumerContext, configurationHash: configurationHash(consumerContext) };
+    expect(() =>
+      verifyBuild(consumerManifest, { ...consumerContext, resources: [{ ...consumer, role: "dead_letter_queue" }] }),
     ).toThrow("Run the build again");
     const obsolete = { ...context, configurationHash: configurationHash({ origin: context.origin }) };
     expect(() => verifyBuild(obsolete, context)).toThrow("Run the build again");

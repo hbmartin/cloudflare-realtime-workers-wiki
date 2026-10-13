@@ -17,6 +17,8 @@ import {
   preparePersonalSlackNotification,
   sendPersonalSlackNotification,
   slackInstallationError,
+  slackTokenPreparationFailure,
+  SlackInstallationAuthError,
   SlackApiError,
   SlackInstallationChangedError,
   SlackRateLimitError,
@@ -796,7 +798,7 @@ const DIGEST_STATEMENT_BUDGET = 240;
 const DIGEST_CHANNEL_COUNT = 2;
 const DIGEST_STATEMENTS_PER_CANDIDATE = 11;
 const DIGEST_REFRESH_STATEMENTS = 7;
-class DigestRefreshBudgetExhaustedError extends Error {}
+class DigestBudgetExhaustedError extends Error {}
 const DIFF_DIGEST_PAGE_LIMIT = 10;
 function digestCandidateCost(env: Env, pages: number) {
   return (
@@ -807,6 +809,59 @@ function digestCandidateCost(env: Env, pages: number) {
 const DIGEST_STATEMENTS_PER_WINDOW = 4;
 const DIGEST_DISCOVERY_STATEMENTS = 1;
 const DIGEST_CHANNEL_STATEMENT_BUDGET = Math.floor(DIGEST_STATEMENT_BUDGET / DIGEST_CHANNEL_COUNT);
+
+// Scope accounting to one channel; count attempted executions, including batch members.
+function digestAccounting(env: Env) {
+  const budget = {
+    used: 0,
+    reserved: 0,
+    get remaining() {
+      return DIGEST_CHANNEL_STATEMENT_BUDGET - this.used - this.reserved;
+    },
+    require(count: number) {
+      if (count > this.remaining) throw new DigestBudgetExhaustedError();
+    },
+    charge(count: number) {
+      this.require(count);
+      this.used += count;
+    },
+  };
+  const originals = new WeakMap<D1PreparedStatement, D1PreparedStatement>();
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement => {
+    const proxy = new Proxy(statement, {
+      get(target, property) {
+        if (property === "bind") return (...values: unknown[]) => wrap(target.bind(...values));
+        const value: unknown = Reflect.get(target, property, target);
+        if (["run", "all", "first", "raw"].includes(String(property)))
+          return (...args: unknown[]) => {
+            budget.charge(1);
+            return Reflect.apply(value as (...args: unknown[]) => unknown, target, args);
+          };
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    originals.set(proxy, statement);
+    return proxy;
+  };
+  const database = new Proxy(env.DB, {
+    get(target, property) {
+      if (property === "prepare") return (sql: string) => wrap(target.prepare(sql));
+      if (property === "batch")
+        return (statements: D1PreparedStatement[]) => {
+          budget.charge(statements.length);
+          return target.batch(statements.map((statement) => originals.get(statement) ?? statement));
+        };
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    budget,
+    env: new Proxy(env, {
+      get: (target, property, receiver) => (property === "DB" ? database : Reflect.get(target, property, receiver)),
+    }),
+  };
+}
 const DIGEST_CANDIDATE_PAGE = Math.floor(
   (DIGEST_CHANNEL_STATEMENT_BUDGET - DIGEST_DISCOVERY_STATEMENTS - DIGEST_STATEMENTS_PER_WINDOW) /
     DIGEST_STATEMENTS_PER_CANDIDATE,
@@ -903,7 +958,9 @@ function digestIdsSql(env: Env, channel: DigestChannel) {
     FROM ${source} n LEFT JOIN notification_preferences preference
       ON preference.user_id=n.user_id AND preference.event_type=n.event_type
     WHERE n.user_id=? AND n.workspace_id=? AND n.${channel === "email" ? "emailed_at" : "slack_at"} IS NULL
-      AND ${digestModeSql(channel)} AND COALESCE(preference.timezone,'UTC')=? AND n.created_at<?`;
+      AND ${digestModeSql(channel)} AND COALESCE(preference.timezone,'UTC')=? AND n.created_at<?
+      AND NOT EXISTS(SELECT 1 FROM deliveries delivery WHERE delivery.outbox_id='outbox:'||n.id AND delivery.channel='${channel}'
+        AND (delivery.status='sent' OR (delivery.status='pending' AND delivery.updated_at>${Date.now() - DELIVERY_CLAIM_STALE_MS})))`;
   return `WITH eligible AS (${eligible}), ranked AS (
     SELECT id,created_at,digest_group,row_number() OVER(PARTITION BY digest_group ORDER BY created_at,id) rank FROM eligible
   ), groups AS (SELECT *,sum(CASE WHEN digest_group LIKE 'page:%' THEN 1 ELSE 0 END)
@@ -924,7 +981,7 @@ function digestRecipientSql(channel: DigestChannel) {
          SELECT 1 FROM slack_installations installation
          JOIN slack_authorized_user_links link
            ON link.installation_id = installation.id AND link.user_id = n.user_id
-        WHERE installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL
+        WHERE installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
        )`;
 }
 
@@ -1062,15 +1119,25 @@ async function suppressDigestRows(
   await env.DB.batch(statements);
 }
 
+function digestSuppressionCost(env: Env, ids: string[]) {
+  return ids.length
+    ? 1 + (env.DIFF_DIGESTS_ENABLED === "true" && ids.some((id) => id.startsWith("change:")) ? 2 : 0)
+    : 0;
+}
+
 async function sendDueEmailDigests(env: Env, timestamp: number) {
   if (!env.SEND_EMAIL || !env.EMAIL_FROM) return;
+  const sender = env.SEND_EMAIL,
+    from = env.EMAIL_FROM;
+  const accounting = digestAccounting(env);
+  env = accounting.env;
+  const { budget } = accounting;
   const dueTimezones = await discoverDigestWindows(env, "email", timestamp);
   if (!dueTimezones.length) return;
   const failures: unknown[] = [];
-  let remainingStatements = DIGEST_CHANNEL_STATEMENT_BUDGET - DIGEST_DISCOVERY_STATEMENTS;
   for (const window of dueTimezones) {
-    if (remainingStatements < DIGEST_STATEMENTS_PER_WINDOW + DIGEST_STATEMENTS_PER_CANDIDATE) break;
-    remainingStatements -= DIGEST_STATEMENTS_PER_WINDOW;
+    if (budget.remaining < DIGEST_STATEMENTS_PER_WINDOW + DIGEST_STATEMENTS_PER_CANDIDATE) break;
+    budget.reserved = 1; // Keep the cursor write available even after failures.
     const readCandidates = (cursor: DigestCursor, pageSize: number) =>
       env.DB.prepare(
         `SELECT n.user_id, n.workspace_id, recipient.name, recipient.email,
@@ -1100,7 +1167,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
         }>();
     const candidateLimit = Math.min(
       DIGEST_CANDIDATE_PAGE,
-      Math.floor(remainingStatements / DIGEST_STATEMENTS_PER_CANDIDATE),
+      Math.floor(budget.remaining / DIGEST_STATEMENTS_PER_CANDIDATE),
     );
     let lastAttempted: DigestCursor | undefined;
     try {
@@ -1113,10 +1180,13 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
       );
       for (const candidate of candidates) {
         const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
-        if (remainingStatements < candidateCost) break;
-        remainingStatements -= candidateCost;
+        if (budget.remaining < candidateCost) break;
+        const candidateStarted = budget.used;
+        let allowance = candidateCost;
+        let cleanupReserved = false;
         let claim: DigestClaim | undefined;
         let phase: "preparation" | "provider" | "finalization" = "preparation";
+        let budgetExhausted = false;
         try {
           const ids = await env.DB.prepare(digestIdsSql(env, "email"))
             .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
@@ -1127,7 +1197,12 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
             candidate.workspace_id,
             ids.results.map((row) => row.id),
           );
+          allowance += digestSuppressionCost(env, suppressed);
+          budget.require(allowance - (budget.used - candidateStarted));
           await suppressDigestRows(env, "email", suppressed, candidate, timestamp, window.cutoff);
+          budget.require(allowance - (budget.used - candidateStarted));
+          budget.reserved++;
+          cleanupReserved = true;
           claim = { token: crypto.randomUUID(), outboxIds: rows.map((row) => `outbox:${row.id}`) };
           // Retain the token and requested IDs if D1 commits but its response fails.
           claim.outboxIds = await claimDeliveries(env, claim.outboxIds, "email", claim.token);
@@ -1152,7 +1227,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
             continue;
           }
           const message = {
-            from: env.EMAIL_FROM,
+            from,
             to: candidate.email,
             subject: `${claimed.length} NoteFlare update${claimed.length === 1 ? "" : "s"}`,
             text: composed?.text ?? `Your daily NoteFlare digest:\n\n${lines.join("\n")}`,
@@ -1163,10 +1238,14 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
                 .join("")}</ul>`,
           };
           phase = "provider";
-          await env.SEND_EMAIL.send(message);
+          await sender.send(message);
           phase = "finalization";
           await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent", null, "emailed_at");
         } catch (error) {
+          if (error instanceof DigestBudgetExhaustedError && !claim) {
+            budgetExhausted = true;
+            break;
+          }
           const providerFailure = phase === "provider";
           const context = {
             userId: candidate.user_id,
@@ -1182,6 +1261,10 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
               error,
             );
           else logDigestInfrastructure("email", phase, error, context);
+          if (cleanupReserved) {
+            budget.reserved--;
+            cleanupReserved = false;
+          }
           failures.push(...(await cleanupDigestClaim(env, "email", claim, error, context)));
           if (!providerFailure) failures.push(error);
           if (providerFailure)
@@ -1192,7 +1275,8 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
               outcome: "failure",
             });
         } finally {
-          lastAttempted = digestCursor(candidate);
+          if (cleanupReserved) budget.reserved--;
+          if (!budgetExhausted) lastAttempted = digestCursor(candidate);
         }
       }
     } catch (error) {
@@ -1202,6 +1286,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
       });
       failures.push(error);
     }
+    budget.reserved = 0;
     try {
       await saveDigestCursor(env, "email", window.timezone, lastAttempted);
     } catch (error) {
@@ -1214,14 +1299,16 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
 }
 
 async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
+  const accounting = digestAccounting(env);
+  env = accounting.env;
+  const { budget } = accounting;
   const dueTimezones = await discoverDigestWindows(env, "slack", timestamp);
   if (!dueTimezones.length) return;
   const failures: unknown[] = [];
-  let remainingStatements = DIGEST_CHANNEL_STATEMENT_BUDGET - DIGEST_DISCOVERY_STATEMENTS;
   const deferredWorkspaces = new Set<string>();
   for (const window of dueTimezones) {
-    if (remainingStatements < DIGEST_STATEMENTS_PER_WINDOW + DIGEST_STATEMENTS_PER_CANDIDATE) break;
-    remainingStatements -= DIGEST_STATEMENTS_PER_WINDOW;
+    if (budget.remaining < DIGEST_STATEMENTS_PER_WINDOW + DIGEST_STATEMENTS_PER_CANDIDATE) break;
+    budget.reserved = 1; // Keep the cursor write available even after failures.
     const readCandidates = (cursor: DigestCursor, pageSize: number) =>
       env.DB.prepare(
         `SELECT n.user_id, n.workspace_id, COALESCE(preference.timezone, 'UTC') timezone,
@@ -1230,7 +1317,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
          JOIN workspace_members membership
            ON membership.workspace_id = n.workspace_id AND membership.user_id = n.user_id
          JOIN slack_installations installation
-           ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL
+           ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
          JOIN slack_authorized_user_links link
            ON link.installation_id = installation.id AND link.user_id = n.user_id
          LEFT JOIN notification_preferences preference
@@ -1246,7 +1333,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
         .all<{ user_id: string; workspace_id: string; timezone: string; comparison_pages: number }>();
     const candidateLimit = Math.min(
       DIGEST_CANDIDATE_PAGE,
-      Math.floor(remainingStatements / DIGEST_STATEMENTS_PER_CANDIDATE),
+      Math.floor(budget.remaining / DIGEST_STATEMENTS_PER_CANDIDATE),
     );
     let lastAttempted: DigestCursor | undefined;
     try {
@@ -1263,10 +1350,12 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           continue;
         }
         const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
-        if (remainingStatements < candidateCost) break;
-        remainingStatements -= candidateCost;
+        if (budget.remaining < candidateCost) break;
+        const candidateStarted = budget.used;
+        let allowance = candidateCost;
+        let cleanupReserved = false;
         let claim: DigestClaim | undefined;
-        let phase: "token" | "preparation" | "provider" | "finalization" = "token";
+        let phase: "token" | "preparation" | "provider" | "finalization" = "preparation";
         let budgetExhausted = false;
         const context = {
           userId: candidate.user_id,
@@ -1274,15 +1363,6 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           timezone: candidate.timezone,
         };
         try {
-          const prepared = await preparePersonalSlackNotification(env, candidate.user_id, candidate.workspace_id, {
-            tokenRefreshMode: "defer",
-            beforeRefresh: () => {
-              if (remainingStatements < DIGEST_REFRESH_STATEMENTS) throw new DigestRefreshBudgetExhaustedError();
-              remainingStatements -= DIGEST_REFRESH_STATEMENTS;
-            },
-          });
-          if (!prepared) throw new HttpError(403, "slack_identity_required", "Slack identity is no longer available.");
-          phase = "preparation";
           const ids = await env.DB.prepare(digestIdsSql(env, "slack"))
             .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
             .all<{ id: string }>();
@@ -1292,8 +1372,23 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
             candidate.workspace_id,
             ids.results.map((row) => row.id),
           );
+          allowance += digestSuppressionCost(env, suppressed);
+          budget.require(allowance - (budget.used - candidateStarted));
           await suppressDigestRows(env, "slack", suppressed, candidate, timestamp, window.cutoff);
           if (!rows.length) continue;
+          phase = "token";
+          const prepared = await preparePersonalSlackNotification(env, candidate.user_id, candidate.workspace_id, {
+            tokenRefreshMode: "defer",
+            beforeRefresh: () => {
+              budget.require(allowance + DIGEST_REFRESH_STATEMENTS - (budget.used - candidateStarted));
+              allowance += DIGEST_REFRESH_STATEMENTS;
+            },
+          });
+          if (!prepared) throw new HttpError(403, "slack_identity_required", "Slack identity is no longer available.");
+          phase = "preparation";
+          budget.require(allowance - (budget.used - candidateStarted));
+          budget.reserved++;
+          cleanupReserved = true;
           claim = { token: crypto.randomUUID(), outboxIds: rows.map((row) => `outbox:${row.id}`) };
           claim.outboxIds = await claimDeliveries(env, claim.outboxIds, "slack", claim.token);
           const claimedIds = new Set(claim.outboxIds);
@@ -1332,7 +1427,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           phase = "finalization";
           await finishClaimedDeliveries(env, claim.outboxIds, "slack", claim.token, "sent", null, "slack_at");
         } catch (error) {
-          if (error instanceof DigestRefreshBudgetExhaustedError) {
+          if (error instanceof DigestBudgetExhaustedError && !claim) {
             budgetExhausted = true;
             break;
           }
@@ -1343,17 +1438,18 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
                 ? "installation_changed"
                 : error instanceof HttpError && error.status === 403 && error.code === "slack_identity_required"
                   ? "slack_identity_required"
-                  : undefined;
+                  : error instanceof SlackInstallationAuthError
+                    ? "installation_auth_required"
+                    : undefined;
           const providerFailure =
             (phase === "provider" || phase === "token") &&
             (skipReason !== undefined || error instanceof SlackApiError || error instanceof SlackRateLimitError);
           if (
             providerFailure &&
-            (error instanceof SlackTokenRefreshInProgressError ||
-              error instanceof SlackInstallationChangedError ||
+            (slackTokenPreparationFailure(error) ||
+              error instanceof SlackInstallationAuthError ||
               error instanceof SlackRateLimitError ||
-              slackInstallationError(error) ||
-              (error instanceof SlackApiError && error.method === "oauth.v2.access"))
+              slackInstallationError(error))
           )
             deferredWorkspaces.add(candidate.workspace_id);
           if (providerFailure && skipReason)
@@ -1372,6 +1468,10 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
               error,
             );
           else logDigestInfrastructure("slack", phase, error, context);
+          if (cleanupReserved) {
+            budget.reserved--;
+            cleanupReserved = false;
+          }
           failures.push(...(await cleanupDigestClaim(env, "slack", claim, error, context)));
           if (!providerFailure) failures.push(error);
           if (providerFailure)
@@ -1383,6 +1483,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
               ...(skipReason ? { code: skipReason } : {}),
             });
         } finally {
+          if (cleanupReserved) budget.reserved--;
           if (!budgetExhausted) lastAttempted = digestCursor(candidate);
         }
       }
@@ -1393,6 +1494,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
       });
       failures.push(error);
     }
+    budget.reserved = 0;
     try {
       await saveDigestCursor(env, "slack", window.timezone, lastAttempted);
     } catch (error) {

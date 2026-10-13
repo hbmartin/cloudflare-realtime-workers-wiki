@@ -226,21 +226,27 @@ export function portableResources(config, settings, name) {
     ...config.queues.producers.map((entry) => resolveResource("queue", entry.binding, entry.queue)),
   ];
   for (const [index, consumer] of config.queues.consumers.entries()) {
-    const queue = consumer.dead_letter_queue;
-    if (!queue || config.queues.producers.some((producer) => producer.queue === queue)) continue;
-    if (queue === "noteflare-delivery-dlq") {
-      if (config.queues.producers.some((producer) => producer.binding === "DELIVERY_DEAD_LETTER_QUEUE")) continue;
-      throw new Error(
-        "The template dead-letter queue requires a producer binding. Restore DELIVERY_DEAD_LETTER_QUEUE or configure a custom, existing dead-letter queue before retrying.",
-      );
+    for (const [role, template, binding, label] of [
+      ["queue", "noteflare-delivery", "DELIVERY_QUEUE", "consumer"],
+      ["dead_letter_queue", "noteflare-delivery-dlq", "DELIVERY_DEAD_LETTER_QUEUE", "dead-letter"],
+    ]) {
+      const queue = consumer[role];
+      if (!queue || config.queues.producers.some((producer) => producer.queue === queue)) continue;
+      if (queue === template) {
+        if (config.queues.producers.some((producer) => producer.binding === binding)) continue;
+        throw new Error(
+          `The template ${label} queue requires a producer binding. Restore ${binding} or configure a custom, existing ${label} queue before retrying.`,
+        );
+      }
+      resources.push({
+        type: "queue",
+        binding: `${role}:${index}`,
+        name: queue,
+        provenance: "configured",
+        consumerOnly: true,
+        role,
+      });
     }
-    resources.push({
-      type: "queue",
-      binding: `dead_letter_queue:${index}`,
-      name: queue,
-      provenance: "configured",
-      consumerOnly: true,
-    });
   }
   return resources;
 }
@@ -304,7 +310,7 @@ export async function preflightGeneratedResources(resources, api) {
     if (resource.consumerOnly) {
       if (!exists)
         throw new Error(
-          `Configured dead-letter queue ${resource.name} does not exist. Create it or restore its producer binding before retrying.`,
+          `Configured ${resource.role === "queue" ? "consumer" : "dead-letter"} queue ${resource.name} does not exist. Create it or restore its producer binding before retrying.`,
         );
     } else if (exists)
       throw new Error(
@@ -736,11 +742,18 @@ export async function main(argv) {
   });
 }
 
+export function deploymentErrorMessage(error) {
+  const message = error instanceof Error ? error.message : "Deployment failed.";
+  return error instanceof Error && error.cause instanceof Error
+    ? `${message}\nCaused by: ${error.cause.message}`
+    : message;
+}
+
 if (import.meta.main) {
   try {
     await main(process.argv.slice(2));
   } catch (error) {
-    console.error(error instanceof Error ? error.message : "Deployment failed.");
+    console.error(deploymentErrorMessage(error));
     process.exitCode = 1;
   }
 }

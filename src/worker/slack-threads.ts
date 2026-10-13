@@ -22,6 +22,7 @@ import {
   SLACK_MIRROR_SCOPES,
   usableBotToken,
   SlackApiError,
+  SlackInstallationChangedError,
   SlackRateLimitError,
   validateSlackIdentity,
   type SlackEventPayload,
@@ -790,10 +791,39 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
     return;
   const table = payload.action === true ? "slack_interaction_receipts" : "slack_inbound_receipts";
   let installation: SlackInstallation;
+  const logPermanentFailure = (code: string) =>
+    logger.warn(
+      "slack.thread.denial_unavailable",
+      "slack",
+      "Slack denial stopped because installation credentials require recovery.",
+      { receiptId: payload.receiptId, installationId: payload.installationId, generation: payload.generation, code },
+    );
+  const stopPermanentFailure = async (error: unknown) => {
+    if (!(error instanceof SlackApiError) || !slackInstallationError(error)) return false;
+    const missingRefresh = error.method === "oauth.v2.access" && error.code === "invalid_auth";
+    if (missingRefresh && installation.bot_refresh_token_ciphertext) return false;
+    if (
+      !(await recordSlackInstallationError(
+        env,
+        installation.id,
+        error,
+        installation.generation,
+        missingRefresh ? { sql: "bot_refresh_token_ciphertext IS NULL", binds: [] } : undefined,
+      ))
+    )
+      throw new SlackInstallationChangedError();
+    logPermanentFailure(error.code);
+    return true;
+  };
   try {
     installation = await installationFor(env, payload.installationId, payload.generation);
+    if (installation.auth_error) {
+      logPermanentFailure(installation.auth_error);
+      return;
+    }
     await validateChannel(env, installation, payload.channelId);
   } catch (error) {
+    if (await stopPermanentFailure(error)) return;
     if (slackTokenPreparationFailure(error) || error instanceof SlackRateLimitError) throw error;
     if (error instanceof HttpError || (error instanceof SlackApiError && error.status < 500)) return;
     throw error;
@@ -837,6 +867,7 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
   } catch (error) {
     if (!dispatched || error instanceof SlackRateLimitError) {
       await env.DB.prepare(`UPDATE ${table} SET denial_sent_at = NULL WHERE id = ?`).bind(payload.receiptId).run();
+      if (await stopPermanentFailure(error)) return;
       throw error;
     }
     // Ephemeral delivery is best effort; never post a public fallback or retry an ambiguous send.

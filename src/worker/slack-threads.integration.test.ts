@@ -2102,49 +2102,82 @@ describe("interactive Slack workspace", () => {
     ).toEqual({ refresh_lease_token: null, auth_error: null });
   });
 
-  it.each([undefined, null, "3600", 0, -1, 0.5, Number.MAX_SAFE_INTEGER])(
-    "persists rotated credentials with a five-minute fallback expiry (%s)",
-    async (expiresIn) => {
-      await env.DB.prepare(
-        "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='installation'",
-      )
-        .bind(await encryptSlackToken(runtime(), "xoxr-old"))
-        .run();
-      const installed = (await env.DB.prepare(
-        "SELECT * FROM slack_installations WHERE id='installation'",
-      ).first<SlackInstallation>())!;
-      const started = Date.now();
-      const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async () =>
-          Response.json({
-            ok: true,
-            access_token: "xoxb-replacement",
-            refresh_token: "xoxr-replacement",
-            expires_in: expiresIn,
-          }),
-        ),
-      );
-      expect(await usableBotToken(runtime(), installed, undefined, "defer")).toBe("xoxb-replacement");
-      const saved = (await env.DB.prepare(
-        "SELECT * FROM slack_installations WHERE id='installation'",
-      ).first<SlackInstallation>())!;
-      expect(await decryptSlackToken(runtime(), saved.bot_token_ciphertext)).toBe("xoxb-replacement");
-      expect(await decryptSlackToken(runtime(), saved.bot_refresh_token_ciphertext!)).toBe("xoxr-replacement");
-      expect(saved.token_expires_at).toBeGreaterThanOrEqual(started + 300_000);
-      expect(saved.token_expires_at).toBeLessThanOrEqual(Date.now() + 300_000);
-      expect(saved.credential_revision).toBe(installed.credential_revision);
-      expect(
-        await env.DB.prepare("SELECT refresh_lease_token FROM slack_installations WHERE id='installation'").first(),
-      ).toEqual({ refresh_lease_token: null });
-      const logs = warning.mock.calls.map(([value]) => value as Record<string, unknown>);
-      expect(logs).toEqual([
-        expect.objectContaining({ event: "slack.token_refresh.expiry_invalid", installationId: "installation" }),
-      ]);
-      expect(JSON.stringify(logs)).not.toContain("replacement");
-    },
-  );
+  it.each([3600, "3600", "0003600"])("uses a valid integer refresh expiry (%s)", async (expiresIn) => {
+    await env.DB.prepare(
+      "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='installation'",
+    )
+      .bind(await encryptSlackToken(runtime(), "xoxr-old"))
+      .run();
+    const installed = (await env.DB.prepare(
+      "SELECT * FROM slack_installations WHERE id='installation'",
+    ).first<SlackInstallation>())!;
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({ ok: true, access_token: "xoxb-new", refresh_token: "xoxr-new", expires_in: expiresIn }),
+      ),
+    );
+    expect(await usableBotToken(runtime(), installed, undefined, "defer")).toBe("xoxb-new");
+    expect(installed.token_expires_at).toBe(now.mock.results[0]?.value + 3600_000);
+    expect(warning).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    undefined,
+    null,
+    "",
+    " 3600",
+    "3.6e3",
+    "1.5",
+    "-1",
+    "0",
+    "9007199254740991",
+    0,
+    -1,
+    0.5,
+    Number.MAX_SAFE_INTEGER,
+  ])("persists rotated credentials with a five-minute fallback expiry (%s)", async (expiresIn) => {
+    await env.DB.prepare(
+      "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='installation'",
+    )
+      .bind(await encryptSlackToken(runtime(), "xoxr-old"))
+      .run();
+    const installed = (await env.DB.prepare(
+      "SELECT * FROM slack_installations WHERE id='installation'",
+    ).first<SlackInstallation>())!;
+    const started = Date.now();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json({
+          ok: true,
+          access_token: "xoxb-replacement",
+          refresh_token: "xoxr-replacement",
+          expires_in: expiresIn,
+        }),
+      ),
+    );
+    expect(await usableBotToken(runtime(), installed, undefined, "defer")).toBe("xoxb-replacement");
+    const saved = (await env.DB.prepare(
+      "SELECT * FROM slack_installations WHERE id='installation'",
+    ).first<SlackInstallation>())!;
+    expect(await decryptSlackToken(runtime(), saved.bot_token_ciphertext)).toBe("xoxb-replacement");
+    expect(await decryptSlackToken(runtime(), saved.bot_refresh_token_ciphertext!)).toBe("xoxr-replacement");
+    expect(saved.token_expires_at).toBeGreaterThanOrEqual(started + 300_000);
+    expect(saved.token_expires_at).toBeLessThanOrEqual(Date.now() + 300_000);
+    expect(saved.credential_revision).toBe(installed.credential_revision);
+    expect(
+      await env.DB.prepare("SELECT refresh_lease_token FROM slack_installations WHERE id='installation'").first(),
+    ).toEqual({ refresh_lease_token: null });
+    const logs = warning.mock.calls.map(([value]) => value as Record<string, unknown>);
+    expect(logs).toEqual([
+      expect.objectContaining({ event: "slack.token_refresh.expiry_invalid", installationId: "installation" }),
+    ]);
+    expect(JSON.stringify(logs)).not.toContain("replacement");
+  });
 
   it.each([
     { responseBody: "json", header: "30", seconds: 30 },
@@ -5851,6 +5884,65 @@ describe("Slack inbound replies and actions", () => {
       expect(calls.filter((c) => c.method === "chat.postEphemeral")).toHaveLength(1);
     },
   );
+  it.each([
+    { stage: "validation", code: "invalid_auth" },
+    { stage: "validation", code: "invalid_refresh_token" },
+    { stage: "dispatch", code: "invalid_refresh_token" },
+    { stage: "changed", code: "invalid_refresh_token" },
+  ])(
+    "stops confirmed permanent denial failures but retries changed credentials ($stage/$code)",
+    async ({ stage, code }) => {
+      const { link } = await activeThread();
+      await acceptSlackReply(runtime(), reply(link.root_message_ts));
+      members = ["UOWNER"];
+      await deliverSlackMutation(runtime(), await inboundId(), false);
+      const payload = JSON.parse(
+        (await env.DB.prepare("SELECT payload_json FROM outbox WHERE topic='slack_interaction_response'").first<{
+          payload_json: string;
+        }>())!.payload_json,
+      ) as Record<string, unknown>;
+      await env.DB.prepare(
+        "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='installation'",
+      )
+        .bind(code === "invalid_auth" ? null : await encryptSlackToken(runtime(), "xoxr-old"))
+        .run();
+      let refreshes = 0;
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("oauth.v2.access")) {
+          if (stage === "dispatch" && refreshes++ === 0)
+            return Response.json({ ok: true, access_token: "xoxb-short", refresh_token: "xoxr-short", expires_in: 1 });
+          if (stage === "changed")
+            await env.DB.prepare(
+              "UPDATE slack_installations SET credential_revision=credential_revision+1 WHERE id='installation'",
+            ).run();
+          return Response.json({ ok: false, error: code });
+        }
+        return mockSlack(input, init);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const log = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      const result = await deliverSlackDenial(runtime(), payload).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      const changedError = expect.objectContaining({ name: "SlackInstallationChangedError" });
+      expect(result).toEqual(stage === "changed" ? changedError : null);
+      expect(
+        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+      ).toEqual({ auth_error: stage === "changed" ? null : code });
+      expect(await env.DB.prepare("SELECT denial_sent_at FROM slack_inbound_receipts").first()).toEqual({
+        denial_sent_at: null,
+      });
+      expect(calls.filter((c) => c.method === "chat.postEphemeral")).toHaveLength(0);
+      const before = fetchMock.mock.calls.length;
+      if (stage !== "changed") await deliverSlackDenial(runtime(), payload);
+      expect(fetchMock.mock.calls).toHaveLength(before);
+      expect(
+        log.mock.calls.some(([entry]) => (entry as { event: string }).event === "slack.thread.denial_unavailable"),
+      ).toBe(stage !== "changed");
+    },
+  );
+
   it("retries transient channel validation before claiming an ephemeral denial", async () => {
     const { link } = await activeThread();
     await acceptSlackReply(runtime(), reply(link.root_message_ts));

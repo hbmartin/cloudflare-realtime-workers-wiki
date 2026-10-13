@@ -16,7 +16,7 @@ import {
   recordPermanentDeliveryFailure,
   retireObsoleteReceipt,
 } from "./slack-delivery";
-import { slackTokenPreparationFailure, slackApi, SlackRateLimitError, slackBulkCandidateSql } from "./slack";
+import { slackApi, SlackRateLimitError, slackBulkCandidateSql } from "./slack";
 
 type Summary = {
   id: string;
@@ -348,11 +348,7 @@ export async function deliverBulkSummary(
         await withSlackPrimaryError(error, "handle_error", { id }, () => finish("retired"));
         return;
       }
-      if (
-        error instanceof SlackRateLimitError ||
-        slackTokenPreparationFailure(error) ||
-        definiteSlackRejection(error)
-      ) {
+      if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
         await withSlackPrimaryError(error, "handle_error", { id }, () =>
           env.DB.prepare(
             `UPDATE slack_bulk_receipts SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,

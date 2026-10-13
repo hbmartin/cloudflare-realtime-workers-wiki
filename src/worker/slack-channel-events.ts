@@ -18,7 +18,6 @@ import { safeSlackText } from "./slack-blocks";
 import { round2Installation, validateMappingEvidence, StaleSlackValidationError } from "./slack-channels";
 import { reconcileBotPost } from "./slack-digests";
 import {
-  slackTokenPreparationFailure,
   slackApi,
   SlackRateLimitError,
   channelActivityActorAccessSql,
@@ -429,11 +428,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
         await finish(null, "retired");
         return;
       }
-      if (
-        error instanceof SlackRateLimitError ||
-        slackTokenPreparationFailure(error) ||
-        definiteSlackRejection(error)
-      ) {
+      if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
         await withSlackPrimaryError(error, "rewind", { eventId }, () =>
           env.DB.prepare(
             `UPDATE slack_channel_events SET round2_state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,
