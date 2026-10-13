@@ -11,6 +11,7 @@ import {
   portableResources,
   preflightGeneratedResources,
   verifyBuild,
+  validateDeliveryQueues,
 } from "./deploy.mjs";
 import { freshDatabase, queryRows } from "./migrate-d1.mjs";
 
@@ -70,11 +71,11 @@ describe("portable resource intent", () => {
       provenance: "saved",
     });
     if (type === "bucket") config.r2_buckets[0].bucket_name = "custom-bucket";
-    else config.queues.producers[0].queue = "custom-queue";
+    else config.queues.producers[0].queue = config.queues.consumers[0].queue = "custom-queue";
     expect(() => portableResources(config, settings, "worker")).toThrow("differs");
     config.d1_databases[0].database_id = "00000000-0000-0000-0000-000000000000";
     if (type === "bucket") config.r2_buckets[0].bucket_name = "custom-bucket";
-    else config.queues.producers[0].queue = "custom-queue";
+    else config.queues.producers[0].queue = config.queues.consumers[0].queue = "custom-queue";
     expect(() => portableResources(config, settings, "worker")).toThrow("differs");
   });
   it("omits unconfigured dead-letter destinations without a producer", () => {
@@ -113,7 +114,7 @@ describe("portable resource intent", () => {
     });
   });
   it.each(
-    ["queue", "dead_letter_queue"].flatMap((role) =>
+    ["dead_letter_queue"].flatMap((role) =>
       ["missing", "existing", "malformed", "ambiguous", "unavailable"].map((state) => ({ role, state })),
     ),
   )("strictly validates consumer-only custom $role queues ($state) before D1", async ({ role, state }) => {
@@ -179,10 +180,58 @@ describe("portable resource intent", () => {
       const config = root();
       config.queues.producers = config.queues.producers.filter((producer) => producer.binding !== binding);
       const api = vi.fn();
-      await expect(portablePreparation(config, null, "worker", api)).rejects.toThrow(`Restore ${binding}`);
+      await expect(portablePreparation(config, null, "worker", api)).rejects.toThrow(binding);
       expect(api).not.toHaveBeenCalled();
     },
   );
+  it.each(["missing", "mismatch", "duplicate-binding", "duplicate-queue", "duplicate-consumer"])(
+    "rejects an invalid delivery contract before provisioning (%s)",
+    async (scenario) => {
+      const config = root();
+      if (scenario === "missing") config.queues.producers.shift();
+      if (["missing", "mismatch"].includes(scenario)) config.queues.consumers[0].queue = "existing-custom";
+      if (scenario === "duplicate-binding")
+        config.queues.producers.push({ ...config.queues.producers[0], queue: "other" });
+      if (scenario === "duplicate-queue") config.queues.producers[1].queue = config.queues.producers[0].queue;
+      if (scenario === "duplicate-consumer") config.queues.consumers.push({ ...config.queues.consumers[0] });
+      const api = vi.fn();
+      await expect(portablePreparation(config, null, "worker", api)).rejects.toThrow(/producer|consumer|unique/);
+      expect(api).not.toHaveBeenCalled();
+      expect(() => validateDeliveryQueues(config)).toThrow(/producer|consumer|unique/);
+    },
+  );
+  it.each(["", "production", "notes-checks-e2e"])(
+    "validates the selected environment without API requests (%s)",
+    (env) => {
+      const config = unstable_readConfig({ config: "wrangler.jsonc", env }, { hideWarnings: true });
+      expect(() => validateDeliveryQueues(config)).not.toThrow();
+      config.queues.consumers[0].queue = "disconnected";
+      expect(() => validateDeliveryQueues(config)).toThrow("delivery consumer");
+    },
+  );
+  it("requires custom delivery producers and consumers to select the same queue", () => {
+    const config = root();
+    config.queues.producers[0].queue = "custom-main";
+    expect(() => portableResources(config, null, "worker")).toThrow("delivery consumer");
+    config.queues.consumers[0].queue = "custom-main";
+    const overrides = portableOverrides(config, null, "worker", "https://example.test", {});
+    expect(overrides.queues.consumers[0].queue).toBe("custom-main");
+    expect(() => validateDeliveryQueues(overrides)).not.toThrow();
+  });
+  it("prints bounded nested causes and primitive diagnostics without credentials", () => {
+    const network = Object.assign(new Error("getaddrinfo api.cloudflare.com"), { code: "ENOTFOUND" });
+    const outer = new Error("Adopt resources", { cause: new TypeError("fetch failed", { cause: network }) });
+    expect(deploymentErrorMessage(outer)).toContain("ENOTFOUND");
+    expect(deploymentErrorMessage(new Error("failed", { cause: "connection closed" }))).toContain("connection closed");
+    network.cause = outer;
+    expect(deploymentErrorMessage(outer).length).toBeLessThan(300);
+    const secret = new Error(
+      "https://user:password@example.test/?token=private Bearer private secret=private xoxb-private-value",
+      { cause: { body: "private", headers: { authorization: "private" } } },
+    );
+    expect(deploymentErrorMessage(secret)).not.toContain("private");
+    expect(deploymentErrorMessage(new Error("x".repeat(5000))).length).toBe(4000);
+  });
   it.each(["provision", "upload"])("prints the original %s failure together with adoption guidance", async (stage) => {
     const cause = new Error("Cloudflare POST request failed (403). Check account permissions.");
     const failure = await deployPrepared(

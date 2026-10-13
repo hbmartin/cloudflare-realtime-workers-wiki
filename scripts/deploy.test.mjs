@@ -38,12 +38,17 @@ const dependencies = () => ({
 
 function buildFixture() {
   const path = mkdtempSync(resolve(tmpdir(), "noteflare-build-"));
+  const queues = {
+    producers: [{ binding: "DELIVERY_QUEUE", queue: "fixture-delivery" }],
+    consumers: [{ queue: "fixture-delivery" }],
+  };
   writeFileSync(
     resolve(path, "wrangler.jsonc"),
     JSON.stringify({
       name: "portable",
       vars: { BETTER_AUTH_URL: "auto" },
-      env: { production: { name: "legacy", vars: { BETTER_AUTH_URL: "https://legacy.example" } } },
+      queues,
+      env: { production: { name: "legacy", vars: { BETTER_AUTH_URL: "https://legacy.example" }, queues } },
     }),
   );
   const stub = resolve(path, "build.cjs");
@@ -54,7 +59,7 @@ function buildFixture() {
       fs.writeFileSync("command-ran", process.argv.slice(2).join(" "));
       fs.mkdirSync("dist/worker", { recursive: true });
       fs.mkdirSync(".wrangler/deploy", { recursive: true });
-      fs.writeFileSync("dist/worker/wrangler.json", JSON.stringify({ name: "legacy", vars: { BETTER_AUTH_URL: "https://legacy.example" } }));
+      fs.writeFileSync("dist/worker/wrangler.json", JSON.stringify({ name: "legacy", vars: { BETTER_AUTH_URL: "https://legacy.example" }, queues: ${JSON.stringify(queues)} }));
       fs.writeFileSync(".wrangler/deploy/config.json", JSON.stringify({ configPath: "../../dist/worker/wrangler.json" }));
     `,
   );
@@ -80,6 +85,39 @@ function buildFixture() {
 }
 describe("deployment entry point", () => {
   const entry = fileURLToPath(new URL("./deploy.mjs", import.meta.url));
+  it.each(["missing", "disconnected", "generated"])(
+    "rejects %s delivery wiring in named deployment dry runs",
+    (mode) => {
+      const { path, env } = buildFixture();
+      try {
+        const configPath = resolve(path, "wrangler.jsonc");
+        const config = JSON.parse(readFileSync(configPath, "utf8"));
+        if (mode === "missing") config.env.production.queues.producers = [];
+        if (mode === "disconnected") config.env.production.queues.consumers[0].queue = "another-queue";
+        writeFileSync(configPath, JSON.stringify(config));
+        if (mode === "generated") {
+          const stubPath = resolve(path, "build.cjs");
+          writeFileSync(
+            stubPath,
+            readFileSync(stubPath, "utf8").replace(
+              '"consumers":[{"queue":"fixture-delivery"}]',
+              '"consumers":[{"queue":"another-queue"}]',
+            ),
+          );
+        }
+        const result = spawnSync(process.execPath, [entry, "deploy", "--production", "--dry-run"], {
+          cwd: path,
+          env,
+          encoding: "utf8",
+        });
+        expect(result.status).toBe(1);
+        expect(result.stderr).toMatch(/DELIVERY_QUEUE|delivery consumer/);
+        expect(existsSync(resolve(path, "command-ran"))).toBe(mode === "generated");
+      } finally {
+        rmSync(path, { recursive: true, force: true });
+      }
+    },
+  );
   it("builds an archive without Git and removes obsolete reusable manifests", () => {
     const { path, env } = buildFixture();
     try {
@@ -320,6 +358,7 @@ describe("deployment targets and portable configuration", () => {
           ...entry,
           queue: index ? "custom-dlq" : "custom-delivery",
         })),
+        consumers: [{ ...root.queues.consumers[0], queue: "custom-delivery", dead_letter_queue: "custom-dlq" }],
       },
     };
     const overrides = portableOverrides(config, null, "wiki", "https://example.com", {});
@@ -395,20 +434,35 @@ describe("deployment targets and portable configuration", () => {
   it("compares nested configuration without depending on object key order", () => {
     const context = {
       origin: "https://notes.example",
-      overrides: { vars: { FIRST: "one", SECOND: "two" }, queues: ["first", "second"] },
+      overrides: {
+        vars: { FIRST: "one", SECOND: "two" },
+        queues: {
+          producers: [
+            { binding: "DELIVERY_QUEUE", queue: "first" },
+            { binding: "DELIVERY_DEAD_LETTER_QUEUE", queue: "second" },
+          ],
+          consumers: [{ queue: "first" }],
+        },
+      },
     };
     const manifest = { ...context, configurationHash: configurationHash(context) };
     expect(() =>
       verifyBuild(manifest, {
         ...context,
-        overrides: { queues: ["first", "second"], vars: { SECOND: "two", FIRST: "one" } },
+        overrides: { queues: context.overrides.queues, vars: { SECOND: "two", FIRST: "one" } },
       }),
     ).not.toThrow();
     expect(() =>
       verifyBuild(manifest, { ...context, overrides: { ...context.overrides, vars: { FIRST: "changed" } } }),
     ).toThrow("configuration overrides");
     expect(() =>
-      verifyBuild(manifest, { ...context, overrides: { ...context.overrides, queues: ["second", "first"] } }),
+      verifyBuild(manifest, {
+        ...context,
+        overrides: {
+          ...context.overrides,
+          queues: { ...context.overrides.queues, producers: context.overrides.queues.producers.toReversed() },
+        },
+      }),
     ).toThrow("configuration overrides");
     expect(() => verifyBuild(context, context)).toThrow("configuration overrides");
   });

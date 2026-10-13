@@ -21,6 +21,8 @@ import {
   SlackInstallationAuthError,
   SlackApiError,
   SlackInstallationChangedError,
+  SlackInstallationHealthPersistenceError,
+  personalSlackInstallationSql,
   SlackRateLimitError,
   SlackTokenRefreshInProgressError,
   slackChannelFanoutStatements,
@@ -806,6 +808,11 @@ function digestCandidateCost(env: Env, pages: number) {
     (env.DIFF_DIGESTS_ENABLED === "true" ? 5 + 4 * Math.min(DIFF_DIGEST_PAGE_LIMIT, pages) : 0)
   );
 }
+function digestClaimAllowance(env: Env, channel: DigestChannel) {
+  // Three claim statements, finalization, and cleanup; Slack also needs two
+  // dispatch reads and one possible installation-health/cooldown write.
+  return 3 + (env.DIFF_DIGESTS_ENABLED === "true" ? 3 : 2) + 1 + (channel === "slack" ? 3 : 0);
+}
 const DIGEST_STATEMENTS_PER_WINDOW = 4;
 const DIGEST_DISCOVERY_STATEMENTS = 1;
 const DIGEST_CHANNEL_STATEMENT_BUDGET = Math.floor(DIGEST_STATEMENT_BUDGET / DIGEST_CHANNEL_COUNT);
@@ -819,10 +826,10 @@ function digestAccounting(env: Env) {
       return DIGEST_CHANNEL_STATEMENT_BUDGET - this.used - this.reserved;
     },
     require(count: number) {
-      if (count > this.remaining) throw new DigestBudgetExhaustedError();
+      if (this.remaining < 0 || Math.max(0, count) > this.remaining) throw new DigestBudgetExhaustedError();
     },
     charge(count: number) {
-      this.require(count);
+      // Admission happens before side effects; mandatory completion cannot be vetoed here.
       this.used += count;
     },
   };
@@ -884,11 +891,13 @@ function logDigestInfrastructure(
     | "preparation"
     | "finalization"
     | "provider"
-    | "cleanup",
+    | "cleanup"
+    | "budget",
   error: unknown,
-  context: { timezone?: string; userId?: string; workspaceId?: string } = {},
+  context: { timezone?: string; userId?: string; workspaceId?: string; statements?: number; limit?: number } = {},
 ) {
   const messages = {
+    budget: "Digest statement estimate exceeded; mandatory persistence completed before stopping.",
     discovery: "Digest discovery failed.",
     candidates: "Digest candidate loading failed.",
     cursor: "Digest cursor save failed.",
@@ -908,9 +917,9 @@ function logDigestInfrastructure(
   );
 }
 
-async function discoverDigestWindows(env: Env, channel: DigestChannel, timestamp: number) {
+async function discoverDigestWindows(env: Env, channel: DigestChannel, timestamp: number, staleClaimCutoff: number) {
   try {
-    return await dueDigestTimezones(env, channel, timestamp, digestWindowLimit());
+    return await dueDigestTimezones(env, channel, timestamp, digestWindowLimit(), staleClaimCutoff);
   } catch (error) {
     logDigestInfrastructure(channel, "discovery", error);
     throw error;
@@ -949,6 +958,11 @@ function digestModeSql(channel: DigestChannel) {
     : `COALESCE(preference.slack, 'off') = 'digest'`;
 }
 
+function digestDeliveryEligibleSql(channel: DigestChannel) {
+  return `NOT EXISTS(SELECT 1 FROM deliveries delivery WHERE delivery.outbox_id='outbox:'||n.id AND delivery.channel='${channel}'
+    AND (delivery.status='sent' OR (delivery.status='pending' AND delivery.updated_at>?)))`;
+}
+
 // A busy page still occupies one digest slot. Its receipt freezes the whole
 // qualifying checkpoint range rather than splitting a day into forty edits.
 function digestIdsSql(env: Env, channel: DigestChannel) {
@@ -959,8 +973,7 @@ function digestIdsSql(env: Env, channel: DigestChannel) {
       ON preference.user_id=n.user_id AND preference.event_type=n.event_type
     WHERE n.user_id=? AND n.workspace_id=? AND n.${channel === "email" ? "emailed_at" : "slack_at"} IS NULL
       AND ${digestModeSql(channel)} AND COALESCE(preference.timezone,'UTC')=? AND n.created_at<?
-      AND NOT EXISTS(SELECT 1 FROM deliveries delivery WHERE delivery.outbox_id='outbox:'||n.id AND delivery.channel='${channel}'
-        AND (delivery.status='sent' OR (delivery.status='pending' AND delivery.updated_at>${Date.now() - DELIVERY_CLAIM_STALE_MS})))`;
+      AND ${digestDeliveryEligibleSql(channel)}`;
   return `WITH eligible AS (${eligible}), ranked AS (
     SELECT id,created_at,digest_group,row_number() OVER(PARTITION BY digest_group ORDER BY created_at,id) rank FROM eligible
   ), groups AS (SELECT *,sum(CASE WHEN digest_group LIKE 'page:%' THEN 1 ELSE 0 END)
@@ -981,11 +994,17 @@ function digestRecipientSql(channel: DigestChannel) {
          SELECT 1 FROM slack_installations installation
          JOIN slack_authorized_user_links link
            ON link.installation_id = installation.id AND link.user_id = n.user_id
-        WHERE installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
+        WHERE installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND ${personalSlackInstallationSql}
        )`;
 }
 
-async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: number, limit: number) {
+async function dueDigestTimezones(
+  env: Env,
+  channel: DigestChannel,
+  timestamp: number,
+  limit: number,
+  staleClaimCutoff: number,
+) {
   const deliveredColumn = channel === "email" ? "emailed_at" : "slack_at";
   const rows = await env.DB.prepare(
     `SELECT COALESCE(preference.timezone, 'UTC') timezone,
@@ -996,11 +1015,11 @@ async function dueDigestTimezones(env: Env, channel: DigestChannel, timestamp: n
          ON preference.user_id = n.user_id AND preference.event_type = n.event_type
        LEFT JOIN digest_delivery_cursors cursor
          ON cursor.channel = ? AND cursor.timezone = COALESCE(preference.timezone, 'UTC')
-      WHERE n.${deliveredColumn} IS NULL AND ${digestModeSql(channel)} ${digestRecipientSql(channel)}
+      WHERE n.${deliveredColumn} IS NULL AND ${digestModeSql(channel)} ${digestRecipientSql(channel)} AND ${digestDeliveryEligibleSql(channel)}
       GROUP BY COALESCE(preference.timezone, 'UTC'), COALESCE(cursor.updated_at, 0)
       ORDER BY 2, 1`,
   )
-    .bind(channel)
+    .bind(channel, staleClaimCutoff)
     .all<{ timezone: string; cursor_updated_at: number; oldest_created_at: number }>();
   return rows.results
     .map((row) => {
@@ -1074,7 +1093,7 @@ export async function saveDigestCursor(env: Env, channel: DigestChannel, timezon
     .run();
 }
 
-async function suppressDigestRows(
+function digestSuppressionStatements(
   env: Env,
   channel: DigestChannel,
   ids: string[],
@@ -1085,7 +1104,7 @@ async function suppressDigestRows(
   timestamp: number,
   cutoff: number,
 ) {
-  if (!ids.length) return;
+  if (!ids.length) return [];
   const column = channel === "email" ? "emailed_at" : "slack_at";
   const inaccessible = `NOT EXISTS(SELECT 1 FROM pages p JOIN spaces s ON s.id=p.space_id
     JOIN workspace_members m ON m.workspace_id=p.workspace_id AND m.user_id=?
@@ -1116,23 +1135,24 @@ async function suppressDigestRows(
       env.DB.prepare(`${covered} UPDATE page_change_recipients SET ${column}=?
       WHERE id IN (SELECT recipient_id FROM covered)`).bind(...binds, timestamp),
     );
-  await env.DB.batch(statements);
+  return statements;
 }
 
-function digestSuppressionCost(env: Env, ids: string[]) {
-  return ids.length
-    ? 1 + (env.DIFF_DIGESTS_ENABLED === "true" && ids.some((id) => id.startsWith("change:")) ? 2 : 0)
-    : 0;
+function reportDigestBudget(channel: DigestChannel, used: number, failures: unknown[]) {
+  if (used <= DIGEST_CHANNEL_STATEMENT_BUDGET) return;
+  const error = new Error("Digest statement estimate exceeded.");
+  logDigestInfrastructure(channel, "budget", error, { statements: used, limit: DIGEST_CHANNEL_STATEMENT_BUDGET });
+  failures.push(error);
 }
 
-async function sendDueEmailDigests(env: Env, timestamp: number) {
+async function sendDueEmailDigests(env: Env, timestamp: number, staleClaimCutoff: number) {
   if (!env.SEND_EMAIL || !env.EMAIL_FROM) return;
   const sender = env.SEND_EMAIL,
     from = env.EMAIL_FROM;
   const accounting = digestAccounting(env);
   env = accounting.env;
   const { budget } = accounting;
-  const dueTimezones = await discoverDigestWindows(env, "email", timestamp);
+  const dueTimezones = await discoverDigestWindows(env, "email", timestamp, staleClaimCutoff);
   if (!dueTimezones.length) return;
   const failures: unknown[] = [];
   for (const window of dueTimezones) {
@@ -1151,12 +1171,21 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
            ON preference.user_id = n.user_id AND preference.event_type = n.event_type
         WHERE n.emailed_at IS NULL AND ${digestModeSql("email")}
           AND COALESCE(preference.timezone, 'UTC') = ? AND n.created_at < ?
+          AND ${digestDeliveryEligibleSql("email")}
           AND (n.user_id > ? OR (n.user_id = ? AND n.workspace_id > ?))
         GROUP BY n.user_id, n.workspace_id, recipient.name, recipient.email, timezone
         ORDER BY n.user_id, n.workspace_id
         LIMIT ?`,
       )
-        .bind(window.timezone, window.cutoff, cursor.userId, cursor.userId, cursor.workspaceId, pageSize)
+        .bind(
+          window.timezone,
+          window.cutoff,
+          staleClaimCutoff,
+          cursor.userId,
+          cursor.userId,
+          cursor.workspaceId,
+          pageSize,
+        )
         .all<{
           user_id: string;
           workspace_id: string;
@@ -1170,6 +1199,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
       Math.floor(budget.remaining / DIGEST_STATEMENTS_PER_CANDIDATE),
     );
     let lastAttempted: DigestCursor | undefined;
+    let windowBudgetBlocked = false;
     try {
       const candidates = await digestCandidates(env, "email", window.timezone, candidateLimit, readCandidates).catch(
         (error: unknown) => {
@@ -1180,7 +1210,10 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
       );
       for (const candidate of candidates) {
         const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
-        if (budget.remaining < candidateCost) break;
+        if (budget.remaining < candidateCost + 1) {
+          windowBudgetBlocked = true;
+          break;
+        }
         const candidateStarted = budget.used;
         let allowance = candidateCost;
         let cleanupReserved = false;
@@ -1189,7 +1222,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
         let budgetExhausted = false;
         try {
           const ids = await env.DB.prepare(digestIdsSql(env, "email"))
-            .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
+            .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff, staleClaimCutoff)
             .all<{ id: string }>();
           const { rows, suppressed } = await accessibleNotifications(
             env,
@@ -1197,10 +1230,20 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
             candidate.workspace_id,
             ids.results.map((row) => row.id),
           );
-          allowance += digestSuppressionCost(env, suppressed);
-          budget.require(allowance - (budget.used - candidateStarted));
-          await suppressDigestRows(env, "email", suppressed, candidate, timestamp, window.cutoff);
-          budget.require(allowance - (budget.used - candidateStarted));
+          const suppression = digestSuppressionStatements(
+            env,
+            "email",
+            suppressed,
+            candidate,
+            timestamp,
+            window.cutoff,
+          );
+          allowance += suppression.length;
+          budget.require(allowance + 1 - (budget.used - candidateStarted));
+          if (suppression.length) await env.DB.batch(suppression);
+          budget.require(
+            Math.max(allowance + 1 - (budget.used - candidateStarted), digestClaimAllowance(env, "email")),
+          );
           budget.reserved++;
           cleanupReserved = true;
           claim = { token: crypto.randomUUID(), outboxIds: rows.map((row) => `outbox:${row.id}`) };
@@ -1237,13 +1280,26 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
                 .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
                 .join("")}</ul>`,
           };
+          budget.require((env.DIFF_DIGESTS_ENABLED === "true" ? 3 : 2) + 0 + 1);
           phase = "provider";
           await sender.send(message);
           phase = "finalization";
           await finishClaimedDeliveries(env, claim.outboxIds, "email", claim.token, "sent", null, "emailed_at");
         } catch (error) {
-          if (error instanceof DigestBudgetExhaustedError && !claim) {
+          if (error instanceof DigestBudgetExhaustedError) {
             budgetExhausted = true;
+            windowBudgetBlocked = true;
+            if (cleanupReserved) {
+              budget.reserved--;
+              cleanupReserved = false;
+            }
+            failures.push(
+              ...(await cleanupDigestClaim(env, "email", claim, error, {
+                timezone: candidate.timezone,
+                userId: candidate.user_id,
+                workspaceId: candidate.workspace_id,
+              })),
+            );
             break;
           }
           const providerFailure = phase === "provider";
@@ -1288,21 +1344,22 @@ async function sendDueEmailDigests(env: Env, timestamp: number) {
     }
     budget.reserved = 0;
     try {
-      await saveDigestCursor(env, "email", window.timezone, lastAttempted);
+      if (lastAttempted || !windowBudgetBlocked) await saveDigestCursor(env, "email", window.timezone, lastAttempted);
     } catch (error) {
       logDigestInfrastructure("email", "cursor", error, { timezone: window.timezone });
       failures.push(error);
     }
   }
+  reportDigestBudget("email", budget.used, failures);
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) throw new AggregateError(failures, "Email digest infrastructure failed.");
 }
 
-async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
+async function sendDuePersonalSlackDigests(env: Env, timestamp: number, staleClaimCutoff: number) {
   const accounting = digestAccounting(env);
   env = accounting.env;
   const { budget } = accounting;
-  const dueTimezones = await discoverDigestWindows(env, "slack", timestamp);
+  const dueTimezones = await discoverDigestWindows(env, "slack", timestamp, staleClaimCutoff);
   if (!dueTimezones.length) return;
   const failures: unknown[] = [];
   const deferredWorkspaces = new Set<string>();
@@ -1317,25 +1374,35 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
          JOIN workspace_members membership
            ON membership.workspace_id = n.workspace_id AND membership.user_id = n.user_id
          JOIN slack_installations installation
-           ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND installation.auth_error IS NULL
+           ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND ${personalSlackInstallationSql}
          JOIN slack_authorized_user_links link
            ON link.installation_id = installation.id AND link.user_id = n.user_id
          LEFT JOIN notification_preferences preference
            ON preference.user_id = n.user_id AND preference.event_type = n.event_type
         WHERE n.slack_at IS NULL AND ${digestModeSql("slack")}
           AND COALESCE(preference.timezone, 'UTC') = ? AND n.created_at < ?
+          AND ${digestDeliveryEligibleSql("slack")}
           AND (n.user_id > ? OR (n.user_id = ? AND n.workspace_id > ?))
         GROUP BY n.user_id, n.workspace_id, timezone
         ORDER BY n.user_id, n.workspace_id
         LIMIT ?`,
       )
-        .bind(window.timezone, window.cutoff, cursor.userId, cursor.userId, cursor.workspaceId, pageSize)
+        .bind(
+          window.timezone,
+          window.cutoff,
+          staleClaimCutoff,
+          cursor.userId,
+          cursor.userId,
+          cursor.workspaceId,
+          pageSize,
+        )
         .all<{ user_id: string; workspace_id: string; timezone: string; comparison_pages: number }>();
     const candidateLimit = Math.min(
       DIGEST_CANDIDATE_PAGE,
       Math.floor(budget.remaining / DIGEST_STATEMENTS_PER_CANDIDATE),
     );
     let lastAttempted: DigestCursor | undefined;
+    let windowBudgetBlocked = false;
     try {
       const candidates = await digestCandidates(env, "slack", window.timezone, candidateLimit, readCandidates).catch(
         (error: unknown) => {
@@ -1350,7 +1417,10 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           continue;
         }
         const candidateCost = digestCandidateCost(env, candidate.comparison_pages);
-        if (budget.remaining < candidateCost) break;
+        if (budget.remaining < candidateCost + 1) {
+          windowBudgetBlocked = true;
+          break;
+        }
         const candidateStarted = budget.used;
         let allowance = candidateCost;
         let cleanupReserved = false;
@@ -1364,7 +1434,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
         };
         try {
           const ids = await env.DB.prepare(digestIdsSql(env, "slack"))
-            .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff)
+            .bind(candidate.user_id, candidate.workspace_id, candidate.timezone, window.cutoff, staleClaimCutoff)
             .all<{ id: string }>();
           const { rows, suppressed } = await accessibleNotifications(
             env,
@@ -1372,21 +1442,37 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
             candidate.workspace_id,
             ids.results.map((row) => row.id),
           );
-          allowance += digestSuppressionCost(env, suppressed);
-          budget.require(allowance - (budget.used - candidateStarted));
-          await suppressDigestRows(env, "slack", suppressed, candidate, timestamp, window.cutoff);
+          const suppression = digestSuppressionStatements(
+            env,
+            "slack",
+            suppressed,
+            candidate,
+            timestamp,
+            window.cutoff,
+          );
+          allowance += suppression.length;
+          budget.require(allowance + 1 - (budget.used - candidateStarted));
+          if (suppression.length) await env.DB.batch(suppression);
           if (!rows.length) continue;
           phase = "token";
           const prepared = await preparePersonalSlackNotification(env, candidate.user_id, candidate.workspace_id, {
             tokenRefreshMode: "defer",
-            beforeRefresh: () => {
-              budget.require(allowance + DIGEST_REFRESH_STATEMENTS - (budget.used - candidateStarted));
-              allowance += DIGEST_REFRESH_STATEMENTS;
+            beforeRefresh: (recovery) => {
+              const refreshCost = DIGEST_REFRESH_STATEMENTS + (recovery ? 2 : 0);
+              budget.require(
+                Math.max(
+                  allowance + refreshCost + 1 - (budget.used - candidateStarted),
+                  refreshCost + digestClaimAllowance(env, "slack"),
+                ),
+              );
+              allowance += refreshCost;
             },
           });
           if (!prepared) throw new HttpError(403, "slack_identity_required", "Slack identity is no longer available.");
           phase = "preparation";
-          budget.require(allowance - (budget.used - candidateStarted));
+          budget.require(
+            Math.max(allowance + 1 - (budget.used - candidateStarted), digestClaimAllowance(env, "slack")),
+          );
           budget.reserved++;
           cleanupReserved = true;
           claim = { token: crypto.randomUUID(), outboxIds: rows.map((row) => `outbox:${row.id}`) };
@@ -1410,6 +1496,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
             await finishClaimedDeliveries(env, claim.outboxIds, "slack", claim.token, "sent", null, "slack_at");
             continue;
           }
+          budget.require((env.DIFF_DIGESTS_ENABLED === "true" ? 3 : 2) + 2 + 1);
           phase = "provider";
           const sent = await sendPersonalSlackNotification(
             env,
@@ -1427,10 +1514,23 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
           phase = "finalization";
           await finishClaimedDeliveries(env, claim.outboxIds, "slack", claim.token, "sent", null, "slack_at");
         } catch (error) {
-          if (error instanceof DigestBudgetExhaustedError && !claim) {
+          if (error instanceof DigestBudgetExhaustedError) {
             budgetExhausted = true;
+            windowBudgetBlocked = true;
+            if (cleanupReserved) {
+              budget.reserved--;
+              cleanupReserved = false;
+            }
+            failures.push(
+              ...(await cleanupDigestClaim(env, "slack", claim, error, {
+                timezone: candidate.timezone,
+                userId: candidate.user_id,
+                workspaceId: candidate.workspace_id,
+              })),
+            );
             break;
           }
+          if (error instanceof SlackInstallationHealthPersistenceError) deferredWorkspaces.add(candidate.workspace_id);
           const skipReason =
             error instanceof SlackTokenRefreshInProgressError
               ? "refresh_in_progress"
@@ -1496,21 +1596,23 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number) {
     }
     budget.reserved = 0;
     try {
-      await saveDigestCursor(env, "slack", window.timezone, lastAttempted);
+      if (lastAttempted || !windowBudgetBlocked) await saveDigestCursor(env, "slack", window.timezone, lastAttempted);
     } catch (error) {
       logDigestInfrastructure("slack", "cursor", error, { timezone: window.timezone });
       failures.push(error);
     }
   }
+  reportDigestBudget("slack", budget.used, failures);
   if (failures.length === 1) throw failures[0];
   if (failures.length > 1) throw new AggregateError(failures, "Slack digest infrastructure failed.");
 }
 
 export async function sendDueNotificationDigests(env: Env, timestamp = Date.now()) {
+  const staleClaimCutoff = Date.now() - DELIVERY_CLAIM_STALE_MS;
   const failures: unknown[] = [];
   for (const send of [sendDueEmailDigests, sendDuePersonalSlackDigests]) {
     try {
-      await send(env, timestamp);
+      await send(env, timestamp, staleClaimCutoff);
     } catch (error) {
       failures.push(error);
     }

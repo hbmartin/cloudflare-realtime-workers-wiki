@@ -81,18 +81,19 @@ export function slackAccessAuthorization(
   ] as const;
   const snapshot = fields.filter(([, value]) => value !== undefined);
   return async () => {
-    const allowed = await env.DB.prepare(`SELECT installation.auth_error FROM slack_authorized_user_links link
-      JOIN slack_installations installation ON installation.id=link.installation_id
+    const allowed =
+      await env.DB.prepare(`SELECT ${requireHealthyInstallation ? "installation.auth_error" : "1"} FROM slack_authorized_user_links link
+      ${requireHealthyInstallation ? "JOIN slack_installations installation ON installation.id=link.installation_id" : ""}
       WHERE installation_id=? AND installation_generation=? AND user_id=?
       ${snapshot.map(([field]) => `AND ${field} IS ?`).join(" ")} ${createdAt === undefined ? "" : "AND authorization_started_at<=?"}`)
-      .bind(
-        installation.id,
-        installation.generation,
-        identity.userId,
-        ...snapshot.map(([, value]) => value),
-        ...(createdAt === undefined ? [] : [createdAt]),
-      )
-      .first<{ auth_error: string | null }>();
+        .bind(
+          installation.id,
+          installation.generation,
+          identity.userId,
+          ...snapshot.map(([, value]) => value),
+          ...(createdAt === undefined ? [] : [createdAt]),
+        )
+        .first<{ auth_error: string | null }>();
     if (!allowed)
       throw new HttpError(
         403,

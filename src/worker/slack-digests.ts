@@ -29,6 +29,7 @@ import {
   slackApi,
   SlackApiError,
   SlackRateLimitError,
+  slackTokenPreparationFailure,
   type SlackInstallation,
   channelActivityActorAccessSql,
   channelActivityActorAuthoritySql,
@@ -955,9 +956,8 @@ export async function deliverDigest(
           if (!dispatched)
             await withSlackPrimaryError(error, "handle_error", { id }, () =>
               env.DB.batch([
-                env.DB.prepare(`UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,claim_token=NULL,claimed_at=NULL,last_error=?
+                env.DB.prepare(`UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,claim_token=NULL,claimed_at=NULL
               WHERE id=? AND state='sending' AND claim_token=? AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
-                  error instanceof SlackApiError ? error.code : null,
                   message!.id,
                   token,
                   id,
@@ -967,6 +967,16 @@ export async function deliverDigest(
                   `UPDATE slack_digest_receipts SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=? AND state='sending'`,
                 ).bind(id, token),
               ]),
+            );
+          const errorCode =
+            error instanceof SlackApiError ? error.code : error instanceof SlackRateLimitError ? "rate_limited" : null;
+          if (errorCode && !slackTokenPreparationFailure(error))
+            await withSlackPrimaryError(error, "handle_error", { id }, () =>
+              env.DB.prepare(`UPDATE slack_digest_messages SET last_error=?
+              WHERE id=? AND state IN ('pending','sending') AND (claim_token IS NULL OR claim_token=?)
+                AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`)
+                .bind(errorCode, message!.id, token, id, token)
+                .run(),
             );
           if (error instanceof SlackDispatchSkippedError && !(error instanceof EmptyDigestPageSkippedError)) return;
           if (!(error instanceof EmptyDigestPageSkippedError)) {
@@ -1027,6 +1037,15 @@ export async function deliverDigest(
       .bind(`outbox:${next.id}`, installation.workspace_id, id, Date.now(), Date.now(), id, token)
       .run();
   } catch (error) {
+    if (slackTokenPreparationFailure(error) && (error instanceof SlackApiError || error instanceof SlackRateLimitError))
+      await recordSecondarySlackError("record", { id }, () =>
+        env.DB.prepare(`UPDATE slack_digest_messages SET last_error=?
+          WHERE id=(SELECT id FROM slack_digest_messages WHERE receipt_id=? AND state='pending' ORDER BY sequence LIMIT 1)
+            AND (claim_token IS NULL OR claim_token=?)
+            AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`)
+          .bind(error instanceof SlackApiError ? error.code : "rate_limited", id, token, id, token)
+          .run(),
+      );
     await recordSecondarySlackError("record", { id }, () => recordDeliveryError(env, installation, error));
     throw error;
   } finally {

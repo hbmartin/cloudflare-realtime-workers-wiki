@@ -194,7 +194,22 @@ const templateSuffixes = new Map([
   ["queue:noteflare-delivery-dlq", "-delivery-dlq"],
 ]);
 
+export function validateDeliveryQueues(config) {
+  const producers = config.queues?.producers ?? [];
+  const delivery = producers.filter((producer) => producer.binding === "DELIVERY_QUEUE");
+  if (delivery.length !== 1 || typeof delivery[0].queue !== "string" || !delivery[0].queue)
+    throw new Error("Restore exactly one DELIVERY_QUEUE producer before deployment.");
+  if (new Set(producers.map((producer) => producer.binding)).size !== producers.length)
+    throw new Error("Queue producer bindings must be unique before deployment.");
+  if (new Set(producers.map((producer) => producer.queue)).size !== producers.length)
+    throw new Error("Queue producer mappings must be unique before deployment.");
+  const consumers = config.queues?.consumers ?? [];
+  if (consumers.length !== 1 || consumers[0].queue !== delivery[0].queue)
+    throw new Error("The delivery consumer must target the DELIVERY_QUEUE producer's queue before deployment.");
+}
+
 export function portableResources(config, settings, name) {
+  validateDeliveryQueues(config);
   // Only the source ID expresses operator intent. A discovered/created ID does not.
   const sourceID = config.d1_databases[0].database_id;
   const provisioned = typeof sourceID === "string" && databaseID.test(sourceID) && sourceID !== placeholderID;
@@ -454,6 +469,7 @@ async function prepare(forced, dryRun) {
   });
   if (target) {
     const config = unstable_readConfig({ config: "wrangler.jsonc", env: target }, { hideWarnings: true });
+    validateDeliveryQueues(config);
     return {
       target,
       name: process.env.WRANGLER_CI_OVERRIDE_NAME || config.name,
@@ -504,6 +520,7 @@ export function outputConfig(root = process.cwd()) {
 }
 
 export function verifyBuild(manifest, expected) {
+  if (manifest.overrides?.queues) validateDeliveryQueues(manifest.overrides);
   for (const key of ["source", "buildUUID", "revision", "target", "name", "account", "origin"])
     if (manifest[key] !== expected[key])
       throw new Error(`Build artifact does not match ${key}. Run the build again before deployment.`);
@@ -555,6 +572,7 @@ async function build(context) {
   });
   const configPath = outputConfig();
   const generated = unstable_readConfig({ config: configPath, env: "" }, { hideWarnings: true });
+  validateDeliveryQueues(generated);
   if (generated.name !== context.name || generated.vars.BETTER_AUTH_URL !== context.origin)
     throw new Error("Vite output does not match the prepared deployment target.");
   if (Object.keys(generated.vars).some((key) => privateVariable.test(key)))
@@ -707,6 +725,7 @@ export async function main(argv) {
   } else manifest = await build(context);
   if (action === "build") return;
   const configArgs = ["--config", manifest.configPath];
+  validateDeliveryQueues(unstable_readConfig({ config: manifest.configPath, env: "" }, { hideWarnings: true }));
   if (dryRun) {
     const result = wrangler(["deploy", ...configArgs, "--dry-run"], { stdio: "inherit" });
     if (result.error || result.status !== 0) throw new Error("Worker dry run failed.");
@@ -743,10 +762,31 @@ export async function main(argv) {
 }
 
 export function deploymentErrorMessage(error) {
-  const message = error instanceof Error ? error.message : "Deployment failed.";
-  return error instanceof Error && error.cause instanceof Error
-    ? `${message}\nCaused by: ${error.cause.message}`
-    : message;
+  const messages = [];
+  const seen = new Set();
+  for (let current = error; current !== undefined && messages.length < 8 && !seen.has(current);) {
+    seen.add(current);
+    if (typeof current === "object" && current !== null) {
+      // Select diagnostic fields only; never serialize API responses or arbitrary objects.
+      const { message, code, cause } = current;
+      if (typeof message === "string" || (typeof code === "string" && /^[A-Z0-9_]+$/.test(code)))
+        messages.push(
+          `${typeof message === "string" ? message : "Request failed."}${typeof code === "string" && /^[A-Z0-9_]+$/.test(code) ? ` (${code})` : ""}`,
+        );
+      else break;
+      current = cause;
+    } else {
+      if (["string", "number", "boolean", "bigint"].includes(typeof current)) messages.push(String(current));
+      break;
+    }
+  }
+  return (messages.join("\nCaused by: ") || "Deployment failed.")
+    .replace(/(https?:\/\/)[^\s/]+@/gi, "$1[redacted]@")
+    .replace(/(https?:\/\/[^\s?#]+)[?#][^\s]*/gi, "$1?[redacted]")
+    .replace(/\b(?:Bearer|Basic)\s+[^\s,;]+/gi, "[redacted]")
+    .replace(/\b(?:xox[baprs]-|xoxe[.-]|ghp_|github_pat_|sk_|secret_)[A-Za-z0-9_.-]+/g, "[redacted]")
+    .replace(/\b((?:[a-z_]*(?:secret|token|password|api_key))\s*[:=]\s*)[^\s,;]+/gi, "$1[redacted]")
+    .slice(0, 4_000);
 }
 
 if (import.meta.main) {
