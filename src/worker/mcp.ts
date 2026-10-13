@@ -3,7 +3,8 @@ import { generateJitteredKeyBetween } from "fractional-indexing-jittered";
 import { z } from "zod";
 import { commentBlockInternalId, createCommentThread, protectedCommentBlockIds, type CommentPage } from "./comments";
 import { findDocumentBlock } from "../shared/notion-blocks";
-import { projectNotionMarkdown } from "../shared/notion-markdown";
+import { projectNotionMarkdown, notionMarkdownWindow } from "../shared/notion-markdown";
+import { seal, unseal } from "./ai-auth";
 import { MarkdownWriteError, parseWritableMarkdown } from "../shared/notion-markdown-write";
 import { markdownMutations } from "../shared/notion-markdown-mutations";
 import { parseMarkdownCommand } from "../shared/notion-markdown-commands";
@@ -144,8 +145,9 @@ function toolError(error: unknown, bindings?: Env) {
           error instanceof HttpError
             ? error.code
             : error instanceof MarkdownWriteError
-              ? "invalid_markdown"
+              ? error.code
               : "tool_unavailable",
+        ...(error instanceof MarkdownWriteError && error.details !== undefined ? { details: error.details } : {}),
         retryable:
           error instanceof HttpError
             ? error.status >= 500 || error.status === 429
@@ -352,7 +354,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
       env.DB.prepare(
         `UPDATE pages SET import_job_id=NULL WHERE id=? AND import_job_id=?
           AND EXISTS (SELECT 1 FROM oauth_operation_receipts
-            WHERE grant_id=? AND operation_id=? AND input_hash=? AND result_json=?)`,
+            WHERE grant_id=? AND operation_id=? AND input_hash=? AND result_json=?) RETURNING id`,
       ).bind(staged.pageId, stageId, access.grantId, input.operation_id, inputHash, JSON.stringify(value)),
       env.DB.prepare(
         `INSERT INTO page_search(page_id,workspace_id,title,body)
@@ -382,7 +384,7 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
         createdAt: timestamp,
       }),
     ]);
-    if (published[0]?.meta.changes !== 1 || published[1]?.meta.changes !== 1)
+    if (published[0]?.meta.changes !== 1 || published[1]?.results.length !== 1)
       throw new HttpError(409, "page_create_unknown", "The staged page was changed before publication.");
   } catch (error) {
     const committed = await receiptFor(env, access.grantId, input.operation_id, "create_page", inputHash);
@@ -481,9 +483,15 @@ async function updatePageTool(
       "page_changed",
       "The document changed. Your draft was not saved. Read the current document and reconcile your edits.",
     );
-  const projection = projectNotionMarkdown(envelope.document, new Map(), {
-    pageHref: (id) => new URL(`/?page=${encodeURIComponent(id)}`, env.BETTER_AUTH_URL).href,
-  });
+  const projection = projectNotionMarkdown(
+    envelope.document,
+    new Map(),
+    {
+      pageHref: (id) => new URL(`/?page=${encodeURIComponent(id)}`, env.BETTER_AUTH_URL).href,
+    },
+    [],
+    { complete: true },
+  );
   const command = parseMarkdownCommand(input.command, projection.markdown);
   const protectedIds = await protectedCommentBlockIds(env, page.id, envelope.document);
   const operations = markdownMutations(
@@ -681,15 +689,77 @@ async function searchPageTool(request: Request, env: Env, query: string, cursor?
   };
 }
 
-async function fetchPageTool(request: Request, env: Env, pageId: string) {
+type FetchDocumentInput = {
+  page_id: string;
+  offset?: number | undefined;
+  limit?: number | undefined;
+  cursor?: string | undefined;
+  expected_revision?: number | undefined;
+  expected_content_epoch?: number | undefined;
+  expected_sequence?: number | undefined;
+};
+type DocumentCursor = { offset: number; revision: number; epoch: number; sequence: number; expiresAt: number };
+
+async function fetchPageTool(request: Request, env: Env, input: FetchDocumentInput) {
   const access = await currentAccess(request, env, ["pages:read"]);
-  const page = await pageForMember(env, access.member, pageId);
+  const page = await pageForMember(env, access.member, input.page_id);
   if (page.kind !== "document") throw new HttpError(422, "document_required", "This page is not a document.");
   const envelope = await roomContent(env, access, page);
-  const projected = projectNotionMarkdown(envelope.document, new Map(), {
-    pageHref: (id) => new URL(`/?page=${encodeURIComponent(id)}`, env.BETTER_AUTH_URL).href,
-  });
-  return {
+  const limit = input.limit ?? 16_000;
+  const binding = `document:${access.member.workspace.id}:${access.member.user.id}:${access.grantId}:${page.id}:${limit}`;
+  let offset = input.offset ?? 0;
+  if (input.cursor) {
+    if (input.offset !== undefined)
+      throw new HttpError(422, "invalid_source_cursor", "Use cursor or offset, not both.");
+    let cursor: DocumentCursor;
+    try {
+      cursor = await unseal<DocumentCursor>(env.BETTER_AUTH_SECRET, binding, input.cursor);
+      if (!Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || cursor.expiresAt <= Date.now())
+        throw new Error("Invalid cursor");
+    } catch {
+      throw new HttpError(
+        422,
+        "invalid_source_cursor",
+        "This cursor expired or belongs to another page or connection. Start again.",
+      );
+    }
+    if (
+      cursor.revision !== envelope.sequence ||
+      cursor.sequence !== envelope.sequence ||
+      cursor.epoch !== envelope.contentEpoch
+    )
+      throw new HttpError(409, "source_changed", "The document changed between chunks. Start the read again.");
+    offset = cursor.offset;
+  } else if (
+    offset > 0 &&
+    (input.expected_revision === undefined ||
+      input.expected_content_epoch === undefined ||
+      input.expected_sequence === undefined)
+  ) {
+    throw new HttpError(
+      422,
+      "snapshot_required",
+      "Nonzero offsets require expected_revision, expected_content_epoch, and expected_sequence.",
+    );
+  }
+  if (
+    (input.expected_revision !== undefined && input.expected_revision !== envelope.sequence) ||
+    (input.expected_sequence !== undefined && input.expected_sequence !== envelope.sequence) ||
+    (input.expected_content_epoch !== undefined && input.expected_content_epoch !== envelope.contentEpoch)
+  )
+    throw new HttpError(409, "source_changed", "The document changed. Start the read again.");
+  const projected = notionMarkdownWindow(
+    envelope.document,
+    {
+      pageHref: (id) => new URL(`/?page=${encodeURIComponent(id)}`, env.BETTER_AUTH_URL).href,
+    },
+    offset,
+    limit,
+  );
+  if (offset > projected.textLength) throw new HttpError(422, "invalid_offset", "The offset is beyond this document.");
+  if (projected.markdown && /^[\uDC00-\uDFFF]/.test(projected.markdown))
+    throw new HttpError(422, "invalid_offset", "The offset splits a Unicode character.");
+  const base = {
     id: page.id,
     title: page.title,
     url: new URL(`/?page=${encodeURIComponent(page.id)}`, env.BETTER_AUTH_URL).href,
@@ -701,10 +771,49 @@ async function fetchPageTool(request: Request, env: Env, pageId: string) {
       access.scopes.has("pages:write") &&
       page.effective_role !== "viewer" &&
       env.NOTION_MARKDOWN_WRITES_ENABLED === "true",
-    markdown: projected.markdown,
-    truncated: projected.truncated,
     unknownBlockIds: projected.unknownBlockIds,
+    offset,
+    sequence: envelope.sequence,
+    textLength: projected.textLength,
   };
+  let markdown = projected.markdown;
+  for (;;) {
+    const complete = offset + markdown.length >= projected.textLength;
+    const value = {
+      ...base,
+      markdown,
+      complete,
+      truncated: !complete,
+      nextOffset: complete ? null : offset + markdown.length,
+      nextCursor: complete
+        ? null
+        : await seal(env.BETTER_AUTH_SECRET, binding, {
+            offset: offset + markdown.length,
+            revision: envelope.sequence,
+            sequence: envelope.sequence,
+            epoch: envelope.contentEpoch,
+            expiresAt: Date.now() + 15 * 60_000,
+          } satisfies DocumentCursor),
+    };
+    if (new TextEncoder().encode(JSON.stringify(result(value))).byteLength <= 48_000) {
+      const current = await currentAccess(request, env, ["pages:read"]);
+      const latest = await pageForMember(env, current.member, page.id);
+      if (latest.content_epoch !== envelope.contentEpoch)
+        throw new HttpError(409, "source_changed", "The document was restored during retrieval. Start again.");
+      const authorized = {
+        ...value,
+        canEdit:
+          current.scopes.has("pages:write") &&
+          latest.effective_role !== "viewer" &&
+          env.NOTION_MARKDOWN_WRITES_ENABLED === "true",
+      };
+      if (new TextEncoder().encode(JSON.stringify(result(authorized))).byteLength <= 48_000) return authorized;
+    }
+    if (markdown.length <= 2)
+      throw new HttpError(413, "document_metadata_too_large", "Document metadata exceeds the response budget.");
+    markdown = markdown.slice(0, Math.floor(markdown.length / 2));
+    if (/[\uD800-\uDBFF]$/.test(markdown)) markdown = markdown.slice(0, -1);
+  }
 }
 
 async function listSpacesTool(request: Request, env: Env) {
@@ -810,7 +919,12 @@ function serverFor(request: Request, env: Env, context: BackgroundContext, acces
       (input) =>
         wrap(async () => {
           const current = await currentAccess(request, env, TOOL_SCOPES.fetch_table!);
-          return fetchTableSource(env, current.member, current.grantId, input);
+          const value = await fetchTableSource(env, current.member, current.grantId, input);
+          const latest = await currentAccess(request, env, TOOL_SCOPES.fetch_table!);
+          const page = await pageForMember(env, latest.member, input.page_id);
+          if (page.content_epoch !== value.contentEpoch)
+            throw new HttpError(409, "source_changed", "The table was restored during retrieval. Start again.");
+          return value;
         }),
     );
     server.registerTool(
@@ -819,7 +933,12 @@ function serverFor(request: Request, env: Env, context: BackgroundContext, acces
       (input) =>
         wrap(async () => {
           const current = await currentAccess(request, env, TOOL_SCOPES.fetch_diagram!);
-          return fetchDiagramSource(env, current.member, current.grantId, input);
+          const value = await fetchDiagramSource(env, current.member, current.grantId, input);
+          const latest = await currentAccess(request, env, TOOL_SCOPES.fetch_diagram!);
+          const page = await pageForMember(env, latest.member, input.page_id);
+          if (page.content_epoch !== value.contentEpoch)
+            throw new HttpError(409, "source_changed", "The diagram was restored during retrieval. Start again.");
+          return value;
         }),
     );
     server.registerTool(
@@ -838,7 +957,7 @@ function serverFor(request: Request, env: Env, context: BackgroundContext, acces
         ...pluginToolContracts.fetch_page,
         ...toolMetadata("fetch_page", true),
       },
-      ({ page_id }) => wrap(() => fetchPageTool(request, env, page_id)),
+      (input) => wrap(() => fetchPageTool(request, env, input)),
     );
     server.registerTool(
       "list_spaces",

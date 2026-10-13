@@ -1,0 +1,25 @@
+// Shared runtime fixtures used unchanged by browser-compatible and Worker suites.
+import type { Value } from "./types";
+export const FORMULA_GOLDENS: ReadonlyArray<readonly [string, Value]> = [
+  ["empty(null)", true],
+  ["round(1.234, 2)", 1.23],
+  ["floor(1.8)", 1],
+  ["ceil(1.2)", 2],
+  ["abs(-4)", 4],
+  ["min(1, 2)", 1],
+  ["max(1, 2)", 2],
+  ["sum(1, null, 2)", 3],
+  ["average(1, 3)", 2],
+  ["median(3, 1, 2)", 2],
+  ['concat("a", "b")', "ab"],
+  ['length("abc")', 3],
+  ['contains("abc", "b")', true],
+  ['lower("AB")', "ab"],
+  ['upper("ab")', "AB"],
+  ['trim(" a ")', "a"],
+  ['toNumber("12")', 12],
+  ["toString(12)", "12"],
+  ['dateAdd("2026-01-01", 1, "days")', "2026-01-02T00:00:00.000Z"],
+  ['dateBetween("2026-01-01", "2026-01-03", "days")', 2],
+  ['if(true and not false, prop("Price") * 2, 0)', 8],
+];

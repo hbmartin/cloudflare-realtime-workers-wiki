@@ -19,10 +19,12 @@ import { inlineImageMime } from "./attachments";
 import { HttpError, normalizeFilename } from "./http";
 import { deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { broadcastWorkspaceEvent } from "./workspace-events";
+import { tableTemplateSnapshot } from "./table-service";
+import { computeRowFormulas } from "../shared/table-computed";
+import { isErrorCell } from "../shared/formula";
 
 const EXPORT_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const EXPORT_MAX_BYTES = 64 * 1024 * 1024;
-const TABLE_EXPORT_BATCH = 500;
 const LINKED_DIAGRAM_ASSET_LIMIT = 64;
 // Browser Rendering loads the HTML from about:blank, so session-gated attachment URLs never resolve there.
 const PDF_INLINE_ASSET_LIMIT = 24 * 1024 * 1024;
@@ -36,8 +38,6 @@ type ExportPage = {
   title: string;
   is_task_list: number;
 };
-type ExportColumn = { id: string; name: string };
-type ExportTableRow = { id: string; cells: string };
 type ExportAttachment = { id: string; r2_key: string; name: string; mime: string };
 type LinkedDiagramAsset = {
   pageId: string;
@@ -261,52 +261,75 @@ async function documentExport(
 }
 
 async function tableExport(env: Env, page: ExportPage): Promise<SerializedExport> {
-  const columns = await env.DB.prepare(`SELECT id, name FROM table_columns WHERE page_id = ? ORDER BY position, id`)
-    .bind(page.id)
-    .all<ExportColumn>();
+  const snapshot = await tableTemplateSnapshot(env, page.id);
+  const columns = snapshot.columns;
+  const members = await env.DB.prepare(
+    "SELECT u.id,u.name FROM user u JOIN workspace_members wm ON wm.user_id=u.id WHERE wm.workspace_id=?",
+  )
+    .bind(page.workspace_id)
+    .all<{ id: string; name: string }>();
+  const names = new Map([
+    ...(snapshot.people ?? []).map((person) => [person.id, person.name] as const),
+    ...members.results.map((person) => [person.id, person.name] as const),
+  ]);
+  const archived = page.is_task_list
+    ? new Set(
+        (
+          await env.DB.prepare(
+            "SELECT l.row_id FROM table_row_pages l JOIN table_rows r ON r.id=l.row_id JOIN pages p ON p.id=l.page_id WHERE r.page_id=? AND p.archived_at IS NOT NULL",
+          )
+            .bind(page.id)
+            .all<{ row_id: string }>()
+        ).results.map((row) => row.row_id),
+      )
+    : new Set<string>();
   const markdown = [`# ${page.title.replaceAll("\n", " ")}\n\n`];
   const html = [
     `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(page.title)}</title><style>body{font:16px/1.55 system-ui,sans-serif;max-width:1100px;margin:40px auto;padding:0 24px;color:#171717}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:7px;text-align:left;vertical-align:top}</style></head><body><h1>${escapeHtml(page.title)}</h1><table><thead><tr>`,
-    ...columns.results.map((column) => `<th>${escapeHtml(column.name)}</th>`),
+    ...columns.map((column) => `<th>${escapeHtml(column.name)}</th>`),
     "</tr></thead><tbody>",
   ];
-  if (columns.results.length) {
-    markdown.push(`| ${columns.results.map((column) => escapeMarkdownCell(column.name)).join(" | ")} |\n`);
-    markdown.push(`| ${columns.results.map(() => "---").join(" | ")} |\n`);
+  if (columns.length) {
+    markdown.push(`| ${columns.map((column) => escapeMarkdownCell(column.name)).join(" | ")} |\n`);
+    markdown.push(`| ${columns.map(() => "---").join(" | ")} |\n`);
   }
-  let offset = 0;
-  while (true) {
-    const rows = await env.DB.prepare(
-      `SELECT row.id,
-              COALESCE(json_group_object(column.id,
-                CASE WHEN column.id = ? AND cell.text_value IS NOT NULL
-                  THEN coalesce(assignee.name, 'Former member')
-                  ELSE COALESCE(cell.text_value, cell.number_value,
-                  CASE WHEN cell.boolean_value IS NULL THEN NULL WHEN cell.boolean_value = 1 THEN 'true' ELSE 'false' END,
-                  cell.date_value, option.label, '') END), '{}') cells
-         FROM table_rows row
-         CROSS JOIN table_columns column
-         LEFT JOIN table_cells cell ON cell.row_id = row.id AND cell.column_id = column.id
-         LEFT JOIN table_select_options option ON option.id = cell.select_value
-         LEFT JOIN user assignee ON assignee.id = cell.text_value
-        WHERE row.page_id = ? AND column.page_id = ?
-          AND (? = 0 OR NOT EXISTS(
-            SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id = link.page_id
-             WHERE link.row_id = row.id AND detail.archived_at IS NOT NULL
-          ))
-        GROUP BY row.id, row.position
-        ORDER BY row.position, row.id LIMIT ? OFFSET ?`,
-    )
-      .bind(`${page.id}-assignee`, page.id, page.id, page.is_task_list, TABLE_EXPORT_BATCH, offset)
-      .all<ExportTableRow>();
-    for (const row of rows.results) {
-      const cells = jsonRecord(row.cells);
-      const values = columns.results.map((column) => String(cells[column.id] ?? ""));
-      markdown.push(`| ${values.map(escapeMarkdownCell).join(" | ")} |\n`);
-      html.push(`<tr>${values.map((value) => `<td>${escapeHtml(value).replaceAll("\n", "<br>")}</td>`).join("")}</tr>`);
-    }
-    offset += rows.results.length;
-    if (rows.results.length < TABLE_EXPORT_BATCH) break;
+  for (const row of snapshot.rows.sort((a, b) => a.position - b.position || a.id.localeCompare(b.id))) {
+    if (archived.has(row.id)) continue;
+    const computed =
+      row.computedCells ??
+      computeRowFormulas({
+        tableId: page.id,
+        tableRevision: snapshot.revision,
+        schemaRevision: 0,
+        rowId: row.id,
+        rowRevision: row.revision ?? snapshot.revision,
+        cells: row.cells,
+        properties: columns,
+      });
+    const values = columns.map((column) => {
+      const value = column.type === "formula" ? computed[column.id]?.value : row.cells[column.id];
+      if (column.type === "created_time") return new Date(row.createdAt).toISOString();
+      if (column.type === "last_edited_time") return new Date(row.editedAt).toISOString();
+      if (column.type === "created_by") return row.createdBy ? (names.get(row.createdBy) ?? "Former member") : "";
+      if (column.type === "last_edited_by") return row.editedBy ? (names.get(row.editedBy) ?? "Former member") : "";
+      if (page.is_task_list && column.id === `${page.id}-assignee` && typeof value === "string")
+        return names.get(value) ?? "Former member";
+      if (isErrorCell(value)) return `#${value["__err"]}`;
+      if (value === null || value === undefined) return "";
+      if (["select", "status"].includes(column.type))
+        return column.options.find((option) => option.id === value)?.label ?? "Deleted option";
+      if (column.type === "multi_select" && Array.isArray(value))
+        return value
+          .map((optionId) => column.options.find((option) => option.id === optionId)?.label ?? "Deleted option")
+          .join(", ");
+      if (column.type === "person" && Array.isArray(value))
+        return value.map((personId) => names.get(personId) ?? "Former member").join(", ");
+      if (Array.isArray(value) || typeof value === "object")
+        throw new Error("This property value cannot be exported as a scalar.");
+      return String(value);
+    });
+    markdown.push(`| ${values.map(escapeMarkdownCell).join(" | ")} |\n`);
+    html.push(`<tr>${values.map((value) => `<td>${escapeHtml(value).replaceAll("\n", "<br>")}</td>`).join("")}</tr>`);
   }
   html.push("</tbody></table></body></html>");
   return { markdown: markdown.join(""), html: html.join(""), linkedDiagramAssets: [] };

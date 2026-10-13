@@ -1,4 +1,5 @@
 export const CLIENT_ERROR_EVENTS = [
+  "client.render_failed",
   "client.global_error",
   "client.unhandled_rejection",
   "client.bundle_load_failed",

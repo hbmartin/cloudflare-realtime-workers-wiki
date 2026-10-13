@@ -14,6 +14,36 @@ function fixture() {
 }
 
 describe("Notion Markdown block mutations", () => {
+  it("matches fetched Markdown across empty paragraphs without losing empty-block identities", () => {
+    const { first, second } = fixture();
+    const empty = notionInputToBlockContainer({ paragraph: {} });
+    const document = { type: "doc", content: [{ type: "blockGroup", content: [first, empty, second] }] };
+    const projection = projectNotionMarkdown(document, new Map(), {}, [], { complete: true });
+    expect(projection.markdown).toBe("First paragraph\n\nSecond paragraph\n");
+    const command = parseMarkdownCommand(
+      {
+        type: "update_content",
+        update_content: {
+          content_updates: [
+            {
+              old_str: projection.markdown.trimEnd(),
+              new_str: "Changed first\n\nChanged second",
+            },
+          ],
+        },
+      },
+      projection.markdown,
+    );
+    const operations = markdownMutations(document, projection, command.edits, true);
+    expect(operations).toHaveLength(2);
+    expect(JSON.stringify(operations)).not.toContain(String(empty.attrs?.id));
+    expect(operations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "replace_block", internalId: first.attrs?.id }),
+        expect.objectContaining({ type: "replace_block", internalId: second.attrs?.id }),
+      ]),
+    );
+  });
   it("replaces only the selected block and keeps its ID", () => {
     const { first, second, document, projection } = fixture();
     const command = parseMarkdownCommand(

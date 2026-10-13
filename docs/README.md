@@ -30,6 +30,11 @@ Choose the guide for your role. Feature availability depends on environment flag
 - [License](../LICENSE), [security policy](../SECURITY.md), and [third-party notices](../THIRD_PARTY_NOTICES.md).
 - [Changelog](../CHANGELOG.md) and [verification evidence](evidence/README.md).
 
+- [Implementation architecture](implementation/architecture.md) and [release evidence](implementation/release.md).
+- [Contributors, validation and integrity release](implementation/contributors-integrity-release.md).
+- [Editor implementation and rendering evidence](implementation/editor-release.md).
+- [Table authority, views and computed data acceptance](implementation/table-authority-release.md).
+
 ## Planning
 
 - [Phased roadmap](roadmap/README.md), including each phase's exit matrix.

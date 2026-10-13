@@ -4,6 +4,7 @@ import {
   defaultBlockSpecs,
   defaultInlineContentSpecs,
   defaultStyleSpecs,
+  type Extension,
 } from "@blocknote/core";
 import { createReactInlineContentSpec } from "@blocknote/react";
 import { useState } from "react";
@@ -14,6 +15,7 @@ import type { PagePreview } from "../shared/types";
 import { api } from "./api";
 import { coreBlockSpecs, inlineMathSpec } from "./editor-blocks";
 import { DateMentionChip } from "./DateMentionChip";
+import { featureBlockSpecs, featureInlineSpecs } from "./editor-feature-blocks";
 
 export const PAGE_NAVIGATE_EVENT = "notes:navigate-page";
 
@@ -213,13 +215,37 @@ const codeBlock = {
   },
 };
 
+function extendTableRowIdentity(extension: Extension) {
+  return {
+    ...extension,
+    tiptapExtensions: extension.tiptapExtensions?.map((node) =>
+      node.name === "tableRow"
+        ? node.extend({
+            addAttributes(this: { parent?: () => Record<string, unknown> }) {
+              return { ...this.parent?.(), apiRowId: { default: "", rendered: false } };
+            },
+          })
+        : node,
+    ),
+  };
+}
+
+const tableBlock = {
+  ...defaultBlockSpecs.table,
+  extensions: defaultBlockSpecs.table.extensions?.map((factory) => {
+    return typeof factory === "function"
+      ? (...args: Parameters<typeof factory>) => extendTableRowIdentity(factory(...args))
+      : extendTableRowIdentity(factory);
+  }),
+};
 export const notesSchema = BlockNoteSchema.create({
-  blockSpecs: { ...defaultBlockSpecs, codeBlock, ...coreBlockSpecs },
+  blockSpecs: { ...defaultBlockSpecs, table: tableBlock, codeBlock, ...coreBlockSpecs, ...featureBlockSpecs },
   inlineContentSpecs: {
     ...defaultInlineContentSpecs,
     mention: mentionInlineSpec,
     dateMention: dateMentionInlineSpec,
     inlineMath: inlineMathSpec,
+    ...featureInlineSpecs,
   },
   styleSpecs: defaultStyleSpecs,
 });

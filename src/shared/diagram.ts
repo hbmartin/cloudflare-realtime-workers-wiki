@@ -100,6 +100,14 @@ function nodeFromMap(id: string, value: Y.Map<unknown>): DiagramNode {
     notes: yText(value.get("notes")),
     color: color(value.get("color")),
     assetId: typeof rawAssetId === "string" && /^[\w-]{1,100}$/.test(rawAssetId) ? rawAssetId : null,
+    linkedPageId:
+      typeof value.get("linkedPageId") === "string" && /^[\w-]{1,100}$/.test(value.get("linkedPageId") as string)
+        ? (value.get("linkedPageId") as string)
+        : null,
+    linkedViewId:
+      typeof value.get("linkedViewId") === "string" && /^[\w-]{1,100}$/.test(value.get("linkedViewId") as string)
+        ? (value.get("linkedViewId") as string)
+        : null,
     references: links(value.get("references")),
     mentions: links(value.get("mentions")),
   };
@@ -181,7 +189,10 @@ function makeLinks(values: readonly DiagramEntityLink[]) {
   return result;
 }
 
-export function diagramNodeMap(node: DiagramNode) {
+export function diagramNodeMap(
+  node: Omit<DiagramNode, "linkedPageId" | "linkedViewId"> &
+    Partial<Pick<DiagramNode, "linkedPageId" | "linkedViewId">>,
+) {
   const result = new Y.Map<unknown>();
   result.set("type", node.type);
   result.set("x", node.x);
@@ -194,6 +205,8 @@ export function diagramNodeMap(node: DiagramNode) {
   result.set("notes", makeText(node.notes));
   result.set("color", node.color);
   if (node.assetId) result.set("assetId", node.assetId);
+  if (node.linkedPageId) result.set("linkedPageId", node.linkedPageId);
+  if (node.linkedPageId && node.linkedViewId) result.set("linkedViewId", node.linkedViewId);
   result.set("references", makeLinks(node.references));
   result.set("mentions", makeLinks(node.mentions));
   return result;
@@ -222,6 +235,8 @@ export function projectDiagram(diagram: Pick<DiagramContentEnvelope, "nodes" | "
   const memberMentions = new Map<string, ProjectedReference>();
   for (const node of diagram.nodes) {
     parts.push(node.label, node.notes);
+    if (node.linkedPageId && !pageReferences.has(node.linkedPageId))
+      pageReferences.set(node.linkedPageId, { targetId: node.linkedPageId, excerpt: excerpt(node, "Linked page") });
     for (const reference of node.references) {
       parts.push(reference.label);
       if (!pageReferences.has(reference.id)) {

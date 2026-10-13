@@ -2,6 +2,7 @@ import type { ActivityItem, ActivityResponse, ChannelEventType } from "../shared
 import { CHANNEL_EVENT_TYPES } from "../shared/activity";
 import type { Env, MemberContext } from "./env";
 import { HttpError } from "./http";
+import { contributorsJsonSql, eventContributors } from "./contributor-identity";
 
 export const OPEN_THREAD_COUNT_SQL = `(SELECT count(*) FROM comment_threads t WHERE t.page_id=p.id AND t.resolved_at IS NULL)`;
 export const TASK_STATUS_SQL = `(SELECT coalesce(substr(c.select_value,length(r.page_id)+2),'todo')
@@ -16,6 +17,8 @@ type ActivityRow = {
   plain_text: string;
   kind: string;
   actor_name: string | null;
+  actor_id: string | null;
+  contributors_json: string;
   event_type: ChannelEventType | null;
   created_at: number;
   unresolved_threads: number;
@@ -31,6 +34,8 @@ function activityItem(row: ActivityRow): ActivityItem {
     excerpt: row.archived_at === null ? row.plain_text.replace(/\s+/g, " ").slice(0, 240) : "",
     kind: row.kind,
     actorName: row.actor_name,
+    actorId: row.actor_id,
+    contributors: eventContributors(row.contributors_json),
     eventType: row.event_type,
     createdAt: row.created_at,
     unresolvedThreads: row.unresolved_threads,
@@ -128,7 +133,9 @@ export async function listActivity(
   }
   const rows =
     await env.DB.prepare(`SELECT ${open ? "p.id" : "a.id"} id,p.id page_id,p.space_id,p.title,p.plain_text,p.kind,p.archived_at,
-    ${open ? "NULL" : "actor.name"} actor_name,${open ? "NULL" : "a.event_type"} event_type,${open ? "p.updated_at" : "a.created_at"} created_at,
+    ${open ? "NULL" : "actor.name"} actor_name,${open ? "NULL" : "a.actor_id"} actor_id,
+    ${open ? "'[]'" : contributorsJsonSql("a.contributor_ids_json", "a.actor_id")} contributors_json,
+    ${open ? "NULL" : "a.event_type"} event_type,${open ? "p.updated_at" : "a.created_at"} created_at,
     ${OPEN_THREAD_COUNT_SQL} unresolved_threads,${TASK_STATUS_SQL} task_status
     FROM pages p JOIN spaces s ON s.id=p.space_id
     ${open ? "" : "JOIN workspace_activity a ON a.page_id=p.id LEFT JOIN user actor ON actor.id=a.actor_id"}

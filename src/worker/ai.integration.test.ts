@@ -941,19 +941,18 @@ describe("private conversation retention and sources", () => {
     ).page;
     await env.DB.prepare("DELETE FROM table_columns WHERE page_id=?").bind(table.id).run();
     await env.DB.batch([
-      env.DB.prepare("INSERT INTO table_columns VALUES('text-column',?,'Text','text',0)").bind(table.id),
-      env.DB.prepare("INSERT INTO table_columns VALUES('number-column',?,'Number','number',1)").bind(table.id),
+      env.DB.prepare(
+        "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('text-column',?,'Text','text',0)",
+      ).bind(table.id),
+      env.DB.prepare(
+        "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('number-column',?,'Number','number',1)",
+      ).bind(table.id),
     ]);
     for (let index = 0; index < 55; index++)
       await env.DB.batch([
-        env.DB.prepare("INSERT INTO table_rows VALUES(?,?,?,?,?,?)").bind(
-          `row-${index}`,
-          table.id,
-          index,
-          member.user.id,
-          1,
-          1,
-        ),
+        env.DB.prepare(
+          "INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+        ).bind(`row-${index}`, table.id, index, member.user.id, 1, 1),
         env.DB.prepare(
           "INSERT INTO table_cells(row_id,column_id,text_value,updated_at) VALUES(?,'text-column',?,1)",
         ).bind(`row-${index}`, index === 2 ? "special" : `Text ${index}`),

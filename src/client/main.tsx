@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { browserSupportsRequiredFeatures } from "./browser-support";
 import { Startup } from "./startup";
+import { RenderBoundary } from "./RenderBoundary";
 import "./startup.css";
 import { installClientTelemetry } from "./telemetry";
 
@@ -21,6 +22,8 @@ if (import.meta.env.PROD && "serviceWorker" in navigator) {
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <Startup supported={browserSupportsRequiredFeatures()} />
+    <RenderBoundary label="The workspace could not be displayed">
+      <Startup supported={browserSupportsRequiredFeatures()} />
+    </RenderBoundary>
   </StrictMode>,
 );

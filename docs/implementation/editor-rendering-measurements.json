@@ -1,0 +1,190 @@
+{
+  "viewport": "1280x800",
+  "repeats": 3,
+  "profile": "97% paragraphs, 1% H2 headings, 1% JavaScript code, 1% KaTeX math",
+  "samples": [
+    {
+      "count": 1000,
+      "mode": "eager",
+      "firstPaintMs": 54,
+      "editPaintMs": 30,
+      "totalBlocks": 1000,
+      "mathPreviews": 10,
+      "highlightedBlocks": 10,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 1000,
+      "mode": "deferred",
+      "firstPaintMs": 50,
+      "editPaintMs": 33,
+      "totalBlocks": 1000,
+      "mathPreviews": 0,
+      "highlightedBlocks": 0,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 1000,
+      "mode": "deferred",
+      "firstPaintMs": 50,
+      "editPaintMs": 34,
+      "totalBlocks": 1000,
+      "mathPreviews": 0,
+      "highlightedBlocks": 0,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 1000,
+      "mode": "eager",
+      "firstPaintMs": 50,
+      "editPaintMs": 33,
+      "totalBlocks": 1000,
+      "mathPreviews": 10,
+      "highlightedBlocks": 10,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 1000,
+      "mode": "eager",
+      "firstPaintMs": 50,
+      "editPaintMs": 33,
+      "totalBlocks": 1000,
+      "mathPreviews": 10,
+      "highlightedBlocks": 10,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 1000,
+      "mode": "deferred",
+      "firstPaintMs": 51,
+      "editPaintMs": 33,
+      "totalBlocks": 1000,
+      "mathPreviews": 0,
+      "highlightedBlocks": 0,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 5000,
+      "mode": "eager",
+      "firstPaintMs": 231,
+      "editPaintMs": 35,
+      "totalBlocks": 5000,
+      "mathPreviews": 50,
+      "highlightedBlocks": 50,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 5000,
+      "mode": "deferred",
+      "firstPaintMs": 227,
+      "editPaintMs": 23,
+      "totalBlocks": 5000,
+      "mathPreviews": 0,
+      "highlightedBlocks": 0,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 5000,
+      "mode": "deferred",
+      "firstPaintMs": 214,
+      "editPaintMs": 20,
+      "totalBlocks": 5000,
+      "mathPreviews": 0,
+      "highlightedBlocks": 0,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 5000,
+      "mode": "eager",
+      "firstPaintMs": 215,
+      "editPaintMs": 35,
+      "totalBlocks": 5000,
+      "mathPreviews": 50,
+      "highlightedBlocks": 50,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 5000,
+      "mode": "eager",
+      "firstPaintMs": 226,
+      "editPaintMs": 24,
+      "totalBlocks": 5000,
+      "mathPreviews": 50,
+      "highlightedBlocks": 50,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 5000,
+      "mode": "deferred",
+      "firstPaintMs": 216,
+      "editPaintMs": 17,
+      "totalBlocks": 5000,
+      "mathPreviews": 0,
+      "highlightedBlocks": 0,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 10000,
+      "mode": "eager",
+      "firstPaintMs": 527,
+      "editPaintMs": 39,
+      "totalBlocks": 10000,
+      "mathPreviews": 100,
+      "highlightedBlocks": 100,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 10000,
+      "mode": "deferred",
+      "firstPaintMs": 591,
+      "editPaintMs": 27,
+      "totalBlocks": 10000,
+      "mathPreviews": 0,
+      "highlightedBlocks": 0,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 10000,
+      "mode": "deferred",
+      "firstPaintMs": 567,
+      "editPaintMs": 15,
+      "totalBlocks": 10000,
+      "mathPreviews": 0,
+      "highlightedBlocks": 0,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 10000,
+      "mode": "eager",
+      "firstPaintMs": 522,
+      "editPaintMs": 35,
+      "totalBlocks": 10000,
+      "mathPreviews": 100,
+      "highlightedBlocks": 100,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 10000,
+      "mode": "eager",
+      "firstPaintMs": 559,
+      "editPaintMs": 42,
+      "totalBlocks": 10000,
+      "mathPreviews": 100,
+      "highlightedBlocks": 100,
+      "docUnchangedByPreviews": true
+    },
+    {
+      "count": 10000,
+      "mode": "deferred",
+      "firstPaintMs": 886,
+      "editPaintMs": 22,
+      "totalBlocks": 10000,
+      "mathPreviews": 0,
+      "highlightedBlocks": 0,
+      "docUnchangedByPreviews": true
+    }
+  ],
+  "recordedAt": "2026-10-13",
+  "environment": "Local Chromium via Playwright, Vite development server, 1280x800, warm Shiki, alternating eager/deferred order",
+  "comparison": "Controlled eager/deferred modes of the same working tree; not historical commits and not production latency"
+}

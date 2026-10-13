@@ -5,7 +5,21 @@ export type { PageKind } from "./page-kind";
 
 export type Role = "owner" | "editor" | "viewer";
 export type SpaceRole = "owner" | "editor" | "viewer";
-export type ColumnType = "text" | "number" | "checkbox" | "date" | "select";
+export type ColumnType =
+  | "text"
+  | "number"
+  | "checkbox"
+  | "date"
+  | "select"
+  | "multi_select"
+  | "person"
+  | "url"
+  | "status"
+  | "created_time"
+  | "created_by"
+  | "last_edited_time"
+  | "last_edited_by"
+  | "formula";
 
 export type SessionUser = {
   id: string;
@@ -59,6 +73,10 @@ export type ClientMemberContext = Omit<MemberContext, "session"> & {
     workspaceActivity?: boolean;
     blockLinks?: boolean;
     liveDiagramEmbeds?: boolean;
+    editorBlocksV2?: boolean;
+    tableAuthority?: boolean;
+    tableBoard?: boolean;
+    tableCalendar?: boolean;
     diffDigests?: boolean;
   };
 };
@@ -132,6 +150,8 @@ export type DiagramNode = {
   notes: string;
   color: DiagramColor;
   assetId: string | null;
+  linkedPageId: string | null;
+  linkedViewId: string | null;
   references: DiagramEntityLink[];
   mentions: DiagramEntityLink[];
 };
@@ -394,6 +414,7 @@ export type SearchResult = {
 };
 
 export type SearchResponse = {
+  matchMode?: "primary" | "title-typo";
   results: SearchResult[];
   limit: number;
   offset: number;

@@ -2,6 +2,7 @@ import { slackAccessAuthorization, SlackInstallationAuthError } from "./slack-id
 export { SlackInstallationAuthError } from "./slack-identity";
 import type { ChannelEventType } from "../shared/activity";
 import { defaultDigestTimezone, digestWindow, channelInvalidReason } from "./slack-schedule";
+import { eventContributorIds } from "./contributor-identity";
 import type {
   NotificationEventType,
   SlackCapability,
@@ -1956,6 +1957,8 @@ export function slackChannelFanoutStatements(
     contentEpoch?: number;
     threadId: string | null;
     actorId: string | null;
+    contributorIds?: readonly string[];
+    data?: Record<string, unknown>;
     eventType: NotificationEventType;
     sourceId: string;
     createdAt: number;
@@ -1969,11 +1972,34 @@ export function slackChannelFanoutStatements(
   const coalesceAfter = fanout.coalesceAfter ?? null;
   const idPrefix = `${eventId}:`;
   return [
+    ...(fanout.eventType === "page_edit" && coalesceAfter !== null
+      ? [
+          database
+            .prepare(`UPDATE slack_channel_events SET contributor_ids_json=
+      (SELECT json_group_array(value) FROM (SELECT value FROM json_each(slack_channel_events.contributor_ids_json) UNION SELECT value FROM json_each(?)))
+      WHERE workspace_id=? AND page_id=? AND actor_id=? AND event_type='page_edit' AND created_at>?
+        AND NOT (?=1 AND cadence='digest')
+        AND subscription_id IN (SELECT id FROM slack_channel_subscriptions WHERE space_id=? AND (page_id IS NULL OR page_id=?))
+        AND EXISTS(SELECT 1 FROM pages p WHERE p.id=slack_channel_events.page_id AND (? IS NULL OR p.content_epoch=?))`)
+            .bind(
+              JSON.stringify(eventContributorIds(fanout)),
+              fanout.workspaceId,
+              fanout.pageId,
+              fanout.actorId,
+              coalesceAfter,
+              fanout.retainDigestChanges ? 1 : 0,
+              fanout.spaceId,
+              fanout.pageId,
+              fanout.contentEpoch ?? null,
+              fanout.contentEpoch ?? null,
+            ),
+        ]
+      : []),
     database
       .prepare(
         `INSERT OR IGNORE INTO slack_channel_events
-          (id, subscription_id, workspace_id, event_type, actor_id, page_id, thread_id, cadence, created_at)
-         SELECT ? || ':' || subscription.id, subscription.id, ?, ?, ?, ?, ?, subscription.cadence, ?
+          (id, subscription_id, workspace_id, event_type, actor_id, page_id, thread_id, cadence, created_at,contributor_ids_json)
+         SELECT ? || ':' || subscription.id, subscription.id, ?, ?, ?, ?, ?, subscription.cadence, ?,?
            FROM slack_channel_subscriptions subscription
            JOIN slack_installations installation ON installation.id = subscription.installation_id
           WHERE installation.workspace_id = ? AND installation.disconnected_at IS NULL
@@ -2000,6 +2026,7 @@ export function slackChannelFanoutStatements(
         fanout.pageId,
         fanout.threadId,
         fanout.createdAt,
+        JSON.stringify(eventContributorIds(fanout)),
         fanout.workspaceId,
         fanout.pageId,
         fanout.workspaceId,

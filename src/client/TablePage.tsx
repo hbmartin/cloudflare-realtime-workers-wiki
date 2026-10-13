@@ -1,3 +1,4 @@
+import { TableAuthorityGate } from "./TableAuthorityGate";
 import type { ReactNode } from "react";
 import { ActionMenu, PageTools } from "./WorkspaceUI";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -332,7 +333,7 @@ export type TablePageProps = {
   backlinksRevision: number;
 };
 
-export function TablePage({
+function LegacyTablePage({
   page,
   metadata,
   member,
@@ -2324,6 +2325,18 @@ function DraftCellInput({
           });
         }
       }}
+    />
+  );
+}
+
+export function TablePage(props: TablePageProps) {
+  return (
+    <TableAuthorityGate
+      page={props.page}
+      member={props.member}
+      {...(props.metadata === undefined ? {} : { metadata: props.metadata })}
+      onSelectPage={props.onSelectPage}
+      legacy={<LegacyTablePage {...props} />}
     />
   );
 }

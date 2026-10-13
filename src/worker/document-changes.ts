@@ -26,6 +26,7 @@ export function checkpointStatements(
     afterKey: string;
     before: { r2_key: string; content_epoch: number; sequence: number } | null;
     actorId: string | null;
+    contributorIds?: readonly string[];
     recipients: string[];
     timestamp: number;
   },
@@ -34,8 +35,8 @@ export function checkpointStatements(
   const id = `${input.pageId}:${input.epoch}:${input.sequence}`;
   return [
     env.DB.prepare(`INSERT OR IGNORE INTO page_change_checkpoints
-      (id,page_id,workspace_id,content_epoch,sequence,before_key,before_epoch,before_sequence,after_key,actor_id,created_at)
-      SELECT ?,p.id,p.workspace_id,?,?,?,?,?,?,nullif(?,''),? FROM pages p
+      (id,page_id,workspace_id,content_epoch,sequence,before_key,before_epoch,before_sequence,after_key,actor_id,contributor_ids_json,created_at)
+      SELECT ?,p.id,p.workspace_id,?,?,?,?,?,?,nullif(?,''),?,? FROM pages p
       JOIN document_projections projection ON projection.page_id=p.id
       WHERE p.id=? AND p.content_epoch=? AND p.kind='document' AND p.archived_at IS NULL
         AND p.import_job_id IS NULL AND p.is_template=0 AND projection.r2_key=? AND projection.sequence=?`).bind(
@@ -47,6 +48,7 @@ export function checkpointStatements(
       input.before?.sequence ?? null,
       input.afterKey,
       input.actorId,
+      JSON.stringify(input.contributorIds ?? (input.actorId ? [input.actorId] : [])),
       input.timestamp,
       input.pageId,
       input.epoch,
@@ -60,6 +62,7 @@ export function checkpointStatements(
       JOIN workspace_members member ON member.workspace_id=c.workspace_id AND member.user_id=recipient.value
       LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=recipient.value
       WHERE c.id=? AND p.archived_at IS NULL AND (c.actor_id IS NULL OR c.actor_id<>recipient.value)
+        AND NOT EXISTS(SELECT 1 FROM json_each(c.contributor_ids_json) author WHERE author.value=recipient.value)
         AND (member.role='owner' OR s.visibility='workspace' OR sm.user_id IS NOT NULL)`).bind(
       JSON.stringify(input.recipients),
       id,

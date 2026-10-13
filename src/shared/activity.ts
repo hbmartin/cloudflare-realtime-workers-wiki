@@ -29,6 +29,8 @@ export type ActivityItem = {
   excerpt: string;
   kind: string;
   actorName: string | null;
+  actorId?: string | null;
+  contributors?: Array<{ id: string; name: string }>;
   eventType: ChannelEventType | null;
   createdAt: number;
   unresolvedThreads: number;

@@ -395,6 +395,7 @@ export function webhookEventStatements(
     contentEpoch?: number;
     publishedOnly?: boolean;
     actorId: string | null;
+    contributorIds?: readonly string[];
     sourceKey: string;
     data?: Record<string, unknown>;
     createdAt: number;
@@ -420,7 +421,10 @@ export function webhookEventStatements(
         input.entityId,
         input.pageId,
         input.actorId,
-        JSON.stringify(input.data ?? {}),
+        JSON.stringify({
+          ...input.data,
+          ...(input.contributorIds ? { contributorIds: [...new Set(input.contributorIds)] } : {}),
+        }),
         input.sourceKey,
         input.createdAt,
         input.contentEpoch ?? null,

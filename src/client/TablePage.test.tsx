@@ -12,6 +12,8 @@ vi.mock("./api", async (importOriginal) => {
   const original = await importOriginal<typeof import("./api")>();
   return { ...original, api: vi.fn() };
 });
+// Authority discovery and rollout are covered by TableAuthorityGate.test.tsx.
+vi.mock("./TableAuthorityGate", () => ({ TableAuthorityGate: ({ legacy }: { legacy: React.ReactNode }) => legacy }));
 
 const page: Page = {
   id: "table-page",

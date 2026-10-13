@@ -3698,12 +3698,7 @@ describe("Worker integration", () => {
 
     await runInDurableObject(stub, async (instance) => {
       const document = instance as unknown as TestDocument;
-      const fragment = document.document.getXmlFragment("document-store");
-      const paragraph = new Y.XmlElement("paragraph");
-      const text = new Y.XmlText();
-      text.insert(0, "Restorable content");
-      paragraph.insert(0, [text]);
-      fragment.insert(0, [paragraph]);
+      installDocumentBlocks(document.document, documentBlock("restorable-content", "Restorable content").container);
       await document.onSave();
       await document.compact(true);
     });

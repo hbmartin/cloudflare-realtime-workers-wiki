@@ -1,12 +1,58 @@
 import { describe, expect, it } from "vitest";
 import { notionInputToBlockContainer } from "./notion-blocks";
-import { projectNotionMarkdown } from "./notion-markdown";
+import { notionMarkdownWindow, projectNotionMarkdown } from "./notion-markdown";
 
 function page(...blocks: ReturnType<typeof notionInputToBlockContainer>[]) {
   return { type: "doc", content: [{ type: "blockGroup", content: blocks }] };
 }
 
 describe("Notion Markdown projection", () => {
+  it("bounds canonical traversal and rejects malformed nodes before serialization", () => {
+    let nested = { type: "paragraph" } as ReturnType<typeof notionInputToBlockContainer>;
+    for (let depth = 0; depth < 66; depth++) nested = { type: "blockGroup", content: [nested] };
+    expect(() => notionMarkdownWindow(nested, {}, 0, 16_000)).toThrow("structural limits");
+    const malformed = { type: "doc", content: [null] } as unknown as ReturnType<typeof notionInputToBlockContainer>;
+    expect(() => projectNotionMarkdown(malformed, new Map(), {}, [], { complete: true })).toThrow("node is malformed");
+  });
+  it("reconstructs canonical content beyond legacy byte and block limits", () => {
+    const blocks = Array.from({ length: 1010 }, (_, index) => ({
+      type: "blockContainer",
+      attrs: { id: `block-${index}` },
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: `${index} ${"📝".repeat(index === 500 ? 270000 : 2)}` }] },
+      ],
+    }));
+    const document = page(...blocks);
+    const full = projectNotionMarkdown(document, new Map(), {}, [], { complete: true }).markdown;
+    const parts: string[] = [];
+    let offset = 0;
+    while (offset < full.length) {
+      const window = notionMarkdownWindow(document, {}, offset, 16001);
+      expect(window.textLength).toBe(full.length);
+      expect(window.markdown.length).toBeGreaterThan(0);
+      expect(window.markdown).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u);
+      parts.push(window.markdown);
+      offset += window.markdown.length;
+    }
+    expect(parts.join("")).toBe(full);
+    expect(parts.join("")).toContain("1009 📝📝");
+  });
+
+  it("keeps empty blocks and list separators consistent in paginated reads", () => {
+    const document = page(
+      notionInputToBlockContainer({ paragraph: { rich_text: [{ text: { content: "First" } }] } }),
+      notionInputToBlockContainer({ paragraph: {} }),
+      notionInputToBlockContainer({ bulleted_list_item: { rich_text: [{ text: { content: "One" } }] } }),
+      notionInputToBlockContainer({ bulleted_list_item: { rich_text: [{ text: { content: "Two" } }] } }),
+      notionInputToBlockContainer({ paragraph: {} }),
+    );
+    const full = projectNotionMarkdown(document, new Map(), {}, [], { complete: true }).markdown;
+    const chunks = Array.from(
+      { length: Math.ceil(full.length / 3) },
+      (_, i) => notionMarkdownWindow(document, {}, i * 3, 3).markdown,
+    );
+    expect(chunks.join("")).toBe(full);
+  });
   it("projects supported blocks with stable source spans", () => {
     const first = notionInputToBlockContainer({ heading_2: { rich_text: [{ text: { content: "Plans" } }] } });
     const second = notionInputToBlockContainer({ paragraph: { rich_text: [{ text: { content: "Ship it" } }] } });

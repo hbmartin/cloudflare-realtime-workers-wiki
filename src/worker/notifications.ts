@@ -12,6 +12,7 @@ import { tracing } from "cloudflare:workers";
 import { DELIVERY_CLAIM_STALE_MS, DeliveryInProgressError } from "./delivery-claim";
 export { DeliveryInProgressError } from "./delivery-claim";
 import type { Env, MemberContext } from "./env";
+import { contributorsJsonSql, eventContributorIds, eventContributors } from "./contributor-identity";
 import { HttpError } from "./http";
 import {
   preparePersonalSlackNotification,
@@ -47,6 +48,7 @@ export type NotificationFanout = {
   threadId: string | null;
   actorId: string | null;
   eventType: NotificationEventType;
+  contributorIds?: readonly string[];
   sourceId: string;
   retainDigestChanges?: boolean;
   taskOperationId?: string;
@@ -71,6 +73,7 @@ type NotificationRow = {
   page_icon: string | null;
   thread_id: string | null;
   data_json: string;
+  contributors_json: string;
   read_at: number | null;
   archived_at: number | null;
   created_at: number;
@@ -95,13 +98,39 @@ function uniqueIds(ids: string[]) {
 // or while the previous edit notification is still unread, collapse into one notification.
 const PAGE_EDIT_COALESCE_MS = 60 * 60 * 1000;
 export function notificationFanoutStatements(database: D1Database, fanout: NotificationFanout) {
-  const recipients = uniqueIds(fanout.recipientIds);
+  const contributing = new Set(eventContributorIds(fanout));
+  const recipients = uniqueIds(fanout.recipientIds).filter(
+    (id) => fanout.eventType !== "page_edit" || !contributing.has(id),
+  );
   const coalesceAfter = fanout.eventType === "page_edit" ? fanout.createdAt - PAGE_EDIT_COALESCE_MS : null;
   const prefix = `${fanout.eventType}:${fanout.sourceId}`;
   const idPrefix = `${prefix}:`;
   const recipientJson = JSON.stringify(recipients);
-  const dataJson = JSON.stringify(fanout.data ?? {});
+  const contributorJson = JSON.stringify([...contributing]);
+  const dataJson = JSON.stringify({ ...fanout.data, contributorIds: [...contributing] });
   return [
+    ...(fanout.eventType === "page_edit"
+      ? [
+          database
+            .prepare(`UPDATE notifications SET data_json=json_set(data_json,'$.contributorIds',json(
+      (SELECT json_group_array(value) FROM (SELECT value FROM json_each(CASE WHEN json_type(notifications.data_json,'$.contributorIds')='array' THEN json_extract(notifications.data_json,'$.contributorIds') ELSE '[]' END)
+        UNION SELECT value FROM json_each(?)))))
+      WHERE workspace_id=? AND page_id=? AND actor_id=? AND event_type='page_edit'
+        AND user_id IN (SELECT value FROM json_each(?))
+        AND ((read_at IS NULL AND archived_at IS NULL) OR created_at>?)
+        AND EXISTS(SELECT 1 FROM pages p WHERE p.id=notifications.page_id AND (? IS NULL OR p.content_epoch=?))`)
+            .bind(
+              contributorJson,
+              fanout.workspaceId,
+              fanout.pageId,
+              fanout.actorId,
+              recipientJson,
+              coalesceAfter,
+              fanout.contentEpoch ?? null,
+              fanout.contentEpoch ?? null,
+            ),
+        ]
+      : []),
     database
       .prepare(
         `INSERT OR IGNORE INTO notifications
@@ -177,8 +206,8 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         `${prefix};`,
       ),
     database
-      .prepare(`INSERT OR IGNORE INTO workspace_activity(id,workspace_id,page_id,space_id,actor_id,thread_id,event_type,created_at,slack_eligible)
-      SELECT ?,p.workspace_id,p.id,p.space_id,nullif(?,''),?,?,?,? FROM pages p WHERE p.id=? AND p.workspace_id=?
+      .prepare(`INSERT OR IGNORE INTO workspace_activity(id,workspace_id,page_id,space_id,actor_id,thread_id,event_type,created_at,slack_eligible,contributor_ids_json)
+      SELECT ?,p.workspace_id,p.id,p.space_id,nullif(?,''),?,?,?,?,? FROM pages p WHERE p.id=? AND p.workspace_id=?
         AND p.archived_at IS NULL AND p.import_job_id IS NULL AND p.is_template=0
         AND (? IS NULL OR p.content_epoch=?)
         AND ? IN ('mention','reply','thread_resolved','thread_reopened','page_edit')
@@ -190,13 +219,16 @@ export function notificationFanoutStatements(database: D1Database, fanout: Notif
         fanout.eventType,
         fanout.createdAt,
         fanout.emitSlackChannel && (fanout.eventType !== "mention" || recipients.length > 0) ? 1 : 0,
+        contributorJson,
         fanout.pageId,
         fanout.workspaceId,
         fanout.contentEpoch ?? null,
         fanout.contentEpoch ?? null,
         fanout.eventType,
       ),
-    ...(fanout.emitSlackChannel ? slackChannelFanoutStatements(database, { ...fanout, coalesceAfter }) : []),
+    ...(fanout.emitSlackChannel
+      ? slackChannelFanoutStatements(database, { ...fanout, contributorIds: [...contributing], coalesceAfter })
+      : []),
   ];
 }
 
@@ -219,7 +251,7 @@ function notificationJson(row: NotificationRow): Notification {
     space: { id: row.space_id, name: row.space_name },
     page: { id: row.page_id, title: row.page_title, icon: row.page_icon },
     threadId: row.thread_id,
-    data: data(row.data_json),
+    data: { ...data(row.data_json), contributors: eventContributors(row.contributors_json) },
     readAt: row.read_at,
     archivedAt: row.archived_at,
     createdAt: row.created_at,
@@ -243,7 +275,8 @@ const ACCESSIBLE_NOTIFICATION_SQL = `
 const NOTIFICATION_COLUMNS = `
   n.id, n.event_type, n.actor_id, actor.name actor_name, actor.email actor_email,
   s.id space_id, s.name space_name, p.id page_id, p.title page_title, p.icon page_icon,
-  n.thread_id, n.data_json, n.read_at, n.archived_at, n.created_at`;
+  n.thread_id, n.data_json, n.read_at, n.archived_at, n.created_at,
+  ${contributorsJsonSql("CASE WHEN json_type(n.data_json,'$.contributorIds')='array' THEN json_extract(n.data_json,'$.contributorIds') ELSE '[]' END", "n.actor_id")} contributors_json`;
 
 export async function listNotifications(
   env: Env,
@@ -696,7 +729,14 @@ async function accessibleNotifications(
 }
 
 function notificationCopy(row: DeliveryRow) {
-  const actor = row.actor_name ?? "A collaborator";
+  const contributors = eventContributors(row.contributors_json);
+  const actor =
+    row.event_type === "page_edit" && contributors.length
+      ? `${contributors
+          .slice(0, 5)
+          .map((contributor) => contributor.name)
+          .join(", ")}${contributors.length > 5 ? ` and ${contributors.length - 5} others` : ""}`
+      : (row.actor_name ?? "A collaborator");
   if (row.event_type === "reminder") return `Reminder: ${row.page_title}`;
   if (row.event_type === "task_assigned") return `${actor} assigned you a task: ${row.page_title}`;
   if (row.event_type === "mention") return `${actor} mentioned you on ${row.page_title}`;

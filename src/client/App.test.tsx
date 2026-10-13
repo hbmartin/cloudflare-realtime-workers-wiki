@@ -7077,6 +7077,8 @@ describe("App error handling", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Pin" })).not.toBeInTheDocument();
-    expect(queryArchive("Archive Secrets")).not.toBeInTheDocument();
+    openPageActions("Archive Secrets");
+    expect(screen.queryByRole("button", { name: "Archive Secrets" })).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Sort children of Secrets" })).toBeInTheDocument();
   });
 });

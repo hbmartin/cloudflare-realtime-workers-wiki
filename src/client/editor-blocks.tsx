@@ -8,7 +8,6 @@ import {
   useEffect,
   useId,
   useLayoutEffect,
-  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -18,6 +17,8 @@ import { resolveEmbed } from "../shared/embed-providers";
 import { ApiClientError, api, apiErrorMessage, json } from "./api";
 import type { Page, SearchTitleSuggestion } from "../shared/types";
 import "katex/dist/katex.min.css";
+import { useNearViewport } from "./near-viewport";
+import { updateHeadingIndex, type IndexedHeading, type HeadingBlock } from "./heading-index";
 
 import { DiagramEmbedContext } from "./diagram-embed-context";
 const LiveDiagramEmbed = lazy(() =>
@@ -92,9 +93,14 @@ const callout = createReactBlockSpec(
 )();
 
 function MathBlock({ formula, update }: { formula: string; update?: (formula: string) => void }) {
+  const { ref: viewportRef, ready } = useNearViewport();
   return (
-    <div className="editor-math-block">
-      <div className="math-preview" dangerouslySetInnerHTML={{ __html: renderedMath(formula, true) }} />
+    <div className="editor-math-block" ref={viewportRef}>
+      {ready ? (
+        <div className="math-preview" dangerouslySetInnerHTML={{ __html: renderedMath(formula, true) }} />
+      ) : (
+        <p className="diagram-placeholder">Math preview</p>
+      )}
       {update && (
         <label contentEditable={false}>
           <span className="visually-hidden">Math formula</span>
@@ -124,11 +130,14 @@ const math = createReactBlockSpec(
         update={editor.isEditable ? (formula) => editor.updateBlock(block, { props: { formula } }) : undefined}
       />
     ),
-    toExternalHTML: ({ block }) => <MathBlock formula={block.props.formula} />,
+    toExternalHTML: ({ block }) => (
+      <div dangerouslySetInnerHTML={{ __html: renderedMath(block.props.formula, true) }} />
+    ),
   },
 )();
 
 export function MermaidBlock({ source, update }: { source: string; update?: (source: string) => void }) {
+  const { ref: viewportRef, ready } = useNearViewport();
   const [colorScheme, setColorScheme] = useState<"light" | "dark">(() =>
     document.documentElement.getAttribute("data-mantine-color-scheme") === "dark" ? "dark" : "light",
   );
@@ -147,6 +156,7 @@ export function MermaidBlock({ source, update }: { source: string; update?: (sou
   }, []);
 
   useEffect(() => {
+    if (!ready) return undefined;
     let active = true;
     const renderId = `${renderBaseId}-${++renderSequence.current}`;
     void import("mermaid")
@@ -170,10 +180,10 @@ export function MermaidBlock({ source, update }: { source: string; update?: (sou
     return () => {
       active = false;
     };
-  }, [colorScheme, renderBaseId, source]);
+  }, [colorScheme, renderBaseId, source, ready]);
 
   return (
-    <div className="editor-mermaid">
+    <div className="editor-mermaid" ref={viewportRef}>
       {preview ? (
         <iframe title="Mermaid diagram preview" sandbox="" srcDoc={preview} />
       ) : (
@@ -334,12 +344,13 @@ type LinkPreview = {
 };
 
 export function BookmarkBlock({ url, title, update }: { url: string; title: string; update?: (url: string) => void }) {
+  const { ref: viewportRef, ready } = useNearViewport();
   const expanded = useContext(EmbedFeatureContext);
   const [loaded, setLoaded] = useState<{ url: string; preview: LinkPreview } | null>(null);
   const [failedImage, setFailedImage] = useState<string | null>(null);
   const preview = loaded?.url === url ? loaded.preview : null;
   useEffect(() => {
-    if (!expanded || !url.startsWith("https://")) return undefined;
+    if (!ready || !expanded || !url.startsWith("https://")) return undefined;
     const controller = new AbortController();
     let retries = 0;
     let retryTimer: number | undefined;
@@ -364,10 +375,10 @@ export function BookmarkBlock({ url, title, update }: { url: string; title: stri
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
       controller.abort();
     };
-  }, [expanded, url]);
+  }, [ready, expanded, url]);
   const displayTitle = title && title !== "Bookmark" && title !== url ? title : preview?.title || title || "Bookmark";
   return (
-    <div className="editor-bookmark">
+    <div className="editor-bookmark" ref={viewportRef}>
       <a href={safeBookmarkUrl(url) ?? undefined} target="_blank" rel="noreferrer">
         {preview?.imageUrl && preview.imageUrl !== failedImage && (
           <img src={preview.imageUrl} alt="" loading="lazy" onError={() => setFailedImage(preview.imageUrl)} />
@@ -423,26 +434,37 @@ const bookmark = createReactBlockSpec(
 function TableOfContentsView({
   editor,
 }: {
-  editor: { document: readonly any[]; onChange: (callback: () => void) => () => void };
+  editor: {
+    document: readonly HeadingBlock[];
+    prosemirrorState: import("prosemirror-state").EditorState;
+    onChange: (
+      callback: (editor: unknown, context: { getChanges: () => { type: string; block: HeadingBlock }[] }) => void,
+    ) => () => void;
+  };
 }) {
-  const [blocks, setBlocks] = useState(editor.document);
-  useEffect(() => editor.onChange(() => setBlocks(editor.document)), [editor]);
-  const headings = useMemo(() => {
-    const output: Array<{ id: string; level: number; text: string }> = [];
-    const visit = (nestedBlocks: readonly any[]) => {
-      for (const block of nestedBlocks) {
-        if (block.type === "heading" && Number(block.props?.level) <= 4) {
-          const text = Array.isArray(block.content)
-            ? block.content.map((item: any) => (typeof item.text === "string" ? item.text : "")).join("")
-            : "";
-          if (text.trim()) output.push({ id: block.id, level: Number(block.props?.level ?? 1), text });
+  const index = useRef(new Map<string, IndexedHeading>());
+  const [headings, setHeadings] = useState<IndexedHeading[]>([]);
+  useEffect(() => {
+    index.current.clear();
+    updateHeadingIndex(
+      index.current,
+      editor.document.map((block) => ({ type: "insert", block })),
+    );
+    const publish = () => {
+      const output: IndexedHeading[] = [];
+      editor.prosemirrorState.doc.descendants((node) => {
+        if (node.type.name === "blockContainer") {
+          const heading = index.current.get(String(node.attrs.id));
+          if (heading) output.push(heading);
         }
-        if (Array.isArray(block.children)) visit(block.children);
-      }
+      });
+      setHeadings(output);
     };
-    visit(blocks);
-    return output;
-  }, [blocks]);
+    publish();
+    return editor.onChange((_editor, context) => {
+      if (updateHeadingIndex(index.current, context.getChanges())) publish();
+    });
+  }, [editor]);
   return (
     <nav className="editor-toc" contentEditable={false} aria-label="Table of contents">
       <strong>Table of contents</strong>
@@ -531,9 +553,11 @@ function SyncedReferenceView({
   onRemove: () => void;
   onUnsync: (content: string) => void;
 }) {
+  const { ref: viewportRef, ready } = useNearViewport();
   const [result, setResult] = useState<TransclusionResult | null>(null);
   const [revision, setRevision] = useState(0);
   useEffect(() => {
+    if (!ready) return undefined;
     let active = true;
     void api<{ results: TransclusionResult[] }>("/api/transclusions/lookup", {
       method: "POST",
@@ -548,11 +572,21 @@ function SyncedReferenceView({
     return () => {
       active = false;
     };
-  }, [blockId, revision, sourcePageId]);
-  if (!result) return <div className="editor-synced-placeholder">Loading synced content…</div>;
-  if (result.status !== "ok") return <div className="editor-synced-placeholder">Synced content is unavailable.</div>;
+  }, [ready, blockId, revision, sourcePageId]);
+  if (!result)
+    return (
+      <div className="editor-synced-placeholder" ref={viewportRef}>
+        Loading synced content…
+      </div>
+    );
+  if (result.status !== "ok")
+    return (
+      <div className="editor-synced-placeholder" ref={viewportRef}>
+        Synced content is unavailable.
+      </div>
+    );
   return (
-    <div className="editor-synced-reference" contentEditable={false}>
+    <div className="editor-synced-reference" contentEditable={false} ref={viewportRef}>
       <div className="editor-synced-actions">
         <a href={`/?page=${encodeURIComponent(sourcePageId)}`}>Edit source</a>
         <button type="button" onClick={() => setRevision((value) => value + 1)}>
@@ -637,6 +671,7 @@ export function LinkedDiagramView({
   title: string;
   update?: (page: Pick<Page, "id" | "title">) => void;
 }) {
+  const { ref: viewportRef, ready } = useNearViewport();
   const liveAccount = useContext(DiagramEmbedContext);
   const [choosing, setChoosing] = useState(!pageId && Boolean(update));
   const [query, setQuery] = useState("");
@@ -767,8 +802,8 @@ export function LinkedDiagramView({
   }
 
   return (
-    <figure className="editor-linked-diagram" contentEditable={false}>
-      {liveAccount ? (
+    <figure className="editor-linked-diagram" contentEditable={false} ref={viewportRef}>
+      {liveAccount && ready ? (
         <Suspense fallback={<p>Loading diagram…</p>}>
           <LiveDiagramEmbed key={pageId} account={liveAccount} pageId={pageId} title={title} />
         </Suspense>

@@ -1,6 +1,6 @@
 # Phase 7: collaborative table authority
 
-Status: not started. Round 2 candidate; must ship before new table views or property types.
+Status: local implementation and acceptance in progress; not merged or deployed. Cutover remains gated by `TABLE_AUTHORITY_ENABLED` and the Round 1 release closeout. See the [implementation release ledger](../implementation/release.md). This phase must ship before new table views or property types.
 
 ## User contract
 

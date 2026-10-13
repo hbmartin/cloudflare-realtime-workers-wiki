@@ -9,6 +9,7 @@ import { correlationHeaders } from "./observability";
 import { pageForMember, type PageRow } from "./page-access";
 import { buildTableRowQuery, collectRowCells, stableTableSnapshot, tableRowBinds } from "./table-read";
 import { seal, unseal } from "./ai-auth";
+import { collaborativeTable, queryTable } from "./table-service";
 
 function sourceUrl(env: Env, pageId: string) {
   return `${new URL(env.BETTER_AUTH_URL).origin}/?page=${encodeURIComponent(pageId)}`;
@@ -37,7 +38,7 @@ export async function readRoomContent<T extends DocumentContentEnvelope | Diagra
     throw new HttpError(409, "source_changed", "The page was restored. Reload its source.");
   return envelope;
 }
-async function readTableChunk(
+export async function readTableChunk(
   env: Env,
   member: MemberContext,
   pageId: string,
@@ -45,6 +46,47 @@ async function readTableChunk(
 ) {
   const page = await pageForMember(env, member, pageId);
   if (page.kind !== "table") throw new HttpError(422, "table_required", "Choose a table page.");
+  if (await collaborativeTable(env, pageId)) {
+    const parameters = new URLSearchParams({ q: query.q ?? "", limit: query.limit ?? "50" });
+    if (query.authorityOffset !== undefined && query.authorityRevision !== undefined) {
+      parameters.set(
+        "cursor",
+        btoa(
+          unescape(
+            encodeURIComponent(
+              JSON.stringify({
+                revision: Number(query.authorityRevision),
+                offset: Number(query.authorityOffset),
+                viewId: null,
+                query: JSON.stringify([...parameters]),
+              }),
+            ),
+          ),
+        ),
+      );
+    }
+    const table = await queryTable(env, member, pageId, parameters.toString()).catch((error: unknown) => {
+      if (error instanceof HttpError && error.code === "table_cursor_stale")
+        throw new HttpError(409, "source_changed", "The table changed between pages. Start the read again.");
+      throw error;
+    });
+    await pageForMember(env, member, pageId);
+    return {
+      page,
+      revision: table.revision,
+      rowCount: table.rowCount,
+      columns: table.columns,
+      rows: table.rows.map((row) => ({
+        id: row.id,
+        position: row.position,
+        cells: {
+          ...row.cells,
+          ...Object.fromEntries(Object.entries(row.computedCells ?? {}).map(([id, computed]) => [id, computed.value])),
+        },
+      })),
+      hasMore: table.nextCursor !== null,
+    };
+  }
   const { snapshot, revision, rowCount } = await stableTableSnapshot(env, pageId, true, async () => {
     const columns = await env.DB.prepare(
       "SELECT id,name,type,position FROM table_columns WHERE page_id=? ORDER BY position,id",
@@ -250,6 +292,9 @@ export async function fetchTableSource(
     q: input.filter ?? "",
     limit: "50",
     ...(cursor ? { afterId: cursor.rowId, afterPosition: String(cursor.position) } : {}),
+    ...(cursor?.offset === undefined
+      ? {}
+      : { authorityOffset: String(cursor.offset), authorityRevision: String(cursor.revision) }),
   });
   if (cursor && (cursor.revision !== chunk.revision || cursor.epoch !== chunk.page.content_epoch))
     throw new HttpError(409, "source_changed", "The table changed between pages. Start the read again.");
@@ -293,6 +338,7 @@ export async function fetchTableSource(
             epoch: chunk.page.content_epoch,
             position: last.position,
             rowId: last.id,
+            offset: (cursor?.offset ?? 0) + rows.length,
             expiresAt: Date.now() + 15 * 60_000,
           } satisfies Cursor)
         : null,

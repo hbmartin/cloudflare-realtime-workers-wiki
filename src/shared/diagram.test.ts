@@ -25,6 +25,8 @@ const first: DiagramNode = {
   notes: "Routes requests",
   color: "blue",
   assetId: null,
+  linkedPageId: null,
+  linkedViewId: null,
   references: [{ id: "page-architecture", label: "Architecture" }],
   mentions: [{ id: "user-alex", label: "Alex" }],
 };

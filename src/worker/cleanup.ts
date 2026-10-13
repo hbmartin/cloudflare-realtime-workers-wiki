@@ -2,7 +2,7 @@ import type { Env } from "./env";
 import { locationHint } from "./http";
 import { correlationHeaders, safeTelemetryErrorMessage } from "./observability";
 
-type DeletionTargetKind = "document_do" | "r2_object" | "r2_prefix";
+type DeletionTargetKind = "document_do" | "table_do" | "r2_object" | "r2_prefix";
 
 interface DeletionJobRow {
   id: string;
@@ -28,6 +28,17 @@ async function deletePrefix(bucket: R2Bucket, prefix: string) {
 }
 
 async function processTarget(env: Env, target: DeletionTargetRow, hint?: DurableObjectLocationHint) {
+  if (target.kind === "table_do") {
+    const response = await env.TABLE.getByName(target.target).fetch(
+      new Request("https://table.internal/purge", {
+        method: "POST",
+        headers: { "x-table-internal": env.BETTER_AUTH_SECRET },
+        signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
+      }),
+    );
+    if (!response.ok) throw new Error(`Table purge failed with ${response.status}`);
+    return;
+  }
   if (target.kind === "r2_object") {
     await env.BUCKET.delete(target.target);
     return;

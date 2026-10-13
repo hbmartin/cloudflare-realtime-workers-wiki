@@ -1,4 +1,5 @@
 import type { Document } from "./document";
+import type { TableAuthority } from "./table-authority";
 import type { WorkspaceEvents } from "./workspace-events";
 import type { JobWorkflowParams } from "./jobs";
 
@@ -8,6 +9,7 @@ export interface AppBindings {
   DB: D1Database;
   BUCKET: R2Bucket;
   DOCUMENT: DurableObjectNamespace<Document>;
+  TABLE: DurableObjectNamespace<TableAuthority>;
   WORKSPACE_EVENTS: DurableObjectNamespace<WorkspaceEvents>;
   NOTES_WORKFLOW: Workflow<Readonly<JobWorkflowParams>>;
   DELIVERY_QUEUE: Queue;
@@ -41,6 +43,10 @@ export interface AppBindings {
   DO_LOCATION_HINT?: DurableObjectLocationHint;
   WORKFLOW_INLINE?: "true";
   EXPANDED_EMBEDS_ENABLED?: "true" | "false";
+  EDITOR_BLOCKS_V2_ENABLED?: "true" | "false";
+  TABLE_AUTHORITY_ENABLED?: "true" | "false";
+  TABLE_BOARD_ENABLED?: "true" | "false";
+  TABLE_CALENDAR_ENABLED?: "true" | "false";
   NOTION_MARKDOWN_WRITES_ENABLED?: "true" | "false";
   OFFLINE_EDITING_ENABLED?: "true" | "false";
   BLOCK_LINKS_ENABLED?: "true" | "false";
@@ -63,6 +69,10 @@ declare global {
       | "BROWSER"
       | "CHATGPT_CONNECTION_ENABLED"
       | "EXPANDED_EMBEDS_ENABLED"
+      | "EDITOR_BLOCKS_V2_ENABLED"
+      | "TABLE_AUTHORITY_ENABLED"
+      | "TABLE_BOARD_ENABLED"
+      | "TABLE_CALENDAR_ENABLED"
       | "NOTION_MARKDOWN_WRITES_ENABLED"
       | "OFFLINE_EDITING_ENABLED"
       | "BLOCK_LINKS_ENABLED"

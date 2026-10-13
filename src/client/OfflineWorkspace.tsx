@@ -10,6 +10,8 @@ import type { ClientMemberContext, Page, Space } from "../shared/types";
 import { api, ApiClientError } from "./api";
 import { OfflineStorageTimeoutError, waitForOfflinePersistence } from "./collaboration";
 import { EmbedFeatureContext } from "./editor-blocks";
+import { RenderBoundary } from "./RenderBoundary";
+import { tabsExtension, footnotesExtension } from "./editor-feature-blocks";
 import { notesSchema } from "./mentions";
 import {
   downloadOfflineMarkdown,
@@ -337,14 +339,19 @@ export function OfflineWorkspace({
                   Export all unsynced copies of this page
                 </button>
               )}
-              <OfflineEditor
-                key={`${selected.pageId}:${localLoadRetry}`}
-                page={selected}
-                accountKey={account.key}
-                quarantined={Boolean(selectedReason)}
-                editingEnabled={account.offlineEditingEnabled && recovery !== "finalizing"}
+              <RenderBoundary
+                resetKey={`${selected.pageId}:${localLoadRetry}`}
                 onRetry={() => setLocalLoadRetry((attempt) => attempt + 1)}
-              />
+              >
+                <OfflineEditor
+                  key={`${selected.pageId}:${localLoadRetry}`}
+                  page={selected}
+                  accountKey={account.key}
+                  quarantined={Boolean(selectedReason)}
+                  editingEnabled={account.offlineEditingEnabled && recovery !== "finalizing"}
+                  onRetry={() => setLocalLoadRetry((attempt) => attempt + 1)}
+                />
+              </RenderBoundary>
             </>
           ) : (
             <p>This page is unavailable offline. Tables, diagrams, and uncached documents need a connection.</p>
@@ -616,6 +623,7 @@ function OfflineBlockEditor({
     () =>
       withCollaboration({
         schema: notesSchema,
+        extensions: [tabsExtension, footnotesExtension],
         uploadFile: async () => {
           throw new Error("Uploads require a connection.");
         },
@@ -631,7 +639,12 @@ function OfflineBlockEditor({
   const theme = useEffectiveColorScheme();
   return (
     <EmbedFeatureContext.Provider value={false}>
-      <BlockNoteView editor={editor} editable={editable} theme={theme} slashMenu={false} className="notes-editor" />
+      <RenderBoundary
+        resetKey={page.pageId}
+        onExport={() => downloadOfflineMarkdown(offlineCopyMarkdown(copy.doc, page.title), `${page.title}-recovery.md`)}
+      >
+        <BlockNoteView editor={editor} editable={editable} theme={theme} slashMenu={false} className="notes-editor" />
+      </RenderBoundary>
       <output className="muted">
         {saveState === "saving"
           ? "Saving locally…"

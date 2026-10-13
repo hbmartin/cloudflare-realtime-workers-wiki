@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Page } from "./types";
-import { buildTree, findNode, isDescendant } from "./tree-model";
+import { buildTree, findNode, isDescendant, sortedTree } from "./tree-model";
 
 const page = (id: string, parentId: string | null, position: string): Page => ({
   id,
@@ -20,6 +20,22 @@ const page = (id: string, parentId: string | null, position: string): Page => ({
 });
 
 describe("page tree", () => {
+  it("sorts only each selected branch and restores exact manual positions", () => {
+    const tree = buildTree([
+      page("container", null, "a"),
+      { ...page("b", "container", "a"), title: "Note 10", updatedAt: 2 },
+      { ...page("a", "container", "b"), title: "note 2", updatedAt: 3 },
+      page("nested", "b", "a"),
+    ]);
+    expect(sortedTree(tree, { root: "title-desc" })[0]!.children.map((child) => child.id)).toEqual(["b", "a"]);
+    expect(sortedTree(tree, { root: "manual", container: "title-asc" })[0]!.children.map((child) => child.id)).toEqual([
+      "a",
+      "b",
+    ]);
+    expect(sortedTree(tree, { container: "updated-asc" })[0]!.children.map((child) => child.id)).toEqual(["b", "a"]);
+    expect(sortedTree(tree, { container: "manual" })[0]!.children.map((child) => child.position)).toEqual(["a", "b"]);
+    expect(tree[0]!.children.map((child) => child.id)).toEqual(["b", "a"]);
+  });
   it("builds a deterministic ordered immutable tree", () => {
     const source = [page("child-b", "root", "b"), page("root", null, "a"), page("child-a", "root", "a")];
     const tree = buildTree(source);

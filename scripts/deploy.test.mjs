@@ -714,6 +714,31 @@ describe("installation secrets and deployment ordering", () => {
     await deployPrepared({ target: "" }, deps);
     expect(calls).toEqual(["migrate", "upload", "health"]);
   });
+  it("checks metadata before and after migration and preserves the applied migration on incomplete coverage", async () => {
+    const deps = dependencies();
+    const calls = [];
+    deps.integrityCheck = vi.fn((stage) => {
+      calls.push(stage);
+      return { ok: true, complete: stage === "before migrations" };
+    });
+    deps.migrateDatabase.mockImplementation(() => {
+      calls.push("migrate");
+      return 0;
+    });
+    await expect(deployPrepared({ target: "production" }, deps)).rejects.toThrow(
+      "applied migrations and resources were preserved",
+    );
+    expect(calls).toEqual(["before migrations", "migrate", "after migrations"]);
+    expect(deps.upload).not.toHaveBeenCalled();
+    expect(deps.health).not.toHaveBeenCalled();
+  });
+  it("blocks migrations when the initial integrity scan finds a structural failure", async () => {
+    const deps = dependencies();
+    deps.integrityCheck = vi.fn(() => ({ ok: false, complete: true }));
+    await expect(deployPrepared({ target: "production" }, deps)).rejects.toThrow("before migrations failed");
+    expect(deps.migrateDatabase).not.toHaveBeenCalled();
+    expect(deps.upload).not.toHaveBeenCalled();
+  });
   it("does not rotate secrets or recreate a deleted setup key after initialization", async () => {
     const deps = dependencies();
     deps.isInitialized.mockReturnValue(true);

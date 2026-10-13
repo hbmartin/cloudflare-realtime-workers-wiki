@@ -56,9 +56,9 @@ export function LiveDiagramEmbed({ account, pageId, title }: { account: string; 
         width: record.width,
         height: record.height,
         zIndex: record.type === "frame" ? -1 : record.zIndex,
-        data: { record, editable: false, commentCount: 0, updateLabel: noEdit },
+        data: { account, record, editable: false, commentCount: 0, updateLabel: noEdit },
       })),
-    [state.records],
+    [state.records, account],
   );
   const edges = useMemo(() => (state.records?.edges ?? []).map(flowEdge), [state.records]);
   return (

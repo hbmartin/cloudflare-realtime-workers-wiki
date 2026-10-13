@@ -19,6 +19,16 @@ import { notificationFanoutStatements } from "./notifications";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import { normalizeSearchValue } from "../shared/search-normalization";
 import { logger } from "./observability";
+import { collaborativeTable, tableCommand, queryTable } from "./table-service";
+import { tableFilterDefaults } from "../shared/table-protocol";
+import type { ProjectionStatement } from "./table-authority";
+
+// Compile the existing pure D1 statement builders into the durable projector event.
+// The adapter never executes SQL; only Worker-owned builders may supply it.
+function durableStatements(build: (db: D1Database) => D1PreparedStatement[]): ProjectionStatement[] {
+  const db = { prepare: (sql: string) => ({ bind: (...binds: (string | number | null)[]) => ({ sql, binds }) }) };
+  return build(db as unknown as D1Database) as unknown as ProjectionStatement[];
+}
 
 export function taskListStatements(db: D1Database, pageId: string) {
   const columns = taskColumns(pageId);
@@ -255,7 +265,7 @@ export async function mutateTask(
   env: Env,
   member: MemberContext,
   listId: string,
-  rowId: string | null,
+  requestedRowId: string | null,
   body: Record<string, unknown>,
   authorization?: { sql: string; binds: unknown[] },
 ) {
@@ -268,12 +278,15 @@ export async function mutateTask(
   const hash = await sha256Hex(
     canonicalJson({
       listId,
-      rowId,
+      rowId: requestedRowId,
       title: body.title,
       assigneeId: body.assigneeId,
       status: body.status,
       dueDate: body.dueDate,
       archived: body.archived,
+      viewId: body.viewId,
+      groupId: body.groupId,
+      date: body.date,
     }),
   );
   const replay = await env.DB.prepare(
@@ -296,13 +309,43 @@ export async function mutateTask(
       pageIds: subtree?.results.map((row) => row.id),
     };
   }
-  const previous = rowId
-    ? (await listTasks(env, member, { listId, rowId, includeArchived: body.archived === false })).tasks[0]
+  const previous = requestedRowId
+    ? (await listTasks(env, member, { listId, rowId: requestedRowId, includeArchived: body.archived === false }))
+        .tasks[0]
     : undefined;
-  if (rowId && !previous) throw new HttpError(404, "task_not_found", "The task no longer exists.");
-  const next = validateTaskFields(body, previous);
+  if (requestedRowId && !previous) throw new HttpError(404, "task_not_found", "The task no longer exists.");
+  const taskInput = { ...body };
+  if (!previous && typeof body.viewId === "string" && (await collaborativeTable(env, listId))) {
+    const snapshot = await queryTable(
+      env,
+      member,
+      listId,
+      new URLSearchParams({ viewId: body.viewId, limit: "1" }).toString(),
+    );
+    const view = snapshot.view;
+    if (!view || view.invalid) throw new HttpError(422, "invalid_task_view", "Repair the view before adding tasks.");
+    const defaults: Record<string, unknown> = { ...tableFilterDefaults(view.filters) };
+    if (view.kind === "board" && view.columnId && Object.hasOwn(body, "groupId"))
+      defaults[view.columnId] = body.groupId;
+    if (view.kind === "calendar" && view.columnId && Object.hasOwn(body, "date")) defaults[view.columnId] = body.date;
+    for (const [field, columnId] of Object.entries(taskColumns(listId))) {
+      const inputField = { title: "title", assignee: "assigneeId", status: "status", due: "dueDate" }[
+        field as "title" | "assignee" | "status" | "due"
+      ];
+      if (
+        Object.hasOwn(defaults, columnId) &&
+        (body[inputField] === undefined ||
+          (view.columnId === columnId && (Object.hasOwn(body, "groupId") || Object.hasOwn(body, "date"))))
+      ) {
+        const value = defaults[columnId];
+        taskInput[inputField] =
+          field === "status" && typeof value === "string" ? value.slice(listId.length + 1) : value;
+      }
+    }
+  }
+  const next = validateTaskFields(taskInput, previous);
   if (
-    body.assigneeId !== undefined &&
+    taskInput.assigneeId !== undefined &&
     next.assigneeId &&
     next.assigneeId !== previous?.assigneeId &&
     !(await taskAssignees(env, member, listId)).some((u) => u.id === next.assigneeId)
@@ -311,9 +354,174 @@ export async function mutateTask(
   const expectedRevision = Number(body.expectedRevision);
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1)
     throw new HttpError(422, "invalid_revision", "A current table revision is required.");
-  const id = rowId ?? crypto.randomUUID();
+  const id = requestedRowId ?? crypto.randomUUID();
   const detailId = previous?.detailPageId ?? crypto.randomUUID();
   const now = Date.now();
+  if (await collaborativeTable(env, listId)) {
+    const stable = await sha256Hex(`${member.workspace.id}:${member.user.id}:${operationId}`);
+    const rowId = rowIdFromStable(previous?.id, stable, "row");
+    const detailPageId = rowIdFromStable(previous?.detailPageId, stable, "detail");
+    const columns = taskColumns(listId);
+    const values: Record<string, unknown> = {};
+    for (const [field, column, value] of [
+      ["title", columns.title, next.title],
+      ["assigneeId", columns.assignee, next.assigneeId],
+      ["status", columns.status, `${listId}-${next.status}`],
+      ["dueDate", columns.due, next.dueDate],
+    ] as const)
+      if (!previous || body[field] !== undefined) values[column] = value;
+    const effects: ProjectionStatement[] = [];
+    if (!previous) {
+      const last = await env.DB.prepare("SELECT position FROM pages WHERE parent_id=? ORDER BY position DESC LIMIT 1")
+        .bind(listId)
+        .first<{ position: string }>();
+      effects.push(
+        {
+          sql: "INSERT OR IGNORE INTO pages(id,workspace_id,space_id,parent_id,kind,position,title,created_by,updated_by,created_at,updated_at) VALUES(?,?,?,?,'document',?,?,?,?,?,?)",
+          binds: [
+            detailPageId,
+            member.workspace.id,
+            page.space_id!,
+            listId,
+            generateJitteredKeyBetween(last?.position ?? null, null),
+            next.title,
+            member.user.id,
+            member.user.id,
+            now,
+            now,
+          ],
+        },
+        {
+          sql: "INSERT OR IGNORE INTO subscriptions(id,workspace_id,user_id,resource_type,resource_id,created_by,created_at) VALUES(?,?,?,'page',?,?,?)",
+          binds: [
+            `page:${detailPageId}:${member.user.id}`,
+            member.workspace.id,
+            member.user.id,
+            detailPageId,
+            member.user.id,
+            now,
+          ],
+        },
+      );
+    } else if (body.title !== undefined)
+      effects.push({
+        sql: "UPDATE pages SET title=?,revision=revision+1,updated_by=?,updated_at=? WHERE id=?",
+        binds: [next.title, member.user.id, now, detailPageId],
+      });
+    const subtree = TASK_DETAIL_SUBTREE_SQL;
+    if (body.archived === true) {
+      effects.push(
+        ...durableStatements((db) => [
+          activityMutationStart(
+            db,
+            activePageSelectionSql(`SELECT id FROM pages WHERE id IN (${subtree})`),
+            [detailPageId],
+            operationId,
+            "archive",
+          ),
+        ]),
+        {
+          sql: `INSERT INTO archive_disconnect_targets(page_id,workspace_id,content_epoch,room,next_attempt_at,created_at,updated_at) SELECT id,workspace_id,content_epoch,id||'~'||content_epoch,?,?,? FROM pages WHERE id IN (${subtree}) AND archived_at IS NULL AND kind IN ('document','diagram') ON CONFLICT(page_id) DO UPDATE SET next_attempt_at=excluded.next_attempt_at,updated_at=excluded.updated_at`,
+          binds: [now, now, now, detailPageId],
+        },
+        {
+          sql: `UPDATE pages SET archived_at=?,archived_by=?,archive_operation_id=? WHERE id IN (${subtree}) AND archived_at IS NULL`,
+          binds: [now, member.user.id, operationId, detailPageId],
+        },
+        ...durableStatements((db) => [activityMutationEnd(db, operationId)]),
+      );
+    } else if (body.archived === false) {
+      const archived = await env.DB.prepare("SELECT archive_operation_id,archived_at FROM pages WHERE id=?")
+        .bind(detailPageId)
+        .first<{ archive_operation_id: string | null; archived_at: number | null }>();
+      effects.push(
+        {
+          sql: `DELETE FROM archive_disconnect_targets WHERE page_id IN (SELECT id FROM pages WHERE id IN (${subtree}) AND archive_operation_id IS ? AND archived_at IS ?)`,
+          binds: [detailPageId, archived?.archive_operation_id ?? null, archived?.archived_at ?? null],
+        },
+        {
+          sql: `UPDATE pages SET archived_at=NULL,archived_by=NULL,archive_operation_id=NULL,revision=revision+1,updated_by=?,updated_at=? WHERE id IN (${subtree}) AND archive_operation_id IS ? AND archived_at IS ?`,
+          binds: [
+            member.user.id,
+            now,
+            detailPageId,
+            archived?.archive_operation_id ?? null,
+            archived?.archived_at ?? null,
+          ],
+        },
+      );
+    }
+    const effectsAfter: ProjectionStatement[] = [];
+    effectsAfter.push(
+      {
+        sql: "INSERT OR IGNORE INTO task_mutation_receipts(workspace_id,actor_id,operation_id,request_hash,row_id,detail_page_id,revision,created_at) VALUES(?,?,?,?,?,?,?,?)",
+        binds: [member.workspace.id, member.user.id, operationId, hash, rowId, detailPageId, expectedRevision + 1, now],
+      },
+      { sql: `DELETE FROM page_search WHERE page_id IN (${subtree})`, binds: [detailPageId] },
+      {
+        sql: `INSERT INTO page_search(page_id,workspace_id,title,body) SELECT id,workspace_id,title,plain_text FROM pages WHERE id IN (${subtree}) AND archived_at IS NULL AND import_job_id IS NULL`,
+        binds: [detailPageId],
+      },
+      ...durableStatements((db) => refreshPageSearchV2SubtreeStatements(db, detailPageId)),
+    );
+    if (next.assigneeId && next.assigneeId !== previous?.assigneeId && body.archived !== true)
+      effectsAfter.push(
+        ...durableStatements((db) =>
+          notificationFanoutStatements(db, {
+            workspaceId: member.workspace.id,
+            spaceId: page.space_id!,
+            pageId: detailPageId,
+            threadId: null,
+            actorId: member.user.id,
+            eventType: "task_assigned",
+            sourceId: `task:${operationId}`,
+            recipientIds: [next.assigneeId!],
+            emitSlackChannel: false,
+            createdAt: now,
+            taskOperationId: operationId,
+          }),
+        ),
+      );
+    const result = await tableCommand(
+      env,
+      member,
+      listId,
+      {
+        operationId,
+        expectedRevision,
+        kind: previous ? "update_cells" : "create_row",
+        payload: previous
+          ? { rowId, values }
+          : {
+              id: rowId,
+              detailPageId,
+              values,
+              ...(typeof body.viewId === "string" ? { viewId: body.viewId } : {}),
+              ...(Object.hasOwn(body, "groupId") ? { groupId: body.groupId } : {}),
+              ...(Object.hasOwn(body, "date") ? { date: body.date } : {}),
+            },
+      },
+      { effects, effectsAfter, detailPageId, taskMutation: true, ...(authorization ? { authorization } : {}) },
+    );
+    if (result.projectionPending)
+      throw new HttpError(
+        503,
+        "task_projection_pending",
+        "The task was saved; its page is still publishing. Retry with the same operation ID.",
+      );
+    const archived =
+      body.archived === true
+        ? await env.DB.prepare(ARCHIVED_TASK_DETAIL_SUBTREE_SQL).bind(detailPageId).all<{ id: string }>()
+        : null;
+    return {
+      rowId,
+      detailPageId,
+      revision: result.revision,
+      replayed: result.replayed,
+      visibleInView: typeof result.result.visibleInView === "boolean" ? result.result.visibleInView : undefined,
+      pageIds: archived?.results.map((row) => row.id),
+    };
+  }
   const token = typeof body.leaseToken === "string" ? body.leaseToken : crypto.randomUUID();
   const tokenHash = await sha256(token);
   const shortLease = typeof body.leaseToken !== "string";
@@ -603,4 +811,8 @@ export async function mutateTask(
           ),
         );
   }
+}
+
+function rowIdFromStable(existing: string | undefined, stable: string, kind: string) {
+  return existing ?? `${stable.slice(0, 40)}-${kind}`;
 }

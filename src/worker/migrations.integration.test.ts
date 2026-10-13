@@ -71,8 +71,14 @@ describe("D1 migrations", () => {
     const tables = ["slack_user_links", "slack_channel_subscriptions", "slack_channel_events", "outbox"] as const;
     const before = await Promise.all(tables.map((table) => env.DB.prepare(`SELECT * FROM ${table}`).all()));
     await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
-    for (const [index, table] of tables.entries())
-      expect((await env.DB.prepare(`SELECT * FROM ${table}`).all()).results).toEqual(before[index]!.results);
+    for (const [index, table] of tables.entries()) {
+      const after = (await env.DB.prepare(`SELECT * FROM ${table}`).all()).results;
+      expect(after).toEqual(
+        before[index]!.results.map((row) =>
+          table === "slack_channel_events" ? { ...row, contributor_ids_json: '["owner"]' } : row,
+        ),
+      );
+    }
     expect(await env.DB.prepare("SELECT * FROM slack_authorized_user_links").first()).toBeNull();
     expect(await env.DB.prepare("SELECT count(*) n FROM slack_history_verifications").first()).toEqual({ n: 0 });
     expect(await env.DB.prepare("SELECT count(*) n FROM slack_method_cooldowns").first()).toEqual({ n: 0 });
