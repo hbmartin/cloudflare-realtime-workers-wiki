@@ -49,6 +49,7 @@ import {
   usableBotToken,
   SlackApiError,
   SlackInstallationChangedError,
+  SlackInstallationAuthError,
   SlackTokenRefreshInProgressError,
   SlackTokenRefreshError,
   SlackRateLimitError,
@@ -5884,6 +5885,84 @@ describe("Slack inbound replies and actions", () => {
       expect(calls.filter((c) => c.method === "chat.postEphemeral")).toHaveLength(1);
     },
   );
+  it.each(["invalid_auth", "token_revoked"])("recovers recorded %s before delivering a denial", async (code) => {
+    const { link } = await activeThread();
+    await acceptSlackReply(runtime(), reply(link.root_message_ts));
+    members = ["UOWNER"];
+    await deliverSlackMutation(runtime(), await inboundId(), false);
+    const payload = JSON.parse(
+      (await env.DB.prepare("SELECT payload_json FROM outbox WHERE topic='slack_interaction_response'").first<{
+        payload_json: string;
+      }>())!.payload_json,
+    ) as Record<string, unknown>;
+    await env.DB.prepare(
+      "UPDATE slack_installations SET auth_error=?,auth_error_at=1,token_expires_at=?,bot_refresh_token_ciphertext=? WHERE id='installation'",
+    )
+      .bind(code, Date.now() + 3_600_000, await encryptSlackToken(runtime(), "xoxr-old"))
+      .run();
+    let recovered = false;
+    const remote = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("oauth.v2.access"))
+        return Response.json(
+          recovered
+            ? { ok: true, access_token: "xoxb-recovered", refresh_token: "xoxr-recovered", expires_in: 3600 }
+            : { ok: false, error: "bad_client_secret" },
+        );
+      return mockSlack(input, init);
+    });
+    vi.stubGlobal("fetch", remote);
+    await expect(deliverSlackDenial(runtime(), payload)).rejects.toBeInstanceOf(SlackTokenRefreshError);
+    expect(await env.DB.prepare("SELECT denial_sent_at FROM slack_inbound_receipts").first()).toEqual({
+      denial_sent_at: null,
+    });
+    recovered = true;
+    await deliverSlackDenial(runtime(), payload);
+    await deliverSlackDenial(runtime(), payload);
+    expect(remote.mock.calls.filter(([url]) => String(url).endsWith("oauth.v2.access"))).toHaveLength(2);
+    expect(calls.filter((c) => c.method === "chat.postEphemeral")).toHaveLength(1);
+    expect(await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first()).toEqual({
+      auth_error: null,
+    });
+  });
+  it("releases a denial rejected by revoked access credentials and recovers on retry", async () => {
+    const { link } = await activeThread();
+    await acceptSlackReply(runtime(), reply(link.root_message_ts));
+    members = ["UOWNER"];
+    await deliverSlackMutation(runtime(), await inboundId(), false);
+    const payload = JSON.parse(
+      (await env.DB.prepare("SELECT payload_json FROM outbox WHERE topic='slack_interaction_response'").first<{
+        payload_json: string;
+      }>())!.payload_json,
+    ) as Record<string, unknown>;
+    await env.DB.prepare("UPDATE slack_installations SET bot_refresh_token_ciphertext=? WHERE id='installation'")
+      .bind(await encryptSlackToken(runtime(), "xoxr-old"))
+      .run();
+    let rejected = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("oauth.v2.access"))
+          return Response.json({
+            ok: true,
+            access_token: "xoxb-recovered",
+            refresh_token: "xoxr-recovered",
+            expires_in: 3600,
+          });
+        if (String(input).endsWith("chat.postEphemeral") && !rejected) {
+          rejected = true;
+          return Response.json({ ok: false, error: "invalid_auth" });
+        }
+        return mockSlack(input, init);
+      }),
+    );
+    await expect(deliverSlackDenial(runtime(), payload)).rejects.toBeInstanceOf(SlackInstallationAuthError);
+    expect(await env.DB.prepare("SELECT denial_sent_at FROM slack_inbound_receipts").first()).toEqual({
+      denial_sent_at: null,
+    });
+    await deliverSlackDenial(runtime(), payload);
+    await deliverSlackDenial(runtime(), payload);
+    expect(calls.filter((c) => c.method === "chat.postEphemeral")).toHaveLength(1);
+  });
   it.each([
     { stage: "validation", code: "invalid_auth" },
     { stage: "validation", code: "invalid_refresh_token" },

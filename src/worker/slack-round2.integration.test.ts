@@ -1,4 +1,6 @@
 import { verifyHistoryPage } from "./slack-history";
+import { slackAccessAuthorization } from "./slack-identity";
+import { countedD1 } from "../../tests/helpers/count-d1";
 let historyTimestamp: string;
 import { verifySlackMapping } from "./slack-verification";
 import { afterD1 } from "../../tests/helpers/d1-races";
@@ -759,6 +761,7 @@ describe("channel validation and scheduling", () => {
     "invalid_grant_type",
     "oauth_authorization_url_mismatch",
     "pkce_not_allowed",
+    "preview_feature_not_available",
     "not_in_channel",
     "no_permission",
     "unknown_oauth_code",
@@ -4202,6 +4205,60 @@ describe("review follow-up permissions and recovery", () => {
     );
     expect(post.body.text).not.toContain("&amp;lt;");
   });
+  it.each([false, true])("reads installation health only when requested by authorization (%s)", async (healthy) => {
+    await env.DB.prepare(
+      "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation,authorization_started_at,verification_method,verified_at,better_auth_account_id,migration_state) VALUES('installation','owner','U123',1,1,0,1,'slack_openid',1,'owner-slack','verified')",
+    ).run();
+    const installation = (await round2Installation(runtime(), "installation"))!;
+    await env.DB.prepare("UPDATE slack_installations SET auth_error='invalid_refresh_token'").run();
+    const counter = countedD1(env.DB);
+    const authorize = slackAccessAuthorization(
+      { ...runtime(), DB: counter.database },
+      installation,
+      { userId: "owner" },
+      undefined,
+      healthy,
+    );
+    const outcome = await authorize().catch((error: unknown) => error);
+    const blocked = expect.objectContaining({ code: "invalid_refresh_token" });
+    expect(outcome).toEqual(healthy ? blocked : undefined);
+    expect(counter.statements).toHaveLength(1);
+    expect(counter.statements[0]!.includes("JOIN slack_installations")).toBe(healthy);
+  });
+  it.each(["invalid_auth", "token_revoked"])(
+    "recovers recorded %s before immediate personal delivery",
+    async (code) => {
+      await page();
+      await env.DB.prepare(
+        "INSERT INTO slack_user_links(installation_id,user_id,slack_user_id,linked_at,installation_generation,security_generation,authorization_started_at,verification_method,verified_at,better_auth_account_id,migration_state) VALUES('installation','owner','U123',1,1,0,1,'slack_openid',1,'owner-slack','verified')",
+      ).run();
+      await env.DB.prepare(
+        "UPDATE slack_installations SET auth_error=?,auth_error_at=1,token_expires_at=?,bot_refresh_token_ciphertext=?",
+      )
+        .bind(code, Date.now() + 3_600_000, await encryptSlackToken(runtime(), "refresh"))
+        .run();
+      const remote = vi.mocked(fetch).getMockImplementation()!;
+      let personalRefreshes = 0;
+      vi.mocked(fetch).mockImplementation(async (input, init) => {
+        if (String(input).endsWith("oauth.v2.access")) {
+          personalRefreshes++;
+          return Response.json({
+            ok: true,
+            access_token: "xoxb-recovered",
+            refresh_token: "xoxr-recovered",
+            expires_in: 3600,
+          });
+        }
+        return remote(input, init);
+      });
+      await sendPersonalSlackNotification(runtime(), "owner", "workspace", "Recovered mention", "page");
+      expect(personalRefreshes).toBe(1);
+      expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(1);
+      expect(
+        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+      ).toEqual({ auth_error: null });
+    },
+  );
 
   it("keeps rate-limit backoff on repeated unmute of an active mapping", async () => {
     const m = await mapping("immediate");
@@ -5825,6 +5882,35 @@ describe("Slack delivery regression fixes", () => {
             : deliverDigest(runtime(), id),
     };
   }
+
+  it.each(["token", "unknown"])("retains pending digest error details after a %s preparation failure", async (kind) => {
+    const { id } = await work("digest");
+    await env.DB.prepare(`INSERT INTO slack_digest_messages(id,receipt_id,sequence,state,page_ids_json,event_ids_json,last_error)
+      VALUES('error-child',?,0,'pending','["page"]','["activity:regression"]','rate_limited')`)
+      .bind(id)
+      .run();
+    if (kind === "token")
+      await env.DB.prepare("UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?")
+        .bind(await encryptSlackToken(runtime(), "refresh"))
+        .run();
+    else await env.DB.prepare("UPDATE slack_installations SET bot_token_ciphertext='broken'").run();
+    const remote = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).endsWith("oauth.v2.access")) return Response.json({ ok: false, error: "bad_client_secret" });
+      return remote(input, init);
+    });
+    const result = await deliverDigest(runtime(), id).then(
+      () => null,
+      (error: unknown) => error,
+    );
+    const originalError = { message: expect.any(String) };
+    expect(result).toMatchObject(kind === "token" ? { code: "bad_client_secret" } : originalError);
+    expect(await env.DB.prepare("SELECT state,last_error FROM slack_digest_messages").first()).toEqual({
+      state: "pending",
+      last_error: kind === "token" ? "bad_client_secret" : "rate_limited",
+    });
+    expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(0);
+  });
 
   it.each(["obsolete", "terminal"] as const)(
     "digest %s retirement handles reserved and unreserved events atomically",

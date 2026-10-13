@@ -23,7 +23,8 @@ import {
   notificationFanoutStatements,
   sendDueNotificationDigests,
 } from "./notifications";
-import { encryptSlackToken } from "./slack";
+import { encryptSlackToken, decryptSlackToken, type SlackInstallation } from "./slack";
+import * as slack from "./slack";
 import { executeScheduledTasks } from "./index";
 import { webhookEventStatements } from "./webhooks";
 
@@ -1255,12 +1256,29 @@ describe("notification feed and subscriptions", () => {
     "late-refresh",
     "mixed-suppression",
     "suppressed-finalization",
+    "health-expired",
+    "health-unexpired",
+    "extra-completion",
+    "extra-refresh",
+    "completion-overrun",
+    "refresh-overrun",
+    "budget-before-refresh",
   ])("keeps a full email and Slack digest tick within the statement budget (%s)", async (scenario) => {
     const installed = await bootstrap();
     const timestamp = Date.UTC(2026, 8, 5, 11, 5);
     const diff = ["diff", "heavy-diff", "heavy-refresh"].includes(scenario);
     const heavy = ["heavy-diff", "heavy-refresh"].includes(scenario);
-    const refreshing = ["refresh", "heavy-refresh"].includes(scenario);
+    const refreshing = [
+      "refresh",
+      "heavy-refresh",
+      "health-expired",
+      "health-unexpired",
+      "extra-refresh",
+      "refresh-overrun",
+      "budget-before-refresh",
+    ].includes(scenario);
+    const healthRecovery = ["health-expired", "health-unexpired"].includes(scenario);
+    const overrun = scenario.endsWith("-overrun");
     const configured: Env = { ...slackEnv(), DIFF_DIGESTS_ENABLED: diff ? "true" : "false" };
     const token = await encryptSlackToken(configured, "xoxb-budget");
     await env.DB.batch([
@@ -1365,13 +1383,41 @@ describe("notification feed and subscriptions", () => {
       )
         .bind(
           await encryptSlackToken(configured, "xoxr-budget"),
-          null,
-          null,
+          healthRecovery ? (scenario === "health-expired" ? "invalid_auth" : "token_revoked") : null,
+          healthRecovery ? timestamp : null,
           scenario === "contention" ? "stuck" : null,
           Date.now() + 30_000,
         )
         .run();
     }
+    if (scenario === "health-unexpired")
+      await env.DB.prepare("UPDATE slack_installations SET token_expires_at=? WHERE id='digest-budget-installation'")
+        .bind(Date.now() + 3600_000)
+        .run();
+    if (scenario === "refresh-overrun" || scenario === "budget-before-refresh")
+      await env.DB.prepare(
+        "INSERT INTO digest_delivery_cursors(channel,user_id,workspace_id,timezone,updated_at) VALUES('slack','','','UTC',42)",
+      ).run();
+    let activeEnv: Env | undefined;
+    let injected = false;
+    const prepareOriginal = slack.preparePersonalSlackNotification;
+    vi.spyOn(slack, "preparePersonalSlackNotification").mockImplementation(async (bindings, ...args) => {
+      activeEnv = bindings;
+      if (scenario === "budget-before-refresh" && !injected) {
+        injected = true;
+        for (let i = 0; i < 100; i++) await bindings.DB.prepare("SELECT 1 AS extra_preparation").first();
+      }
+      return prepareOriginal(bindings, ...args);
+    });
+    const sendOriginal = slack.sendPersonalSlackNotification;
+    vi.spyOn(slack, "sendPersonalSlackNotification").mockImplementation(async (bindings, ...args) => {
+      const result = await sendOriginal(bindings, ...args);
+      if (scenario === "extra-completion" || (scenario === "completion-overrun" && !injected)) {
+        injected = true;
+        for (let i = 0; i < (overrun ? 130 : 1); i++) await bindings.DB.prepare("SELECT 1 AS extra_completion").first();
+      }
+      return result;
+    });
     const batchMetadata = new WeakMap<D1PreparedStatement, { statement: D1PreparedStatement; sql: string }>();
     const wrapBudgetStatement = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => {
       const proxy = new Proxy(statement, {
@@ -1397,6 +1443,15 @@ describe("notification feed and subscriptions", () => {
               batchMetadata.get(statements[0]!)?.sql.includes("UPDATE deliveries SET status = ?")
             )
               throw new Error("D1 finalization unavailable");
+            if (
+              ["extra-refresh", "refresh-overrun"].includes(scenario) &&
+              !injected &&
+              batchMetadata.get(statements[1]!)?.sql.includes("SET bot_token_ciphertext = ?")
+            ) {
+              injected = true;
+              for (let i = 0; i < (overrun ? 130 : 1); i++)
+                await activeEnv!.DB.prepare("SELECT 1 AS extra_refresh").first();
+            }
             return target.batch(statements.map((statement) => batchMetadata.get(statement)!.statement));
           };
         if (property === "prepare") return (sql: string) => wrapBudgetStatement(target.prepare(sql), sql);
@@ -1451,34 +1506,46 @@ describe("notification feed and subscriptions", () => {
     );
     const expectedError = expect.any(Error);
     expect(error).toEqual(
-      ["finalization", "suppressed-finalization", "cleanup"].includes(scenario) ? expectedError : null,
+      ["finalization", "suppressed-finalization", "cleanup"].includes(scenario) || overrun ? expectedError : null,
     );
 
-    const slackDispatches = heavy
-      ? 2
-      : scenario === "diff"
-        ? 8
-        : ["late-refresh", "suppressed-finalization"].includes(scenario)
-          ? 9
-          : 10;
+    const slackDispatches = ["refresh-overrun", "budget-before-refresh"].includes(scenario)
+      ? 0
+      : scenario === "completion-overrun"
+        ? 1
+        : heavy
+          ? 2
+          : scenario === "diff"
+            ? 8
+            : ["late-refresh", "suppressed-finalization"].includes(scenario)
+              ? 9
+              : 10;
     expect(send).toHaveBeenCalledTimes(heavy ? 2 : 10);
     expect(fetchMock).toHaveBeenCalledTimes(
-      scenario === "contention" ? 0 : scenario === "recovery" ? 1 : slackDispatches + (refreshing ? 1 : 0),
+      ["contention", "budget-before-refresh"].includes(scenario)
+        ? 0
+        : scenario === "recovery"
+          ? 1
+          : slackDispatches + (refreshing ? 1 : 0),
     );
-    expect(typeof firstSlackPayload?.text).toBe(["contention", "recovery"].includes(scenario) ? "undefined" : "string");
+    expect(typeof firstSlackPayload?.text).toBe(
+      ["contention", "recovery", "refresh-overrun", "budget-before-refresh"].includes(scenario)
+        ? "undefined"
+        : "string",
+    );
     expect(await env.DB.prepare("SELECT COUNT(*) count FROM deliveries WHERE channel='slack'").first()).toEqual({
       count: ["contention", "recovery"].includes(scenario) ? 0 : slackDispatches * (heavy ? 11 : 1),
     });
-    expect(queries.length).toBeLessThanOrEqual(240);
+    expect(overrun || queries.length <= 240).toBe(true);
     const slackStart = queries.findIndex(
       (sql) => sql.startsWith("SELECT COALESCE(preference.timezone") && sql.includes("n.slack_at"),
     );
     expect(slackStart).toBeGreaterThan(0);
     expect(slackStart).toBeLessThanOrEqual(120);
-    expect(queries.length - slackStart).toBeLessThanOrEqual(120);
+    expect(queries.length - slackStart <= 120).toBe(!overrun);
     expect(queries.some((query) => /page_change_(checkpoints|recipients)/.test(query))).toBe(diff);
     expect(queries.filter((query) => query.includes("SET refresh_lease_token=?,refresh_lease_until=?"))).toHaveLength(
-      refreshing || ["contention", "recovery"].includes(scenario) ? 1 : 0,
+      (refreshing && scenario !== "budget-before-refresh") || ["contention", "recovery"].includes(scenario) ? 1 : 0,
     );
     const secondary = log.mock.calls
       .map(([record]) => record as Record<string, unknown>)
@@ -1498,6 +1565,49 @@ describe("notification feed and subscriptions", () => {
     expect(secondary.length).toBe(scenario === "cleanup" ? 20 : 0);
     expect(secondary.slice(0, 1).concat(secondary.slice(10, 11))).toEqual(
       scenario === "cleanup" ? expectedCleanupLogs : [],
+    );
+    const checkCredentials = healthRecovery || ["extra-refresh", "refresh-overrun"].includes(scenario);
+    let credentials;
+    if (checkCredentials) {
+      const current = (await env.DB.prepare(
+        "SELECT * FROM slack_installations WHERE id='digest-budget-installation'",
+      ).first<SlackInstallation & { refresh_lease_token: string | null }>())!;
+      credentials = {
+        health: current.auth_error,
+        refresh: await decryptSlackToken(configured, current.bot_refresh_token_ciphertext!),
+        lease: current.refresh_lease_token,
+      };
+    }
+    expect(credentials).toEqual(
+      checkCredentials ? { health: null, refresh: "xoxr-refreshed", lease: null } : undefined,
+    );
+    expect(log.mock.calls.some(([entry]) => (entry as { stage: string }).stage === "budget")).toBe(overrun);
+    let overrunRetry;
+    if (overrun) {
+      await sendDueNotificationDigests(bindings, timestamp + 15 * 60_000);
+      overrunRetry = {
+        posts,
+        refreshes: fetchMock.mock.calls.filter(([url]) => String(url).endsWith("oauth.v2.access")).length,
+        sent: await env.DB.prepare(
+          "SELECT count(*) count FROM deliveries WHERE channel='slack' AND status='sent'",
+        ).first(),
+      };
+    }
+    expect(overrunRetry).toEqual(
+      overrun ? { posts: 10, refreshes: scenario === "refresh-overrun" ? 1 : 0, sent: { count: 10 } } : undefined,
+    );
+    let admissionRetry;
+    if (scenario === "budget-before-refresh") {
+      const cursor = await env.DB.prepare(
+        "SELECT user_id,workspace_id,updated_at FROM digest_delivery_cursors WHERE channel='slack'",
+      ).first();
+      await sendDueNotificationDigests(bindings, timestamp + 15 * 60_000);
+      admissionRetry = { cursor, posts };
+    }
+    expect(admissionRetry).toEqual(
+      scenario === "budget-before-refresh"
+        ? { cursor: { user_id: "", workspace_id: "", updated_at: 42 }, posts: 10 }
+        : undefined,
     );
     let lateRetry;
     if (scenario === "late-refresh") {
@@ -1975,7 +2085,13 @@ describe("notification feed and subscriptions", () => {
       expect(
         await env.DB.prepare(`SELECT COUNT(*) delivered FROM notifications
       WHERE id IN ('recovery-notification-recovery-b','recovery-notification-recovery-c') AND emailed_at IS NOT NULL AND slack_at IS NOT NULL`).first(),
-      ).toEqual({ delivered: 2 });
+      ).toEqual({ delivered: failure === "installation-health" ? 0 : 2 });
+      expect(fetchMock.mock.calls.filter(() => failure === "installation-health")).toHaveLength(
+        failure === "installation-health" ? 1 : 0,
+      );
+      expect(send.mock.calls.filter(() => failure === "installation-health")).toHaveLength(
+        failure === "installation-health" ? 3 : 0,
+      );
       expect(
         await env.DB.prepare(`SELECT status,claim_token FROM deliveries WHERE idempotency_key=?`)
           .bind(`outbox:competing-notification:${channel}`)
@@ -2033,7 +2149,7 @@ describe("notification feed and subscriptions", () => {
     },
   );
 
-  it.each(["empty", "inaccessible", "claimed", "known-auth", "health-revoked"])(
+  it.each(["empty", "inaccessible", "claimed", "sent", "known-auth", "health-revoked"])(
     "does not refresh credentials for %s candidates",
     async (state) => {
       const installed = await bootstrap();
@@ -2068,20 +2184,20 @@ describe("notification feed and subscriptions", () => {
       await verifySlackDigestRecipients([installed.userId]);
       if (state === "inaccessible")
         await env.DB.prepare("UPDATE pages SET archived_at=? WHERE id=?").bind(timestamp, installed.page.id).run();
-      if (state === "claimed")
+      if (state === "claimed" || state === "sent")
         await env.DB.batch([
           env.DB.prepare(
             "INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at) VALUES('outbox:empty-notification',?,'notification','{}',?,?)",
           ).bind(installed.workspaceId, timestamp, timestamp),
           env.DB.prepare(
-            "INSERT INTO deliveries(idempotency_key,outbox_id,channel,status,attempts,updated_at,claim_token) VALUES('outbox:empty-notification:slack','outbox:empty-notification','slack','pending',1,?,'held')",
-          ).bind(Date.now()),
+            "INSERT INTO deliveries(idempotency_key,outbox_id,channel,status,attempts,updated_at,claim_token) VALUES('outbox:empty-notification:slack','outbox:empty-notification','slack',?,1,?,'held')",
+          ).bind(state === "sent" ? "sent" : "pending", Date.now()),
         ]);
       if (["known-auth", "health-revoked"].includes(state))
         await env.DB.prepare(
           "UPDATE slack_installations SET token_expires_at=NULL,auth_error=? WHERE id='empty-installation'",
         )
-          .bind(state === "known-auth" ? "token_revoked" : null)
+          .bind(state === "known-auth" ? "invalid_refresh_token" : null)
           .run();
       if (state === "health-revoked")
         await env.DB.prepare(
@@ -2113,12 +2229,24 @@ describe("notification feed and subscriptions", () => {
             : env.DB;
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock);
-      await sendDueNotificationDigests({ ...configured, DB: database }, timestamp);
+      const counter = countedD1(database);
+      await sendDueNotificationDigests({ ...configured, DB: counter.database }, timestamp);
       expect(fetchMock).not.toHaveBeenCalled();
+      let settledSelection;
+      if (state === "sent" || state === "claimed")
+        settledSelection = {
+          candidatesRead: counter.statements.some((sql) => sql.includes("COUNT(DISTINCT CASE")),
+          cursor: await env.DB.prepare("SELECT 1 FROM digest_delivery_cursors WHERE channel='slack'").first(),
+        };
+      expect(settledSelection).toEqual(
+        state === "sent" || state === "claimed" ? { candidatesRead: false, cursor: null } : undefined,
+      );
       const delivered = await env.DB.prepare(
         "SELECT slack_at IS NOT NULL delivered FROM notifications WHERE id='empty-notification'",
       ).first();
-      expect(delivered).toEqual({ delivered: ["claimed", "known-auth", "health-revoked"].includes(state) ? 0 : 1 });
+      expect(delivered).toEqual({
+        delivered: ["claimed", "sent", "known-auth", "health-revoked"].includes(state) ? 0 : 1,
+      });
     },
   );
 

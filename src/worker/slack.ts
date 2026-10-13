@@ -167,6 +167,24 @@ export class SlackTokenRefreshError extends SlackApiError {
   }
 }
 
+export class SlackInstallationHealthPersistenceError extends Error {
+  constructor(
+    readonly rejection: SlackApiError,
+    cause: unknown,
+  ) {
+    super("Could not persist Slack installation health.", { cause });
+    this.name = "SlackInstallationHealthPersistenceError";
+  }
+}
+
+const slackRefreshableAuthError = (
+  installation: Pick<SlackInstallation, "auth_error" | "bot_refresh_token_ciphertext">,
+) =>
+  ["invalid_auth", "token_revoked"].includes(installation.auth_error ?? "") &&
+  Boolean(installation.bot_refresh_token_ciphertext);
+export const personalSlackInstallationSql = `(installation.auth_error IS NULL OR
+  (installation.auth_error IN ('invalid_auth','token_revoked') AND installation.bot_refresh_token_ciphertext IS NOT NULL))`;
+
 export const slackTokenPreparationFailure = (error: unknown): boolean =>
   (error instanceof SlackApiError && error.method === "oauth.v2.access") ||
   error instanceof SlackTokenRefreshInProgressError ||
@@ -1458,15 +1476,21 @@ export async function usableBotToken(
   installation: SlackInstallation,
   signal?: AbortSignal,
   tokenRefreshMode: TokenRefreshMode = "wait",
-  beforeRefresh?: () => void,
+  beforeRefresh?: (recovery: boolean) => void,
+  forceRefresh = false,
 ) {
   signal?.throwIfAborted();
-  if (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000) {
+  if (
+    !forceRefresh &&
+    (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000)
+  ) {
     return decryptSlackToken(env, installation.bot_token_ciphertext);
   }
   if (!Number.isSafeInteger(installation.generation))
     throw new Error("Slack installation generation is unavailable for token refresh.");
-  beforeRefresh?.();
+  beforeRefresh?.(
+    Boolean(installation.auth_error && !["missing_scope", "account_inactive"].includes(installation.auth_error)),
+  );
   await checkSlackCooldown(env, installation, "oauth.v2.access");
   if (!installation.bot_refresh_token_ciphertext) {
     throw new SlackTokenRefreshError("invalid_auth", 401, installation.credential_revision);
@@ -1645,10 +1669,7 @@ export async function usableBotToken(
         .first<SlackInstallation>();
       if (!current || current.generation !== installation.generation) throw new SlackInstallationChangedError();
       if (current.bot_token_ciphertext === oldCiphertext) throw new Error("Slack token refresh was not persisted.");
-      installation.bot_token_ciphertext = current.bot_token_ciphertext;
-      installation.bot_refresh_token_ciphertext = current.bot_refresh_token_ciphertext;
-      installation.token_expires_at = current.token_expires_at;
-      installation.credential_revision = current.credential_revision;
+      Object.assign(installation, current);
       return decryptSlackToken(env, current.bot_token_ciphertext);
     }
     installation.bot_token_ciphertext = accessTokenCiphertext;
@@ -1656,6 +1677,7 @@ export async function usableBotToken(
     installation.token_expires_at = expiresAt;
     installation.credential_revision += 1;
     const priorAuth = (before?.results[0] as { auth_error: string | null } | undefined)?.auth_error;
+    installation.auth_error = priorAuth && ["missing_scope", "account_inactive"].includes(priorAuth) ? priorAuth : null;
     if (priorAuth && !["missing_scope", "account_inactive"].includes(priorAuth)) {
       try {
         await round2WakeStatement(env, null, installation.id, installation.generation).run();
@@ -2128,12 +2150,21 @@ export async function preparePersonalSlackNotification(
   env: Env,
   userId: string,
   workspaceId: string,
-  options: { tokenRefreshMode?: TokenRefreshMode; beforeRefresh?: () => void } = {},
+  options: { tokenRefreshMode?: TokenRefreshMode; beforeRefresh?: (recovery: boolean) => void } = {},
 ): Promise<PreparedPersonalSlackNotification | null> {
   const installation = await personalSlackRecipient(env, userId, workspaceId);
   if (!installation) return null;
+  const recover = slackRefreshableAuthError(installation);
+  if (installation.auth_error && !recover) throw new SlackInstallationAuthError(installation.auth_error);
+  const token = await usableBotToken(
+    env,
+    installation,
+    undefined,
+    options.tokenRefreshMode,
+    options.beforeRefresh,
+    recover,
+  );
   if (installation.auth_error) throw new SlackInstallationAuthError(installation.auth_error);
-  const token = await usableBotToken(env, installation, undefined, options.tokenRefreshMode, options.beforeRefresh);
   return { userId, installation, token };
 }
 
@@ -2146,10 +2177,10 @@ export async function sendPersonalSlackNotification(
   presentation?: { escaped: boolean; sections?: string[] },
   options: { tokenRefreshMode?: TokenRefreshMode; prepared?: PreparedPersonalSlackNotification } = {},
 ) {
-  const prepared = options.prepared;
+  const prepared = options.prepared ?? (await preparePersonalSlackNotification(env, userId, workspaceId, options));
   if (prepared && (prepared.userId !== userId || prepared.installation.workspace_id !== workspaceId))
     throw new Error("Prepared Slack recipient does not match the notification.");
-  const row = prepared?.installation ?? (await personalSlackRecipient(env, userId, workspaceId));
+  const row = prepared?.installation;
   if (!row) return false;
   if (row.auth_error) throw new SlackInstallationAuthError(row.auth_error);
   const safeText = presentation?.escaped ? text : escapeSlackMrkdwn(text);
@@ -2209,7 +2240,7 @@ export async function sendPersonalSlackNotification(
           context,
           secondary,
         );
-        throw secondary;
+        throw new SlackInstallationHealthPersistenceError(error, secondary);
       }
     }
     throw error;

@@ -35,6 +35,7 @@ const LEGACY_OAUTH_NOTIFICATION_ERRORS = [
   "invalid_grant_type",
   "oauth_authorization_url_mismatch",
   "pkce_not_allowed",
+  "preview_feature_not_available",
 ];
 const legacyOAuthErrorsSql = LEGACY_OAUTH_NOTIFICATION_ERRORS.map((code) => `'${code}'`).join(",");
 export type MappingValidation = {
