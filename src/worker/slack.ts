@@ -1,4 +1,5 @@
-import { slackAccessAuthorization } from "./slack-identity";
+import { slackAccessAuthorization, SlackInstallationAuthError } from "./slack-identity";
+export { SlackInstallationAuthError } from "./slack-identity";
 import type { ChannelEventType } from "../shared/activity";
 import { defaultDigestTimezone, digestWindow, channelInvalidReason } from "./slack-schedule";
 import type {
@@ -59,6 +60,7 @@ const SLACK_CAPABILITY_SCOPES: Record<SlackCapability, readonly string[]> = {
 };
 
 export type SlackInstallation = {
+  auth_error: string | null;
   file_scope_error_revision?: number | null;
   generation: number;
   credential_revision: number;
@@ -182,13 +184,13 @@ const CHANNEL_ERRORS = new Set([
 export const slackInstallationError = (error: unknown): boolean =>
   error instanceof SlackApiError && INSTALLATION_ERRORS.has(error.code);
 export const slackMissingScope = (error: unknown): error is SlackApiError =>
-  error instanceof SlackApiError && error.method !== "oauth.v2.access" && error.code === "missing_scope";
+  error instanceof SlackApiError && !slackTokenPreparationFailure(error) && error.code === "missing_scope";
 export const slackHasScopes = (scopes: string, required: readonly string[]): boolean => {
   const granted = new Set(scopes.split(",").map((scope) => scope.trim()));
   return required.every((scope) => granted.has(scope));
 };
 export const slackChannelError = (error: unknown): boolean =>
-  error instanceof SlackApiError && error.method !== "oauth.v2.access" && CHANNEL_ERRORS.has(error.code);
+  error instanceof SlackApiError && !slackTokenPreparationFailure(error) && CHANNEL_ERRORS.has(error.code);
 
 export async function recordSlackInstallationError(
   env: Env,
@@ -449,7 +451,7 @@ async function encryptionKey(env: Env) {
 export function definiteSlackRejection(error: unknown): error is SlackApiError {
   return (
     error instanceof SlackApiError &&
-    error.method !== "oauth.v2.access" &&
+    !slackTokenPreparationFailure(error) &&
     error.status < 500 &&
     ![
       "http_error",
@@ -1580,7 +1582,8 @@ export async function usableBotToken(
         );
         // A competing refresh may still be persisting its token. An abbreviated
         // recovery check cannot establish that the installation needs relinking.
-        if (tokenRefreshMode === "wait") await recordSlackInstallationError(env, installation.id, error);
+        if (tokenRefreshMode === "wait")
+          await recordSlackInstallationError(env, installation.id, error, installation.generation);
         throw error;
       }
       throw new SlackTokenRefreshError(
@@ -1594,12 +1597,16 @@ export async function usableBotToken(
     const refreshTokenCiphertext = result.refresh_token
       ? await encryptSlackToken(env, result.refresh_token)
       : installation.bot_refresh_token_ciphertext;
+    const expiry =
+      typeof result.expires_in === "string" && /^\d+$/.test(result.expires_in)
+        ? Number(result.expires_in)
+        : result.expires_in;
     const validExpiry =
-      typeof result.expires_in === "number" &&
-      Number.isSafeInteger(result.expires_in) &&
-      result.expires_in > 0 &&
-      Number.isSafeInteger(updatedAt + result.expires_in * 1000);
-    const expiresAt = updatedAt + (validExpiry ? (result.expires_in as number) * 1000 : 300_000);
+      typeof expiry === "number" &&
+      Number.isSafeInteger(expiry) &&
+      expiry > 0 &&
+      Number.isSafeInteger(updatedAt + expiry * 1000);
+    const expiresAt = updatedAt + (validExpiry ? (expiry as number) * 1000 : 300_000);
     if (!validExpiry)
       logger.warn(
         "slack.token_refresh.expiry_invalid",
@@ -2125,6 +2132,7 @@ export async function preparePersonalSlackNotification(
 ): Promise<PreparedPersonalSlackNotification | null> {
   const installation = await personalSlackRecipient(env, userId, workspaceId);
   if (!installation) return null;
+  if (installation.auth_error) throw new SlackInstallationAuthError(installation.auth_error);
   const token = await usableBotToken(env, installation, undefined, options.tokenRefreshMode, options.beforeRefresh);
   return { userId, installation, token };
 }
@@ -2143,6 +2151,7 @@ export async function sendPersonalSlackNotification(
     throw new Error("Prepared Slack recipient does not match the notification.");
   const row = prepared?.installation ?? (await personalSlackRecipient(env, userId, workspaceId));
   if (!row) return false;
+  if (row.auth_error) throw new SlackInstallationAuthError(row.auth_error);
   const safeText = presentation?.escaped ? text : escapeSlackMrkdwn(text);
   try {
     await slackApi(
@@ -2170,19 +2179,39 @@ export async function sendPersonalSlackNotification(
       {
         ...(options.tokenRefreshMode ? { tokenRefreshMode: options.tokenRefreshMode } : {}),
         ...(prepared ? { preparedToken: prepared.token } : {}),
-        beforeDispatch: slackAccessAuthorization(env, row, {
-          userId,
-          slackUserId: row.slack_user_id,
-          accountId: row.accountId,
-          verifiedAt: row.verifiedAt,
-          linkedAt: row.linkedAt,
-          securityGeneration: row.securityGeneration,
-        }),
+        beforeDispatch: slackAccessAuthorization(
+          env,
+          row,
+          {
+            userId,
+            slackUserId: row.slack_user_id,
+            accountId: row.accountId,
+            verifiedAt: row.verifiedAt,
+            linkedAt: row.linkedAt,
+            securityGeneration: row.securityGeneration,
+          },
+          undefined,
+          true,
+        ),
       },
     );
   } catch (error) {
-    if (error instanceof SlackApiError && error.method === "chat.postMessage" && slackInstallationError(error))
-      await recordSlackInstallationError(env, row.id, error, row.generation);
+    if (error instanceof SlackApiError && error.method === "chat.postMessage" && slackInstallationError(error)) {
+      try {
+        await recordSlackInstallationError(env, row.id, error, row.generation);
+      } catch (secondary) {
+        const context = { userId, workspaceId, installationId: row.id, generation: row.generation };
+        logger.error("slack.personal.delivery_failed", "slack", "Personal Slack message rejected.", context, error);
+        logger.error(
+          "slack.personal.health_record_failed",
+          "slack",
+          "Could not record Slack installation health.",
+          context,
+          secondary,
+        );
+        throw secondary;
+      }
+    }
     throw error;
   }
   return true;

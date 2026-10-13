@@ -77,9 +77,9 @@ Resource naming uses this precedence:
 - Untouched templates use `<worker>-attachments`, `<worker>-delivery`, and `<worker>-delivery-dlq`.
   These generated names are stable and shortened with a deterministic hash to fit the 63-character
   R2/queue limits. Producer and consumer names resolve together. If a consumer specifies the template
-  dead-letter name without its producer, preparation stops before provisioning or migrations. Restore
-  `DELIVERY_DEAD_LETTER_QUEUE` or select a custom, existing dead-letter queue; preparation validates
-  that custom destination through every queue lookup page. If no dead-letter name is configured,
+  delivery or dead-letter name without its producer, preparation stops before provisioning or migrations. Restore
+  `DELIVERY_QUEUE` or `DELIVERY_DEAD_LETTER_QUEUE`, respectively, or select a custom, existing queue; preparation validates
+  unmatched custom consumer destinations through every queue lookup page. If no dead-letter name is configured,
   the setting is omitted.
 
 Before creating D1 or running migrations, preparation checks each generated bucket by exact name
@@ -95,6 +95,7 @@ after partial provisioning or before upload saves the bindings, inspect the crea
 explicitly configure the intended names and D1 ID before retrying. Applied migrations are retained;
 unbound databases with populated migration history require an explicit ID. An empty database with
 an empty migration history remains safe to reuse.
+Provisioning and upload errors print their original failure message alongside this recovery guidance.
 
 New rate-limit namespace IDs are derived from the Worker and binding names; retries keep the same IDs
 and updates retain saved IDs. Generated Workflow and database names stay within 64 characters by

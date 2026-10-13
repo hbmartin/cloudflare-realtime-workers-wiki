@@ -748,29 +748,40 @@ describe("channel validation and scheduling", () => {
         .first(),
     ).toEqual({ validation_state: "valid", muted_at: 1, snoozed_until: 9999999999999, mirror_enabled: 1 });
   });
-  it.each(["ratelimited", "bad_client_secret", "invalid_client_id", "not_in_channel"])(
-    "clears only erroneous OAuth notification blocks after guarded revalidation (%s)",
-    async (code) => {
-      const m = await mapping();
+  it.each([
+    "ratelimited",
+    "bad_client_secret",
+    "invalid_client_id",
+    "bad_redirect_uri",
+    "cannot_install_an_org_installed_app",
+    "invalid_code",
+    "invalid_code_verifier",
+    "invalid_grant_type",
+    "oauth_authorization_url_mismatch",
+    "pkce_not_allowed",
+    "not_in_channel",
+    "no_permission",
+    "unknown_oauth_code",
+  ])("clears only erroneous OAuth notification blocks after guarded revalidation (%s)", async (code) => {
+    const m = await mapping();
+    await env.DB.prepare(
+      "UPDATE slack_channel_subscriptions SET notification_blocked_at=1,notification_error=?,validation_error=NULL,validated_at=0 WHERE id=?",
+    )
+      .bind(code, m.id)
+      .run();
+    await revalidateMappings(runtime());
+    expect(
       await env.DB.prepare(
-        "UPDATE slack_channel_subscriptions SET notification_blocked_at=1,notification_error=?,validation_error=NULL,validated_at=0 WHERE id=?",
+        "SELECT notification_blocked_at,notification_error FROM slack_channel_subscriptions WHERE id=?",
       )
-        .bind(code, m.id)
-        .run();
-      await revalidateMappings(runtime());
-      expect(
-        await env.DB.prepare(
-          "SELECT notification_blocked_at,notification_error FROM slack_channel_subscriptions WHERE id=?",
-        )
-          .bind(m.id)
-          .first(),
-      ).toEqual(
-        code === "not_in_channel"
-          ? { notification_blocked_at: 1, notification_error: code }
-          : { notification_blocked_at: null, notification_error: null },
-      );
-    },
-  );
+        .bind(m.id)
+        .first(),
+    ).toEqual(
+      ["not_in_channel", "no_permission", "unknown_oauth_code"].includes(code)
+        ? { notification_blocked_at: 1, notification_error: code }
+        : { notification_blocked_at: null, notification_error: null },
+    );
+  });
 
   it("preserves a concurrent channel block during OAuth-block revalidation", async () => {
     const m = await mapping();

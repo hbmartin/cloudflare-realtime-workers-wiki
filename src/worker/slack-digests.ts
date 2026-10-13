@@ -26,7 +26,6 @@ import type { Env } from "./env";
 import { digestBlocks, type DigestPage } from "./slack-blocks";
 import { round2Installation, validateMappingEvidence, StaleSlackValidationError } from "./slack-channels";
 import {
-  slackTokenPreparationFailure,
   slackApi,
   SlackApiError,
   SlackRateLimitError,
@@ -956,8 +955,9 @@ export async function deliverDigest(
           if (!dispatched)
             await withSlackPrimaryError(error, "handle_error", { id }, () =>
               env.DB.batch([
-                env.DB.prepare(`UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,claim_token=NULL,claimed_at=NULL
+                env.DB.prepare(`UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,claim_token=NULL,claimed_at=NULL,last_error=?
               WHERE id=? AND state='sending' AND claim_token=? AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`).bind(
+                  error instanceof SlackApiError ? error.code : null,
                   message!.id,
                   token,
                   id,
@@ -992,11 +992,7 @@ export async function deliverDigest(
                 await withSlackPrimaryError(error, "handle_error", { id }, () => retireRoot("terminal", error.code));
                 return;
               }
-              if (
-                error instanceof SlackRateLimitError ||
-                slackTokenPreparationFailure(error) ||
-                definiteSlackRejection(error)
-              ) {
+              if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
                 await withSlackPrimaryError(error, "handle_error", { id }, () =>
                   env.DB.prepare(
                     `UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,last_error=? WHERE id=? AND claim_token=?`,
