@@ -75,8 +75,8 @@ export async function validateMappingEvidence(
     const saved =
       await env.DB.prepare(`UPDATE slack_channel_subscriptions SET channel_name=?,channel_type=?,validation_state='valid',
       validation_error=NULL,validation_scope_error_revision=NULL,bot_is_member=1,validated_at=?,
-      notification_blocked_at=CASE WHEN (notification_error=validation_error AND notification_error<>'missing_scope') OR notification_error='msg_too_long' THEN NULL ELSE notification_blocked_at END,
-      notification_error=CASE WHEN (notification_error=validation_error AND notification_error<>'missing_scope') OR notification_error='msg_too_long' THEN NULL ELSE notification_error END WHERE ${fence}`)
+      notification_blocked_at=CASE WHEN (notification_error=validation_error AND notification_error<>'missing_scope') OR notification_error IN ('msg_too_long','ratelimited','bad_client_secret','invalid_client_id') THEN NULL ELSE notification_blocked_at END,
+      notification_error=CASE WHEN (notification_error=validation_error AND notification_error<>'missing_scope') OR notification_error IN ('msg_too_long','ratelimited','bad_client_secret','invalid_client_id') THEN NULL ELSE notification_error END WHERE ${fence}`)
         .bind(channel.name, channel.is_private ? "private_channel" : "public_channel", Date.now(), ...fenceBinds())
         .run();
     if (!saved.meta.changes) throw new StaleSlackValidationError();

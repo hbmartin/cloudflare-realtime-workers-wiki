@@ -11,6 +11,7 @@ import { pageForMember } from "./page-access";
 import { logger } from "./observability";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import {
+  slackTokenPreparationFailure,
   slackApi,
   definiteSlackRejection,
   recordSlackInstallationError,
@@ -793,6 +794,7 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
     installation = await installationFor(env, payload.installationId, payload.generation);
     await validateChannel(env, installation, payload.channelId);
   } catch (error) {
+    if (slackTokenPreparationFailure(error) || error instanceof SlackRateLimitError) throw error;
     if (error instanceof HttpError || (error instanceof SlackApiError && error.status < 500)) return;
     throw error;
   }
@@ -803,26 +805,37 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
     .bind(Date.now(), payload.receiptId)
     .run();
   if (!claimed.meta.changes) return;
+  let dispatched = false;
   try {
-    await slackApi(env, installation, "chat.postEphemeral", {
-      channel: payload.channelId,
-      user: payload.slackUserId,
-      ...(payload.action === true ? {} : { thread_ts: payload.threadTs }),
-      text:
-        payload.reason === "connect" ||
-        payload.text === CONNECT ||
-        payload.text === "Connect your Slack account from NoteFlare Settings before using this action."
-          ? CONNECT
-          : payload.reason === "expired" || payload.text === EXPIRED_ACTION
-            ? EXPIRED_ACTION
-            : payload.text === BROADCAST_MISSING
-              ? BROADCAST_MISSING
-              : payload.text === CONTENT_ERROR
-                ? CONTENT_ERROR
-                : DENIED,
-    });
+    await slackApi(
+      env,
+      installation,
+      "chat.postEphemeral",
+      {
+        channel: payload.channelId,
+        user: payload.slackUserId,
+        ...(payload.action === true ? {} : { thread_ts: payload.threadTs }),
+        text:
+          payload.reason === "connect" ||
+          payload.text === CONNECT ||
+          payload.text === "Connect your Slack account from NoteFlare Settings before using this action."
+            ? CONNECT
+            : payload.reason === "expired" || payload.text === EXPIRED_ACTION
+              ? EXPIRED_ACTION
+              : payload.text === BROADCAST_MISSING
+                ? BROADCAST_MISSING
+                : payload.text === CONTENT_ERROR
+                  ? CONTENT_ERROR
+                  : DENIED,
+      },
+      {
+        onDispatch: () => {
+          dispatched = true;
+        },
+      },
+    );
   } catch (error) {
-    if (error instanceof SlackRateLimitError) {
+    if (!dispatched || error instanceof SlackRateLimitError) {
       await env.DB.prepare(`UPDATE ${table} SET denial_sent_at = NULL WHERE id = ?`).bind(payload.receiptId).run();
       throw error;
     }
@@ -1057,6 +1070,7 @@ async function resumeHistoryClock(env: Env, delivery: Delivery, installationId: 
 
 function definitelyNotPosted(error: unknown) {
   return (
+    slackTokenPreparationFailure(error) ||
     error instanceof SlackRateLimitError ||
     (error instanceof SlackApiError &&
       error.status < 500 &&
@@ -1440,6 +1454,7 @@ export async function deliverSlackThread(
         await withSlackPrimaryError(error, "handle_error", { deliveryId }, () => pauseHistoryClock(env, delivery));
       throw error;
     }
+    if (slackTokenPreparationFailure(error) && !slackInstallationError(error)) throw error;
     if (slackMissingScope(error)) {
       if (delivery.state === "sending")
         await withSlackPrimaryError(error, "handle_error", { deliveryId }, () => pauseHistoryClock(env, delivery));

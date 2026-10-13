@@ -26,6 +26,7 @@ import type { Env } from "./env";
 import { digestBlocks, type DigestPage } from "./slack-blocks";
 import { round2Installation, validateMappingEvidence, StaleSlackValidationError } from "./slack-channels";
 import {
+  slackTokenPreparationFailure,
   slackApi,
   SlackApiError,
   SlackRateLimitError,
@@ -972,7 +973,7 @@ export async function deliverDigest(
             await withSlackPrimaryError(error, "handle_error", { id }, () =>
               recordDeliveryError(env, installation, error, mapping!.id, mapping!.channel_id),
             );
-            if (error instanceof SlackApiError && error.code === "msg_too_long") {
+            if (definiteSlackRejection(error) && error.code === "msg_too_long") {
               await withSlackPrimaryError(error, "handle_error", { id }, () =>
                 recordPermanentDeliveryFailure(
                   env,
@@ -991,7 +992,11 @@ export async function deliverDigest(
                 await withSlackPrimaryError(error, "handle_error", { id }, () => retireRoot("terminal", error.code));
                 return;
               }
-              if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
+              if (
+                error instanceof SlackRateLimitError ||
+                slackTokenPreparationFailure(error) ||
+                definiteSlackRejection(error)
+              ) {
                 await withSlackPrimaryError(error, "handle_error", { id }, () =>
                   env.DB.prepare(
                     `UPDATE slack_digest_messages SET state='pending',attempted_at=NULL,last_error=? WHERE id=? AND claim_token=?`,

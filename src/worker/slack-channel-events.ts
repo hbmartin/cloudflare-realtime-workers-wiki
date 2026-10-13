@@ -18,8 +18,8 @@ import { safeSlackText } from "./slack-blocks";
 import { round2Installation, validateMappingEvidence, StaleSlackValidationError } from "./slack-channels";
 import { reconcileBotPost } from "./slack-digests";
 import {
+  slackTokenPreparationFailure,
   slackApi,
-  SlackApiError,
   SlackRateLimitError,
   channelActivityActorAccessSql,
   channelActivityActorAuthoritySql,
@@ -413,7 +413,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
       await withSlackPrimaryError(error, "record", { eventId }, () =>
         recordDeliveryError(env, installation, error, destination.subscriptionId, destination.channelId),
       );
-      if (error instanceof SlackApiError && error.code === "msg_too_long") {
+      if (definiteSlackRejection(error) && error.code === "msg_too_long") {
         await recordPermanentDeliveryFailure(
           env,
           installation,
@@ -429,7 +429,11 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
         await finish(null, "retired");
         return;
       }
-      if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
+      if (
+        error instanceof SlackRateLimitError ||
+        slackTokenPreparationFailure(error) ||
+        definiteSlackRejection(error)
+      ) {
         await withSlackPrimaryError(error, "rewind", { eventId }, () =>
           env.DB.prepare(
             `UPDATE slack_channel_events SET round2_state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,

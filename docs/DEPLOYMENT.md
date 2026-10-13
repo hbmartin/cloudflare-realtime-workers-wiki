@@ -50,8 +50,9 @@ later.
 Push an update to the repository Cloudflare created, or use **Retry deployment** after correcting a
 failed build. Workers Builds prepares once, builds once, then verifies the build UUID, revision,
 source, target, auth origin, resource names and provenance, configuration overrides, and generated configuration before migrating and uploading. Its ignored
-`.wrangler/noteflare-build.json` metadata must belong to the current run. Retry reuses resource bindings
-and already-applied migrations. Saved dashboard variables, including feature settings, are retained.
+`.wrangler/noteflare-build.json` metadata must belong to the current run. After a successful upload saves
+the Worker bindings, retries reuse those resources and already-applied migrations. A failed first upload
+can require explicit adoption of partially provisioned resources, as described below. Saved dashboard variables, including feature settings, are retained.
 If those settings change between build and deploy, rebuild before retrying; verification stops before migrations or upload. Older manifests also require rebuilding. Override object-key order does not matter, but array order does.
 
 Without a saved D1 binding, the helper derives a database name from the Worker name (`<worker>-db`)
@@ -65,17 +66,21 @@ Existing bindings recognize `database_id` and the older `id` field and reject co
 
 Resource naming uses this precedence:
 
-- Saved Worker bucket and queue bindings are retained when the source still contains template defaults.
+- Saved Worker bucket and queue bindings are retained when the source still contains template defaults,
+  including when the source has a concrete D1 ID. This preserves installations created by earlier versions.
 - Custom source names are explicit selections. A valid, non-placeholder D1 ID already in the source
-  configuration also makes its configured bucket and queue names explicit, including `noteflare`,
+  configuration also makes its configured bucket and queue names explicit when no saved binding exists, including `noteflare`,
   `noteflare-delivery`, and `noteflare-delivery-dlq`. This recognizes the provisioned configuration
   produced by the native deployment form; a database ID discovered or created during preparation
-  does not establish that intent. Conflicting explicit names and saved bindings stop deployment for
+  does not establish that intent. Conflicting custom source names and saved bindings stop deployment for
   both buckets and queues. Correct the source to match the intended saved bindings before retrying.
 - Untouched templates use `<worker>-attachments`, `<worker>-delivery`, and `<worker>-delivery-dlq`.
   These generated names are stable and shortened with a deterministic hash to fit the 63-character
-  R2/queue limits. Producer and consumer names resolve together. A consumer with no dead-letter
-  producer retains its configured dead-letter name, or omits that setting if none was configured.
+  R2/queue limits. Producer and consumer names resolve together. If a consumer specifies the template
+  dead-letter name without its producer, preparation stops before provisioning or migrations. Restore
+  `DELIVERY_DEAD_LETTER_QUEUE` or select a custom, existing dead-letter queue; preparation validates
+  that custom destination through every queue lookup page. If no dead-letter name is configured,
+  the setting is omitted.
 
 Before creating D1 or running migrations, preparation checks each generated bucket by exact name
 and searches every queue lookup page. Failed, malformed, and ambiguous lookups stop preparation.

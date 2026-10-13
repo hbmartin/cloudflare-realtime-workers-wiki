@@ -749,7 +749,7 @@ it.each(
         return property === "DB" ? db : Reflect.get(target, property, receiver);
       },
     });
-    const recipientsPerTick = channel === "email" ? 2 : 1;
+    const recipientsPerTick = 2;
     for (let tick = 1; tick <= 8 / recipientsPerTick; tick++) {
       statements.length = 0;
       await sendDueNotificationDigests(counted, digestTimestamp());
