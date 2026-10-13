@@ -26,6 +26,7 @@ import {
 import { pageContributorStatements, versionContributorStatement } from "./page-info";
 import type { DocumentContentEnvelope } from "../shared/types";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
+import { normalizeYCodeBlocks } from "../shared/code-content";
 import { joinBytes, splitBytes } from "../shared/bytes";
 import { jitteredBackoff } from "../shared/retry";
 import type { Env } from "./env";
@@ -820,6 +821,17 @@ export class Document extends YServer {
     }
     if (!this.metadata.retired && this.metadata.content_kind === "document") {
       try {
+        if (normalizeYCodeBlocks(this.document)) this.flushPendingUpdates();
+      } catch (error) {
+        logger.warn(
+          "document.code_compatibility.failed",
+          "document",
+          "Existing code block requires recovery.",
+          { pageId: this.ids.pageId },
+          error,
+        );
+      }
+      try {
         normalizeYDocumentTables(this.document);
         this.flushPendingUpdates();
       } catch (error) {
@@ -1288,11 +1300,13 @@ export class Document extends YServer {
       Y.applyUpdate(clone, Y.encodeStateAsUpdate(this.document));
       try {
         normalizeYDocumentTables(clone);
+        normalizeYCodeBlocks(clone);
         clone.transact(() => {
           for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(clone, operation);
           if (operationId && requestHash) clone.getMap<string>("api-operation-receipts").set(operationId, requestHash);
         }, "api-validation");
         normalizeYDocumentTables(clone);
+        normalizeYCodeBlocks(clone);
       } catch (error) {
         const code = error instanceof Error ? error.message : "invalid_mutation";
         clone.destroy();
@@ -1473,6 +1487,7 @@ export class Document extends YServer {
           Y.applyUpdate(candidate, update);
           migrateLegacyColumns(candidate);
           normalizeYDocumentTables(candidate);
+          normalizeYCodeBlocks(candidate);
           validateDocumentTree(yXmlFragmentToProsemirrorJSON(candidate.getXmlFragment("document-store")));
           update = Y.encodeStateAsUpdate(candidate);
         } catch (error) {
@@ -3193,6 +3208,7 @@ export class Document extends YServer {
             Y.applyUpdate(candidate, selectedBytes);
             migrateLegacyColumns(candidate);
             normalizeYDocumentTables(candidate);
+            normalizeYCodeBlocks(candidate);
             validateDocumentTree(yXmlFragmentToProsemirrorJSON(candidate.getXmlFragment("document-store")));
             selectedBytes = Y.encodeStateAsUpdate(candidate);
           } catch (error) {

@@ -5,10 +5,10 @@ import { evaluateMetadataIntegrity, INTEGRITY_PAGE_COLUMNS, integrityMetadataSql
 import { emptyDatabaseSchema, queryRows } from "./migrate-d1.mjs";
 
 /** Read-only metadata check usable by REST or Wrangler deployment adapters. */
-export function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) {
+export async function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) {
   if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 100_000)
     throw new Error("Integrity batch size is invalid.");
-  const tables = query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name", "integrity schema");
+  const tables = await query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name", "integrity schema");
   if (emptyDatabaseSchema(tables))
     return {
       ok: true,
@@ -29,7 +29,9 @@ export function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) {
       incomplete: [{ code: "unsupported_core_schema" }],
       classifications: {},
     };
-  const columns = new Set(query("PRAGMA table_info(pages)", "integrity page schema").map((column) => column.name));
+  const columns = new Set(
+    (await query("PRAGMA table_info(pages)", "integrity page schema")).map((column) => column.name),
+  );
   if (INTEGRITY_PAGE_COLUMNS.split(",").some((column) => !columns.has(column)))
     return {
       ok: false,
@@ -60,8 +62,8 @@ export function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) {
     .filter(([, enabled]) => enabled)
     .map(([key]) => `SELECT '${key}' source,count(*) rows FROM ${sourceTables[key]}`)
     .join(" UNION ALL ");
-  const readCounts = () => {
-    const counts = query(summarySql, "integrity coverage counts");
+  const readCounts = async () => {
+    const counts = await query(summarySql, "integrity coverage counts");
     if (
       counts.some((row) => !supported[row.source] || !Number.isSafeInteger(row.rows) || row.rows < 0) ||
       counts.length !== Object.values(supported).filter(Boolean).length ||
@@ -82,8 +84,8 @@ export function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) {
   // counts after that collection's second fingerprint has already been read.
   const watermarkSql =
     "SELECT count(*) pages,cast(coalesce(sum(revision),0) AS TEXT) revisions,cast(coalesce(sum(content_epoch),0) AS TEXT) epochs,cast(coalesce(sum(indexed_seq),0) AS TEXT) sequences,cast(coalesce(sum(updated_at),0) AS TEXT) updates FROM pages";
-  const watermark = query(watermarkSql, "integrity initial revision");
-  const scan = (counts, collect) => {
+  const watermark = await query(watermarkSql, "integrity initial revision");
+  const scan = async (counts, collect) => {
     const data = { complete: true };
     const fingerprint = createHash("sha256");
     for (const [key, sql] of Object.entries(statements)) {
@@ -96,7 +98,7 @@ export function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) {
       let read = 0;
       for (;;) {
         const where = cursor === undefined ? "" : ` WHERE ${keys[key]} > '${cursor.replaceAll("'", "''")}'`;
-        const rows = query(`${base}${where} ORDER BY ${keys[key]} LIMIT ${batchSize}`, `integrity ${key}`);
+        const rows = await query(`${base}${where} ORDER BY ${keys[key]} LIMIT ${batchSize}`, `integrity ${key}`);
         if (rows.length > batchSize) throw new Error("Invalid integrity batch coverage.");
         for (const row of rows) {
           const id = row[field];
@@ -121,16 +123,16 @@ export function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) {
     }
     return { data, fingerprint: fingerprint.digest("hex") };
   };
-  const counts = readCounts();
-  const first = scan(counts, true);
-  const second = scan(readCounts(), false);
+  const counts = await readCounts();
+  const first = await scan(counts, true);
+  const second = await scan(await readCounts(), false);
   const data = first.data;
   const result = evaluateMetadataIntegrity(data);
-  const finalCounts = readCounts();
+  const finalCounts = await readCounts();
   if (
     !second.data.complete ||
     first.fingerprint !== second.fingerprint ||
-    JSON.stringify(watermark) !== JSON.stringify(query(watermarkSql, "integrity final revision")) ||
+    JSON.stringify(watermark) !== JSON.stringify(await query(watermarkSql, "integrity final revision")) ||
     Object.keys(counts).some((key) => counts[key] !== finalCounts[key])
   ) {
     result.incomplete.push({ code: "workspace_revision_changed" });
@@ -234,7 +236,7 @@ export async function main(argv, execute, environment = process.env) {
         } else if (!["--local", "--remote"].includes(passthrough[i]))
           throw new Error(`Unknown integrity option: ${passthrough[i]}`);
       }
-      result = metadataIntegrityCheck((sql, stage) =>
+      result = await metadataIntegrityCheck((sql, stage) =>
         queryRows(
           execute(["d1", "execute", "DB", ...passthrough, "--json", "--command", sql], {
             timeout: 300_000,

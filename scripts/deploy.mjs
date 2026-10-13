@@ -43,7 +43,7 @@ function wranglerJSON(args) {
   }
 }
 
-async function cloudflare() {
+async function cloudflare(configuredAccount) {
   const credentials = wranglerJSON(["auth", "token", "--json"]);
   const headers =
     credentials.type === "api_key"
@@ -51,7 +51,7 @@ async function cloudflare() {
       : { Authorization: `Bearer ${credentials.token}` };
   if (!credentials.token && !(credentials.key && credentials.email))
     throw new Error("Cloudflare authentication is missing.");
-  let account = process.env.CLOUDFLARE_ACCOUNT_ID;
+  let account = process.env.CLOUDFLARE_ACCOUNT_ID ?? configuredAccount;
   if (!account) {
     const identity = wranglerJSON(["whoami", "--json"]);
     if (identity.accounts?.length !== 1)
@@ -83,6 +83,31 @@ async function cloudflare() {
     return paginated ? { result: value.result, result_info: value.result_info } : value.result;
   };
   return { account, api };
+}
+
+export async function queryD1(api, id, sql) {
+  if (typeof id !== "string" || !databaseID.test(id) || id === placeholderID)
+    throw new Error("Configured DB has an invalid database ID.");
+  const result = await api(`/d1/database/${id}/query`, { method: "POST", body: { sql } });
+  if (
+    !Array.isArray(result) ||
+    result.length !== 1 ||
+    result[0]?.success !== true ||
+    !Array.isArray(result[0].results) ||
+    result[0].results.some((row) => !row || typeof row !== "object" || Array.isArray(row))
+  )
+    throw new Error("Cloudflare returned invalid D1 query results.");
+  return result[0].results;
+}
+
+export function integrityDatabaseID(config, account, expectedAccount) {
+  if ((expectedAccount && account !== expectedAccount) || (config.account_id && account !== config.account_id))
+    throw new Error("Cloudflare account changed. Rebuild before deployment.");
+  const bindings = config.d1_databases?.filter((binding) => binding.binding === "DB") ?? [];
+  const id = bindings[0]?.database_id;
+  if (bindings.length !== 1 || typeof id !== "string" || !databaseID.test(id) || id === placeholderID)
+    throw new Error("Generated DB binding has an invalid database ID. Rebuild before deployment.");
+  return id;
 }
 
 function deployedDatabaseID(settings) {
@@ -141,17 +166,7 @@ export async function portableDatabase(config, settings, name, api, dryRun = fal
         throw new Error("D1 provisioning did not return a valid database ID.");
       // A build/deploy retry may reuse an empty provisioned resource. Populated databases
       // require a saved Worker binding or an explicit database_id before any migration.
-      const query = async (sql) => {
-        const result = await api(`/d1/database/${id}/query`, { method: "POST", body: { sql } });
-        if (
-          !Array.isArray(result) ||
-          result.length !== 1 ||
-          result[0]?.success !== true ||
-          !Array.isArray(result[0].results)
-        )
-          throw new Error("Cloudflare returned invalid D1 query results.");
-        return result[0].results;
-      };
+      const query = (sql) => queryD1(api, id, sql);
       const tables = await query("SELECT name FROM sqlite_master WHERE type='table';");
       if (
         !emptyDatabaseSchema(tables) ||
@@ -757,32 +772,30 @@ export async function main(argv) {
   } else manifest = await build(context);
   if (action === "build") return;
   const configArgs = ["--config", manifest.configPath];
-  validateDeliveryQueues(unstable_readConfig({ config: manifest.configPath, env: "" }, { hideWarnings: true }));
+  const config = unstable_readConfig({ config: manifest.configPath, env: "" }, { hideWarnings: true });
+  validateDeliveryQueues(config);
   if (dryRun) {
     const result = wrangler(["deploy", ...configArgs, "--dry-run"], { stdio: "inherit" });
     if (result.error || result.status !== 0) throw new Error("Worker dry run failed.");
     return;
   }
+  const connection = await cloudflare(config.account_id ?? manifest.account ?? undefined);
+  const integrityDB = integrityDatabaseID(config, connection.account, manifest.account);
   await deployPrepared(manifest, {
     repairIntegrity: options.includes("--repair-integrity"),
     isInitialized: () => initializedDatabase(manifest.configPath),
     inspectSecrets: async () => {
-      const connection = await cloudflare();
       const names = await connection.api(`/workers/scripts/${manifest.name}/secrets`, { allowMissing: true });
       if (names !== null && !Array.isArray(names)) throw new Error("Invalid Worker secret listing.");
       return (names ?? []).map((entry) => entry.name);
     },
-    integrityCheck: () =>
-      metadataIntegrityCheck((sql, stage) =>
-        queryRows(wrangler(["d1", "execute", "DB", ...configArgs, "--remote", "--json", "--command", sql]), stage),
-      ),
+    integrityCheck: () => metadataIntegrityCheck((sql) => queryD1(connection.api, integrityDB, sql)),
     migrateDatabase: () =>
       migrate(["--remote", ...configArgs], wrangler, {
         slackReviewMigrationSafe: process.env.SLACK_REVIEW_MIGRATION_SAFE === "true",
         pageMoveMigrationSafe: process.env.PAGE_MOVE_RECEIPT_MIGRATION_SAFE === "true",
       }),
     provisionResources: async () => {
-      const connection = await cloudflare();
       if (connection.account !== manifest.account)
         throw new Error("Cloudflare account changed. Rebuild before deployment.");
       await createGeneratedResources(manifest.resources, connection.api);

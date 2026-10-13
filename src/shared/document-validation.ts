@@ -54,6 +54,39 @@ function fail(message: string): never {
   throw new DocumentValidationError(message);
 }
 
+export function isDocumentFormattingMark(type: string) {
+  return STYLE_MARKS.has(type);
+}
+
+export function validateDocumentMarks(value: unknown): NonNullable<ProseMirrorJson["marks"]> {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) fail("Document marks must be an array.");
+  for (const mark of value) {
+    if (!mark || typeof mark !== "object" || Array.isArray(mark) || typeof mark.type !== "string")
+      fail("Document mark type is required.");
+    if (!STYLE_MARKS.has(mark.type) && !isCommentMark(mark.type)) fail("Document contains an unknown mark.");
+    if (mark.attrs !== undefined && (!mark.attrs || typeof mark.attrs !== "object" || Array.isArray(mark.attrs)))
+      fail("Document mark attributes must be an object.");
+    for (const attribute of Object.values(mark.attrs ?? {}))
+      if (
+        attribute !== null &&
+        typeof attribute !== "string" &&
+        typeof attribute !== "boolean" &&
+        !(typeof attribute === "number" && Number.isFinite(attribute))
+      )
+        fail("Document mark attribute is invalid.");
+    if (mark.type === "link" && mark.attrs?.href !== undefined && typeof mark.attrs.href !== "string")
+      fail("Link destination is invalid.");
+    if (
+      isCommentMark(mark.type) &&
+      ((mark.attrs?.threadId !== undefined && typeof mark.attrs.threadId !== "string") ||
+        (mark.attrs?.orphan !== undefined && typeof mark.attrs.orphan !== "boolean"))
+    )
+      fail("Comment annotation attributes are invalid.");
+  }
+  return value;
+}
+
 /** Validate the headless BlockNote wire tree without loading React or browser node views. */
 export function validateDocumentTree(value: unknown): asserts value is ProseMirrorJson {
   if (!value || typeof value !== "object" || (value as ProseMirrorJson).type !== "doc")
@@ -113,30 +146,7 @@ export function validateDocumentTree(value: unknown): asserts value is ProseMirr
       ids.add(id);
     }
     if (node.type === "text" && (typeof node.text !== "string" || !node.text)) fail("Text nodes must contain text.");
-    if (node.marks !== undefined && !Array.isArray(node.marks)) fail("Document marks must be an array.");
-    for (const mark of node.marks ?? []) {
-      if (!mark || typeof mark.type !== "string") fail("Document mark type is required.");
-      if (!STYLE_MARKS.has(mark.type) && !isCommentMark(mark.type)) fail("Document contains an unknown mark.");
-      if (mark.attrs !== undefined && (!mark.attrs || typeof mark.attrs !== "object" || Array.isArray(mark.attrs)))
-        fail("Document mark attributes must be an object.");
-      for (const attribute of Object.values(mark.attrs ?? {}))
-        if (
-          attribute !== null &&
-          typeof attribute !== "string" &&
-          typeof attribute !== "boolean" &&
-          !(typeof attribute === "number" && Number.isFinite(attribute))
-        )
-          fail("Document mark attribute is invalid.");
-      if (mark.type === "link" && mark.attrs?.href !== undefined && typeof mark.attrs.href !== "string")
-        fail("Link destination is invalid.");
-      if (
-        isCommentMark(mark.type) &&
-        ((mark.attrs?.threadId !== undefined && typeof mark.attrs.threadId !== "string") ||
-          (mark.attrs?.orphan !== undefined && typeof mark.attrs.orphan !== "boolean"))
-      )
-        fail("Comment annotation attributes are invalid.");
-      marks.add(mark.type);
-    }
+    for (const mark of validateDocumentMarks(node.marks)) marks.add(mark.type!);
     if (
       node.attrs?.textAlignment !== undefined &&
       !["left", "center", "right", "justify"].includes(String(node.attrs.textAlignment))

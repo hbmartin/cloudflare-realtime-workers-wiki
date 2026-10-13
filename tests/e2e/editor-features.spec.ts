@@ -19,6 +19,36 @@ async function features(page: Page) {
   });
 }
 
+test("HTML code imports preserve whitespace and reopen with plain text line breaks", async ({ page }) => {
+  await signInOwner(page);
+  const toggle = page.getByRole("button", { name: "Open navigation" });
+  if (await toggle.isVisible()) await toggle.click();
+  await page.getByRole("button", { name: "Import notes", exact: true }).click();
+  const title = `code-import-${Date.now()}`;
+  const dialog = page.getByRole("dialog", { name: "Import notes" });
+  await dialog.locator('input[type="file"]').setInputFiles({
+    name: `${title}.html`,
+    mimeType: "text/html",
+    buffer: Buffer.from(
+      '<pre><code>\n  <strong>first</strong><br><a href="https://example.test">second</a>\n\tend</code></pre>',
+    ),
+  });
+  await dialog.getByRole("button", { name: "Upload and inspect" }).click();
+  const job = page.getByRole("dialog", { name: "Imports & exports" }).locator(".activity-list > li").first();
+  await expect(job.locator(".job-status")).toHaveText("awaiting confirmation", { timeout: 30_000 });
+  await job.getByRole("button", { name: "Confirm import" }).click();
+  await expect(job.locator(".job-status")).toHaveText("succeeded", { timeout: 30_000 });
+  await job.getByRole("button", { name: "Open page" }).click();
+  await expect(page.getByLabel("Page title")).toHaveValue(title);
+  const code = page.locator('.bn-editor [data-content-type="codeBlock"] code');
+  await expect(code).toBeVisible();
+  expect(await code.textContent()).toBe("\n  first\nsecond\n\tend");
+  await expect(code.locator("strong,em,a")).toHaveCount(0);
+  await page.reload();
+  await expect(code).toBeVisible();
+  expect(await code.textContent()).toBe("\n  first\nsecond\n\tend");
+});
+
 test("native API tables reopen and collaborative editing preserves stable row identities", async ({
   page,
   context,

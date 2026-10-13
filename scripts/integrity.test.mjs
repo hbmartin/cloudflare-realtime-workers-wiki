@@ -4,13 +4,13 @@ import { DatabaseSync } from "node:sqlite";
 import { contentIntegrityCheck, metadataIntegrityCheck } from "./integrity.mjs";
 import { INTEGRITY_PAGE_COLUMNS } from "../src/shared/integrity.ts";
 
-test("empty database is a valid fresh-install metadata precheck", () => {
-  assert.equal(metadataIntegrityCheck(() => [{ name: "d1_migrations" }]).ok, true);
+test("empty database is a valid fresh-install metadata precheck", async () => {
+  assert.equal((await metadataIntegrityCheck(() => [{ name: "d1_migrations" }])).ok, true);
 });
 
-test("missing core schema and incomplete query coverage never pass", () => {
-  assert.equal(metadataIntegrityCheck(() => [{ name: "user" }]).complete, false);
-  const result = metadataIntegrityCheck((sql) => {
+test("missing core schema and incomplete query coverage never pass", async () => {
+  assert.equal((await metadataIntegrityCheck(() => [{ name: "user" }])).complete, false);
+  const result = await metadataIntegrityCheck((sql) => {
     if (sql.includes("sqlite_master")) return ["pages", "spaces", "workspaces"].map((name) => ({ name }));
     if (sql.includes("PRAGMA")) return INTEGRITY_PAGE_COLUMNS.split(",").map((name) => ({ name }));
     if (sql.includes(" UNION ALL "))
@@ -37,7 +37,7 @@ function metadataFixture() {
   return db;
 }
 
-test("metadata pagination reads every page beyond the old 100000-row ceiling", () => {
+test("metadata pagination reads every page beyond the old 100000-row ceiling", async () => {
   const db = metadataFixture();
   try {
     db.exec("BEGIN");
@@ -45,7 +45,7 @@ test("metadata pagination reads every page beyond the old 100000-row ceiling", (
     for (let i = 0; i < 100_001; i++) insert.run(String(i).padStart(6, "0"));
     db.exec("COMMIT");
     let batches = 0;
-    const result = metadataIntegrityCheck((sql) => {
+    const result = await metadataIntegrityCheck(async (sql) => {
       if (sql.startsWith("SELECT id,workspace_id,space_id")) batches++;
       return db.prepare(sql).all();
     });
@@ -58,19 +58,19 @@ test("metadata pagination reads every page beyond the old 100000-row ceiling", (
   }
 });
 
-test("metadata fingerprint rejects same-count scope changes and nonadvancing batches", () => {
+test("metadata fingerprint rejects same-count scope changes and nonadvancing batches", async () => {
   const db = metadataFixture();
   try {
     db.exec("INSERT INTO pages VALUES('page','workspace','space',NULL,'document',1,1,0,1,NULL,0,NULL)");
     let scans = 0;
-    const result = metadataIntegrityCheck((sql) => {
+    const result = await metadataIntegrityCheck((sql) => {
       if (sql.startsWith("SELECT id,workspace_id,space_id") && ++scans === 2)
         db.exec("UPDATE pages SET space_id='other'");
       return db.prepare(sql).all();
     });
     assert.equal(result.ok, false);
     assert.ok(result.incomplete.some((failure) => failure.code === "workspace_revision_changed"));
-    assert.throws(
+    await assert.rejects(
       () =>
         metadataIntegrityCheck((sql) => {
           if (sql.startsWith("SELECT id FROM workspaces")) return [{ id: "same" }, { id: "same" }];
@@ -83,13 +83,13 @@ test("metadata fingerprint rejects same-count scope changes and nonadvancing bat
   }
 });
 
-test("the final page watermark rejects late writes after pages have been fingerprinted", () => {
+test("the final page watermark rejects late writes after pages have been fingerprinted", async () => {
   const db = metadataFixture();
   try {
     db.exec(`CREATE TABLE attachments(id TEXT PRIMARY KEY,page_id TEXT,workspace_id TEXT,r2_key TEXT,size INTEGER);
       INSERT INTO pages VALUES('page','workspace','space',NULL,'document',1,1,0,1,NULL,0,NULL)`);
     let scans = 0;
-    const result = metadataIntegrityCheck((sql) => {
+    const result = await metadataIntegrityCheck((sql) => {
       if (sql.startsWith("SELECT id,page_id,workspace_id,r2_key,size") && ++scans === 2)
         db.exec("UPDATE pages SET space_id='missing',revision=revision+1");
       return db.prepare(sql).all();

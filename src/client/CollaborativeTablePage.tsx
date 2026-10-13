@@ -1269,6 +1269,8 @@ function Property({
     [editedSource, setSourceDraft] = useState<ReturnType<typeof propertyDraft> | null>(null),
     [option, setOption] = useState(""),
     [clearInvalid, setClearInvalid] = useState(false);
+  if (editedName?.value === column.name) setNameDraft(null);
+  if (editedSource?.value === currentSource) setSourceDraft(null);
   const nameDraft = editedName ?? propertyDraft(column.name, column.revision),
     sourceDraft = editedSource ?? propertyDraft(currentSource, column.revision);
   const conflict =
