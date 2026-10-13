@@ -46,6 +46,10 @@ const INLINE_ATOMS = new Set(["mention", "dateMention", "inlineMath", "statusBad
 const STYLE_MARKS = new Set(["bold", "italic", "underline", "strike", "code", "link", "textColor", "backgroundColor"]);
 const MAX_NODES = 250_000;
 
+function isCommentMark(type: string) {
+  return type === "comment" || /^comment--[A-Za-z0-9:_-]{1,200}$/.test(type);
+}
+
 function fail(message: string): never {
   throw new DocumentValidationError(message);
 }
@@ -112,8 +116,7 @@ export function validateDocumentTree(value: unknown): asserts value is ProseMirr
     if (node.marks !== undefined && !Array.isArray(node.marks)) fail("Document marks must be an array.");
     for (const mark of node.marks ?? []) {
       if (!mark || typeof mark.type !== "string") fail("Document mark type is required.");
-      if (!STYLE_MARKS.has(mark.type) && !/^comment--[A-Za-z0-9:_-]{1,200}$/.test(mark.type))
-        fail("Document contains an unknown mark.");
+      if (!STYLE_MARKS.has(mark.type) && !isCommentMark(mark.type)) fail("Document contains an unknown mark.");
       if (mark.attrs !== undefined && (!mark.attrs || typeof mark.attrs !== "object" || Array.isArray(mark.attrs)))
         fail("Document mark attributes must be an object.");
       for (const attribute of Object.values(mark.attrs ?? {}))
@@ -126,6 +129,12 @@ export function validateDocumentTree(value: unknown): asserts value is ProseMirr
           fail("Document mark attribute is invalid.");
       if (mark.type === "link" && mark.attrs?.href !== undefined && typeof mark.attrs.href !== "string")
         fail("Link destination is invalid.");
+      if (
+        isCommentMark(mark.type) &&
+        ((mark.attrs?.threadId !== undefined && typeof mark.attrs.threadId !== "string") ||
+          (mark.attrs?.orphan !== undefined && typeof mark.attrs.orphan !== "boolean"))
+      )
+        fail("Comment annotation attributes are invalid.");
       marks.add(mark.type);
     }
     if (
@@ -193,12 +202,22 @@ export function validateDocumentTree(value: unknown): asserts value is ProseMirr
   nodes.codeBlock = {
     group: "blockContent",
     content: "text*",
-    marks: [...marks].filter((type) => type.startsWith("comment--")).join(" "),
+    marks: [...marks].filter(isCommentMark).join(" "),
   };
   for (const type of ATOM_BLOCKS) nodes[type] = { group: "blockContent", atom: true };
   for (const type of INLINE_ATOMS) nodes[type] = { group: "inline", inline: true, atom: true };
   try {
-    const schema = new Schema({ nodes, marks: Object.fromEntries([...marks].map((type) => [type, {}])) });
+    const schema = new Schema({
+      nodes,
+      marks: Object.fromEntries(
+        [...marks].map((type) => [
+          type,
+          isCommentMark(type)
+            ? { attrs: { threadId: { default: "" }, orphan: { default: false } }, excludes: "", group: "annotation" }
+            : {},
+        ]),
+      ),
+    });
     Node.fromJSON(schema, value).check();
   } catch {
     fail("Document node structure is incompatible with the editor.");
@@ -234,6 +253,12 @@ export function requiredDocumentCapabilities(document: ProseMirrorJson) {
   let visited = 0;
   while (pending.length) {
     const { node, depth } = pending.pop()!;
+    // Formatting splits text into runs without changing the document structure.
+    // The full write validator still counts every run toward its payload limit.
+    if (node.type === "text") {
+      if (typeof node.text === "string" && !node.content?.length) continue;
+      required.add("unsupported:document-structure");
+    }
     if (++visited > MAX_NODES || depth > 64) {
       required.add("unsupported:document-structure");
       break;

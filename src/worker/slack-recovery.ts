@@ -1,5 +1,5 @@
 import { type HistoryVerificationOptions } from "./slack-history";
-import { slackBulkCandidateSql, SlackApiError } from "./slack";
+import { slackBulkCandidateSql, slackRecoveryEligibleSql, SlackApiError } from "./slack";
 import { reconcileSlackChannelEvent } from "./slack-channel-events";
 import {
   retireDigestReceiptStatements,
@@ -41,7 +41,8 @@ function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string) {
     AND NOT EXISTS(SELECT 1 FROM slack_channel_events e JOIN slack_channel_subscriptions m ON m.id=e.subscription_id
       JOIN pages page ON page.id=e.page_id JOIN slack_installations installation ON installation.id=m.installation_id
       WHERE e.summary_id=r.id AND ${slackBulkCandidateSql} AND NOT ${mappingDeliveryPauseSql("m", Date.now())})`;
-  else if (topic === "slack_file_upload") destinationPause = `(${thumbnailEligibilitySql()})='paused'`;
+  else if (topic === "slack_file_upload")
+    destinationPause = `(${thumbnailEligibilitySql("r", Date.now(), true)})='paused'`;
   const childClaim = `(SELECT max(child.claimed_at) FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state='pending')`;
   const claimed =
     topic === "slack_digest"
@@ -50,7 +51,7 @@ function receiptStatusSql(topic: keyof typeof round2Receipts, idSql: string) {
   return `SELECT r.${contract.state} state,${claimed} claimed_at,${topic === "slack_file_upload" ? "NULL" : "r.attempted_at"} attempted_at,
     ${channel ? `r.delivered_at IS NOT NULL OR r.suppressed_at IS NOT NULL` : "0"} completed,
     ${topic === "slack_digest" ? "EXISTS(SELECT 1 FROM slack_digest_messages child WHERE child.receipt_id=r.id AND child.state='sending')" : channel ? "r.attempted_at IS NOT NULL AND r.round2_state='pending'" : "0"} uncertain_child,
-    ${topic === "slack_file_upload" ? destinationPause : `i.disconnected_at IS NULL AND i.generation=r.installation_generation AND (i.auth_error IS NOT NULL OR (${destinationPause}))`} paused
+    ${topic === "slack_file_upload" ? destinationPause : `i.disconnected_at IS NULL AND i.generation=r.installation_generation AND (NOT ${slackRecoveryEligibleSql("i")} OR (${destinationPause}))`} paused
     FROM ${contract.table} r ${mapping ? "JOIN slack_channel_subscriptions m ON m.id=r.subscription_id" : ""}
     JOIN slack_installations i ON i.id=${installation} WHERE r.id=${idSql}`;
 }

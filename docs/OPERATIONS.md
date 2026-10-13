@@ -379,6 +379,7 @@ projection-invalidation events; losing one costs freshness, not data.
 
 `triggers.crons` in `wrangler.jsonc` is set to `*/15 * * * *`. The scheduled handler retries document-room
 disconnects left behind by archive, and Durable Object and R2 targets left behind by permanent deletion.
+Permanent deletion first accepts a durable job, then removes canonical table rows and their projections, then page metadata and physical storage. Accepted jobs survive failures; restores return `deletion_pending` until row deletion completes. Repeated permanent-delete requests resume the same job. Staging jobs that were never accepted expire after 24 hours.
 Disabling it does not degrade gracefully: archived pages keep live editors connected, and permanently
 deleted pages leak Durable Objects and R2 objects indefinitely.
 

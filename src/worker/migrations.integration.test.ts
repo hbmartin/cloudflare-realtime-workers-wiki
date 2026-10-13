@@ -7,6 +7,34 @@ import { redriveRound2Outbox } from "./slack-recovery";
 beforeEach(() => reset());
 
 describe("D1 migrations", () => {
+  it("0091 preserves existing cleanup jobs and their completed target progress", async () => {
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((migration) => migration.name < "0091"),
+    );
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO deletion_jobs(id,workspace_id,root_page_id,attempts,next_attempt_at,last_error,created_at,updated_at) VALUES('legacy-cleanup','workspace','deleted-page',3,100,'retry',1,2)",
+      ),
+      env.DB.prepare(
+        "INSERT INTO deletion_targets(job_id,kind,target,attempts,completed_at,last_error) VALUES('legacy-cleanup','table_do','deleted-table',2,NULL,'temporary'),('legacy-cleanup','r2_object','uploads/deleted',1,50,NULL)",
+      ),
+    ]);
+    const job = await env.DB.prepare("SELECT * FROM deletion_jobs").first();
+    const targets = (await env.DB.prepare("SELECT * FROM deletion_targets ORDER BY kind,target").all()).results;
+    await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
+    expect(await env.DB.prepare("SELECT * FROM deletion_jobs").first()).toEqual({
+      ...job,
+      phase: "cleanup",
+      actor_id: null,
+    });
+    expect((await env.DB.prepare("SELECT * FROM deletion_targets ORDER BY kind,target").all()).results).toEqual(
+      targets,
+    );
+    expect(await env.DB.prepare("SELECT count(*) count FROM deletion_job_pages").first()).toEqual({ count: 0 });
+    await env.DB.prepare("DELETE FROM deletion_jobs WHERE id='legacy-cleanup'").run();
+    expect(await env.DB.prepare("SELECT count(*) count FROM deletion_targets").first()).toEqual({ count: 0 });
+  });
   it.each(["0001", "0067", "0068", "0069", "0072", "0073", "0075", "0076", "0077", "0078", "0079", "0081", "0082"])(
     "upgrades a database before %s through the additive follow-up",
     async (foundation) => {

@@ -1,10 +1,12 @@
 // @vitest-environment jsdom
 import { BlockNoteEditor, mapTableCell, contentNodeToTableContent, tableContentToNodes } from "@blocknote/core";
 import { TableHandlesExtension, TableHandlesView, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
+import { CommentsExtension } from "@blocknote/core/comments";
 import { Fragment, Schema, Slice } from "prosemirror-model";
 import { EditorState, NodeSelection, TextSelection } from "prosemirror-state";
 import { describe, expect, it, vi } from "vitest";
-import { notesSchema } from "./mentions";
+import { notesCommentSchema, notesSchema } from "./mentions";
+import { ServerThreadStore } from "./server-thread-store";
 import { footnoteCatalog } from "../shared/editor-features";
 import { documentToYjsUpdate, htmlToDocument, markdownToDocument } from "../shared/import-content";
 import { serializeDocument } from "../shared/document-projection";
@@ -15,7 +17,7 @@ import { moveTabPanel, duplicateTabPanel } from "./tab-operations";
 import { paginateBlocks } from "./presentation-layout";
 import { updateHeadingIndex } from "./heading-index";
 import * as Y from "yjs";
-import { ySyncPluginKey, yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
+import { prosemirrorToYXmlFragment, ySyncPluginKey, yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { validateDocumentTree } from "../shared/document-validation";
 
 const schema = new Schema({
@@ -30,6 +32,50 @@ const schema = new Schema({
 });
 const search = { query: "cat", caseSensitive: false, wholeWord: false };
 describe("document editor features", () => {
+  it("validates real editor comment annotations after Yjs normalizes their mark names, including code", () => {
+    const doc = new Y.Doc();
+    const editor = BlockNoteEditor.create({
+      schema: notesSchema,
+      extensions: [
+        CommentsExtension({
+          threadStore: new ServerThreadStore("page", "owner", () => {}),
+          schema: notesCommentSchema,
+          resolveUsers: async () => [],
+        }),
+      ],
+      initialContent: [
+        { id: "annotated-paragraph", type: "paragraph", content: "Commented text" },
+        { id: "annotated-code", type: "codeBlock", content: "const value = 1;" },
+      ],
+    });
+    try {
+      editor.transact((tr) => {
+        tr.doc.descendants((node, pos) => {
+          if (node.isText)
+            tr.addMark(pos, pos + node.nodeSize, editor.pmSchema.mark("comment", { threadId: "thread" }));
+        });
+      });
+      editor.prosemirrorState.doc.check();
+      const fragment = doc.getXmlFragment("document-store");
+      prosemirrorToYXmlFragment(editor.prosemirrorState.doc, fragment);
+      const restored = yXmlFragmentToProsemirrorJSON(fragment);
+      const marks: Array<{ type: string; attrs?: Record<string, unknown> }> = [];
+      const collect = (node: any) => {
+        marks.push(...(node.marks ?? []));
+        for (const child of node.content ?? []) collect(child);
+      };
+      collect(restored);
+      expect(marks).toEqual([
+        { type: "comment", attrs: { threadId: "thread", orphan: false } },
+        { type: "comment", attrs: { threadId: "thread", orphan: false } },
+      ]);
+      expect(() => validateDocumentTree(restored)).not.toThrow();
+      editor.pmSchema.nodeFromJSON(restored).check();
+    } finally {
+      editor.unmount();
+      doc.destroy();
+    }
+  });
   it("mounts an empty collaborative document before its initial blocks receive IDs", () => {
     const doc = new Y.Doc();
     const editor = BlockNoteEditor.create({

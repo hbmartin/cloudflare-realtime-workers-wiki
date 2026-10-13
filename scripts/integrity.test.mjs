@@ -1,5 +1,6 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 import { contentIntegrityCheck, metadataIntegrityCheck } from "./integrity.mjs";
 import { INTEGRITY_PAGE_COLUMNS } from "../src/shared/integrity.ts";
 
@@ -23,6 +24,81 @@ test("missing core schema and incomplete query coverage never pass", () => {
   });
   assert.equal(result.ok, false);
   assert.equal(result.complete, false);
+});
+
+function metadataFixture() {
+  const db = new DatabaseSync(":memory:");
+  db.exec(`CREATE TABLE workspaces(id TEXT PRIMARY KEY);
+    CREATE TABLE spaces(id TEXT PRIMARY KEY,workspace_id TEXT);
+    CREATE TABLE pages(id TEXT PRIMARY KEY,workspace_id TEXT,space_id TEXT,parent_id TEXT,kind TEXT,
+      revision INTEGER,content_epoch INTEGER,indexed_seq INTEGER,updated_at INTEGER,archived_at INTEGER,
+      is_template INTEGER,import_job_id TEXT);
+    INSERT INTO workspaces VALUES('workspace'); INSERT INTO spaces VALUES('space','workspace');`);
+  return db;
+}
+
+test("metadata pagination reads every page beyond the old 100000-row ceiling", () => {
+  const db = metadataFixture();
+  try {
+    db.exec("BEGIN");
+    const insert = db.prepare("INSERT INTO pages VALUES(?,'workspace','space',NULL,'document',1,1,0,1,NULL,0,NULL)");
+    for (let i = 0; i < 100_001; i++) insert.run(String(i).padStart(6, "0"));
+    db.exec("COMMIT");
+    let batches = 0;
+    const result = metadataIntegrityCheck((sql) => {
+      if (sql.startsWith("SELECT id,workspace_id,space_id")) batches++;
+      return db.prepare(sql).all();
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.complete, true);
+    assert.equal(result.checkedPages, 100_001);
+    assert.equal(batches, 202);
+  } finally {
+    db.close();
+  }
+});
+
+test("metadata fingerprint rejects same-count scope changes and nonadvancing batches", () => {
+  const db = metadataFixture();
+  try {
+    db.exec("INSERT INTO pages VALUES('page','workspace','space',NULL,'document',1,1,0,1,NULL,0,NULL)");
+    let scans = 0;
+    const result = metadataIntegrityCheck((sql) => {
+      if (sql.startsWith("SELECT id,workspace_id,space_id") && ++scans === 2)
+        db.exec("UPDATE pages SET space_id='other'");
+      return db.prepare(sql).all();
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.incomplete.some((failure) => failure.code === "workspace_revision_changed"));
+    assert.throws(
+      () =>
+        metadataIntegrityCheck((sql) => {
+          if (sql.startsWith("SELECT id FROM workspaces")) return [{ id: "same" }, { id: "same" }];
+          return db.prepare(sql).all();
+        }),
+      /did not advance/,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("the final page watermark rejects late writes after pages have been fingerprinted", () => {
+  const db = metadataFixture();
+  try {
+    db.exec(`CREATE TABLE attachments(id TEXT PRIMARY KEY,page_id TEXT,workspace_id TEXT,r2_key TEXT,size INTEGER);
+      INSERT INTO pages VALUES('page','workspace','space',NULL,'document',1,1,0,1,NULL,0,NULL)`);
+    let scans = 0;
+    const result = metadataIntegrityCheck((sql) => {
+      if (sql.startsWith("SELECT id,page_id,workspace_id,r2_key,size") && ++scans === 2)
+        db.exec("UPDATE pages SET space_id='missing',revision=revision+1");
+      return db.prepare(sql).all();
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.incomplete.some((failure) => failure.code === "workspace_revision_changed"));
+  } finally {
+    db.close();
+  }
 });
 
 test("content checker follows all cursors and verifies exact coverage", async () => {

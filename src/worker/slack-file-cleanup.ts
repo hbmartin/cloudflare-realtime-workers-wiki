@@ -11,6 +11,8 @@ import {
   SlackApiError,
   SlackRateLimitError,
   usableBotToken,
+  slackRecoveryEligibleSql,
+  SlackInstallationAuthError,
   type SlackInstallation,
 } from "./slack";
 
@@ -25,6 +27,11 @@ type CleanupJob = {
 };
 const RETRY_MS = 15 * 60_000;
 const LEASE_MS = 60_000;
+const recoverableCleanupSql = `state='paused' AND EXISTS(SELECT 1 FROM slack_installations installation
+  WHERE installation.workspace_id=slack_file_cleanup_jobs.workspace_id AND installation.team_id=slack_file_cleanup_jobs.team_id
+    AND installation.bot_user_id=slack_file_cleanup_jobs.bot_user_id AND installation.disconnected_at IS NULL
+    AND ${slackRecoveryEligibleSql()} AND installation.file_scope_error_revision IS NULL
+    AND instr(','||installation.scopes||',',',files:write,')>0)`;
 
 export async function slackFileCleanupHealth(env: Env, workspaceId: string): Promise<SlackCleanupHealth> {
   const rows =
@@ -44,7 +51,7 @@ export async function processSlackFileCleanup(env: Env, id: string) {
   const now = Date.now();
   const token = crypto.randomUUID();
   const claim = await env.DB.prepare(`UPDATE slack_file_cleanup_jobs SET claim_token=?,claimed_at=?
-    WHERE id=? AND state='pending' AND next_attempt_at<=? AND (claimed_at IS NULL OR claimed_at<=?)`)
+    WHERE id=? AND ((state='pending' AND next_attempt_at<=?) OR (${recoverableCleanupSql})) AND (claimed_at IS NULL OR claimed_at<=?)`)
     .bind(token, now, id, now, now - LEASE_MS)
     .run();
   if (!claim.meta.changes) return false;
@@ -65,7 +72,7 @@ export async function processSlackFileCleanup(env: Env, id: string) {
     }
     const installation =
       await env.DB.prepare(`SELECT * FROM slack_installations WHERE workspace_id=? AND team_id=? AND bot_user_id=?
-      AND disconnected_at IS NULL AND auth_error IS NULL`)
+      AND disconnected_at IS NULL AND ${slackRecoveryEligibleSql("slack_installations")}`)
         .bind(job.workspace_id, job.team_id, job.bot_user_id)
         .first<SlackInstallation>();
     if (
@@ -81,13 +88,16 @@ export async function processSlackFileCleanup(env: Env, id: string) {
       preparedToken = await usableBotToken(env, installation);
     } catch (error) {
       const paused =
-        error instanceof SlackApiError &&
-        ((error.code === "missing_scope" && (await recordSlackFileScopeError(env, installation, error))) ||
-          (slackInstallationError(error) &&
-            (await recordSlackInstallationError(env, installation.id, error, installation.generation))));
+        error instanceof SlackInstallationAuthError ||
+        (error instanceof SlackApiError &&
+          ((error.code === "missing_scope" && (await recordSlackFileScopeError(env, installation, error))) ||
+            (slackInstallationError(error) &&
+              (await recordSlackInstallationError(env, installation.id, error, installation.generation)))));
       await save(
         paused ? "paused" : "pending",
-        error instanceof SlackApiError ? error.code : "cleanup_credentials_unavailable",
+        error instanceof SlackApiError || error instanceof SlackInstallationAuthError
+          ? error.code
+          : "cleanup_credentials_unavailable",
         paused ? null : Date.now() + RETRY_MS,
       );
       return false;
@@ -160,7 +170,7 @@ export async function processSlackFileCleanup(env: Env, id: string) {
 export async function processDueSlackFileCleanup(env: Env) {
   const now = Date.now();
   const rows = await env.DB.prepare(`SELECT id,workspace_id,team_id FROM slack_file_cleanup_jobs
-    WHERE state='pending' AND next_attempt_at<=? AND (claimed_at IS NULL OR claimed_at<=?) ORDER BY next_attempt_at,id LIMIT 25`)
+    WHERE ((state='pending' AND next_attempt_at<=?) OR (${recoverableCleanupSql})) AND (claimed_at IS NULL OR claimed_at<=?) ORDER BY coalesce(next_attempt_at,0),id LIMIT 25`)
     .bind(now, now - LEASE_MS)
     .all<{ id: string; workspace_id: string; team_id: string }>();
   const limited = new Set<string>();

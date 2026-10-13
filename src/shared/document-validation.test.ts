@@ -26,6 +26,27 @@ describe("document validation", () => {
     expect(requiredDocumentCapabilities(page(block("table", { type: "table" })))).toEqual(["native-tables-v1"]);
   });
 
+  it("counts structural elements for capabilities while retaining complete write limits and rejecting text children", () => {
+    const manyTextRuns = page(
+      block("runs", { type: "paragraph", content: Array.from({ length: 250_000 }, () => ({ ...text })) }),
+    );
+    expect(requiredDocumentCapabilities(manyTextRuns)).toEqual([]);
+    expect(() => validateDocumentTree(manyTextRuns)).toThrow(/structural limits/);
+    expect(
+      requiredDocumentCapabilities({
+        type: "doc",
+        content: Array.from({ length: 250_000 }, () => ({ type: "paragraph" })),
+      }),
+    ).toContain("unsupported:document-structure");
+    const malformedText = page(
+      block("malformed", { type: "paragraph", content: [{ ...text, content: [{ type: "footnoteReference" }] }] }),
+    );
+    expect(requiredDocumentCapabilities(malformedText)).toEqual(["footnotes-v1", "unsupported:document-structure"]);
+    expect(
+      requiredDocumentCapabilities(page(block("missing-text", { type: "paragraph", content: [{ type: "text" }] }))),
+    ).toContain("unsupported:document-structure");
+  });
+
   it("accepts supported block and inline structure including empty documents", () => {
     expect(() => validateDocumentTree(page())).not.toThrow();
     expect(() =>
@@ -49,6 +70,20 @@ describe("document validation", () => {
         page(block("code", { type: "codeBlock", content: [{ ...text, marks: [{ type: "comment--thread_1" }] }] })),
       ),
     ).not.toThrow();
+    const annotation = { type: "comment", attrs: { threadId: "thread", orphan: false } };
+    for (const type of ["paragraph", "codeBlock"]) {
+      expect(() =>
+        validateDocumentTree(page(block(type, { type, content: [{ ...text, marks: [annotation] }] }))),
+      ).not.toThrow();
+    }
+    for (const mark of [
+      { ...annotation, attrs: { threadId: 1 } },
+      { ...annotation, attrs: { orphan: "false" } },
+      { type: "commentary" },
+    ])
+      expect(() =>
+        validateDocumentTree(page(block("invalid", { type: "paragraph", content: [{ ...text, marks: [mark] }] }))),
+      ).toThrow(/annotation|unknown mark/);
     for (const node of [
       { type: "footnoteReference", attrs: { definitionId: "note" } },
       { type: "hardBreak" },

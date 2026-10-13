@@ -48,6 +48,7 @@ export type EvalContext = {
   depth: number;
   maxDepth: number;
   memo: Map<string, Value>; // keyed by propId for the current row-eval
+  optionLabels?: ReadonlyMap<string, string>;
 };
 
 export type PropertyLookup = {

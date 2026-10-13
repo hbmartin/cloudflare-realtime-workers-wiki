@@ -1,7 +1,55 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { calculateColumn, computeRowFormulas } from "./table-computed";
-import { compileFormula } from "./formula/index";
+import { compileFormula, prepareFormulaEvaluation } from "./formula/index";
+import { registry } from "./formula/functions/registry";
+import * as checking from "./formula/typecheck";
 describe("typed table computations", () => {
+  it("reuses prepared schemas and evaluates shared dependencies once per row without leaking memo values", () => {
+    const input = { id: "input", name: "Input", type: "text" };
+    const first = {
+      id: "first",
+      name: "First",
+      type: "formula",
+      config: compileFormula('toNumber(prop("Input"))', [input], "first"),
+    };
+    const second = {
+      id: "second",
+      name: "Second",
+      type: "formula",
+      config: compileFormula('prop("First") + 1', [input, first], "second"),
+    };
+    const third = {
+      id: "third",
+      name: "Third",
+      type: "formula",
+      config: compileFormula('prop("First") * 2', [input, first], "third"),
+    };
+    const properties = [input, first, second, third];
+    const typecheck = vi.spyOn(checking, "typecheck");
+    const prepared = prepareFormulaEvaluation(properties);
+    const evaluate = vi.spyOn(registry.get("tonumber")!, "eval");
+    try {
+      for (let index = 0; index < 20_000; index++) {
+        const computed = computeRowFormulas({
+          tableId: "table",
+          tableRevision: 4,
+          schemaRevision: 1,
+          rowId: `row-${index}`,
+          rowRevision: index,
+          properties,
+          prepared,
+          cells: { input: String(index) },
+        });
+        expect(computed.second?.value).toBe(index + 1);
+        expect(computed.third?.value).toBe(index * 2);
+      }
+      expect(evaluate).toHaveBeenCalledTimes(20_000);
+      expect(typecheck).toHaveBeenCalledTimes(3);
+    } finally {
+      evaluate.mockRestore();
+      typecheck.mockRestore();
+    }
+  });
   it("counts collection emptiness without treating collections as scalar unique values", () => {
     const inputs = [null, [], ["person"], ["first", "second"]];
     expect(calculateColumn("row_count", inputs)).toMatchObject({ value: 4, unsupportedCount: 0 });

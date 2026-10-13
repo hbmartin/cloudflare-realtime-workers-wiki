@@ -1,13 +1,17 @@
 import type { Env } from "./env";
 import { locationHint } from "./http";
 import { correlationHeaders, safeTelemetryErrorMessage } from "./observability";
+import { HttpError } from "./http";
+import type { PageRow } from "./page-access";
 
-type DeletionTargetKind = "document_do" | "table_do" | "r2_object" | "r2_prefix";
+type DeletionTargetKind = "document_do" | "table_do" | "table_row" | "r2_object" | "r2_prefix";
 
 interface DeletionJobRow {
   id: string;
   attempts: number;
   workspace_id: string;
+  phase: "staging" | "rows" | "cleanup";
+  root_page_id: string;
 }
 
 interface DeletionTargetRow {
@@ -18,6 +22,210 @@ interface DeletionTargetRow {
 const CLEANUP_LEASE_MS = 15 * 60_000;
 const DOCUMENT_PURGE_TIMEOUT_MS = 30_000;
 
+export const TASK_DELETION_PENDING_SQL = `EXISTS(SELECT 1 FROM deletion_job_pages lock
+ JOIN deletion_jobs job ON job.id=lock.job_id JOIN table_row_pages link ON link.page_id=lock.page_id
+ WHERE job.phase='rows' AND link.row_id=?) OR EXISTS(SELECT 1 FROM deletion_targets target
+ JOIN deletion_jobs job ON job.id=target.job_id WHERE job.phase='rows' AND target.kind='table_row'
+ AND json_extract(target.target,'$.rowId')=?)`;
+
+export async function requireTaskRestorable(env: Env, rowId: string) {
+  const pending = await env.DB.prepare(`SELECT 1 pending WHERE ${TASK_DELETION_PENDING_SQL}`)
+    .bind(rowId, rowId)
+    .first();
+  if (pending)
+    throw new HttpError(409, "deletion_pending", "Permanent deletion has already been accepted for this task.");
+}
+
+export async function pendingPageDeletion(env: Env, pageId: string) {
+  return env.DB.prepare(`WITH RECURSIVE subtree(id) AS (
+    SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id
+  ) SELECT job.id FROM deletion_job_pages lock JOIN deletion_jobs job ON job.id=lock.job_id
+    WHERE lock.page_id IN subtree AND job.phase='rows' LIMIT 1`)
+    .bind(pageId)
+    .first<{ id: string }>();
+}
+
+export async function acceptedDeletionJob(env: Env, workspaceId: string, rootId: string) {
+  const job = await env.DB.prepare(`SELECT id FROM deletion_jobs
+    WHERE workspace_id=? AND root_page_id=? AND phase IN ('rows','cleanup') ORDER BY created_at LIMIT 1`)
+    .bind(workspaceId, rootId)
+    .first<{ id: string }>();
+  if (!job) return null;
+  const pages = await env.DB.prepare("SELECT page_id FROM deletion_job_pages WHERE job_id=? ORDER BY page_id")
+    .bind(job.id)
+    .all<{ page_id: string }>();
+  return { jobId: job.id, pageIds: pages.results.map((page) => page.page_id) };
+}
+
+/** Staging is disposable. Once activated, this intent survives every cleanup failure. */
+export async function acceptPageDeletion(env: Env, workspaceId: string, actorId: string, rootId: string) {
+  const previous = await acceptedDeletionJob(env, workspaceId, rootId);
+  if (previous) return previous;
+  const pages = await env.DB.prepare(`WITH RECURSIVE subtree(id) AS (
+    SELECT id FROM pages WHERE id=? AND workspace_id=?
+    UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id
+  ) SELECT * FROM pages WHERE id IN subtree`)
+    .bind(rootId, workspaceId)
+    .all<PageRow>();
+  if (!pages.results.length || pages.results.some((page) => page.archived_at === null))
+    throw new HttpError(409, "archive_first", "Archive the whole page subtree before permanently deleting it.");
+  const pageIds = pages.results.map((page) => page.id);
+  const serializedIds = JSON.stringify(pageIds);
+  const attachments =
+    await env.DB.prepare(`SELECT r2_key FROM attachments WHERE page_id IN (SELECT value FROM json_each(?))
+    UNION ALL SELECT r2_key FROM attachment_uploads WHERE page_id IN (SELECT value FROM json_each(?)) AND state IN ('r2_complete','committed')`)
+      .bind(serializedIds, serializedIds)
+      .all<{ r2_key: string }>();
+  const targets = new Map<string, DeletionTargetRow>();
+  for (const page of pages.results) {
+    if (page.kind === "table") targets.set(`table:${page.id}`, { kind: "table_do", target: page.id });
+    else if (page.kind === "document" || page.kind === "diagram") {
+      targets.set(`prefix:${page.id}`, {
+        kind: "r2_prefix",
+        target: `${page.kind === "diagram" ? "diagrams" : "documents"}/${page.id}/`,
+      });
+      for (let epoch = 1; epoch <= page.content_epoch; epoch++)
+        targets.set(`document:${page.id}:${epoch}`, { kind: "document_do", target: `${page.id}~${epoch}` });
+    }
+  }
+  for (const attachment of attachments.results)
+    targets.set(`object:${attachment.r2_key}`, { kind: "r2_object", target: attachment.r2_key });
+  const details = await env.DB.prepare(`SELECT link.page_id detailPageId,row.id rowId,row.page_id tableId,a.generation
+    FROM table_row_pages link JOIN table_rows row ON row.id=link.row_id
+    JOIN table_authority a ON a.page_id=row.page_id AND a.state IN ('seeding','do','repairing')
+    WHERE link.page_id IN (SELECT value FROM json_each(?)) AND row.page_id NOT IN (SELECT value FROM json_each(?))`)
+    .bind(serializedIds, serializedIds)
+    .all<{ detailPageId: string; rowId: string; tableId: string; generation: number }>();
+  for (const detail of details.results)
+    targets.set(`row:${detail.rowId}`, { kind: "table_row", target: JSON.stringify(detail) });
+  const jobId = crypto.randomUUID();
+  const timestamp = Date.now();
+  try {
+    await env.DB.prepare(`INSERT INTO deletion_jobs(id,workspace_id,root_page_id,next_attempt_at,created_at,updated_at,phase,actor_id)
+      VALUES(?,?,?,?,?,?,'staging',?)`)
+      .bind(jobId, workspaceId, rootId, Number.MAX_SAFE_INTEGER, timestamp, timestamp, actorId)
+      .run();
+    const statements = [
+      ...pages.results.map((page) =>
+        env.DB.prepare(
+          `INSERT INTO deletion_job_pages(job_id,page_id,archive_operation_id,archived_at) VALUES(?,?,?,?)`,
+        ).bind(jobId, page.id, page.archive_operation_id ?? null, page.archived_at),
+      ),
+      ...[...targets.values()].map((target) =>
+        env.DB.prepare("INSERT INTO deletion_targets(job_id,kind,target) VALUES(?,?,?)").bind(
+          jobId,
+          target.kind,
+          target.target,
+        ),
+      ),
+    ];
+    for (let i = 0; i < statements.length; i += 80) await env.DB.batch(statements.slice(i, i + 80));
+    const accepted = await env.DB.prepare(`UPDATE deletion_jobs SET phase='rows',next_attempt_at=?,updated_at=?
+      WHERE id=? AND phase='staging'
+      AND NOT EXISTS (SELECT 1 FROM deletion_job_pages lock LEFT JOIN pages p ON p.id=lock.page_id
+        WHERE lock.job_id=? AND (p.id IS NULL OR p.workspace_id<>? OR p.archived_at IS NOT lock.archived_at OR p.archive_operation_id IS NOT lock.archive_operation_id))
+      AND NOT EXISTS (SELECT 1 FROM deletion_job_pages own JOIN deletion_job_pages other ON other.page_id=own.page_id
+        JOIN deletion_jobs job ON job.id=other.job_id WHERE own.job_id=? AND job.id<>? AND job.phase IN ('rows','cleanup'))
+      AND (WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id)
+        SELECT count(*) FROM subtree) = (SELECT count(*) FROM deletion_job_pages WHERE job_id=?)
+      AND NOT EXISTS(SELECT 1 FROM deletion_job_pages lock WHERE lock.job_id=? AND lock.page_id NOT IN (
+        WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id=s.id)
+        SELECT id FROM subtree))
+      AND NOT EXISTS(SELECT 1 FROM table_row_pages link JOIN table_rows row ON row.id=link.row_id
+        JOIN table_authority authority ON authority.page_id=row.page_id AND authority.state<>'d1'
+        WHERE link.page_id IN(SELECT page_id FROM deletion_job_pages WHERE job_id=?)
+        AND row.page_id NOT IN(SELECT page_id FROM deletion_job_pages WHERE job_id=?)
+        AND NOT EXISTS(SELECT 1 FROM deletion_targets target WHERE target.job_id=? AND target.kind='table_row'
+          AND json_extract(target.target,'$.rowId')=row.id AND json_extract(target.target,'$.detailPageId')=link.page_id
+          AND json_extract(target.target,'$.tableId')=row.page_id AND json_extract(target.target,'$.generation')=authority.generation))
+      RETURNING id`)
+      .bind(
+        timestamp,
+        timestamp,
+        jobId,
+        jobId,
+        workspaceId,
+        jobId,
+        jobId,
+        rootId,
+        jobId,
+        jobId,
+        rootId,
+        jobId,
+        jobId,
+        jobId,
+      )
+      .first<{ id: string }>();
+    if (!accepted) {
+      const raced = await acceptedDeletionJob(env, workspaceId, rootId);
+      await env.DB.prepare("DELETE FROM deletion_jobs WHERE id=? AND phase='staging'").bind(jobId).run();
+      if (raced) return raced;
+      throw new HttpError(
+        409,
+        "deletion_pending",
+        "The page subtree changed or overlaps an accepted deletion. Reload before retrying.",
+      );
+    }
+    return { jobId, pageIds };
+  } catch (error) {
+    await env.DB.prepare("DELETE FROM deletion_jobs WHERE id=? AND phase='staging'").bind(jobId).run();
+    throw error;
+  }
+}
+
+async function removeDeletionMetadata(env: Env, job: DeletionJobRow, leaseUntil: number) {
+  const guard = "EXISTS(SELECT 1 FROM deletion_jobs WHERE id=? AND phase='cleanup' AND next_attempt_at=?)";
+  const ids = "SELECT page_id FROM deletion_job_pages WHERE job_id=?";
+  const result = await env.DB.batch([
+    env.DB.prepare(`UPDATE deletion_jobs SET phase='cleanup',updated_at=? WHERE id=? AND phase='rows' AND next_attempt_at=?
+      AND NOT EXISTS(SELECT 1 FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL)
+      AND EXISTS(SELECT 1 FROM deletion_job_pages WHERE job_id=? AND page_id=?)
+      AND NOT EXISTS(SELECT 1 FROM deletion_job_pages lock LEFT JOIN pages p ON p.id=lock.page_id WHERE lock.job_id=?
+        AND (p.id IS NULL OR p.workspace_id<>? OR p.archived_at IS NOT lock.archived_at OR p.archive_operation_id IS NOT lock.archive_operation_id))
+      AND NOT EXISTS(SELECT 1 FROM pages p WHERE p.parent_id IN (${ids}) AND p.id NOT IN (${ids}))
+      AND NOT EXISTS(SELECT 1 FROM table_row_pages link JOIN table_rows row ON row.id=link.row_id
+        JOIN table_authority a ON a.page_id=row.page_id AND a.state<>'d1'
+        WHERE link.page_id IN (${ids}) AND row.page_id NOT IN (${ids})) RETURNING id`).bind(
+      Date.now(),
+      job.id,
+      leaseUntil,
+      job.id,
+      job.id,
+      job.root_page_id,
+      job.id,
+      job.workspace_id,
+      job.id,
+      job.id,
+      job.id,
+      job.id,
+    ),
+    env.DB.prepare(`DELETE FROM table_rows WHERE id IN(SELECT row_id FROM table_row_pages WHERE page_id IN (${ids}))
+      AND page_id NOT IN (${ids}) AND ${guard}`).bind(job.id, job.id, job.id, leaseUntil),
+    env.DB.prepare(`INSERT OR REPLACE INTO table_projection_context(page_id,generation)
+      SELECT page_id,generation FROM table_authority WHERE page_id IN (${ids}) AND ${guard}`).bind(
+      job.id,
+      job.id,
+      leaseUntil,
+    ),
+    env.DB.prepare(`DELETE FROM page_search WHERE page_id IN (${ids}) AND ${guard}`).bind(job.id, job.id, leaseUntil),
+    env.DB.prepare(
+      `DELETE FROM attachment_uploads WHERE state IN ('r2_complete','committed') AND page_id IN (${ids}) AND ${guard}`,
+    ).bind(job.id, job.id, leaseUntil),
+    env.DB.prepare(`DELETE FROM pages WHERE id=? AND workspace_id=? AND ${guard} RETURNING id`).bind(
+      job.root_page_id,
+      job.workspace_id,
+      job.id,
+      leaseUntil,
+    ),
+    env.DB.prepare(`DELETE FROM table_projection_context WHERE page_id IN (${ids}) AND ${guard}`).bind(
+      job.id,
+      job.id,
+      leaseUntil,
+    ),
+  ]);
+  return result[0]?.results.length === 1 && result[5]?.results.length === 1;
+}
+
 async function deletePrefix(bucket: R2Bucket, prefix: string) {
   let cursor: string | undefined;
   do {
@@ -27,7 +235,23 @@ async function deletePrefix(bucket: R2Bucket, prefix: string) {
   } while (cursor);
 }
 
-async function processTarget(env: Env, target: DeletionTargetRow, hint?: DurableObjectLocationHint) {
+async function processTarget(env: Env, target: DeletionTargetRow, hint?: DurableObjectLocationHint, jobId?: string) {
+  if (target.kind === "table_row") {
+    const tuple = JSON.parse(target.target) as { tableId: string };
+    const response = await env.TABLE.getByName(tuple.tableId).fetch(
+      new Request("https://table.internal/delete-row", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-table-internal": env.BETTER_AUTH_SECRET },
+        body: JSON.stringify({ ...tuple, jobId }),
+        signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
+      }),
+    );
+    if (!response.ok) throw new Error(`Canonical row deletion failed with ${response.status}`);
+    const result = await response.json<{ ok?: unknown; projectionPending?: unknown }>();
+    if (result.ok !== true || result.projectionPending !== false)
+      throw new Error("Canonical row deletion projection is pending");
+    return;
+  }
   if (target.kind === "table_do") {
     const response = await env.TABLE.getByName(target.target).fetch(
       new Request("https://table.internal/purge", {
@@ -64,19 +288,20 @@ export async function processDeletionJob(env: Env, jobId: string) {
   const job = await env.DB.prepare(
     `UPDATE deletion_jobs
         SET next_attempt_at = ?, updated_at = ?
-      WHERE id = ? AND next_attempt_at <= ?
-      RETURNING id, attempts, workspace_id`,
+      WHERE id = ? AND next_attempt_at <= ? AND phase<>'staging'
+      RETURNING id, attempts, workspace_id, phase, root_page_id`,
   )
     .bind(leaseUntil, claimedAt, jobId, claimedAt)
     .first<DeletionJobRow>();
   if (!job) return;
 
-  const targets = await env.DB.prepare(
+  let targets = await env.DB.prepare(
     `SELECT kind, target FROM deletion_targets
       WHERE job_id = ? AND completed_at IS NULL
+        AND (?<>'rows' OR kind='table_row')
       ORDER BY CASE kind WHEN 'document_do' THEN 0 WHEN 'r2_object' THEN 1 ELSE 2 END, target`,
   )
-    .bind(job.id)
+    .bind(job.id, job.phase ?? "cleanup")
     .all<DeletionTargetRow>();
 
   let hint: DurableObjectLocationHint | undefined;
@@ -87,31 +312,60 @@ export async function processDeletionJob(env: Env, jobId: string) {
     hint = locationHint(workspace?.location_hint ?? undefined);
   }
 
-  for (const target of targets.results) {
-    try {
-      await processTarget(env, target, hint);
-      await env.DB.prepare(
-        `UPDATE deletion_targets
+  let phaseFailure: string | undefined;
+  for (;;) {
+    for (const target of targets.results) {
+      try {
+        await processTarget(env, target, hint, job.id);
+        await env.DB.prepare(
+          `UPDATE deletion_targets
             SET completed_at = ?, attempts = attempts + 1, last_error = NULL
           WHERE job_id = ? AND kind = ? AND target = ?
             AND EXISTS (
               SELECT 1 FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?
             )`,
-      )
-        .bind(Date.now(), job.id, target.kind, target.target, job.id, leaseUntil)
-        .run();
-    } catch (error) {
-      const message = safeTelemetryErrorMessage(error, "Unknown cleanup failure");
-      await env.DB.prepare(
-        `UPDATE deletion_targets
+        )
+          .bind(Date.now(), job.id, target.kind, target.target, job.id, leaseUntil)
+          .run();
+      } catch (error) {
+        const message = safeTelemetryErrorMessage(error, "Unknown cleanup failure");
+        await env.DB.prepare(
+          `UPDATE deletion_targets
             SET attempts = attempts + 1, last_error = ?
           WHERE job_id = ? AND kind = ? AND target = ?
             AND EXISTS (
               SELECT 1 FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?
             )`,
+        )
+          .bind(message, job.id, target.kind, target.target, job.id, leaseUntil)
+          .run();
+      }
+    }
+    if (job.phase !== "rows") break;
+    const remainingRows = await env.DB.prepare(
+      "SELECT count(*) count FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL",
+    )
+      .bind(job.id)
+      .first<{ count: number }>();
+    if (remainingRows?.count) break;
+    try {
+      if (!(await removeDeletionMetadata(env, job, leaseUntil)))
+        throw new Error("Deletion metadata ownership changed or cleanup lease expired");
+      job.phase = "cleanup";
+      targets = await env.DB.prepare(
+        "SELECT kind,target FROM deletion_targets WHERE job_id=? AND completed_at IS NULL ORDER BY kind,target",
       )
-        .bind(message, job.id, target.kind, target.target, job.id, leaseUntil)
-        .run();
+        .bind(job.id)
+        .all<DeletionTargetRow>();
+      if (targets.results.some((target) => target.kind === "document_do")) {
+        const workspace = await env.DB.prepare("SELECT location_hint FROM workspaces WHERE id=?")
+          .bind(job.workspace_id)
+          .first<{ location_hint: string | null }>();
+        hint = locationHint(workspace?.location_hint ?? undefined);
+      }
+    } catch (error) {
+      phaseFailure = safeTelemetryErrorMessage(error, "Deletion metadata cleanup failed");
+      break;
     }
   }
 
@@ -120,7 +374,7 @@ export async function processDeletionJob(env: Env, jobId: string) {
   )
     .bind(job.id)
     .first<{ count: number }>();
-  if (!pending?.count) {
+  if (!pending?.count && job.phase !== "rows") {
     await env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?`)
       .bind(job.id, leaseUntil)
       .run();
@@ -140,13 +394,23 @@ export async function processDeletionJob(env: Env, jobId: string) {
         SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
       WHERE id = ? AND next_attempt_at = ?`,
   )
-    .bind(attempts, Date.now() + delay, failed?.last_error ?? "Cleanup incomplete", Date.now(), job.id, leaseUntil)
+    .bind(
+      attempts,
+      Date.now() + delay,
+      phaseFailure ?? failed?.last_error ?? "Cleanup incomplete",
+      Date.now(),
+      job.id,
+      leaseUntil,
+    )
     .run();
 }
 
 export async function processDueDeletionJobs(env: Env, limit = 10) {
+  await env.DB.prepare("DELETE FROM deletion_jobs WHERE phase='staging' AND created_at<?")
+    .bind(Date.now() - 24 * 60 * 60_000)
+    .run();
   const jobs = await env.DB.prepare(
-    `SELECT id FROM deletion_jobs WHERE next_attempt_at <= ? ORDER BY created_at LIMIT ?`,
+    `SELECT id FROM deletion_jobs WHERE next_attempt_at <= ? AND phase<>'staging' ORDER BY created_at LIMIT ?`,
   )
     .bind(Date.now(), limit)
     .all<{ id: string }>();

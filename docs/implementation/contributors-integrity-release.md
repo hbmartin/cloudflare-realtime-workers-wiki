@@ -74,6 +74,10 @@ Bounds are explicit. A content object larger than 10 MiB, more than 2,000 canoni
 
 Deployment invokes the read-only metadata checker before and after migrations, using the configured Cloudflare credentials and D1 query adapter. No owner session is required for these deployment checks. Fresh empty databases are supported; optional legacy tables are identified in `supportedTables`. Unsupported core schemas and truncated metadata reads cannot pass. Integrity checks never repair content, roll back migrations or modify migration history.
 
+Deployment metadata scans use complete keyset pagination and compare two scans of every supported collection, including counts and metadata fingerprints. They have no total-row ceiling. The owner content-inspection bounds above remain unchanged.
+
+For a migration that repairs an existing metadata anomaly, `node scripts/deploy.mjs deploy --repair-integrity` explicitly permits existing structural failures or a recognized older schema in the initial check. Database failures, incomplete coverage and concurrent metadata changes still stop deployment. The post-migration check must be complete and clean before Worker upload; migration preflights remain mandatory. Normal deployment retains strict checks both before and after migrations.
+
 The standalone metadata command is:
 
 ```sh

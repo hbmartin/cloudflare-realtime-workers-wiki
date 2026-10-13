@@ -2,19 +2,22 @@ import type { Env, MemberContext } from "./env";
 import { HttpError, type HttpErrorStatus } from "./http";
 import { pageForMember, requirePageEditor } from "./page-access";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
-import type { ColumnType } from "../shared/types";
 import {
   normalizedColumnName,
-  versionedPropertyConfig,
-  metadataColumns,
-  type CollaborativeColumn,
-  type CollaborativeRow,
   type TableCommand,
   type TableCommandResult,
   type TableQueryResult,
   type TableView,
 } from "../shared/table-protocol";
 import { tableActorSignature, type TableActor, type ProjectionStatement } from "./table-authority";
+import {
+  projectionColumns,
+  projectionRows,
+  compareTableProjection,
+  type TableSnapshot,
+  type TableVerification,
+} from "./table-projection";
+export type { TableSnapshot } from "./table-projection";
 
 type TableRegistry = {
   page_id: string;
@@ -121,46 +124,6 @@ export async function tableInternal<T>(env: Env, pageId: string, path: string, b
   );
 }
 
-async function projectionColumns(env: Env, pageId: string): Promise<CollaborativeColumn[]> {
-  const [columns, options] = await Promise.all([
-    env.DB.prepare("SELECT * FROM table_columns WHERE page_id=? ORDER BY position,id").bind(pageId).all<{
-      id: string;
-      name: string;
-      type: ColumnType;
-      position: number;
-      property_revision: number;
-      property_generation: number;
-      config_json: string | null;
-    }>(),
-    env.DB.prepare(
-      "SELECT o.* FROM table_select_options o JOIN table_columns p ON p.id=o.column_id WHERE p.page_id=? ORDER BY o.position,o.id",
-    )
-      .bind(pageId)
-      .all<{ id: string; column_id: string; label: string; position: number; color: string }>(),
-  ]);
-  return columns.results.map((column) => ({
-    id: column.id,
-    name: column.name,
-    type: column.type,
-    position: column.position,
-    revision: column.property_revision,
-    generation: column.property_generation,
-    config: versionedPropertyConfig(column.config_json ? JSON.parse(column.config_json) : {}),
-    options: options.results
-      .filter((option) => option.column_id === column.id)
-      .map((option) => ({ id: option.id, label: option.label, position: option.position, color: option.color })),
-  }));
-}
-
-export type TableSnapshot = {
-  revision: number;
-  columns: CollaborativeColumn[];
-  views: TableView[];
-  rows: CollaborativeRow[];
-  taskList?: boolean;
-  people?: Array<{ id: string; name: string }>;
-};
-
 /** Internal template snapshots bind every page to one revision; D1 is never read for migrated data. */
 export async function tableTemplateSnapshot(env: Env, pageId: string): Promise<TableSnapshot> {
   const registry = await tableRegistry(env, pageId);
@@ -232,67 +195,6 @@ export async function tableTemplateSnapshot(env: Env, pageId: string): Promise<T
   }
   return snapshot;
 }
-async function projectionRows(env: Env, pageId: string, after: string | null): Promise<CollaborativeRow[]> {
-  const rows = await env.DB.prepare(
-    `SELECT r.*,detail.page_id detail_page_id FROM table_rows r LEFT JOIN table_row_pages detail ON detail.row_id=r.id WHERE r.page_id=? ${after ? "AND r.id>?" : ""} ORDER BY r.id LIMIT 100`,
-  )
-    .bind(pageId, ...(after ? [after] : []))
-    .all<{
-      id: string;
-      position: number;
-      created_at: number;
-      created_by: string | null;
-      updated_at: number;
-      updated_by: string | null;
-      row_revision: number;
-      detail_page_id: string | null;
-    }>();
-  const cells = rows.results.length
-    ? await env.DB.prepare(
-        "SELECT * FROM table_cells WHERE row_id IN (SELECT value FROM json_each(?)) ORDER BY row_id,column_id",
-      )
-        .bind(JSON.stringify(rows.results.map((row) => row.id)))
-        .all<{
-          row_id: string;
-          column_id: string;
-          text_value: string | null;
-          number_value: number | null;
-          boolean_value: number | null;
-          date_value: string | null;
-          select_value: string | null;
-          json_value: string | null;
-          cell_revision: number;
-        }>()
-    : { results: [] };
-  return rows.results.map((row) => {
-    const values = cells.results.filter((cell) => cell.row_id === row.id);
-    return {
-      id: row.id,
-      revision: row.row_revision,
-      position: row.position,
-      cells: Object.fromEntries(
-        values.map((cell) => [
-          cell.column_id,
-          cell.json_value !== null
-            ? JSON.parse(cell.json_value)
-            : (cell.text_value ??
-              cell.number_value ??
-              (cell.boolean_value === null ? null : Boolean(cell.boolean_value)) ??
-              cell.date_value ??
-              cell.select_value ??
-              null),
-        ]),
-      ),
-      cellRevisions: Object.fromEntries(values.map((cell) => [cell.column_id, cell.cell_revision])),
-      detailPageId: row.detail_page_id,
-      createdAt: row.created_at,
-      createdBy: row.created_by,
-      editedAt: row.updated_at,
-      editedBy: row.updated_by,
-    };
-  });
-}
-
 /** A generation fence rejects legacy writes while deterministic bounded seed batches resume. */
 export async function enableTableAuthority(env: Env, member: MemberContext, pageId: string) {
   const page = await pageForMember(env, member, pageId);
@@ -301,6 +203,14 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
   if (page.kind !== "table") throw new HttpError(422, "table_required", "Choose a table.");
   let registry = await tableRegistry(env, pageId);
   if (registry && ["do", "repairing"].includes(registry.state)) return registry;
+  if (registry?.state !== "seeding") {
+    const deleting = await env.DB.prepare(`SELECT 1 FROM table_rows row JOIN table_row_pages link ON link.row_id=row.id
+      JOIN deletion_job_pages locked ON locked.page_id=link.page_id JOIN deletion_jobs job ON job.id=locked.job_id
+      WHERE row.page_id=? AND job.phase='rows' LIMIT 1`)
+      .bind(pageId)
+      .first();
+    if (deleting) throw new HttpError(409, "deletion_pending", "A task in this table is being permanently deleted.");
+  }
   const lease = await env.DB.prepare(
     "SELECT holder_user_id,holder_session_id FROM table_leases WHERE page_id=? AND expires_at>?",
   )
@@ -316,11 +226,19 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
     .bind(pageId)
     .first<{ revision: number }>();
   if (!state) throw new HttpError(409, "table_state_missing", "Table state is missing.");
-  await env.DB.prepare(
-    `INSERT INTO table_authority(page_id,state,generation,seed_revision) VALUES(?,'seeding',1,?) ON CONFLICT(page_id) DO UPDATE SET state='seeding',seed_revision=excluded.seed_revision WHERE table_authority.state='d1'`,
-  )
-    .bind(pageId, state.revision)
-    .run();
+  if (registry?.state !== "seeding") {
+    try {
+      await env.DB.prepare(
+        `INSERT INTO table_authority(page_id,state,generation,seed_revision) VALUES(?,'seeding',1,?) ON CONFLICT(page_id) DO UPDATE SET state='seeding',seed_revision=excluded.seed_revision WHERE table_authority.state='d1'`,
+      )
+        .bind(pageId, state.revision)
+        .run();
+    } catch (error) {
+      if (String(error).includes("deletion_pending"))
+        throw new HttpError(409, "deletion_pending", "A task in this table is being permanently deleted.");
+      throw error;
+    }
+  }
   registry = (await tableRegistry(env, pageId))!;
   const frozen = await env.DB.prepare("SELECT revision FROM table_state WHERE page_id=?")
     .bind(pageId)
@@ -410,97 +328,14 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
 export async function repairTableProjection(env: Env, member: MemberContext, pageId: string) {
   await pageForMember(env, member, pageId);
   if (member.role !== "owner") throw new HttpError(403, "owner_required", "Only an owner can repair a projection.");
-  await env.DB.prepare("UPDATE table_authority SET state='repairing' WHERE page_id=? AND state='do'")
-    .bind(pageId)
-    .run();
-  await tableInternal(env, pageId, "/repair", {});
-  const result = await verifyTableProjection(env, pageId);
-  if (!result.projectionMatches)
-    throw new HttpError(
-      503,
-      "table_projection_mismatch",
-      "Projection verification failed. The write fence remains active; retry repair.",
-    );
-  await env.DB.prepare("UPDATE table_authority SET state='do' WHERE page_id=? AND state='repairing'")
-    .bind(pageId)
-    .run();
-  return result;
+  return tableInternal<Awaited<ReturnType<typeof compareTableProjection>>>(env, pageId, "/repair", {});
 }
 
 /** Compare the actual disposable projection, including typed values and computed source stamps. */
 export async function verifyTableProjection(env: Env, pageId: string) {
   const canonical = await tableTemplateSnapshot(env, pageId);
-  const projected: TableSnapshot = {
-    revision: canonical.revision,
-    columns: await projectionColumns(env, pageId),
-    rows: [],
-    views: (
-      await env.DB.prepare("SELECT value_json FROM table_views WHERE page_id=? ORDER BY id")
-        .bind(pageId)
-        .all<{ value_json: string }>()
-    ).results.map((view) => JSON.parse(view.value_json) as TableView),
-    people: (
-      await env.DB.prepare("SELECT user_id id,name FROM table_people WHERE page_id=? ORDER BY user_id")
-        .bind(pageId)
-        .all<{ id: string; name: string }>()
-    ).results,
-  };
-  let after: string | null = null;
-  do {
-    const rows = await projectionRows(env, pageId, after);
-    projected.rows.push(...rows);
-    if (projected.rows.length > 20000)
-      throw new HttpError(422, "table_limit", "This table exceeds the verification row limit.");
-    after = rows.length === 100 ? rows.at(-1)!.id : null;
-  } while (after);
-  const caches = (
-    await env.DB.prepare(
-      "SELECT c.* FROM table_computed_cells c JOIN table_rows r ON r.id=c.row_id WHERE r.page_id=? ORDER BY c.row_id,c.column_id",
-    )
-      .bind(pageId)
-      .all<{ row_id: string; column_id: string; value_json: string; source_json: string }>()
-  ).results;
-  for (const row of projected.rows)
-    row.computedCells = Object.fromEntries(
-      caches
-        .filter((cache) => cache.row_id === row.id)
-        .map((cache) => [
-          cache.column_id,
-          { version: 1 as const, value: JSON.parse(cache.value_json), source: JSON.parse(cache.source_json) },
-        ]),
-    );
-  const hashSnapshot = async (snapshot: TableSnapshot) => {
-    let hash = await sha256Hex(
-      canonicalJson({
-        columns: snapshot.columns.map(({ conversion: _conversion, ...column }) => column),
-        views: snapshot.views,
-        people: snapshot.people ?? [],
-      }),
-    );
-    for (const row of snapshot.rows) {
-      const value = { ...row, cells: { ...row.cells }, computedCells: row.computedCells ?? {} };
-      for (const property of snapshot.columns) if (metadataColumns.has(property.type)) delete value.cells[property.id];
-      hash = await sha256Hex(`${hash}:${canonicalJson(value)}`);
-    }
-    return hash;
-  };
-  const [canonicalHash, projectionHash] = await Promise.all([hashSnapshot(canonical), hashSnapshot(projected)]);
-  const current = await tableInternal<{
-    revision: number;
-    projectedRevision: number;
-    generation: number;
-    hash: string;
-    rowCount: number;
-  }>(env, pageId, "/verify");
-  const registry = await tableRegistry(env, pageId);
-  const consistent = current.revision === canonical.revision && registry?.projected_revision === canonical.revision;
-  return {
-    ...current,
-    canonicalHash,
-    projectionHash,
-    projectionMatches: consistent && canonicalHash === projectionHash,
-    consistent,
-  };
+  const current = await tableInternal<TableVerification>(env, pageId, "/verify");
+  return compareTableProjection(env, pageId, canonical, current);
 }
 
 /** Serialize trusted statement builders; this adapter never executes SQL. */

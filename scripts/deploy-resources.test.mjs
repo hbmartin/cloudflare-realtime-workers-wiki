@@ -232,6 +232,22 @@ describe("portable resource intent", () => {
     expect(deploymentErrorMessage(secret)).not.toContain("private");
     expect(deploymentErrorMessage(new Error("x".repeat(5000))).length).toBe(4000);
   });
+  it.each(["api_key", "password", "access_token", "CLIENT_SECRET"])(
+    "redacts quoted %s credentials, spaces and escaped quotes",
+    (key) => {
+      const diagnostic = JSON.stringify({ [key]: 'dummy private "quoted" credential', message: "failed" });
+      const text = deploymentErrorMessage(new Error(diagnostic));
+      expect(text).toContain("[redacted]");
+      expect(text).not.toContain("dummy");
+      expect(text).not.toContain("quoted");
+      expect(text).toContain("failed");
+      expect(deploymentErrorMessage(new Error(`${key}='dummy private credential'`))).not.toContain("dummy");
+      const escaped = deploymentErrorMessage(new Error(JSON.stringify(diagnostic)));
+      expect(escaped).not.toContain("dummy");
+      expect(escaped).not.toContain("quoted");
+      expect(escaped).not.toContain("credential");
+    },
+  );
   it.each(["provision", "upload"])("prints the original %s failure together with adoption guidance", async (stage) => {
     const cause = new Error("Cloudflare POST request failed (403). Check account permissions.");
     const failure = await deployPrepared(

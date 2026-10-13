@@ -70,6 +70,9 @@ import {
   SlackApiError,
   slackMissingScope,
   slackInstallationError,
+  slackRefreshableAuthError,
+  usableBotToken,
+  type SlackInstallation,
   SLACK_REDRIVE_STALE_MS,
 } from "./slack";
 import { deliverSlackHome } from "./slack-workspace";
@@ -2174,7 +2177,7 @@ async function redriveNonReceiptSlackOutbox(env: Env) {
               history_pause_total_ms: number;
             })
           : null;
-      const installation = await env.DB.prepare(`SELECT auth_error_at,auth_paused_ms FROM slack_installations
+      const installation = await env.DB.prepare(`SELECT * FROM slack_installations
       WHERE workspace_id=? AND disconnected_at IS NULL ${row.topic === "slack_share_response" ? "AND id=? AND generation=?" : ""}`)
         .bind(
           row.workspace_id,
@@ -2185,7 +2188,16 @@ async function redriveNonReceiptSlackOutbox(env: Env) {
               ]
             : []),
         )
-        .first<{ auth_error_at: number | null; auth_paused_ms: number }>();
+        .first<SlackInstallation & { auth_error_at: number | null; auth_paused_ms: number }>();
+      if (installation && slackRefreshableAuthError(installation)) {
+        await usableBotToken(env, installation, undefined, "defer");
+        Object.assign(
+          installation,
+          await env.DB.prepare(`SELECT auth_error_at,auth_paused_ms FROM slack_installations WHERE id=?`)
+            .bind(installation.id)
+            .first(),
+        );
+      }
       const authClock =
         (installation?.auth_paused_ms ?? 0) +
         (installation?.auth_error_at === null || installation?.auth_error_at === undefined

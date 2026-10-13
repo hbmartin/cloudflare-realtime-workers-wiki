@@ -21,7 +21,7 @@ import { deleteR2AttemptArtifacts, deleteR2Prefix } from "./r2";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { tableTemplateSnapshot } from "./table-service";
 import { computeRowFormulas } from "../shared/table-computed";
-import { isErrorCell } from "../shared/formula";
+import { isErrorCell, prepareFormulaEvaluation } from "../shared/formula";
 
 const EXPORT_ARTIFACT_TTL_MS = 7 * 24 * 60 * 60_000;
 const EXPORT_MAX_BYTES = 64 * 1024 * 1024;
@@ -293,6 +293,7 @@ async function tableExport(env: Env, page: ExportPage): Promise<SerializedExport
     markdown.push(`| ${columns.map((column) => escapeMarkdownCell(column.name)).join(" | ")} |\n`);
     markdown.push(`| ${columns.map(() => "---").join(" | ")} |\n`);
   }
+  const prepared = prepareFormulaEvaluation(columns);
   for (const row of snapshot.rows.sort((a, b) => a.position - b.position || a.id.localeCompare(b.id))) {
     if (archived.has(row.id)) continue;
     const computed =
@@ -305,6 +306,7 @@ async function tableExport(env: Env, page: ExportPage): Promise<SerializedExport
         rowRevision: row.revision ?? snapshot.revision,
         cells: row.cells,
         properties: columns,
+        prepared,
       });
     const values = columns.map((column) => {
       const value = column.type === "formula" ? computed[column.id]?.value : row.cells[column.id];

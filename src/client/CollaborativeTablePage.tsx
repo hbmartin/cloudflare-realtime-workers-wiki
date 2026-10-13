@@ -789,7 +789,9 @@ function viewDraft(view: TableView | null, columns: CollaborativeColumn[]) {
     filters: view?.filters?.kind === "group" ? view.filters.filters : view?.filters ? [view.filters] : [],
     join: view?.filters?.kind === "group" ? view.filters.operator : ("and" as const),
     sorts: view?.sorts ?? [],
-    visible: view?.visibleColumnIds ?? columns.map((column) => column.id),
+    visible:
+      view?.visibleColumnIds.filter((id) => columns.some((column) => column.id === id)) ??
+      columns.map((column) => column.id),
     calculations: view?.calculations ?? {},
   };
 }
@@ -865,7 +867,7 @@ function ViewEditor({
           personal,
           filters: { kind: "group", operator: join, filters },
           sorts,
-          visibleColumnIds: visible,
+          visibleColumnIds: visible.filter((id) => columns.some((column) => column.id === id)),
           calculations,
         });
       }}

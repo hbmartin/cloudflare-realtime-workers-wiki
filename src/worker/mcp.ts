@@ -72,11 +72,11 @@ export async function pruneStagedMcpPages(env: Env) {
     const cleanupId = `mcp:cleanup:${row.id}`;
     const claimedAt = Date.now();
     const claimed = await env.DB.prepare(
-      "UPDATE pages SET import_job_id=?,updated_at=? WHERE id=? AND import_job_id=? AND updated_at=?",
+      "UPDATE pages SET import_job_id=?,updated_at=? WHERE id=? AND import_job_id=? AND updated_at=? RETURNING id",
     )
       .bind(cleanupId, claimedAt, row.id, row.import_job_id, row.updated_at)
-      .run();
-    if (claimed.meta.changes !== 1) continue;
+      .all<{ id: string }>();
+    if (claimed.results.length !== 1) continue;
     try {
       const purged = await env.DOCUMENT.getByName(`${row.id}~${row.content_epoch}`).fetch(
         new Request("https://document.internal/purge", {
@@ -285,11 +285,11 @@ async function createPageTool(request: Request, env: Env, context: BackgroundCon
   if (!stage || stage.import_job_id !== stageId)
     throw new HttpError(409, "page_create_unknown", "The page creation outcome could not be verified.");
   const reserved = await env.DB.prepare(
-    "UPDATE pages SET updated_at=? WHERE id=? AND workspace_id=? AND import_job_id=?",
+    "UPDATE pages SET updated_at=? WHERE id=? AND workspace_id=? AND import_job_id=? RETURNING id",
   )
     .bind(Date.now(), staged.pageId, access.member.workspace.id, stageId)
-    .run();
-  if (reserved.meta.changes !== 1)
+    .all<{ id: string }>();
+  if (reserved.results.length !== 1)
     throw new HttpError(409, "page_create_unknown", "The staged page was changed before content could be saved.");
   access = await currentAccess(request, env, ["pages:write"]);
   await writableDestination(env, access, input.space_id, parentId);

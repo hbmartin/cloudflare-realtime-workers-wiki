@@ -55,7 +55,13 @@ import {
   resolvePartSize,
   UPLOAD_SESSION_TTL_MS,
 } from "./attachments";
-import { processDeletionJob, processDueDeletionJobs } from "./cleanup";
+import {
+  acceptPageDeletion,
+  acceptedDeletionJob,
+  pendingPageDeletion,
+  processDeletionJob,
+  processDueDeletionJobs,
+} from "./cleanup";
 import { linkPreview, linkPreviewImage, pruneLinkPreviews } from "./link-previews";
 import {
   deleteDateReminder,
@@ -309,7 +315,6 @@ registerMetricMiddleware(app, "*", async (c, next) => {
     if (registered) setMetricRouteTemplate(registered);
   }
 });
-const DELETION_TARGET_BATCH_SIZE = 50;
 // Each page costs three or four statements, so this stays far inside D1's per-invocation
 // query ceiling while still collapsing a tree level into one request.
 const PAGE_BATCH_MAX = 50;
@@ -4598,6 +4603,8 @@ app.post("/api/pages/:id/restore", async (c) => {
   requireEditor(member);
   const page = await pageForMember(c.env, member, c.req.param("id"), true);
   requirePageEditor(page);
+  if (await pendingPageDeletion(c.env, page.id))
+    throw new HttpError(409, "deletion_pending", "Permanent deletion has already been accepted for this page.");
   if (page.archived_at === null) {
     const active = await c.env.DB.prepare(
       `WITH RECURSIVE subtree(id) AS (
@@ -4659,6 +4666,10 @@ app.post("/api/pages/:id/restore", async (c) => {
     ? "archive_operation_id = ?"
     : "archive_operation_id IS NULL AND archived_at = ?";
   const archiveOwnership = archiveOperationId ?? archiveTimestamp;
+  const deletionGuard = `NOT EXISTS(SELECT 1 FROM deletion_job_pages lock JOIN deletion_jobs job ON job.id=lock.job_id
+    WHERE job.phase='rows' AND lock.page_id IN (
+      WITH RECURSIVE locked_subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN locked_subtree s ON p.parent_id=s.id)
+      SELECT id FROM locked_subtree))`;
   const restoredSnapshotStatement = c.env.DB.prepare(
     `SELECT * FROM pages WHERE id IN (
       WITH RECURSIVE subtree(id) AS (SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id)
@@ -4673,8 +4684,8 @@ app.post("/api/pages/:id/restore", async (c) => {
          WITH RECURSIVE subtree(id) AS (
            SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
          ) SELECT pages.id FROM pages JOIN subtree ON subtree.id = pages.id WHERE ${archiveOwnershipSql}
-       )`,
-      ).bind(page.id, archiveOwnership),
+       ) AND ${deletionGuard}`,
+      ).bind(page.id, archiveOwnership, page.id),
       c.env.DB.prepare(
         `WITH RECURSIVE subtree(id) AS (
          SELECT id FROM pages WHERE id = ? AND workspace_id = ?
@@ -4682,8 +4693,8 @@ app.post("/api/pages/:id/restore", async (c) => {
        ) UPDATE pages
            SET archived_at = NULL, archived_by = NULL, archive_operation_id = NULL,
                revision = revision + 1, updated_by = ?, updated_at = ?
-         WHERE id IN subtree AND ${archiveOwnershipSql}`,
-      ).bind(page.id, member.workspace.id, member.user.id, now(), archiveOwnership),
+         WHERE id IN subtree AND ${archiveOwnershipSql} AND ${deletionGuard}`,
+      ).bind(page.id, member.workspace.id, member.user.id, now(), archiveOwnership, page.id),
       c.env.DB.prepare(
         `DELETE FROM page_search WHERE page_id IN (
          WITH RECURSIVE subtree(id) AS (
@@ -4705,6 +4716,8 @@ app.post("/api/pages/:id/restore", async (c) => {
     restoredSnapshotStatement,
   );
   if (!restored || !restored.results.some((item) => item.id === page.id)) {
+    if (await pendingPageDeletion(c.env, page.id))
+      throw new HttpError(409, "deletion_pending", "Permanent deletion has already been accepted for this page.");
     throw new Error("The restore batch did not return its authoritative page snapshot.");
   }
   const restoredPages = restored.results.map(pageJson);
@@ -4729,146 +4742,16 @@ app.post("/api/pages/:id/restore", async (c) => {
 app.post("/api/pages/:id/permanent-delete", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   requireOwner(member);
-  const page = await pageForMember(c.env, member, c.req.param("id"), true);
-  if (!page.archived_at) throw new HttpError(409, "archive_first", "Archive a page before permanently deleting it.");
-  const [subtree, attachments] = await Promise.all([
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
-         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       ) SELECT * FROM pages WHERE id IN subtree`,
-    )
-      .bind(page.id)
-      .all<PageRow>(),
-    c.env.DB.prepare(
-      `WITH RECURSIVE subtree(id) AS (
-         SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-       )
-       SELECT r2_key FROM attachments WHERE page_id IN subtree
-       UNION ALL
-       SELECT r2_key FROM attachment_uploads
-        WHERE page_id IN subtree AND state IN ('r2_complete', 'committed')`,
-    )
-      .bind(page.id)
-      .all<{ r2_key: string }>(),
-  ]);
-  const jobId = crypto.randomUUID();
-  const timestamp = now();
-  const targets = new Map<string, { kind: "document_do" | "table_do" | "r2_object" | "r2_prefix"; target: string }>();
-  for (const item of subtree.results) {
-    if (item.kind === "table") {
-      targets.set(`table_do:${item.id}`, { kind: "table_do", target: item.id });
-      continue;
-    }
-    if (item.kind !== "document" && item.kind !== "diagram") continue;
-    const prefix = `${item.kind === "diagram" ? "diagrams" : "documents"}/${item.id}/`;
-    targets.set(`r2_prefix:${prefix}`, { kind: "r2_prefix", target: prefix });
-    for (let epoch = 1; epoch <= item.content_epoch; epoch++) {
-      targets.set(`document_do:${item.id}~${epoch}`, { kind: "document_do", target: `${item.id}~${epoch}` });
-    }
+  const rootId = c.req.param("id");
+  const existing = await acceptedDeletionJob(c.env, member.workspace.id, rootId);
+  if (existing) {
+    c.executionCtx.waitUntil(processDeletionJob(c.env, existing.jobId));
+    return c.json({ ok: true, pageIds: existing.pageIds, cleanupPending: true }, 202);
   }
-  for (const attachment of attachments.results) {
-    targets.set(`r2_object:${attachment.r2_key}`, { kind: "r2_object", target: attachment.r2_key });
-  }
-  const targetValues = [...targets.values()];
-  const rowDetails = await c.env.DB.prepare(
-    `SELECT link.row_id,row.page_id table_page_id FROM table_row_pages link JOIN table_rows row ON row.id=link.row_id
-     WHERE link.page_id IN (SELECT value FROM json_each(?))
-       AND row.page_id NOT IN (SELECT value FROM json_each(?))`,
-  )
-    .bind(
-      JSON.stringify(subtree.results.map((item) => item.id)),
-      JSON.stringify(subtree.results.map((item) => item.id)),
-    )
-    .all<{ row_id: string; table_page_id: string }>();
-  for (const detail of rowDetails.results) {
-    if (await collaborativeTable(c.env, detail.table_page_id)) {
-      const deleted = await tableCommand(
-        c.env,
-        member,
-        detail.table_page_id,
-        {
-          operationId: `permanent-delete:${page.id}:${detail.row_id}`,
-          kind: "delete_row",
-          payload: { rowId: detail.row_id },
-        },
-        { allowDeleteDetail: true, taskMutation: true },
-      );
-      if (deleted.projectionPending)
-        throw new HttpError(
-          503,
-          "table_projection_pending",
-          "Row removal is committed; retry deletion after its projection catches up.",
-        );
-    }
-  }
-  try {
-    await c.env.DB.prepare(
-      `INSERT INTO deletion_jobs
-        (id, workspace_id, root_page_id, next_attempt_at, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-      .bind(jobId, member.workspace.id, page.id, Number.MAX_SAFE_INTEGER, timestamp, timestamp)
-      .run();
-    for (let index = 0; index < targetValues.length; index += DELETION_TARGET_BATCH_SIZE) {
-      await c.env.DB.batch(
-        targetValues
-          .slice(index, index + DELETION_TARGET_BATCH_SIZE)
-          .map((target) =>
-            c.env.DB.prepare(`INSERT INTO deletion_targets (job_id, kind, target) VALUES (?, ?, ?)`).bind(
-              jobId,
-              target.kind,
-              target.target,
-            ),
-          ),
-      );
-    }
-    const results = await c.env.DB.batch([
-      c.env.DB.prepare(`UPDATE deletion_jobs SET next_attempt_at = ?, updated_at = ? WHERE id = ?`).bind(
-        timestamp,
-        timestamp,
-        jobId,
-      ),
-      c.env.DB.prepare(
-        `DELETE FROM page_search WHERE page_id IN (
-           WITH RECURSIVE subtree(id) AS (
-             SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-           ) SELECT id FROM subtree
-         )`,
-      ).bind(page.id),
-      c.env.DB.prepare(
-        `DELETE FROM attachment_uploads
-          WHERE state IN ('r2_complete', 'committed') AND page_id IN (
-            WITH RECURSIVE subtree(id) AS (
-              SELECT ? UNION ALL SELECT p.id FROM pages p JOIN subtree s ON p.parent_id = s.id
-            ) SELECT id FROM subtree
-          )`,
-      ).bind(page.id),
-      // The context and metadata deletion are one transaction; no legacy writer can observe this fence.
-      c.env.DB.prepare(`INSERT OR REPLACE INTO table_projection_context(page_id,generation)
-        SELECT page_id,generation FROM table_authority WHERE page_id IN (SELECT value FROM json_each(?))`).bind(
-        JSON.stringify(subtree.results.map((item) => item.id)),
-      ),
-      c.env.DB.prepare(`DELETE FROM pages WHERE id = ? AND workspace_id = ?`).bind(page.id, member.workspace.id),
-      c.env.DB.prepare("DELETE FROM table_projection_context WHERE page_id IN (SELECT value FROM json_each(?))").bind(
-        JSON.stringify(subtree.results.map((item) => item.id)),
-      ),
-    ]);
-    if (!results[4]?.meta.changes) throw new Error("Page metadata changed during permanent deletion.");
-  } catch (error) {
-    try {
-      await c.env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ?`).bind(jobId).run();
-    } catch (cleanupError) {
-      logger.error(
-        "deletion.staged_job.discard_failed",
-        "deletion",
-        "Staged deletion job could not be discarded.",
-        { jobId },
-        cleanupError,
-      );
-    }
-    throw error;
-  }
-  const pageIds = subtree.results.map((item) => item.id);
+  const page = await pageForMember(c.env, member, rootId, true);
+  if (page.archived_at === null)
+    throw new HttpError(409, "archive_first", "Archive a page before permanently deleting it.");
+  const { jobId, pageIds } = await acceptPageDeletion(c.env, member.workspace.id, member.user.id, page.id);
   sendMutationEvent(c, member.workspace.id, { type: "pages-removed", pageIds, permanently: true });
   if (page.is_template) sendWorkspaceEvent(c, member.workspace.id, { type: "organization-invalidated" });
   c.executionCtx.waitUntil(

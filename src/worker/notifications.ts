@@ -23,7 +23,7 @@ import {
   SlackApiError,
   SlackInstallationChangedError,
   SlackInstallationHealthPersistenceError,
-  personalSlackInstallationSql,
+  slackRecoveryEligibleSql,
   SlackRateLimitError,
   SlackTokenRefreshInProgressError,
   slackChannelFanoutStatements,
@@ -839,7 +839,7 @@ export async function deliverNotification(env: Env, notificationId: string, outb
 const DIGEST_STATEMENT_BUDGET = 240;
 const DIGEST_CHANNEL_COUNT = 2;
 const DIGEST_STATEMENTS_PER_CANDIDATE = 11;
-const DIGEST_REFRESH_STATEMENTS = 7;
+const DIGEST_REFRESH_STATEMENTS = 8;
 class DigestBudgetExhaustedError extends Error {}
 const DIFF_DIGEST_PAGE_LIMIT = 10;
 function digestCandidateCost(env: Env, pages: number) {
@@ -851,7 +851,10 @@ function digestCandidateCost(env: Env, pages: number) {
 function digestClaimAllowance(env: Env, channel: DigestChannel) {
   // Three claim statements, finalization, and cleanup; Slack also needs two
   // dispatch reads and one possible installation-health/cooldown write.
-  return 3 + (env.DIFF_DIGESTS_ENABLED === "true" ? 3 : 2) + 1 + (channel === "slack" ? 3 : 0);
+  return 3 + digestDispatchAllowance(env, channel);
+}
+function digestDispatchAllowance(env: Env, channel: DigestChannel) {
+  return (env.DIFF_DIGESTS_ENABLED === "true" ? 3 : 2) + 1 + (channel === "slack" ? 3 : 0);
 }
 const DIGEST_STATEMENTS_PER_WINDOW = 4;
 const DIGEST_DISCOVERY_STATEMENTS = 1;
@@ -1034,7 +1037,7 @@ function digestRecipientSql(channel: DigestChannel) {
          SELECT 1 FROM slack_installations installation
          JOIN slack_authorized_user_links link
            ON link.installation_id = installation.id AND link.user_id = n.user_id
-        WHERE installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND ${personalSlackInstallationSql}
+        WHERE installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND ${slackRecoveryEligibleSql()}
        )`;
 }
 
@@ -1320,7 +1323,7 @@ async function sendDueEmailDigests(env: Env, timestamp: number, staleClaimCutoff
                 .map((row) => `<li>${escapeHtml(notificationCopy(row))}</li>`)
                 .join("")}</ul>`,
           };
-          budget.require((env.DIFF_DIGESTS_ENABLED === "true" ? 3 : 2) + 0 + 1);
+          budget.require(digestDispatchAllowance(env, "email"));
           phase = "provider";
           await sender.send(message);
           phase = "finalization";
@@ -1414,7 +1417,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number, staleCla
          JOIN workspace_members membership
            ON membership.workspace_id = n.workspace_id AND membership.user_id = n.user_id
          JOIN slack_installations installation
-           ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND ${personalSlackInstallationSql}
+           ON installation.workspace_id = n.workspace_id AND installation.disconnected_at IS NULL AND ${slackRecoveryEligibleSql()}
          JOIN slack_authorized_user_links link
            ON link.installation_id = installation.id AND link.user_id = n.user_id
          LEFT JOIN notification_preferences preference
@@ -1536,7 +1539,7 @@ async function sendDuePersonalSlackDigests(env: Env, timestamp: number, staleCla
             await finishClaimedDeliveries(env, claim.outboxIds, "slack", claim.token, "sent", null, "slack_at");
             continue;
           }
-          budget.require((env.DIFF_DIGESTS_ENABLED === "true" ? 3 : 2) + 2 + 1);
+          budget.require(digestDispatchAllowance(env, "slack"));
           phase = "provider";
           const sent = await sendPersonalSlackNotification(
             env,

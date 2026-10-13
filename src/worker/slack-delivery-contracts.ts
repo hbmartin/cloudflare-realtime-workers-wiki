@@ -1,4 +1,5 @@
 import type { Env } from "./env";
+import { slackRecoveryEligibleSql } from "./slack-auth-policy";
 
 export type DeliveryOutcome = "completed" | "paused" | "competing" | "retryable" | "uncertain";
 
@@ -191,7 +192,7 @@ export function mappingDeliveryPauseSql(alias: string, now: string | number) {
 
 // Pauses preserve only a current artifact with an otherwise usable destination.
 // Use the same evidence in delivery and recovery, including mixed mappings.
-export function thumbnailEligibilitySql(artifact = "r", now = Date.now()) {
+export function thumbnailEligibilitySql(artifact = "r", now = Date.now(), recovery = false) {
   const destination = `SELECT 1 FROM pages p JOIN diagram_projections d ON d.page_id=p.id AND d.content_epoch=p.content_epoch
     JOIN slack_channel_subscriptions m ON m.space_id=p.space_id AND (m.page_id IS NULL OR m.page_id=p.id)
     JOIN slack_installations installation ON installation.id=m.installation_id
@@ -202,7 +203,7 @@ export function thumbnailEligibilitySql(artifact = "r", now = Date.now()) {
       AND (m.validation_state='valid' OR ${mappingDeliveryPauseSql("m", now)})
       AND EXISTS(SELECT 1 FROM workspace_members owner WHERE owner.workspace_id=p.workspace_id AND owner.user_id=m.created_by AND owner.role='owner')`;
   return `CASE WHEN NOT EXISTS(${destination}) THEN 'obsolete'
-    WHEN EXISTS(${destination} AND installation.auth_error IS NULL AND m.validation_state='valid' AND m.notification_blocked_at IS NULL
+    WHEN EXISTS(${destination} AND ${recovery ? slackRecoveryEligibleSql() : "installation.auth_error IS NULL"} AND m.validation_state='valid' AND m.notification_blocked_at IS NULL
       AND NOT ${mappingDeliveryPauseSql("m", now)}) THEN 'ready' ELSE 'paused' END`;
 }
 

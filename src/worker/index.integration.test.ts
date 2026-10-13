@@ -7554,10 +7554,10 @@ describe("Worker integration", () => {
       context,
     );
     expect(deleted.status).toBe(202);
+    await waitOnExecutionContext(context);
     expect(
       await env.DB.prepare(`SELECT request_hash FROM page_create_receipts WHERE page_id = ?`).bind(id).first(),
     ).toBeNull();
-    await waitOnExecutionContext(context);
 
     const recreateContext = createExecutionContext();
     const recreated = await worker.fetch(

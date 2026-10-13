@@ -739,6 +739,43 @@ describe("installation secrets and deployment ordering", () => {
     expect(deps.migrateDatabase).not.toHaveBeenCalled();
     expect(deps.upload).not.toHaveBeenCalled();
   });
+  it.each([
+    { ok: false, complete: true, failures: [{ code: "invalid_space" }] },
+    { ok: false, complete: false, incomplete: [{ code: "unsupported_page_schema" }] },
+  ])("explicit repair permits existing failures but requires a clean postcheck: %j", async (before) => {
+    const deps = dependencies();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    deps.repairIntegrity = true;
+    deps.integrityCheck = vi.fn((stage) => (stage === "before migrations" ? before : { ok: true, complete: true }));
+    await deployPrepared({ target: "production" }, deps);
+    expect(deps.migrateDatabase).toHaveBeenCalledOnce();
+    expect(deps.upload).toHaveBeenCalledOnce();
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining("Explicit integrity repair"));
+    deps.upload.mockClear();
+    deps.integrityCheck.mockReturnValue(before);
+    await expect(deployPrepared({ target: "production" }, deps)).rejects.toThrow("after migrations failed");
+    expect(deps.upload).not.toHaveBeenCalled();
+    warning.mockRestore();
+  });
+  it.each([
+    { ok: false, complete: false, incomplete: [{ code: "metadata_coverage_incomplete" }] },
+    {
+      ok: false,
+      complete: false,
+      incomplete: [{ code: "unsupported_page_schema" }, { code: "workspace_revision_changed" }],
+    },
+  ])("explicit repair still rejects incomplete or changing coverage: %j", async (result) => {
+    const deps = dependencies();
+    deps.repairIntegrity = true;
+    deps.integrityCheck = vi.fn(() => result);
+    await expect(deployPrepared({ target: "production" }, deps)).rejects.toThrow("before migrations failed");
+    expect(deps.migrateDatabase).not.toHaveBeenCalled();
+    deps.integrityCheck.mockImplementation(() => {
+      throw new Error("database unavailable");
+    });
+    await expect(deployPrepared({ target: "production" }, deps)).rejects.toThrow("database unavailable");
+    expect(deps.migrateDatabase).not.toHaveBeenCalled();
+  });
   it("does not rotate secrets or recreate a deleted setup key after initialization", async () => {
     const deps = dependencies();
     deps.isInitialized.mockReturnValue(true);
