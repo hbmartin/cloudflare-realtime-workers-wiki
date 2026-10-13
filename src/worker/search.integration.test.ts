@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { Page, SearchResponse, SearchTitleSuggestion, Space, Tag } from "../shared/types";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { normalizeQueuedTitles } from "./search";
+import { acceptPageDeletion, processDeletionJob } from "./cleanup";
+import type { Env } from "./env";
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -56,12 +58,13 @@ async function createPage(
   title: string,
   spaceId: string,
   kind: "document" | "table" | "diagram" = "document",
+  parentId: string | null = null,
 ) {
   const response = await SELF.fetch(
     request(cookie, "/api/pages", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ title, spaceId, kind, parentId: null }),
+      body: JSON.stringify({ title, spaceId, kind, parentId }),
     }),
   );
   expect(response.status).toBe(201);
@@ -86,6 +89,86 @@ beforeEach(async () => {
 });
 
 describe("search v2", () => {
+  it.each(["rows", "cleanup"] as const)(
+    "hides accepted %s deletions from archived listings while retaining staging and unrelated pages",
+    async (phase) => {
+      const installed = await bootstrap();
+      const root = await createPage(installed.cookie, "Architecture pending root", installed.generalId);
+      const child = await createPage(
+        installed.cookie,
+        "Architecture pending child",
+        installed.generalId,
+        "document",
+        root.id,
+      );
+      const unrelated = await createPage(installed.cookie, "Architecture retained", installed.generalId);
+      const staged = await createPage(installed.cookie, "Architecture staged", installed.generalId);
+      await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id IN (?,?,?,?)")
+        .bind(root.id, child.id, unrelated.id, staged.id)
+        .run();
+      const accepted = await acceptPageDeletion(env, installed.workspaceId, installed.userId, root.id);
+      const failingDb = new Proxy(env.DB, {
+        get(target, key) {
+          if (key === "batch")
+            return async () => {
+              throw new Error("metadata cleanup unavailable");
+            };
+          const value = Reflect.get(target, key);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      await processDeletionJob({ ...env, DB: failingDb } as Env, accepted.jobId);
+      expect(
+        await env.DB.prepare("SELECT phase,last_error FROM deletion_jobs WHERE id=?").bind(accepted.jobId).first(),
+      ).toEqual({ phase: "rows", last_error: "metadata cleanup unavailable" });
+      expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(root.id).first()).not.toBeNull();
+      if (phase === "cleanup")
+        await env.DB.prepare("UPDATE deletion_jobs SET phase='cleanup' WHERE id=?").bind(accepted.jobId).run();
+      await env.DB.batch([
+        env.DB.prepare(
+          "INSERT INTO deletion_jobs(id,workspace_id,root_page_id,next_attempt_at,created_at,updated_at,phase) VALUES('staged-deletion',?,?,0,1,1,'staging')",
+        ).bind(installed.workspaceId, staged.id),
+        env.DB.prepare("INSERT INTO deletion_job_pages(job_id,page_id,archived_at) VALUES('staged-deletion',?,1)").bind(
+          staged.id,
+        ),
+        env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('foreign-workspace','Foreign',1)"),
+        env.DB.prepare(
+          "INSERT INTO deletion_jobs(id,workspace_id,root_page_id,next_attempt_at,created_at,updated_at,phase) VALUES('foreign-deletion','foreign-workspace',?,0,1,1,'rows')",
+        ).bind(unrelated.id),
+        env.DB.prepare(
+          "INSERT INTO deletion_job_pages(job_id,page_id,archived_at) VALUES('foreign-deletion',?,1)",
+        ).bind(unrelated.id),
+      ]);
+      const visibleIds = new Set([unrelated.id, staged.id]);
+      const tree = await (
+        await SELF.fetch(request(installed.cookie, "/api/pages/tree?archived=true"))
+      ).json<{ pages: Page[] }>();
+      expect(new Set(tree.pages.map((page) => page.id))).toEqual(visibleIds);
+      for (const archive of ["archived", "all"]) {
+        const primary = await (
+          await SELF.fetch(request(installed.cookie, `/api/search?q=Architecture&archive=${archive}`))
+        ).json<SearchResponse>();
+        expect(new Set(primary.results.map((result) => result.page.id))).toEqual(visibleIds);
+        const fuzzy = await (
+          await SELF.fetch(request(installed.cookie, `/api/search?q=architecure&archive=${archive}`))
+        ).json<SearchResponse>();
+        expect(fuzzy.matchMode).toBe("title-typo");
+        expect(new Set(fuzzy.results.map((result) => result.page.id))).toEqual(visibleIds);
+        const pagedIds: string[] = [];
+        for (const offset of [0, 1, 2]) {
+          const page = await (
+            await SELF.fetch(
+              request(installed.cookie, `/api/search?q=Architecture&archive=${archive}&limit=1&offset=${offset}`),
+            )
+          ).json<SearchResponse>();
+          pagedIds.push(...page.results.map((result) => result.page.id));
+          expect(page.hasMore).toBe(offset === 0);
+        }
+        expect(pagedIds).toHaveLength(2);
+        expect(new Set(pagedIds)).toEqual(visibleIds);
+      }
+    },
+  );
   it("migrates existing normalized titles and the queue while preserving the public trigram index", async () => {
     await reset();
     const migration = env.TEST_MIGRATIONS!.find((item) => item.name.startsWith("0090_"))!;
@@ -125,6 +208,11 @@ describe("search v2", () => {
       .all<{ detail: string }>();
     expect(plan.results.some((row) => row.detail.includes("USING INDEX") && row.detail.includes("page_id=?"))).toBe(
       true,
+    );
+    // Exercise the current worker only after completing the forward upgrade.
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((item) => item.name > migration.name),
     );
     const found = await (
       await SELF.fetch(request(installed.cookie, "/api/search?q=architecure"))

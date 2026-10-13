@@ -86,6 +86,7 @@ import {
 } from "./jobs";
 import worker from "./index";
 import { hmacSha256 } from "../shared/security";
+import { logger } from "./observability";
 
 const scopes =
   "commands,chat:write,links:read,links:write,channels:read,groups:read,channels:history,groups:history,users:read";
@@ -2534,6 +2535,340 @@ describe("interactive Slack workspace", () => {
       ).toEqual({ auth_error: null });
     },
   );
+
+  describe("redrive recovery batching", () => {
+    async function recoveryRows(
+      count = 3,
+      installationId = "installation",
+      workspaceId = "workspace",
+      prefix = "batch",
+    ) {
+      const now = Date.now();
+      await env.DB.prepare(`UPDATE slack_installations SET auth_error='token_revoked',auth_error_at=?,
+        token_expires_at=?,bot_refresh_token_ciphertext=? WHERE id=?`)
+        .bind(now, now + 3_600_000, await encryptSlackToken(runtime(), `${installationId}-refresh`), installationId)
+        .run();
+      await env.DB.batch(
+        Array.from({ length: count }, (_, index) => {
+          const id = `${prefix}-${index}`;
+          return [
+            env.DB.prepare(`INSERT INTO slack_unfurls
+              (id,installation_id,installation_generation,workspace_id,user_id,channel_id,message_ts,unfurls_json,created_at)
+              VALUES(?,?,0,?,'owner','CSPACE','1700000700.000001','{}',?)`).bind(id, installationId, workspaceId, now),
+            env.DB.prepare(`INSERT INTO outbox
+              (id,workspace_id,topic,payload_json,available_at,created_at,enqueued_at,slack_redrive_due_at,
+                attempts,slack_redrive_count,slack_claim_recheck_at,last_error)
+              VALUES(?,?,'slack_unfurl',?,1,?,1,1,2,3,6,'existing diagnostic')`).bind(
+              id,
+              workspaceId,
+              JSON.stringify({ unfurlId: id }),
+              now,
+            ),
+          ];
+        }).flat(),
+      );
+    }
+
+    async function schedules(prefix = "batch") {
+      return (
+        await env.DB.prepare(`SELECT id,attempts,enqueued_at,available_at,slack_redrive_due_at,
+          slack_redrive_count,slack_claim_recheck_at,last_error FROM outbox WHERE id LIKE ? ORDER BY id`)
+          .bind(`${prefix}-%`)
+          .all()
+      ).results;
+    }
+
+    it.each(["network", "timeout", "http", "malformed", "bad_client_secret"])(
+      "defers every sibling after one %s refresh failure using the failure clock",
+      async (kind) => {
+        let now = Date.now();
+        vi.spyOn(Date, "now").mockImplementation(() => now);
+        await recoveryRows();
+        const before = await schedules();
+        const logged = vi.spyOn(logger, "error");
+        const remote = vi.fn(async () => {
+          now += 10_000;
+          if (kind === "network") throw new TypeError("network unavailable");
+          if (kind === "timeout") throw new DOMException("timed out", "TimeoutError");
+          if (kind === "malformed") return new Response("malformed");
+          return Response.json(
+            { ok: false, error: kind === "http" ? "service_unavailable" : kind },
+            { status: kind === "http" ? 503 : 200 },
+          );
+        });
+        vi.stubGlobal("fetch", remote);
+        const counter = countedD1(env.DB);
+        expect(await redriveStaleSlackOutbox({ ...runtime(), DB: counter.database })).toBe(0);
+        expect(remote).toHaveBeenCalledOnce();
+        expect(logged).toHaveBeenCalledOnce();
+        expect(
+          counter.statements.filter((sql) => sql.includes("SET refresh_lease_token=?,refresh_lease_until=?")),
+        ).toHaveLength(1);
+        expect(await schedules()).toEqual(before.map((row) => ({ ...row, slack_redrive_due_at: now + 60_000 })));
+        expect(
+          await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+        ).toEqual({
+          auth_error: "token_revoked",
+        });
+        await redriveStaleSlackOutbox(runtime());
+        expect(remote).toHaveBeenCalledOnce();
+        now += 60_000;
+        await redriveStaleSlackOutbox(runtime());
+        expect(remote).toHaveBeenCalledTimes(2);
+        expect(logged).toHaveBeenCalledTimes(2);
+      },
+    );
+
+    it("checks a held refresh lease once per captured credentials", async () => {
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      await recoveryRows();
+      const before = await schedules();
+      await env.DB.prepare("UPDATE slack_installations SET refresh_lease_token='held',refresh_lease_until=?")
+        .bind(now + 30_000)
+        .run();
+      const counter = countedD1(env.DB);
+      const remote = vi.fn();
+      vi.stubGlobal("fetch", remote);
+      await redriveStaleSlackOutbox({ ...runtime(), DB: counter.database });
+      expect(remote).not.toHaveBeenCalled();
+      expect(
+        counter.statements.filter((sql) => sql.includes("SET refresh_lease_token=?,refresh_lease_until=?")),
+      ).toHaveLength(1);
+      expect(await schedules()).toEqual(before.map((row) => ({ ...row, slack_redrive_due_at: now + 60_000 })));
+    });
+
+    it.each(["1", "900"])("respects the absolute OAuth cooldown for Retry-After %s", async (retryAfter) => {
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      await recoveryRows();
+      const before = await schedules();
+      const remote = vi.fn(async () => new Response("", { status: 429, headers: { "retry-after": retryAfter } }));
+      vi.stubGlobal("fetch", remote);
+      const counter = countedD1(env.DB);
+      await redriveStaleSlackOutbox({ ...runtime(), DB: counter.database });
+      expect(remote).toHaveBeenCalledOnce();
+      expect(
+        counter.statements.filter((sql) => sql.includes("SELECT retry_at FROM slack_method_cooldowns")),
+      ).toHaveLength(1);
+      expect(await schedules()).toEqual(
+        before.map((row) => ({ ...row, slack_redrive_due_at: now + Math.max(60_000, Number(retryAfter) * 1000) })),
+      );
+    });
+
+    it.each(["invalid_refresh_token", "account_inactive"])(
+      "keeps permanent OAuth %s failures durable",
+      async (code) => {
+        const now = Date.now();
+        vi.spyOn(Date, "now").mockReturnValue(now);
+        await recoveryRows();
+        const before = await schedules();
+        const remote = vi.fn(async () => Response.json({ ok: false, error: code }));
+        vi.stubGlobal("fetch", remote);
+        await redriveStaleSlackOutbox(runtime());
+        expect(remote).toHaveBeenCalledOnce();
+        expect(await schedules()).toEqual(before.map((row) => ({ ...row, slack_redrive_due_at: now + 60_000 })));
+        expect(
+          await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+        ).toEqual({
+          auth_error: code,
+        });
+      },
+    );
+
+    it.each([3, 50])("lets another installation recover past %s failed rows", async (count) => {
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      await recoveryRows(count);
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES('other-workspace','Other',1)"),
+        env.DB.prepare(`INSERT INTO slack_installations
+          (id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at)
+          SELECT 'other-installation','other-workspace','TOTHER',team_name,bot_user_id,bot_token_ciphertext,scopes,
+            installed_by,created_at,updated_at FROM slack_installations WHERE id='installation'`),
+      ]);
+      await recoveryRows(2, "other-installation", "other-workspace", "other");
+      const before = await schedules();
+      const remote = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (new URLSearchParams(String(init?.body)).get("refresh_token") === "installation-refresh")
+          throw new TypeError("network unavailable");
+        return Response.json({ ok: true, access_token: "xoxb-other", refresh_token: "xoxr-other", expires_in: 3600 });
+      });
+      vi.stubGlobal("fetch", remote);
+      const first = await redriveStaleSlackOutbox(runtime());
+      expect(first).toBe(count === 50 ? 0 : 2);
+      const second = count === 50 ? await redriveStaleSlackOutbox(runtime()) : 0;
+      expect(first + second).toBe(2);
+      expect(remote).toHaveBeenCalledTimes(2);
+      expect(await schedules()).toEqual(before.map((row) => ({ ...row, slack_redrive_due_at: now + 60_000 })));
+      expect(await schedules("other")).toEqual(
+        ["other-0", "other-1"].map((id) => ({
+          id,
+          attempts: 2,
+          enqueued_at: null,
+          available_at: now + 120 * 60_000,
+          slack_redrive_due_at: null,
+          slack_redrive_count: 4,
+          slack_claim_recheck_at: null,
+          last_error: "Queue acknowledgement missing; scheduled redrive",
+        })),
+      );
+    });
+
+    it.each(["generation", "revision", "access", "refresh"])(
+      "tries fresh credentials after a competing %s change",
+      async (change) => {
+        await recoveryRows();
+        const replacement = await encryptSlackToken(runtime(), "replacement");
+        const db = afterD1(
+          env.DB,
+          (sql, method) => method === "run" && sql.startsWith("UPDATE outbox SET slack_redrive_due_at=max"),
+          async () => {
+            const assignment =
+              change === "generation"
+                ? "generation=generation+1"
+                : change === "revision"
+                  ? "credential_revision=credential_revision+1"
+                  : `${change === "access" ? "bot_token_ciphertext" : "bot_refresh_token_ciphertext"}=?`;
+            await env.DB.prepare(`UPDATE slack_installations SET ${assignment} WHERE id='installation'`)
+              .bind(...(["access", "refresh"].includes(change) ? [replacement] : []))
+              .run();
+            if (change === "generation")
+              await env.DB.prepare("UPDATE slack_unfurls SET installation_generation=1").run();
+          },
+        );
+        const remote = vi.fn(async () => {
+          if (remote.mock.calls.length === 1) throw new TypeError("network unavailable");
+          return Response.json({ ok: true, access_token: "xoxb-fresh", refresh_token: "xoxr-fresh", expires_in: 3600 });
+        });
+        vi.stubGlobal("fetch", remote);
+        expect(await redriveStaleSlackOutbox({ ...runtime(), DB: db })).toBe(2);
+        expect(remote).toHaveBeenCalledTimes(2);
+        expect(
+          await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+        ).toEqual({
+          auth_error: null,
+        });
+      },
+    );
+
+    it.each(["unknown_health_error", "account_inactive", "missing_scope"])(
+      "preserves a concurrent %s health change and blocks recovery",
+      async (health) => {
+        await recoveryRows();
+        const db = afterD1(
+          env.DB,
+          (sql, method) => method === "run" && sql.startsWith("UPDATE outbox SET slack_redrive_due_at=max"),
+          async () => {
+            await env.DB.prepare("UPDATE slack_installations SET auth_error=? WHERE id='installation'")
+              .bind(health)
+              .run();
+          },
+        );
+        const remote = vi.fn(async () => {
+          throw new TypeError("network unavailable");
+        });
+        vi.stubGlobal("fetch", remote);
+        expect(await redriveStaleSlackOutbox({ ...runtime(), DB: db })).toBe(0);
+        expect(remote).toHaveBeenCalledOnce();
+        expect(
+          await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+        ).toEqual({
+          auth_error: health,
+        });
+      },
+    );
+
+    it.each(["attempts", "payload", "availability", "enqueue", "deadline", "claim_deadline", "scope"])(
+      "preserves a competing %s schedule when delaying failed recovery",
+      async (change) => {
+        const now = Date.now();
+        vi.spyOn(Date, "now").mockReturnValue(now);
+        await recoveryRows();
+        const remote = vi.fn(async () => {
+          const assignment = {
+            attempts: "attempts=attempts+1",
+            payload: "payload_json=json_set(payload_json,'$.changed',1)",
+            availability: "available_at=2",
+            enqueue: "enqueued_at=NULL",
+            deadline: "slack_redrive_due_at=?",
+            claim_deadline: "slack_claim_recheck_at=2",
+            scope: "slack_scope_paused_at=2",
+          }[change]!;
+          await env.DB.prepare(`UPDATE outbox SET ${assignment} WHERE id='batch-0'`)
+            .bind(...(change === "deadline" ? [now + 120_000] : []))
+            .run();
+          throw new TypeError("network unavailable");
+        });
+        vi.stubGlobal("fetch", remote);
+        await redriveStaleSlackOutbox(runtime());
+        expect(remote).toHaveBeenCalledOnce();
+        const rows = await schedules();
+        expect(rows[0]!.slack_redrive_due_at).toBe(change === "deadline" ? now + 120_000 : 1);
+        expect(rows.slice(1).map((row) => row.slack_redrive_due_at)).toEqual([now + 60_000, now + 60_000]);
+      },
+    );
+
+    it("does not cache a database failure during token preparation", async () => {
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      await recoveryRows();
+      const db = afterD1(
+        env.DB,
+        (sql) => sql.includes("SELECT retry_at FROM slack_method_cooldowns"),
+        async () => {
+          throw new Error("cooldown read unavailable");
+        },
+      );
+      const remote = vi.fn(async () => {
+        throw new TypeError("network unavailable");
+      });
+      vi.stubGlobal("fetch", remote);
+      const logged = vi.spyOn(logger, "error");
+      await redriveStaleSlackOutbox({ ...runtime(), DB: db });
+      expect(remote).toHaveBeenCalledOnce();
+      expect((await schedules()).map((row) => row.slack_redrive_due_at)).toEqual([1, now + 60_000, now + 60_000]);
+      expect(logged).toHaveBeenCalledTimes(2);
+      expect(logged.mock.calls[0]![4]).toMatchObject({ message: "cooldown read unavailable" });
+    });
+
+    it("does not cache terminal-health persistence failures", async () => {
+      await recoveryRows();
+      const before = await schedules();
+      await env.DB.prepare(`CREATE TRIGGER fail_batched_health BEFORE UPDATE OF auth_error ON slack_installations
+        BEGIN SELECT RAISE(ABORT,'health unavailable'); END`).run();
+      const remote = vi.fn(async () => Response.json({ ok: false, error: "invalid_refresh_token" }));
+      vi.stubGlobal("fetch", remote);
+      const logged = vi.spyOn(logger, "error");
+      await redriveStaleSlackOutbox(runtime());
+      expect(remote).toHaveBeenCalledTimes(3);
+      expect(logged).toHaveBeenCalledTimes(3);
+      expect(await schedules()).toEqual(before);
+      expect(
+        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+      ).toEqual({
+        auth_error: "token_revoked",
+      });
+    });
+
+    it("keeps the failed credentials cached when the first deferral write fails", async () => {
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(now);
+      await recoveryRows();
+      await env.DB.prepare(`CREATE TRIGGER fail_batched_deferral BEFORE UPDATE OF slack_redrive_due_at ON outbox
+        WHEN OLD.id='batch-0' BEGIN SELECT RAISE(ABORT,'deferral unavailable'); END`).run();
+      const remote = vi.fn(async () => {
+        throw new TypeError("network unavailable");
+      });
+      vi.stubGlobal("fetch", remote);
+      const logged = vi.spyOn(logger, "error");
+      await redriveStaleSlackOutbox(runtime());
+      expect(remote).toHaveBeenCalledOnce();
+      expect(logged).toHaveBeenCalledTimes(2);
+      expect((await schedules()).map((row) => row.slack_redrive_due_at)).toEqual([1, now + 60_000, now + 60_000]);
+      expect(String(logged.mock.calls[1]![4])).toContain("deferral unavailable");
+    });
+  });
 
   it("does not repeat a fenced terminal refresh write over newer installation health", async () => {
     await env.DB.prepare(

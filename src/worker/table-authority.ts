@@ -2017,6 +2017,13 @@ export class TableAuthority extends DurableObject<Env> {
     id(body.jobId);
     if (target.tableId !== meta.pageId || target.generation !== meta.generation || !meta.seeded)
       return fail("Deletion target generation changed.", 409, "table_generation_conflict");
+    const userId = `deletion-job:${body.jobId}`;
+    const command: TableCommand = {
+      kind: "delete_row",
+      operationId: `permanent-delete:${body.jobId}:${target.rowId}`,
+      payload: { rowId: target.rowId },
+    };
+    const hash = await sha256Hex(canonicalJson(command));
     const authorize = async () => {
       const accepted = await this.env.DB.prepare(`SELECT job.workspace_id,authority.generation,authority.state
       FROM deletion_jobs job JOIN deletion_targets target ON target.job_id=job.id
@@ -2052,27 +2059,31 @@ export class TableAuthority extends DurableObject<Env> {
     if (row && row.detail_page_id !== target.detailPageId)
       return fail("Deletion target ownership changed.", 403, "table_forbidden");
     if (!row) {
-      const claim = await this.env.DB.prepare("SELECT page_id FROM table_id_claims WHERE kind='row' AND id=?")
-        .bind(target.rowId)
-        .first<{ page_id: string }>();
-      if (claim?.page_id !== meta.pageId) return fail("Deletion target ownership changed.", 403, "table_forbidden");
+      const receipt = this.rows<{ hash: string }>(
+        "SELECT hash FROM receipts WHERE actor_id=? AND operation_id=?",
+        userId,
+        command.operationId,
+      )[0];
+      if (receipt) {
+        if (receipt.hash !== hash)
+          return fail("That operation ID describes a different command.", 409, "idempotency_key_reused");
+      } else {
+        const claim = await this.env.DB.prepare("SELECT page_id FROM table_id_claims WHERE kind='row' AND id=?")
+          .bind(target.rowId)
+          .first<{ page_id: string }>();
+        if (claim?.page_id !== meta.pageId) return fail("Deletion target ownership changed.", 403, "table_forbidden");
+      }
     }
     await this.ctx.storage.setAlarm(Date.now() + 1000);
     await this.project();
     if (this.rows<StoredRow>("SELECT * FROM rows WHERE id=?", target.rowId).length) {
-      const command: TableCommand = {
-        kind: "delete_row",
-        operationId: `permanent-delete:${body.jobId}:${target.rowId}`,
-        payload: { rowId: target.rowId },
-      };
-      const hash = await sha256Hex(canonicalJson(command));
       await authorize();
       this.ctx.storage.transactionSync(() => {
         if (this.rows("SELECT id FROM rows WHERE id=?", target.rowId).length)
           this.command(
             {
               ...this.meta(),
-              userId: `deletion-job:${body.jobId}`,
+              userId,
               deletionJob: body.jobId,
               allowDeleteDetail: true,
               taskMutation: true,

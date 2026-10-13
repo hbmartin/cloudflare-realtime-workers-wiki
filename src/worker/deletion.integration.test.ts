@@ -1,4 +1,11 @@
-import { abortAllDurableObjects, applyD1Migrations, env } from "cloudflare:test";
+import {
+  abortAllDurableObjects,
+  applyD1Migrations,
+  env,
+  evictDurableObject,
+  runDurableObjectAlarm,
+  runInDurableObject,
+} from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Env, MemberContext } from "./env";
 import { acceptPageDeletion, pendingPageDeletion, processDeletionJob, requireTaskRestorable } from "./cleanup";
@@ -69,7 +76,164 @@ async function retry(jobId: string) {
   await processDeletionJob(env, jobId);
 }
 
+async function seededFixture() {
+  const f = await fixture(false);
+  await enableTableAuthority(env, f.member, f.listId);
+  expect(
+    await env.DB.prepare("SELECT id FROM table_id_claims WHERE kind='row' AND id=?").bind(f.rowId).first(),
+  ).toBeNull();
+  return f;
+}
+
+async function deletionTarget(jobId: string) {
+  const stored = await env.DB.prepare("SELECT target FROM deletion_targets WHERE job_id=? AND kind='table_row'")
+    .bind(jobId)
+    .first<{ target: string }>();
+  if (!stored) throw new Error("Missing deletion test target");
+  return JSON.parse(stored.target) as { tableId: string; rowId: string; detailPageId: string; generation: number };
+}
+
 describe("accepted permanent deletion", () => {
+  it.each(["immediate retry", "alarm after eviction"] as const)(
+    "completes seeded legacy row deletion after projection failure with %s",
+    async (recovery) => {
+      const f = await seededFixture();
+      const accepted = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.detailId);
+      await env.DB.prepare(
+        "CREATE TRIGGER failed_seeded_row_deletion BEFORE DELETE ON table_rows BEGIN SELECT RAISE(ABORT,'temporary_delete_failure'); END",
+      ).run();
+      const stub = env.TABLE.getByName(f.listId);
+      try {
+        await processDeletionJob(env, accepted.jobId);
+        expect((await queryTable(env, f.member, f.listId)).rows).toHaveLength(0);
+        expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id=?").bind(f.rowId).first()).not.toBeNull();
+        expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).not.toBeNull();
+        expect(
+          await env.DB.prepare("SELECT completed_at FROM deletion_targets WHERE job_id=? AND kind='table_row'")
+            .bind(accepted.jobId)
+            .first(),
+        ).toEqual({ completed_at: null });
+        await runInDurableObject(stub, (_instance, state) => {
+          const receipt = state.storage.sql
+            .exec<{ result: string }>(
+              "SELECT result FROM receipts WHERE actor_id=? AND operation_id=?",
+              `deletion-job:${accepted.jobId}`,
+              `permanent-delete:${accepted.jobId}:${f.rowId}`,
+            )
+            .one();
+          expect(JSON.parse(receipt.result)).toMatchObject({ projectionPending: true });
+        });
+        await env.DB.prepare("DROP TRIGGER failed_seeded_row_deletion").run();
+        if (recovery === "alarm after eviction") {
+          await evictDurableObject(stub);
+          if (!(await runDurableObjectAlarm(stub))) throw new Error("Missing deletion retry alarm");
+        }
+        await retry(accepted.jobId);
+        expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id=?").bind(f.rowId).first()).toBeNull();
+        expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).toBeNull();
+        expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(accepted.jobId).first()).toBeNull();
+      } finally {
+        await env.DB.prepare("DROP TRIGGER IF EXISTS failed_seeded_row_deletion").run();
+      }
+    },
+  );
+
+  it("replays a seeded deletion receipt after a lost successful response and eviction", async () => {
+    const f = await seededFixture();
+    const accepted = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.detailId);
+    const target = await deletionTarget(accepted.jobId);
+    const table = {
+      getByName: (name: string) => ({
+        fetch: async (request: Request) => {
+          const response = await env.TABLE.getByName(name).fetch(request);
+          if (!response.ok) throw new Error("Unexpected deletion test dispatch failure");
+          await response.text();
+          throw new Error("lost_successful_response");
+        },
+      }),
+    };
+    await processDeletionJob({ ...env, TABLE: table } as unknown as Env, accepted.jobId);
+    expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id=?").bind(f.rowId).first()).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).not.toBeNull();
+    expect(
+      await env.DB.prepare("SELECT phase,last_error FROM deletion_jobs WHERE id=?").bind(accepted.jobId).first(),
+    ).toMatchObject({ phase: "rows", last_error: "lost_successful_response" });
+    await evictDurableObject(env.TABLE.getByName(f.listId));
+    await expect(
+      tableInternal(env, f.listId, "/delete-row", { ...target, jobId: "foreign-job" }),
+    ).rejects.toMatchObject({ status: 403 });
+    await expect(
+      tableInternal(env, f.listId, "/delete-row", { ...target, jobId: accepted.jobId, detailPageId: f.listId }),
+    ).rejects.toMatchObject({ status: 403 });
+    await expect(
+      tableInternal(env, f.listId, "/delete-row", { ...target, jobId: accepted.jobId, generation: 2 }),
+    ).rejects.toMatchObject({ code: "table_generation_conflict" });
+    await retry(accepted.jobId);
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(accepted.jobId).first()).toBeNull();
+  });
+
+  it.each(["missing", "foreign actor", "foreign operation", "wrong hash"] as const)(
+    "rejects absent seeded rows with %s deletion evidence",
+    async (evidence) => {
+      const f = await seededFixture();
+      const accepted = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.detailId);
+      const target = await deletionTarget(accepted.jobId);
+      expect(await tableInternal(env, f.listId, "/delete-row", { ...target, jobId: accepted.jobId })).toMatchObject({
+        ok: true,
+        projectionPending: false,
+      });
+      await runInDurableObject(env.TABLE.getByName(f.listId), (_instance, state) => {
+        const actorId = `deletion-job:${accepted.jobId}`;
+        const operationId = `permanent-delete:${accepted.jobId}:${f.rowId}`;
+        if (evidence === "missing")
+          state.storage.sql.exec("DELETE FROM receipts WHERE actor_id=? AND operation_id=?", actorId, operationId);
+        else if (evidence === "foreign actor")
+          state.storage.sql.exec(
+            "UPDATE receipts SET actor_id='deletion-job:foreign' WHERE actor_id=? AND operation_id=?",
+            actorId,
+            operationId,
+          );
+        else if (evidence === "foreign operation")
+          state.storage.sql.exec(
+            "UPDATE receipts SET operation_id='permanent-delete:foreign' WHERE actor_id=? AND operation_id=?",
+            actorId,
+            operationId,
+          );
+        else
+          state.storage.sql.exec(
+            "UPDATE receipts SET hash='wrong-hash' WHERE actor_id=? AND operation_id=?",
+            actorId,
+            operationId,
+          );
+      });
+      await expect(
+        tableInternal(env, f.listId, "/delete-row", { ...target, jobId: accepted.jobId }),
+      ).rejects.toMatchObject({ status: evidence === "wrong hash" ? 409 : 403 });
+      expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).not.toBeNull();
+      expect(
+        await env.DB.prepare("SELECT completed_at FROM deletion_targets WHERE job_id=? AND kind='table_row'")
+          .bind(accepted.jobId)
+          .first(),
+      ).toEqual({ completed_at: null });
+    },
+  );
+
+  it("retains matching row-claim fallback when a deletion receipt is unavailable", async () => {
+    const f = await fixture();
+    const accepted = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.detailId);
+    const target = await deletionTarget(accepted.jobId);
+    expect(await tableInternal(env, f.listId, "/delete-row", { ...target, jobId: accepted.jobId })).toMatchObject({
+      ok: true,
+      projectionPending: false,
+    });
+    await runInDurableObject(env.TABLE.getByName(f.listId), (_instance, state) => {
+      state.storage.sql.exec("DELETE FROM receipts WHERE actor_id=?", `deletion-job:${accepted.jobId}`);
+    });
+    await processDeletionJob(env, accepted.jobId);
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).toBeNull();
+  });
+
   it("persists intent before row removal, rejects restore and resumes one job", async () => {
     const f = await fixture();
     const accepted = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.detailId);

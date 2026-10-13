@@ -10,6 +10,7 @@ import { PAGE_KINDS } from "../shared/page-kind";
 import { ID_PATTERN } from "../shared/validation";
 import type { MemberContext } from "./env";
 import { HttpError } from "./http";
+import { ACCEPTED_PAGE_DELETION_SQL } from "./cleanup";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { normalizedTitle, titleSimilarity, titleTrigramMatch } from "../shared/title-search";
 
@@ -170,6 +171,7 @@ export async function searchPages(
     "p.workspace_id = ?",
     "p.import_job_id IS NULL",
     "p.is_template = 0",
+    `NOT ${ACCEPTED_PAGE_DELETION_SQL}`,
     "(? = 'owner' OR s.visibility = 'workspace' OR sm.user_id IS NOT NULL)",
   ];
   const whereBindings: unknown[] = [match, member.workspace.id, member.role];

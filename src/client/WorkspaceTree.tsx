@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { BRANCH_SORT_LABELS, sortedTree, type BranchSort } from "../shared/tree-model";
+import { BRANCH_SORT_LABELS, findNode, sortedTree, type BranchSort } from "../shared/tree-model";
 import type { Page, PageKind, PageNode } from "../shared/types";
 import { ActionMenu, Icon, readPreference, savePreference } from "./WorkspaceUI";
 
@@ -53,6 +53,7 @@ export function WorkspaceTree({
   preferenceKey,
   revealRequest,
   onRevealHandled,
+  treeReady = true,
 }: {
   nodes: PageNode[];
   selectedId: string | null;
@@ -65,6 +66,7 @@ export function WorkspaceTree({
   preferenceKey: string;
   revealRequest?: { id: string; sequence: number } | undefined;
   onRevealHandled?: (sequence: number) => void;
+  treeReady?: boolean;
 }) {
   const [sorting, setSorting] = useState<Record<string, BranchSort>>(() =>
     readPreference(`${preferenceKey}:sorting`, {}),
@@ -111,6 +113,7 @@ export function WorkspaceTree({
   }, [nodes, selectedId]);
   useEffect(() => {
     if (!revealRequest || handledReveal.current === revealRequest.sequence) return undefined;
+    if (!treeReady && !findNode(nodes, revealRequest.id)) return undefined;
     const path = ancestorIds(nodes, revealRequest.id);
     if (path.some((id) => collapsed.includes(id))) {
       // eslint-disable-next-line react/set-state-in-effect
@@ -119,17 +122,18 @@ export function WorkspaceTree({
     }
     const timer = requestAnimationFrame(() => {
       const item = ref.current?.querySelector<HTMLElement>(`[data-tree-page="${CSS.escape(revealRequest.id)}"]`);
-      if (!item) return;
-      item.focus();
-      item.scrollIntoView({ block: "nearest" });
-      item.animate([{ backgroundColor: "var(--accent-soft, #dbeafe)" }, { backgroundColor: "transparent" }], {
-        duration: 1500,
-      });
+      if (item) {
+        item.focus();
+        item.scrollIntoView({ block: "nearest" });
+        item.animate([{ backgroundColor: "var(--accent-soft, #dbeafe)" }, { backgroundColor: "transparent" }], {
+          duration: 1500,
+        });
+      } else if (!treeReady) return;
       handledReveal.current = revealRequest.sequence;
       onRevealHandled?.(revealRequest.sequence);
     });
     return () => cancelAnimationFrame(timer);
-  }, [revealRequest, collapsed, nodes, onRevealHandled]);
+  }, [revealRequest, collapsed, nodes, onRevealHandled, treeReady]);
   const toggle = (id: string) =>
     setCollapsed((current) => (current.includes(id) ? current.filter((x) => x !== id) : [...current, id]));
   const visible: PageNode[] = [];

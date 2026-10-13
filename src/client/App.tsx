@@ -1587,8 +1587,11 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [revealRequest, setRevealRequest] = useState<{ id: string; sequence: number }>();
+  const [revealRequest, setRevealRequest] = useState<{ id: string; sequence: number; spaceId: string }>();
   const revealSequence = useRef(0);
+  const handleRevealHandled = useCallback((sequence: number) => {
+    setRevealRequest((current) => (current?.sequence === sequence ? undefined : current));
+  }, []);
   const [view, setView] = useState<
     "pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings" | "activity" | "writing"
   >(() => {
@@ -3057,6 +3060,8 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
 
   const selected = pages.find((page) => page.id === selectedId) ?? null;
   const currentSpaceId = activeSpaceId || selected?.spaceId || pages[0]?.spaceId || "";
+  const currentSpaceIdRef = useCommittedRef(currentSpaceId);
+  if (revealRequest && revealRequest.spaceId !== currentSpaceId) handleRevealHandled(revealRequest.sequence);
   const activeSpace = spaces.find((space) => space.id === currentSpaceId) ?? null;
   const activePages = useMemo(
     () =>
@@ -4040,10 +4045,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               preferenceKey={`${preferencesKey}:tree:${currentSpaceId}`}
               nodes={tree}
               selectedId={resolvedSelectedId}
-              revealRequest={revealRequest}
-              onRevealHandled={(sequence) =>
-                setRevealRequest((current) => (current?.sequence === sequence ? undefined : current))
-              }
+              treeReady={pagesLoaded}
+              revealRequest={revealRequest?.spaceId === currentSpaceId ? revealRequest : undefined}
+              onRevealHandled={handleRevealHandled}
               editable={canEditActiveSpace}
               canCreate={canCreatePage}
               onSelect={navigateToPage}
@@ -4294,10 +4298,17 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                       data-close-menu
                       onClick={() => {
                         const revealPage = activeSelected;
+                        const sequence = ++revealSequence.current;
+                        setRevealRequest(undefined);
+                        const spaceId = currentSpaceId;
+                        const current = () =>
+                          sequence === revealSequence.current &&
+                          (pendingSelectionIdRef.current ?? selectedIdRef.current) === revealPage.id &&
+                          currentSpaceIdRef.current === spaceId;
                         const reveal = (id: string) => {
-                          if (revealPage.spaceId) setActiveSpaceId(revealPage.spaceId);
+                          if (!current()) return;
                           openSidebar();
-                          setRevealRequest({ id, sequence: ++revealSequence.current });
+                          setRevealRequest({ id, sequence, spaceId });
                         };
                         if (!sidebarHiddenPageIds.has(revealPage.id)) reveal(revealPage.id);
                         else
@@ -4308,12 +4319,13 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                                 .find((entry) => !sidebarHiddenPageIds.has(entry.id) && entry.id !== revealPage.id);
                               if (container) reveal(container.id);
                             })
-                            .catch((error) =>
-                              reportWorkspaceError(
-                                { source: "organization" },
-                                apiErrorMessage(error, "The page could not be revealed."),
-                              ),
-                            );
+                            .catch((error) => {
+                              if (current())
+                                reportWorkspaceError(
+                                  { source: "organization" },
+                                  apiErrorMessage(error, "The page could not be revealed."),
+                                );
+                            });
                       }}
                     >
                       Reveal in sidebar

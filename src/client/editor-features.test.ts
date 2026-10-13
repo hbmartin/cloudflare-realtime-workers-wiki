@@ -3,7 +3,7 @@ import { BlockNoteEditor, mapTableCell, contentNodeToTableContent, tableContentT
 import { TableHandlesExtension, TableHandlesView, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
 import { CommentsExtension } from "@blocknote/core/comments";
 import { Fragment, Schema, Slice } from "prosemirror-model";
-import { EditorState, NodeSelection, TextSelection } from "prosemirror-state";
+import { EditorState, NodeSelection, TextSelection, type Transaction } from "prosemirror-state";
 import { describe, expect, it, vi } from "vitest";
 import { notesCommentSchema, notesSchema } from "./mentions";
 import { ServerThreadStore } from "./server-thread-store";
@@ -496,7 +496,35 @@ describe("document editor features", () => {
       // Native indent moves a gap containing tabs with a wrapper-only ReplaceAroundStep slice.
       editor.transact((tr) => tr.setSelection(NodeSelection.create(tr.doc, sourcePos)));
       expect(editor.canNestBlock()).toBe(true);
+      let indent: Transaction | undefined;
+      const dispatch = editor.prosemirrorView.dispatch.bind(editor.prosemirrorView);
+      const capture = vi.spyOn(editor.prosemirrorView, "dispatch").mockImplementation((tr) => {
+        indent = tr;
+        dispatch(tr);
+      });
       editor.nestBlock();
+      capture.mockRestore();
+      expect(editor.prosemirrorState.doc.eq(initial)).toBe(true);
+      if (!indent) throw new Error("Native indentation did not dispatch a transaction.");
+      const indentSteps = indent.steps;
+      expect(indentSteps.some((step) => "gapFrom" in step)).toBe(true);
+      editor.transact((tr) => {
+        // Move all original positions before replaying the native indent steps.
+        tr.insert(
+          1,
+          editor.pmSchema.nodeFromJSON({
+            type: "blockContainer",
+            attrs: { id: "prefix" },
+            content: [{ type: "paragraph", content: [{ type: "text", text: "Before" }] }],
+          }),
+        );
+        tr.doc.check();
+        for (const step of indentSteps) {
+          const mapped = step.map(tr.mapping);
+          if (!mapped) throw new Error("The indent step could not be mapped.");
+          tr.step(mapped);
+        }
+      });
       expect(editor.prosemirrorState.doc.eq(initial)).toBe(true);
 
       editor.transact((tr) => {
@@ -508,6 +536,10 @@ describe("document editor features", () => {
       expect(editor.prosemirrorState.doc.eq(initial)).toBe(false);
       editor.updateBlock("outer-body", { content: "Still editable" });
       expect(editor.getBlock("outer-body")!.content).toEqual([{ type: "text", text: "Still editable", styles: {} }]);
+      // Attribute changes use ReplaceAroundStep but do not move or insert tabs.
+      editor.updateBlock("outer-body", { props: { textColor: "red" } });
+      const body = editor.getBlock("outer-body")!;
+      expect(body.type === "paragraph" && body.props.textColor).toBe("red");
       editor.removeBlocks(["sibling"]);
       validateDocumentTree(editor.prosemirrorState.doc.toJSON());
       editor.insertBlocks([tabs("valid")], "outer", "after");

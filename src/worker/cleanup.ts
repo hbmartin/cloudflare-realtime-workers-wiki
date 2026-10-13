@@ -22,6 +22,10 @@ interface DeletionTargetRow {
 const CLEANUP_LEASE_MS = 15 * 60_000;
 const DOCUMENT_PURGE_TIMEOUT_MS = 30_000;
 
+export const ACCEPTED_PAGE_DELETION_SQL = `EXISTS(SELECT 1 FROM deletion_job_pages lock
+ JOIN deletion_jobs job ON job.id=lock.job_id WHERE lock.page_id=p.id
+ AND job.workspace_id=p.workspace_id AND job.phase IN ('rows','cleanup'))`;
+
 export const TASK_DELETION_PENDING_SQL = `EXISTS(SELECT 1 FROM deletion_job_pages lock
  JOIN deletion_jobs job ON job.id=lock.job_id JOIN table_row_pages link ON link.page_id=lock.page_id
  WHERE job.phase='rows' AND link.row_id=?) OR EXISTS(SELECT 1 FROM deletion_targets target

@@ -125,6 +125,12 @@ beforeEach(() => {
         }
         if (command.kind === "update_cells") Object.assign(data.rows[0]!.cells, command.payload.values);
         if (command.kind === "save_view") {
+          if (
+            (command.payload.visibleColumnIds as string[]).some(
+              (id) => !data.columns.some((property) => property.id === id),
+            )
+          )
+            throw new ApiClientError(400, "invalid_input", "Invalid visible properties.");
           const previous = data.views.find((view) => view.id === command.payload.id);
           if (previous && previous.revision !== command.payload.revision)
             throw new ApiClientError(409, "table_revision_conflict", "View changed.");
@@ -392,6 +398,21 @@ describe("collaborative table UI", () => {
     expect(screen.getByLabelText("View name")).toHaveValue("Remote view");
     fireEvent.click(screen.getByRole("button", { name: "Save view" }));
     await waitFor(() => expect(writes[0]?.payload).toMatchObject({ name: "Remote view", revision: 2 }));
+  });
+  it("copies an edited view after a collaborator removes a visible property without discarding the draft", async () => {
+    data.views[0] = { ...grid, visibleColumnIds: ["Title", "Amount"] };
+    show("grid");
+    fireEvent.click(await screen.findByRole("button", { name: "Views" }));
+    fireEvent.change(screen.getByLabelText("View name"), { target: { value: "My draft" } });
+    data.columns = data.columns.filter((property) => property.id !== "Amount");
+    data.views[0] = { ...data.views[0]!, visibleColumnIds: ["Title"], revision: 2 };
+    await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+    expect(screen.getByLabelText("View name")).toHaveValue("My draft");
+    fireEvent.click(screen.getByRole("button", { name: "Save as new view" }));
+    await waitFor(() => expect(screen.queryByLabelText("View name")).toBeNull());
+    expect(writes[0]?.payload).toMatchObject({ name: "My draft copy", visibleColumnIds: ["Title"] });
+    expect(writes[0]?.payload).not.toHaveProperty("id");
+    expect(writes[0]?.payload).not.toHaveProperty("revision");
   });
   it("disables every view authoring control until the submitted settings finish saving", async () => {
     const user = userEvent.setup();

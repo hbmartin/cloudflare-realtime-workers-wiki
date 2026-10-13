@@ -95,16 +95,19 @@ export const tabsExtension = createExtension({
         if (!tr.docChanged || tr.getMeta(ySyncPluginKey)?.isChangeOrigin) return true;
         // Initial collaborative blocks may not have IDs yet. Inspect native steps
         // without converting them to BlockNote blocks before UniqueID runs.
-        const structuralTabsChange = tr.steps.some((step) => {
-          const replacement = step as { slice?: Slice; gapFrom?: number };
-          // Indent/wrap steps can move tabs in their gap without putting them in the slice.
-          if (replacement.gapFrom !== undefined) return true;
-          let insertedTabs = false;
-          replacement.slice?.content.descendants((node) => {
-            insertedTabs ||= node.type.name === "tabs";
-            return !insertedTabs;
-          });
-          return insertedTabs;
+        const structuralTabsChange = tr.steps.some((step, index) => {
+          const replacement = step as { slice?: Slice; gapFrom?: number; gapTo?: number };
+          let affectedTabs = false;
+          const inspect = (node: import("prosemirror-model").Node) => {
+            affectedTabs ||= node.type.name === "tabs";
+            return !affectedTabs;
+          };
+          replacement.slice?.content.descendants(inspect);
+          // Gap positions belong to the document immediately before this step.
+          // Native indentation can preserve tabs in a wrapper-only replacement.
+          if (!affectedTabs && replacement.gapFrom !== undefined && replacement.gapTo !== undefined)
+            tr.docs[index]!.nodesBetween(replacement.gapFrom, replacement.gapTo, inspect);
+          return affectedTabs;
         });
         return !structuralTabsChange || !containsNestedTabs(tr.doc);
       },
