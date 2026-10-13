@@ -2,7 +2,6 @@ import { pruneDocumentChanges } from "./document-changes";
 import { tableTemplateSnapshot, type TableSnapshot } from "./table-service";
 import { metadataColumns, type TableFilter, type TableValue, type TableView } from "../shared/table-protocol";
 import { normalizeSearchValue } from "../shared/search-normalization";
-import { TASK_STATUSES, taskColumns } from "../shared/tasks";
 import {
   slackOutboxSnapshotFields,
   slackConsumerOutboxFence,
@@ -243,6 +242,15 @@ function templateCloneOptions(row: JobRow): TemplateCloneOptions {
   return options as TemplateCloneOptions;
 }
 
+export function requireCloneableTemplate(isTaskList: boolean | number | null | undefined) {
+  if (isTaskList)
+    throw new HttpError(
+      422,
+      "task_template_unsupported",
+      "Templates can contain documents, tables, and diagrams. Create task lists directly in their project.",
+    );
+}
+
 function replaceAttachmentReferences(value: unknown, ids: ReadonlyMap<string, string>): unknown {
   if (typeof value === "string") {
     const direct = ids.get(value);
@@ -309,6 +317,7 @@ async function captureTemplateTable(env: Env, job: JobRow, options: TemplateClon
   const key = `jobs/${job.id}/table-template.json`;
   if (await env.BUCKET.head(key)) return;
   const snapshot = await tableTemplateSnapshot(env, options.sourcePageId);
+  requireCloneableTemplate(snapshot.taskList);
   snapshot.views = snapshot.views.filter((view) => !view.ownerId || view.ownerId === job.requested_by);
   await assertJobActive(env, job);
   await env.BUCKET.put(key, JSON.stringify(snapshot), {
@@ -320,34 +329,19 @@ async function captureTemplateTable(env: Env, job: JobRow, options: TemplateClon
 /** Resume from a captured canonical snapshot, never from subsequently changed source projections. */
 async function cloneTemplateTable(env: Env, job: JobRow, options: TemplateCloneOptions) {
   const completeKey = `jobs/${job.id}/table-clone.complete.json`;
-  if (await env.BUCKET.head(completeKey)) return;
   await captureTemplateTable(env, job, options);
   const object = await env.BUCKET.get(`jobs/${job.id}/table-template.json`);
   if (!object) throw new Error("The captured table template is missing.");
   const snapshot = await object.json<TableSnapshot>();
+  requireCloneableTemplate(snapshot.taskList);
+  if (await env.BUCKET.head(completeKey)) return;
   const target = options.targetPageId,
     timestamp = Date.now();
   const mappedId = async (kind: string, sourceId: string) =>
     `${target}:${kind}:${(await sha256Hex(sourceId)).slice(0, 32)}`;
-  const sourceTaskColumns = taskColumns(options.sourcePageId),
-    targetTaskColumns = taskColumns(target);
-  const taskColumnMap = new Map(
-    Object.entries(sourceTaskColumns).map(([key, value]) => [
-      value,
-      targetTaskColumns[key as keyof typeof targetTaskColumns],
-    ]),
-  );
   const columnIds = new Map(
     await Promise.all(
-      snapshot.columns.map(
-        async (column) =>
-          [
-            column.id,
-            snapshot.taskList && taskColumnMap.has(column.id)
-              ? taskColumnMap.get(column.id)!
-              : await mappedId("column", column.id),
-          ] as const,
-      ),
+      snapshot.columns.map(async (column) => [column.id, await mappedId("column", column.id)] as const),
     ),
   );
   const optionSourceIds = new Set(snapshot.columns.flatMap((column) => column.options.map((option) => option.id)));
@@ -359,20 +353,9 @@ async function cloneTemplateTable(env: Env, job: JobRow, options: TemplateCloneO
         else if (Array.isArray(value)) for (const selected of value) optionSourceIds.add(selected);
       }
     }
-  const taskOptionIds = new Map(
-    TASK_STATUSES.map((status) => [`${options.sourcePageId}-${status}`, `${target}-${status}`]),
-  );
   const optionIds = new Map(
     await Promise.all(
-      [...optionSourceIds].map(
-        async (optionId) =>
-          [
-            optionId,
-            snapshot.taskList && taskOptionIds.has(optionId)
-              ? taskOptionIds.get(optionId)!
-              : await mappedId("option", optionId),
-          ] as const,
-      ),
+      [...optionSourceIds].map(async (optionId) => [optionId, await mappedId("option", optionId)] as const),
     ),
   );
   const rowIds = new Map(
@@ -555,6 +538,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     .bind(options.targetPageId, job.workspace_id)
     .first<TemplateSourceRow>();
   if (existing) {
+    requireCloneableTemplate(existing.is_task_list);
     if (existing.import_job_id === null && existing.created_by === job.requested_by)
       return { published: true, page: existing };
     if (existing.import_job_id !== job.id)
@@ -588,6 +572,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     .bind(options.sourcePageId, job.workspace_id, options.targetSpaceId)
     .first<TemplateSourceRow>();
   if (!source) throw new HttpError(409, "job_failed", "The template source is no longer available.");
+  requireCloneableTemplate(source.is_task_list);
   if (source.kind === "document" || source.kind === "diagram") {
     const response = await env.DOCUMENT.getByName(`${source.id}~${source.content_epoch}`).fetch(
       new Request("https://document.internal/content", {
@@ -891,6 +876,13 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
 
 export async function runTemplateClone(env: Env, job: JobRow, step: Pick<WorkflowStep, "do">) {
   const options = templateCloneOptions(job);
+  // Run outside cached workflow steps so retries cannot publish an unsupported snapshot.
+  const pages = await env.DB.prepare("SELECT is_task_list FROM pages WHERE workspace_id=? AND id IN (?,?)")
+    .bind(job.workspace_id, options.sourcePageId, options.targetPageId)
+    .all<{ is_task_list: number }>();
+  for (const page of pages.results) requireCloneableTemplate(page.is_task_list);
+  const captured = await env.BUCKET.get(`jobs/${job.id}/table-template.json`);
+  if (captured) requireCloneableTemplate((await captured.json<TableSnapshot>()).taskList);
   const staged = await step.do("stage template clone", () => stageTemplateClone(env, job, options));
   if (staged.published) {
     await updateJob(env, job, {

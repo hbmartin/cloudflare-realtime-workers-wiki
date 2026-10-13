@@ -27,6 +27,7 @@ import worker from "./index";
 import { requireMember } from "./auth";
 import { readAiSource, fetchDiagramSource, fetchTableSource } from "./ai-sources";
 import { pruneAi } from "./ai";
+import { enableTableAuthority, tableCommand } from "./table-service";
 /* oxlint-disable vitest/no-standalone-expect -- Fixture setup validates authenticated bootstrap and mocked provider credentials. */
 
 const ORIGIN = "http://example.test";
@@ -982,6 +983,65 @@ describe("private conversation retention and sources", () => {
       fetchTableSource(env, member, "grant-one", { page_id: table.id, cursor: first.nextCursor! }),
     ).rejects.toMatchObject({ code: "source_changed" });
     expect(JSON.stringify(first)).not.toMatch(/lease|session|holder/);
+  });
+  it("reads every row across legacy and authority AI chunks and rejects an intervening mutation", async () => {
+    const table = (
+      await (
+        await call("/api/pages", "POST", { kind: "table", title: "Paged source", spaceId: page.spaceId })
+      ).json<{ page: Page }>()
+    ).page;
+    const columnId = `${table.id}-text`;
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM table_columns WHERE page_id=?").bind(table.id),
+      env.DB.prepare("INSERT INTO table_columns(id,page_id,name,type,position) VALUES(?,?,'Text','text',0)").bind(
+        columnId,
+        table.id,
+      ),
+      env.DB.prepare(
+        `WITH RECURSIVE seq(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM seq WHERE n<501)
+         INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at)
+         SELECT ? || n,?,n,?,1,1 FROM seq`,
+      ).bind(`${table.id}-row-`, table.id, member.user.id),
+      env.DB.prepare(
+        `INSERT INTO table_cells(row_id,column_id,text_value,updated_at)
+         SELECT id,?,CASE WHEN position=501 THEN 'unrelated' ELSE 'match' END,1 FROM table_rows WHERE page_id=?`,
+      ).bind(columnId, table.id),
+    ]);
+    const source = { pageId: table.id, scope: { kind: "table" as const, filter: "match" } };
+    const legacy = JSON.parse((await readAiSource(env, member, source)).text) as { rows: { id: string }[] };
+    expect(legacy.rows).toHaveLength(501);
+    await enableTableAuthority(env, member, table.id);
+    const migrated = JSON.parse((await readAiSource(env, member, source)).text) as { rows: { id: string }[] };
+    expect(migrated.rows.map((row) => row.id)).toEqual(legacy.rows.map((row) => row.id));
+    expect(new Set(migrated.rows.map((row) => row.id)).size).toBe(501);
+    expect(
+      JSON.parse((await readAiSource(env, member, { pageId: table.id, scope: { kind: "page" } })).text).rows,
+    ).toHaveLength(502);
+    let changed = false;
+    const changingEnv = {
+      ...env,
+      TABLE: {
+        getByName: (...args: Parameters<typeof env.TABLE.getByName>) => {
+          const stub = env.TABLE.getByName(...args);
+          return {
+            fetch: async (resource: Request) => {
+              const response = await stub.fetch(resource);
+              if (!changed && new URL(resource.url).pathname === "/query") {
+                changed = true;
+                await tableCommand(env, member, table.id, {
+                  operationId: crypto.randomUUID(),
+                  kind: "create_row",
+                  payload: { values: { [columnId]: "match" } },
+                });
+              }
+              return response;
+            },
+          };
+        },
+      },
+    } as unknown as Env;
+    await expect(readAiSource(changingEnv, member, source)).rejects.toMatchObject({ code: "source_changed" });
+    expect(changed).toBe(true);
   });
   it("reads diagram labels and relationships without assets and rejects a changing diagram cursor", async () => {
     const diagram = (

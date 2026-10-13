@@ -2522,6 +2522,151 @@ describe("job execution", () => {
     expect(new TextDecoder().decode(await download.arrayBuffer())).toBe("%PDF-test");
   });
 
+  it("rejects task-list template creation, instantiation, and retry before creating work", async () => {
+    const installed = await bootstrap();
+    const response = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "table", taskList: true, title: "Tasks" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const list = (await response.json<{ page: Page }>()).page;
+    expect(list.taskList).toBe(true);
+    const create = vi.fn();
+    const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
+    for (const path of ["/api/templates", `/api/templates/${list.id}/instantiate`]) {
+      if (path.endsWith("instantiate"))
+        await env.DB.prepare("UPDATE pages SET is_template=1 WHERE id=?").bind(list.id).run();
+      const rejected = await worker.fetch(
+        request(installed.cookie, path, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ pageId: list.id }),
+        }),
+        bindings,
+        createExecutionContext(),
+      );
+      expect(rejected.status).toBe(422);
+      expect(await rejected.json()).toMatchObject({ error: { code: "task_template_unsupported" } });
+    }
+    expect(await env.DB.prepare("SELECT count(*) count FROM jobs WHERE type='template_clone'").first()).toEqual({
+      count: 0,
+    });
+    for (const unsupported of ["source", "target", "snapshot"]) {
+      const jobId = crypto.randomUUID();
+      await env.DB.prepare(
+        `INSERT INTO jobs(id,workspace_id,space_id,type,status,requested_by,options_json,created_at,updated_at)
+         VALUES(?,?,?,'template_clone','failed',?,?,1,1)`,
+      )
+        .bind(
+          jobId,
+          installed.workspaceId,
+          `${installed.workspaceId}-general`,
+          installed.userId,
+          JSON.stringify({
+            sourcePageId: unsupported === "source" ? list.id : installed.pageId,
+            targetPageId: unsupported === "target" ? list.id : crypto.randomUUID(),
+            targetSpaceId: `${installed.workspaceId}-general`,
+            parentId: null,
+            title: "Unsupported",
+            isTemplate: false,
+          }),
+        )
+        .run();
+      if (unsupported === "snapshot")
+        await env.BUCKET.put(`jobs/${jobId}/table-template.json`, JSON.stringify({ taskList: true }));
+      const rejected = await worker.fetch(
+        request(installed.cookie, `/api/jobs/${jobId}/retry`, { method: "POST" }),
+        bindings,
+        createExecutionContext(),
+      );
+      expect(rejected.status).toBe(422);
+      expect(await rejected.json()).toMatchObject({ error: { code: "task_template_unsupported" } });
+      expect(await env.DB.prepare("SELECT status,attempt FROM jobs WHERE id=?").bind(jobId).first()).toEqual({
+        status: "failed",
+        attempt: 1,
+      });
+    }
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it.each(["source", "staged", "published", "snapshot"] as const)(
+    "rejects a task %s before cached workflow steps and keeps cleanup ownership",
+    async (kind) => {
+      const installed = await bootstrap();
+      const jobId = crypto.randomUUID(),
+        targetPageId = crypto.randomUUID(),
+        attachmentId = crypto.randomUUID();
+      const options = {
+        sourcePageId: installed.pageId,
+        targetPageId,
+        targetSpaceId: `${installed.workspaceId}-general`,
+        parentId: null,
+        title: "Unsupported",
+        isTemplate: false,
+      };
+      await env.DB.prepare(
+        `INSERT INTO jobs(id,workspace_id,space_id,type,status,requested_by,options_json,created_at,updated_at)
+         VALUES(?,?,?,'template_clone','running',?,?,1,1)`,
+      )
+        .bind(jobId, installed.workspaceId, options.targetSpaceId, installed.userId, JSON.stringify(options))
+        .run();
+      if (kind === "source")
+        await env.DB.prepare("UPDATE pages SET is_task_list=1 WHERE id=?").bind(installed.pageId).run();
+      const targetExists = kind === "staged" || kind === "published";
+      const assetKey = `assets/${installed.workspaceId}/${attachmentId}/clone`;
+      if (targetExists) {
+        await env.DB.batch([
+          env.DB.prepare(
+            `INSERT INTO pages(id,workspace_id,space_id,kind,position,title,is_task_list,import_job_id,created_by,created_at,updated_at)
+             VALUES(?,?,?,'table','z-test','Unsupported',1,?,?,1,1)`,
+          ).bind(
+            targetPageId,
+            installed.workspaceId,
+            options.targetSpaceId,
+            kind === "staged" ? jobId : null,
+            installed.userId,
+          ),
+          env.DB.prepare("INSERT INTO table_state(page_id,revision) VALUES(?,1)").bind(targetPageId),
+          env.DB.prepare(
+            "INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) VALUES(?,?,0,?,1,1)",
+          ).bind(`${targetPageId}-row`, targetPageId, installed.userId),
+          env.DB.prepare(
+            `INSERT INTO attachments(id,workspace_id,page_id,r2_key,name,mime,size,created_by,created_at)
+             VALUES(?,?,?,?,'asset.txt','text/plain',5,?,1)`,
+          ).bind(attachmentId, installed.workspaceId, targetPageId, assetKey, installed.userId),
+        ]);
+        await env.BUCKET.put(assetKey, "asset");
+      }
+      if (kind === "snapshot") {
+        await env.BUCKET.put(
+          `jobs/${jobId}/table-template.json`,
+          JSON.stringify({ taskList: true, revision: 1, rows: [], columns: [], views: [] }),
+        );
+        await env.BUCKET.put(`jobs/${jobId}/table-clone.complete.json`, "{}");
+      }
+      const job = (await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(jobId).first<JobRow>())!;
+      const step = { do: vi.fn(async () => ({ published: true })) };
+      await expect(runTemplateClone(env, job, step as never)).rejects.toMatchObject({
+        status: 422,
+        code: "task_template_unsupported",
+      });
+      expect(step.do).not.toHaveBeenCalled();
+      await env.DB.prepare("UPDATE jobs SET status='failed' WHERE id=?").bind(jobId).run();
+      await cleanupTemplateClone(env, job, async () => true);
+      const target = await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(targetPageId).first();
+      expect(target).toEqual(kind === "published" ? { id: targetPageId } : null);
+      expect(Boolean(await env.BUCKET.get(assetKey))).toBe(kind === "published");
+      expect(
+        await env.DB.prepare("SELECT count(*) count FROM table_rows WHERE page_id=?").bind(targetPageId).first(),
+      ).toEqual({ count: kind === "published" ? 1 : 0 });
+      expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(installed.pageId).first()).not.toBeNull();
+    },
+  );
+
   it("publishes a document template atomically and rewrites cloned attachment references", async () => {
     const installed = await bootstrap();
     const capturedTag = crypto.randomUUID(),

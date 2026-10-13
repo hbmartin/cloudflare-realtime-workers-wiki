@@ -247,6 +247,15 @@ describe("per-table authority", () => {
     expect(retyped.invalidView).toBe(true);
     expect(retyped.columns.find((property) => property.id === "twice")!.config?.validationError).toBeTruthy();
     expect(retyped.rows[0]!.computedCells?.twice?.value).toMatchObject({ __err: "DEPENDENCY_ERROR" });
+    await write(pageId, member, "create_column", { name: "Unrelated", type: "text" });
+    const unchangedError = await queryTable(env, member, pageId, "viewId=grid");
+    expect(unchangedError.view?.revision).toBe(retyped.view?.revision);
+    await write(pageId, member, "update_column", {
+      columnId: "twice",
+      revision: unchangedError.columns.find((property) => property.id === "twice")!.revision,
+      source: "1",
+    });
+    expect((await queryTable(env, member, pageId, "viewId=grid")).invalidView).toBe(true);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
   });
   it("validates property configuration versions, typed calculations and duplicate option identities", async () => {
@@ -529,4 +538,263 @@ describe("per-table authority", () => {
     await tableInternal(env, pageId, "/purge", {});
     await expect(queryTable(env, member, pageId)).rejects.toMatchObject({ code: "table_purged" });
   });
+  it.each(["create", "rename", "archive"] as const)(
+    "drains pending task %s effects before repairing and preserves failed retries",
+    async (kind) => {
+      const { pageId, member } = await fixture(true);
+      await enableTableAuthority(env, member, pageId);
+      const original = await mutateTask(env, member, pageId, null, {
+        title: "Original task",
+        operationId: "repair-original",
+        expectedRevision: 1,
+      });
+      const trigger =
+        kind === "create"
+          ? "BEFORE INSERT ON pages WHEN NEW.title='Pending task'"
+          : kind === "rename"
+            ? "BEFORE UPDATE OF title ON pages WHEN NEW.title='Pending task'"
+            : "BEFORE UPDATE OF archived_at ON pages WHEN NEW.archived_at IS NOT NULL";
+      await env.DB.prepare(
+        `CREATE TRIGGER pending_task_failure ${trigger} BEGIN SELECT RAISE(ABORT,'transient_publication_failure'); END`,
+      ).run();
+      const body = {
+        operationId: "repair-pending",
+        expectedRevision: 2,
+        ...(kind === "archive" ? { archived: true } : { title: "Pending task" }),
+      };
+      await expect(
+        mutateTask(env, member, pageId, kind === "create" ? null : original.rowId, body),
+      ).rejects.toMatchObject({ code: "task_projection_pending" });
+      for (let retry = 0; retry < 2; retry++) {
+        await expect(repairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
+        expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "repairing", projected_revision: 2 });
+        expect(await tableInternal(env, pageId, "/verify")).toMatchObject({ revision: 3, projectedRevision: 2 });
+      }
+      await env.DB.prepare("DROP TRIGGER pending_task_failure").run();
+      expect((await repairTableProjection(env, member, pageId)).projectionMatches).toBe(true);
+      const replay = await mutateTask(env, member, pageId, kind === "create" ? null : original.rowId, body);
+      expect(replay.replayed).toBe(true);
+      const detail = await env.DB.prepare("SELECT title,archived_at FROM pages WHERE id=?")
+        .bind(replay.detailPageId)
+        .first<{ title: string; archived_at: number | null }>();
+      expect(detail!.title).toBe(kind === "archive" ? "Original task" : "Pending task");
+      expect(detail!.archived_at !== null).toBe(kind === "archive");
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) count FROM task_mutation_receipts WHERE operation_id='repair-pending'",
+        ).first(),
+      ).toEqual({ count: 1 });
+      expect(
+        await env.DB.prepare("SELECT count(*) count FROM archive_disconnect_targets WHERE page_id=?")
+          .bind(replay.detailPageId)
+          .first(),
+      ).toEqual({ count: Number(kind === "archive") });
+      expect((await queryTable(env, member, pageId)).rows).toHaveLength(kind === "create" ? 2 : 1);
+    },
+  );
+  it("advances the seed watermark only after the complete rebuild and resumes a failed seed", async () => {
+    const { pageId, member } = await fixture();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('seed-title',?,'Title','text',0)",
+      ).bind(pageId),
+      env.DB.prepare(
+        "INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) VALUES('seed-row',?,0,?,1,1)",
+      ).bind(pageId, member.user.id),
+      env.DB.prepare(
+        "INSERT INTO table_cells(row_id,column_id,text_value,updated_at) VALUES('seed-row','seed-title','Captured',1)",
+      ),
+      env.DB.prepare(
+        "CREATE TRIGGER failed_seed_projection BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'transient_seed_failure'); END",
+      ),
+    ]);
+    await expect(enableTableAuthority(env, member, pageId)).rejects.toMatchObject({ status: 500 });
+    expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "seeding", projected_revision: 0 });
+    expect(await tableInternal(env, pageId, "/verify")).toMatchObject({ revision: 1, projectedRevision: 0 });
+    await expect(tableInternal(env, pageId, "/repair", {})).rejects.toMatchObject({
+      status: 503,
+      code: "table_projection_pending",
+    });
+    await env.DB.prepare("DROP TRIGGER failed_seed_projection").run();
+    await enableTableAuthority(env, member, pageId);
+    expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+    expect((await queryTable(env, member, pageId)).rows[0]).toMatchObject({
+      id: "seed-row",
+      cells: { "seed-title": "Captured" },
+    });
+    await write(pageId, member, "create_column", { name: "Committed property", type: "text" });
+    await expect(tableInternal(env, pageId, "/seed-finish", {})).rejects.toMatchObject({
+      status: 409,
+      code: "table_seed_conflict",
+    });
+  });
+  it("invalidates direct and transitive formula views when the edited formula changes result type", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "source", name: "Source", type: "formula", source: "1" });
+    await write(pageId, member, "create_column", {
+      id: "dependent",
+      name: "Dependent",
+      type: "formula",
+      source: 'prop("Source")',
+    });
+    await write(pageId, member, "create_column", {
+      id: "transitive",
+      name: "Transitive",
+      type: "formula",
+      source: 'prop("Dependent")',
+    });
+    await write(pageId, member, "create_row", { values: {} });
+    for (const columnId of ["source", "transitive"])
+      await write(pageId, member, "save_view", {
+        id: `${columnId}-view`,
+        name: columnId,
+        filters: { kind: "condition", columnId, operator: "gt", value: 0 },
+        calculations: { [columnId]: "sum" },
+      });
+    const sameTypeBefore = await queryTable(env, member, pageId, "viewId=source-view");
+    await write(pageId, member, "update_column", {
+      columnId: "source",
+      revision: sameTypeBefore.columns.find((column) => column.id === "source")!.revision,
+      source: "2",
+    });
+    const sameTypeAfter = await queryTable(env, member, pageId, "viewId=source-view");
+    expect(sameTypeAfter.invalidView).toBe(false);
+    expect(sameTypeAfter.view?.revision).toBe(sameTypeBefore.view?.revision);
+    const before = await queryTable(env, member, pageId);
+    await write(pageId, member, "update_column", {
+      columnId: "source",
+      revision: before.columns.find((column) => column.id === "source")!.revision,
+      source: '"done"',
+    });
+    for (const columnId of ["source", "transitive"]) {
+      const data = await queryTable(env, member, pageId, `viewId=${columnId}-view`);
+      expect(data.invalidView).toBe(true);
+      expect(data.rows).toHaveLength(1);
+      expect(data.columns.find((column) => column.id === columnId)!.config?.resultType).toBe("string");
+    }
+    expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+  });
+  it.each([false, true])(
+    "adds rows through computed equality filters without writing read-only defaults (task=%s)",
+    async (task) => {
+      const { pageId, member } = await fixture(task);
+      await enableTableAuthority(env, member, pageId);
+      const titleId = task ? `${pageId}-title` : "default-title";
+      if (!task) await write(pageId, member, "create_column", { id: titleId, name: "Title", type: "text" });
+      await write(pageId, member, "create_column", {
+        id: "default-formula",
+        name: "Computed",
+        type: "formula",
+        source: "1",
+      });
+      await write(pageId, member, "create_column", { id: "default-creator", name: "Creator", type: "created_by" });
+      await write(pageId, member, "save_view", {
+        id: "computed-defaults",
+        name: "Computed defaults",
+        filters: {
+          kind: "group",
+          operator: "and",
+          filters: [
+            { kind: "condition", columnId: titleId, operator: "eq", value: "Default title" },
+            { kind: "condition", columnId: "default-formula", operator: "eq", value: 1 },
+            { kind: "condition", columnId: "default-creator", operator: "eq", value: member.user.id },
+          ],
+        },
+      });
+      if (task)
+        await mutateTask(env, member, pageId, null, {
+          operationId: "computed-default-task",
+          expectedRevision: (await queryTable(env, member, pageId)).revision,
+          viewId: "computed-defaults",
+        });
+      else await write(pageId, member, "create_row", { values: {}, viewId: "computed-defaults" });
+      const data = await queryTable(env, member, pageId, "viewId=computed-defaults");
+      expect(data.rows).toHaveLength(1);
+      expect(data.rows[0]!.cells[titleId]).toBe("Default title");
+      expect(data.rows[0]!.cells["default-creator"]).toBe(member.user.id);
+      expect(data.rows[0]!.computedCells?.["default-formula"]?.value).toBe(1);
+    },
+  );
+  it.each(["select", "status", "multi_select"] as const)(
+    "searches normalized %s option labels and keeps pagination/filter counts consistent",
+    async (type) => {
+      const { pageId, member } = await fixture();
+      await enableTableAuthority(env, member, pageId);
+      await write(pageId, member, "create_column", { id: "searched-state", name: "State", type });
+      await write(pageId, member, "create_column", { id: "searched-title", name: "Title", type: "text" });
+      await write(pageId, member, "add_option", {
+        columnId: "searched-state",
+        id: "selected-option-id",
+        label: "Ｒｅａｄｙ  for review",
+      });
+      const value = type === "multi_select" ? ["selected-option-id"] : "selected-option-id";
+      for (const name of ["First", "Second"])
+        await write(pageId, member, "create_row", { values: { "searched-state": value, "searched-title": name } });
+      const params = new URLSearchParams({ q: "READY for review", limit: "1" });
+      const first = await queryTable(env, member, pageId, params.toString());
+      expect(first.rowCount).toBe(2);
+      expect(first.rows).toHaveLength(1);
+      params.set("cursor", first.nextCursor!);
+      const second = await queryTable(env, member, pageId, params.toString());
+      expect(second.rowCount).toBe(2);
+      expect(second.rows[0]!.id).not.toBe(first.rows[0]!.id);
+      expect(second.nextCursor).toBeNull();
+      expect((await queryTable(env, member, pageId, "q=selected-option-id")).rowCount).toBe(0);
+      await write(pageId, member, "save_view", {
+        id: "search-filter",
+        name: "Search filter",
+        filters: { kind: "condition", columnId: "searched-title", operator: "eq", value: "First" },
+      });
+      expect((await queryTable(env, member, pageId, "viewId=search-filter&q=ready")).rowCount).toBe(1);
+      await write(pageId, member, "delete_option", { columnId: "searched-state", optionId: "selected-option-id" });
+      expect((await queryTable(env, member, pageId, "q=ready")).rowCount).toBe(0);
+    },
+  );
+  it("moves timestamp rows to the selected viewer month while preserving their source clock", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "viewer-date", name: "Date", type: "date" });
+    const row = await write(pageId, member, "create_row", {
+      values: { "viewer-date": "2026-10-02T00:15:00.125+09:00" },
+    });
+    await write(pageId, member, "save_view", {
+      id: "viewer-calendar",
+      name: "Calendar",
+      kind: "calendar",
+      columnId: "viewer-date",
+    });
+    await write(pageId, member, "move_row", {
+      rowId: row.result.rowId,
+      viewId: "viewer-calendar",
+      targetDate: "2026-11-01",
+    });
+    expect((await queryTable(env, member, pageId)).rows[0]!.cells["viewer-date"]).toBe("2026-11-01T00:15:00.125+09:00");
+    await write(pageId, member, "move_row", {
+      rowId: row.result.rowId,
+      viewId: "viewer-calendar",
+      targetDate: "2026-11-01",
+      timeZone: "America/Los_Angeles",
+    });
+    const data = await queryTable(
+      env,
+      member,
+      pageId,
+      "viewId=viewer-calendar&month=2026-11&timeZone=America%2FLos_Angeles",
+    );
+    expect(data.rows).toHaveLength(1);
+    expect(data.rows[0]!.cells["viewer-date"]).toBe("2026-11-02T00:15:00.125+09:00");
+    await expect(
+      write(pageId, member, "move_row", {
+        rowId: row.result.rowId,
+        viewId: "viewer-calendar",
+        targetDate: "2026-11-02",
+        timeZone: "Unknown/Zone",
+      }),
+    ).rejects.toMatchObject({ status: 422 });
+  });
 });
+
+async function tableRegistryForTest(pageId: string) {
+  return env.DB.prepare("SELECT state,projected_revision FROM table_authority WHERE page_id=?").bind(pageId).first();
+}

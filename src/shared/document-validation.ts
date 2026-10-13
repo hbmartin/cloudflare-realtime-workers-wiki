@@ -190,6 +190,11 @@ export function validateDocumentTree(value: unknown): asserts value is ProseMirr
     tableParagraph: { content: "inline*" },
   };
   for (const type of INLINE_BLOCKS) nodes[type] = { group: "blockContent", content: "inline*" };
+  nodes.codeBlock = {
+    group: "blockContent",
+    content: "text*",
+    marks: [...marks].filter((type) => type.startsWith("comment--")).join(" "),
+  };
   for (const type of ATOM_BLOCKS) nodes[type] = { group: "blockContent", atom: true };
   for (const type of INLINE_ATOMS) nodes[type] = { group: "inline", inline: true, atom: true };
   try {

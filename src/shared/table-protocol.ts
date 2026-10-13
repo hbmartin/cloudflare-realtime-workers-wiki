@@ -220,7 +220,10 @@ export function validateTableValue(column: CollaborativeColumn, input: unknown):
 
 /** Conservative equality defaults adapted from AFFiNE's MIT generate-default-values.ts,
  * source 0b69a6da21e8fd35beb85667bb8496d9b3852238. Group assignment is applied afterwards. */
-export function tableFilterDefaults(filter: TableFilter | null): Record<string, TableValue> {
+export function tableFilterDefaults(
+  filter: TableFilter | null,
+  columns: readonly Pick<CollaborativeColumn, "id" | "type">[],
+): Record<string, TableValue> {
   if (!filter || filter.kind !== "group" || filter.operator !== "and") return {};
   const counts = new Map<string, number>();
   for (const child of filter.filters)
@@ -230,6 +233,9 @@ export function tableFilterDefaults(filter: TableFilter | null): Record<string, 
       child.kind === "condition" &&
       child.operator === "eq" &&
       child.value !== undefined &&
+      columns.some(
+        (column) => column.id === child.columnId && column.type !== "formula" && !metadataColumns.has(column.type),
+      ) &&
       counts.get(child.columnId) === 1
         ? [[child.columnId, child.value]]
         : [],

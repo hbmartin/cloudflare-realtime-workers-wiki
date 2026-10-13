@@ -83,4 +83,40 @@ describe("personal tree sorting and reveal", () => {
     view.rerender(<WorkspaceTree {...input} revealRequest={{ id: "child", sequence: 2 }} />);
     await waitFor(() => expect(screen.getByRole("treeitem", { name: "Child" })).toHaveFocus());
   });
+  it("consumes reveals once and expands a later externally selected branch", async () => {
+    const input = {
+      ...props(),
+      nodes: buildTree([
+        page("ten", "Note 10", "a"),
+        page("child", "Child", "a", "ten"),
+        page("two", "note 2", "b"),
+        page("other", "Other child", "a", "two"),
+      ]),
+    };
+    localStorage.setItem(input.preferenceKey, JSON.stringify(["ten", "two"]));
+    const onRevealHandled = vi.fn();
+    const revealRequest = { id: "child", sequence: 1 };
+    const view = render(<WorkspaceTree {...input} revealRequest={revealRequest} onRevealHandled={onRevealHandled} />);
+    await waitFor(() => expect(onRevealHandled).toHaveBeenCalledWith(1));
+    view.rerender(
+      <WorkspaceTree {...input} selectedId="other" revealRequest={revealRequest} onRevealHandled={onRevealHandled} />,
+    );
+    expect(screen.getByRole("treeitem", { name: "Other child" })).toBeInTheDocument();
+    screen.getByRole("treeitem", { name: "Other child" }).focus();
+    fireEvent.click(screen.getByRole("button", { name: "Collapse Note 10" }));
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    expect(onRevealHandled).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("treeitem", { name: "Child" })).not.toBeInTheDocument();
+    expect(HTMLElement.prototype.animate).toHaveBeenCalledTimes(1);
+    view.rerender(
+      <WorkspaceTree
+        {...input}
+        selectedId="other"
+        revealRequest={{ id: "child", sequence: 2 }}
+        onRevealHandled={onRevealHandled}
+      />,
+    );
+    await waitFor(() => expect(onRevealHandled).toHaveBeenLastCalledWith(2));
+    expect(screen.getByRole("treeitem", { name: "Child" })).toHaveFocus();
+  });
 });

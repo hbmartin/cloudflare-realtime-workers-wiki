@@ -2,9 +2,10 @@
 // packages/editor-ext/src/lib/{tabs,status,footnotes}; AGPL-3.0.
 import { createExtension, type BlockNoteEditor } from "@blocknote/core";
 import { createReactBlockSpec, createReactInlineContentSpec } from "@blocknote/react";
-import { Plugin, PluginKey, TextSelection } from "prosemirror-state";
+import { Plugin, PluginKey, TextSelection, type Selection } from "prosemirror-state";
+import type { Slice } from "prosemirror-model";
 
-import { yUndoPluginKey } from "y-prosemirror";
+import { ySyncPluginKey, yUndoPluginKey } from "y-prosemirror";
 import { Decoration, DecorationSet } from "prosemirror-view";
 import { useEffect, useState } from "react";
 import {
@@ -55,6 +56,17 @@ export const footnotesExtension = createExtension({
   ],
 });
 export const tabsPluginKey = new PluginKey<ReadonlyMap<string, string>>("notesTabs");
+export function selectionInsideTabs(selection: Selection) {
+  for (let depth = selection.$from.depth; depth > 0; depth--) {
+    const node = selection.$from.node(depth);
+    if (node.type.name === "blockContainer" && node.firstChild?.type.name === "tabs") return true;
+  }
+  return false;
+}
+function containsNestedTabs(node: import("prosemirror-model").Node, inTabs = false): boolean {
+  const tabs = node.type.name === "blockContainer" && node.firstChild?.type.name === "tabs";
+  return (tabs && inTabs) || node.content.content.some((child) => containsNestedTabs(child, inTabs || tabs));
+}
 function tabGroups(doc: import("prosemirror-model").Node) {
   const groups: Array<{ id: string; panels: Array<{ id: string; pos: number; size: number }> }> = [];
   doc.descendants((node, pos) => {
@@ -79,6 +91,23 @@ export const tabsExtension = createExtension({
   prosemirrorPlugins: [
     new Plugin({
       key: tabsPluginKey,
+      filterTransaction: (tr) => {
+        if (!tr.docChanged || tr.getMeta(ySyncPluginKey)?.isChangeOrigin) return true;
+        // Initial collaborative blocks may not have IDs yet. Inspect native steps
+        // without converting them to BlockNote blocks before UniqueID runs.
+        const structuralTabsChange = tr.steps.some((step) => {
+          const replacement = step as { slice?: Slice; gapFrom?: number };
+          // Indent/wrap steps can move tabs in their gap without putting them in the slice.
+          if (replacement.gapFrom !== undefined) return true;
+          let insertedTabs = false;
+          replacement.slice?.content.descendants((node) => {
+            insertedTabs ||= node.type.name === "tabs";
+            return !insertedTabs;
+          });
+          return insertedTabs;
+        });
+        return !structuralTabsChange || !containsNestedTabs(tr.doc);
+      },
       state: {
         init: () => new Map<string, string>(),
         apply: (tr, previous) => {

@@ -347,7 +347,7 @@ export class TableAuthority extends DurableObject<Env> {
                 );
             }
           });
-          await this.repair();
+          await this.repair(true);
           this.putMeta({ ...meta, seeded: true, projectedRevision: meta.revision });
           return Response.json(await this.verification());
         }
@@ -658,6 +658,13 @@ export class TableAuthority extends DurableObject<Env> {
       time = sub?.time ?? Date.now(),
       p = command.payload,
       projection: ProjectionStatement[] = sub?.projection ?? [];
+    const schemaChanged =
+      !sub &&
+      (["create_column", "update_column", "delete_column", "commit_type"].includes(command.kind) ||
+        (command.kind === "bulk" &&
+          Array.isArray(p.commands) &&
+          p.commands.some((item) => item?.kind === "create_column")));
+    const previousColumns = schemaChanged ? this.columns() : [];
     let result: Record<string, unknown> = {};
     const saveColumn = (column: CollaborativeColumn) => {
       this.ctx.storage.sql.exec("INSERT OR REPLACE INTO properties VALUES(?,?)", column.id, JSON.stringify(column));
@@ -829,7 +836,7 @@ export class TableAuthority extends DurableObject<Env> {
       if (p.viewId) {
         const view = this.view(p.viewId, actor);
         if (view.invalid) return fail("Repair this view before adding rows.");
-        values = { ...tableFilterDefaults(view.filters), ...values };
+        values = { ...tableFilterDefaults(view.filters, this.columns()), ...values };
         if (view.kind === "board" && view.columnId && Object.hasOwn(p, "groupId"))
           values[view.columnId] = p.groupId ?? null;
         if (view.kind === "calendar" && view.columnId && p.date !== undefined) values[view.columnId] = p.date;
@@ -944,6 +951,7 @@ export class TableAuthority extends DurableObject<Env> {
             this.rowValue(this.row(p.rowId)).cells[view.columnId],
             value,
             this.column(view.columnId).config?.timeZone as string | undefined,
+            p.timeZone === undefined ? undefined : validateCalendarZone(p.timeZone),
           );
         } catch (error) {
           return fail(error instanceof Error ? error.message : "Invalid calendar move.");
@@ -1083,23 +1091,26 @@ export class TableAuthority extends DurableObject<Env> {
       result = { results };
     } else return fail("Unsupported command.");
     if (sub) return { revision, operationId: command.operationId, replayed: false, result, projectionPending: true };
-    const schemaChanged =
-      ["create_column", "update_column", "delete_column", "commit_type"].includes(command.kind) ||
-      (command.kind === "bulk" &&
-        (p.commands as Array<{ kind: string }>).some((item) => item.kind === "create_column"));
     const schemaRevision = (meta.schemaRevision ?? 0) + (schemaChanged ? 1 : 0);
     if (schemaChanged) {
       const original = this.columns();
       const invalidTypes = new Set<string>();
       for (const property of retypeFormulaProperties(original)) {
-        const previous = original.find((column) => column.id === property.id)!;
-        if (property.type !== "formula" || canonicalJson(property.config) === canonicalJson(previous.config)) continue;
-        if (property.config?.validationError || property.config?.resultType !== previous.config?.resultType)
+        const current = original.find((column) => column.id === property.id)!;
+        const previous = previousColumns.find((column) => column.id === property.id);
+        if (property.type !== "formula") continue;
+        if (
+          previous?.type === "formula" &&
+          ((property.config?.validationError && property.config.validationError !== previous.config?.validationError) ||
+            property.config?.resultType !== previous.config?.resultType)
+        )
           invalidTypes.add(property.id);
+        if (canonicalJson(property.config) === canonicalJson(current.config)) continue;
         saveColumn({
           ...property,
           config: versionedPropertyConfig(property.config),
-          revision: property.revision + (invalidTypes.has(property.id) ? 1 : 0),
+          revision:
+            property.revision + (invalidTypes.has(property.id) && property.revision === previous?.revision ? 1 : 0),
         });
       }
       for (const stored of this.rows<{ id: string; value: string }>("SELECT id,value FROM views")) {
@@ -1466,8 +1477,16 @@ export class TableAuthority extends DurableObject<Env> {
     const filter = this.filterSql(invalidView ? null : (view?.filters ?? null));
     const q = url.searchParams.get("q")?.trim().slice(0, 200);
     if (q) {
-      filter.sql += ` AND EXISTS(SELECT 1 FROM cells search WHERE search.row_id=r.id AND instr(lower(search.value),lower(?))>0)`;
-      filter.binds.push(q);
+      const matchedOptions = columns.flatMap((column) =>
+        column.options
+          .filter((option) => normalizeSearchValue(option.label).includes(normalizeSearchValue(q)))
+          .map((option) => option.id),
+      );
+      filter.sql += ` AND EXISTS(SELECT 1 FROM cells search JOIN properties property ON property.id=search.column_id WHERE search.row_id=r.id AND
+        CASE WHEN json_extract(property.value,'$.type') IN ('select','status','multi_select') THEN
+          EXISTS(SELECT 1 FROM json_each(CASE WHEN json_type(search.value)='array' THEN search.value ELSE json_array(json_extract(search.value,'$')) END) selected WHERE selected.value IN (SELECT value FROM json_each(?)))
+        ELSE instr(lower(search.value),lower(?))>0 END)`;
+      filter.binds.push(JSON.stringify(matchedOptions), q);
     }
     if (url.searchParams.has("groupId") && view?.columnId) {
       filter.sql += ` AND ${this.expression(view.columnId)} IS ?`;
@@ -1674,28 +1693,38 @@ export class TableAuthority extends DurableObject<Env> {
       this.projecting = null;
     }
   }
-  private async repair(): Promise<void> {
+  private async repair(seedBaseline = false): Promise<void> {
     if (this.repairing) return fail("Repair is already running.", 409);
     this.repairing = true;
     try {
-      if (this.projecting) await this.projecting;
+      if (seedBaseline && this.rows("SELECT revision FROM events LIMIT 1").length)
+        return fail("A seed baseline cannot replace committed table events.", 409, "table_seed_conflict");
+      await this.project();
       const meta = this.meta();
+      if (!seedBaseline && meta.projectedRevision !== meta.revision)
+        return fail("Pending table publications must complete before repair.", 503, "table_projection_pending");
       await this.applyProjection(
         [
-          { sql: "DELETE FROM table_rows WHERE page_id=?", binds: [meta.pageId] },
-          { sql: "DELETE FROM table_columns WHERE page_id=?", binds: [meta.pageId] },
-          { sql: "DELETE FROM table_views WHERE page_id=?", binds: [meta.pageId] },
-          { sql: "DELETE FROM table_people WHERE page_id=?", binds: [meta.pageId] },
+          // Until cutover, D1 is the frozen seed source. Preserve it for retries.
+          ...(!seedBaseline
+            ? [
+                { sql: "DELETE FROM table_rows WHERE page_id=?", binds: [meta.pageId] },
+                { sql: "DELETE FROM table_columns WHERE page_id=?", binds: [meta.pageId] },
+                { sql: "DELETE FROM table_views WHERE page_id=?", binds: [meta.pageId] },
+                { sql: "DELETE FROM table_people WHERE page_id=?", binds: [meta.pageId] },
+              ]
+            : []),
           ...this.columns().flatMap((column) => this.columnProjection(column)),
           ...this.rows<{ value: string }>("SELECT value FROM views").map((view) =>
             this.viewProjection(JSON.parse(view.value) as TableView),
           ),
           ...this.rows<{ id: string; name: string }>("SELECT * FROM people").map((person) => ({
-            sql: "INSERT INTO table_people(page_id,user_id,name) VALUES(?,?,?)",
+            sql: "INSERT INTO table_people(page_id,user_id,name) VALUES(?,?,?) ON CONFLICT(page_id,user_id) DO UPDATE SET name=excluded.name",
             binds: [meta.pageId, person.id, person.name],
           })),
         ],
         meta.revision,
+        false,
       );
       for (const row of this.rows<StoredRow>("SELECT * FROM rows ORDER BY id")) {
         const statements = this.rowProjection(row);
@@ -1707,9 +1736,13 @@ export class TableAuthority extends DurableObject<Env> {
             this.cellProjection(row.id, cell.column_id, JSON.parse(cell.value), cell.revision, row.edited_at),
           );
         statements.push(...this.computedProjection(row.id, meta.revision));
-        await this.applyProjection(statements, meta.revision);
+        await this.applyProjection(statements, meta.revision, false);
       }
+      await this.applyProjection([], meta.revision);
       this.putMeta({ ...this.meta(), projectedRevision: meta.revision });
+    } catch (error) {
+      if (!this.purged) await this.ctx.storage.setAlarm(Date.now() + 1000);
+      throw error;
     } finally {
       this.repairing = false;
     }

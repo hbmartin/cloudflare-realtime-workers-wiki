@@ -20,8 +20,14 @@ export function validateCalendarZone(value: unknown): string {
   return value;
 }
 
-/** Day drags preserve an existing fixed offset, or the property's IANA wall-clock rule across DST. */
-export function moveCalendarDate(previous: unknown, target: unknown, propertyZone?: string): string | null {
+/** Preserve the source clock while landing on the selected day in the viewer's zone. */
+export function moveCalendarDate(
+  previous: unknown,
+  target: unknown,
+  propertyZone?: string,
+  displayZone?: string,
+): string | null {
+  if (displayZone !== undefined) validateCalendarZone(displayZone);
   if (target === null) return null;
   if (
     typeof target !== "string" ||
@@ -32,10 +38,10 @@ export function moveCalendarDate(previous: unknown, target: unknown, propertyZon
   if (typeof previous !== "string" || !previous.includes("T")) return target;
   const instant = new Date(previous);
   if (!Number.isFinite(instant.getTime())) throw new Error("The existing timestamp is invalid.");
-  if (!propertyZone) return `${target}${previous.slice(10)}`;
-  validateCalendarZone(propertyZone);
+  if (!propertyZone && displayZone === undefined) return `${target}${previous.slice(10)}`;
+  if (propertyZone) validateCalendarZone(propertyZone);
   const formatter = new Intl.DateTimeFormat("en-CA", {
-    timeZone: propertyZone,
+    timeZone: propertyZone ?? "UTC",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -50,17 +56,32 @@ export function moveCalendarDate(previous: unknown, target: unknown, propertyZon
     return `${part("year")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}:${part("second")}`;
   };
   const clock = wallTime(instant).slice(10),
-    desired = `${target}${clock}`;
-  const desiredUtc = Date.parse(`${desired}Z`);
-  let candidate = desiredUtc;
-  for (let iteration = 0; iteration < 4; iteration++)
-    candidate += desiredUtc - Date.parse(`${wallTime(new Date(candidate))}Z`);
-  if (wallTime(new Date(candidate)) !== desired)
-    throw new Error("This local time does not exist on the selected day. Choose another time.");
-  const offset = Math.round((desiredUtc - candidate) / 60000),
-    sign = offset >= 0 ? "+" : "-",
-    magnitude = Math.abs(offset);
-  const suffix = `${sign}${String(Math.floor(magnitude / 60)).padStart(2, "0")}:${String(magnitude % 60).padStart(2, "0")}`;
-  const fraction = /\.\d+/.exec(previous)?.[0] ?? "";
-  return `${desired}${fraction}${suffix}`;
+    fraction = /\.\d+/.exec(previous)?.[0] ?? "",
+    targetDay = Date.parse(`${target}T00:00:00Z`),
+    preferredDay =
+      displayZone === undefined
+        ? targetDay
+        : Date.parse(`${propertyZone ? wallTime(instant).slice(0, 10) : previous.slice(0, 10)}T00:00:00Z`) +
+          targetDay -
+          Date.parse(`${calendarDay(previous, displayZone)}T00:00:00Z`);
+  // Try the original source/viewer day relationship first, then account for offset changes.
+  for (const delta of displayZone === undefined ? [0] : [0, -1, 1, -2, 2]) {
+    const day = new Date(preferredDay + delta * 86400000).toISOString().slice(0, 10);
+    let value = `${day}${previous.slice(10)}`;
+    if (propertyZone) {
+      const desired = `${day}${clock}`,
+        desiredUtc = Date.parse(`${desired}Z`);
+      let candidate = desiredUtc;
+      for (let iteration = 0; iteration < 4; iteration++)
+        candidate += desiredUtc - Date.parse(`${wallTime(new Date(candidate))}Z`);
+      if (wallTime(new Date(candidate)) !== desired) continue;
+      const offset = Math.round((desiredUtc - candidate) / 60000),
+        sign = offset >= 0 ? "+" : "-",
+        magnitude = Math.abs(offset);
+      const suffix = `${sign}${String(Math.floor(magnitude / 60)).padStart(2, "0")}:${String(magnitude % 60).padStart(2, "0")}`;
+      value = `${desired}${fraction}${suffix}`;
+    }
+    if (displayZone === undefined || calendarDay(value, displayZone) === target) return value;
+  }
+  throw new Error("This local time does not exist on the selected day. Choose another time.");
 }

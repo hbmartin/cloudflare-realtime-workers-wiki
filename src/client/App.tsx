@@ -1588,6 +1588,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [revealRequest, setRevealRequest] = useState<{ id: string; sequence: number }>();
+  const revealSequence = useRef(0);
   const [view, setView] = useState<
     "pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings" | "activity" | "writing"
   >(() => {
@@ -4040,6 +4041,9 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               nodes={tree}
               selectedId={resolvedSelectedId}
               revealRequest={revealRequest}
+              onRevealHandled={(sequence) =>
+                setRevealRequest((current) => (current?.sequence === sequence ? undefined : current))
+              }
               editable={canEditActiveSpace}
               canCreate={canCreatePage}
               onSelect={navigateToPage}
@@ -4293,7 +4297,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                         const reveal = (id: string) => {
                           if (revealPage.spaceId) setActiveSpaceId(revealPage.spaceId);
                           openSidebar();
-                          setRevealRequest((previous) => ({ id, sequence: (previous?.sequence ?? 0) + 1 }));
+                          setRevealRequest({ id, sequence: ++revealSequence.current });
                         };
                         if (!sidebarHiddenPageIds.has(revealPage.id)) reveal(revealPage.id);
                         else

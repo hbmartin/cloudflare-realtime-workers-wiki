@@ -324,7 +324,7 @@ export async function mutateTask(
     );
     const view = snapshot.view;
     if (!view || view.invalid) throw new HttpError(422, "invalid_task_view", "Repair the view before adding tasks.");
-    const defaults: Record<string, unknown> = { ...tableFilterDefaults(view.filters) };
+    const defaults: Record<string, unknown> = { ...tableFilterDefaults(view.filters, snapshot.columns) };
     if (view.kind === "board" && view.columnId && Object.hasOwn(body, "groupId"))
       defaults[view.columnId] = body.groupId;
     if (view.kind === "calendar" && view.columnId && Object.hasOwn(body, "date")) defaults[view.columnId] = body.date;

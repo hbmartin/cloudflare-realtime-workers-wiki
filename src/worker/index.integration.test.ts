@@ -40,6 +40,8 @@ import type {
 import { processDueUploadReaps } from "./attachments";
 import { processDeletionJob } from "./cleanup";
 import { migrateLegacyColumns } from "./document";
+import { requireMember } from "./auth";
+import { enableTableAuthority, queryTable } from "./table-service";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import worker, { backfillTableSearchValues, executeScheduledTasks, runSlackMaintenance } from "./index";
@@ -8902,6 +8904,17 @@ describe("calm workspace task lists", () => {
       }),
     );
     expect(moved.status).toBe(422);
+    expect(
+      (
+        await SELF.fetch(
+          authenticatedRequest(installed.cookie, `/api/pages/${result.detailPageId}/move-space`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ spaceId: `${installed.workspaceId}-general`, parentId: null }),
+          }),
+        )
+      ).status,
+    ).toBe(422);
     const held = await acquireLease(installed.cookie, list.id);
     expect(
       (
@@ -8977,6 +8990,58 @@ describe("calm workspace task lists", () => {
     expect(tasks.tasks).toHaveLength(1);
     expect(await (await SELF.fetch(share.url)).text()).toContain("Completed task");
   }, 45_000);
+  it("moves a task list and its details together and revokes table access in a private space", async () => {
+    const installed = await bootstrap(),
+      list = await taskList(installed);
+    const created = await change(installed, list.id, {
+      title: "Private task",
+      expectedRevision: 1,
+      operationId: crypto.randomUUID(),
+    });
+    const { detailPageId } = await created.json<{ detailPageId: string }>();
+    const child = await createPage(installed.cookie, "document", detailPageId);
+    const owner = await requireMember(authenticatedRequest(installed.cookie, "/api/me"), env);
+    const readerId = crypto.randomUUID(),
+      privateSpace = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES(?,'Reader',?,1,1)").bind(
+        readerId,
+        `${readerId}@example.test`,
+      ),
+      env.DB.prepare("INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES(?,?,'viewer',1)").bind(
+        installed.workspaceId,
+        readerId,
+      ),
+      env.DB.prepare(
+        `INSERT INTO spaces(id,workspace_id,name,slug,visibility,position,created_by,created_at,updated_at)
+         VALUES(?,?,'Private','private-test','private','z',?,1,1)`,
+      ).bind(privateSpace, installed.workspaceId, installed.userId),
+    ]);
+    const reader = {
+      ...owner,
+      user: { id: readerId, name: "Reader", email: `${readerId}@example.test` },
+      role: "viewer" as const,
+    };
+    await enableTableAuthority(env, owner, list.id);
+    expect((await queryTable(env, reader, list.id)).rows).toHaveLength(1);
+    const moved = await SELF.fetch(
+      authenticatedRequest(installed.cookie, `/api/pages/${list.id}/move-space`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ spaceId: privateSpace, parentId: null }),
+      }),
+    );
+    expect(moved.status).toBe(200);
+    expect(
+      (
+        await env.DB.prepare("SELECT space_id FROM pages WHERE id IN (?,?,?)")
+          .bind(list.id, detailPageId, child.id)
+          .all<{ space_id: string }>()
+      ).results,
+    ).toEqual([{ space_id: privateSpace }, { space_id: privateSpace }, { space_id: privateSpace }]);
+    await expect(queryTable(env, reader, list.id)).rejects.toMatchObject({ status: 404 });
+    expect((await queryTable(env, owner, list.id)).rows).toHaveLength(1);
+  });
   it("invalidates task views when a parent containing a task list is archived and restored", async () => {
     const installed = await bootstrap();
     const parent = await createPage(installed.cookie);

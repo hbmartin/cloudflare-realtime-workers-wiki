@@ -193,6 +193,7 @@ import {
   NotesJobWorkflow,
   recoverQueuedJobs,
   redriveStaleSlackOutbox,
+  requireCloneableTemplate,
   startJobExecution,
   sweepOutbox,
   type DeliveryQueueMessage,
@@ -2048,12 +2049,7 @@ app.post("/api/templates", async (c) => {
   const source = await pageForMember(c.env, member, text(body.pageId, "pageId", 100));
   requirePageEditor(source);
   if (source.is_template) throw new HttpError(409, "already_template", "This page is already a template.");
-  if (source.is_task_list)
-    throw new HttpError(
-      422,
-      "task_template_unsupported",
-      "Templates can contain documents, tables, and diagrams. Create task lists directly in their project.",
-    );
+  requireCloneableTemplate(source.is_task_list);
   if (!source.space_id) throw new HttpError(409, "space_required", "The source page is not assigned to a space.");
   const title = body.title === undefined ? source.title : text(body.title, "title", PAGE_TITLE_MAX);
   const targetPageId = crypto.randomUUID();
@@ -2091,6 +2087,7 @@ app.post("/api/templates/:id/instantiate", async (c) => {
   const template = await pageForMember(c.env, member, c.req.param("id"));
   requirePageEditor(template);
   if (!template.is_template) throw new HttpError(404, "template_not_found", "Template not found.");
+  requireCloneableTemplate(template.is_task_list);
   if (!template.space_id) throw new HttpError(409, "space_required", "The template is not assigned to a space.");
   const body = await jsonBody(c.req.raw);
   const parentId = nullableId(body.parentId, "parentId");
@@ -2535,6 +2532,13 @@ async function authorizeJobRetry(env: Env, member: MemberContext, job: JobRow, p
     requireEditor(member);
     const source = await pageForMember(env, member, text(options.sourcePageId, "sourcePageId", 100));
     requirePageEditor(source);
+    requireCloneableTemplate(source.is_task_list);
+    const target = await env.DB.prepare("SELECT is_task_list FROM pages WHERE id=? AND workspace_id=?")
+      .bind(text(options.targetPageId, "targetPageId", 100), member.workspace.id)
+      .first<{ is_task_list: number }>();
+    requireCloneableTemplate(target?.is_task_list);
+    const captured = await env.BUCKET.get(`jobs/${job.id}/table-template.json`);
+    if (captured) requireCloneableTemplate((await captured.json<{ taskList?: boolean }>()).taskList);
     await editableSpaceForMember(env, member, text(options.targetSpaceId, "targetSpaceId", 100));
     const parentId = nullableId(options.parentId, "parentId");
     if (parentId) requirePageEditor(await pageForMember(env, member, parentId));

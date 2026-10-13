@@ -13,8 +13,8 @@ function containerAt(doc: PMNode, id: string) {
   return found;
 }
 
-/** Retain the actual child nodes: BlockNote's high-level table representation
- * omits native API row attributes, so rebuilding children would lose identity. */
+/** Move the actual child nodes so nested block, native-row and footnote
+ * identities are retained together. */
 export function moveTabPanel(editor: BlockNoteEditor<any, any, any>, tabsId: string, panelId: string, delta: -1 | 1) {
   const tabs = containerAt(editor.prosemirrorState.doc, tabsId);
   if (!tabs || tabs.node.firstChild?.type.name !== "tabs") return;

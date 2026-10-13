@@ -42,6 +42,24 @@ describe("document validation", () => {
       validateDocumentTree(page(block("legacy-columns", { type: "columns", attrs: { count: 2 }, content: [text] }))),
     ).not.toThrow();
   });
+  it("limits code blocks to plain text while retaining comment annotations", () => {
+    expect(() => validateDocumentTree(page(block("code", { type: "codeBlock", content: [text] })))).not.toThrow();
+    expect(() =>
+      validateDocumentTree(
+        page(block("code", { type: "codeBlock", content: [{ ...text, marks: [{ type: "comment--thread_1" }] }] })),
+      ),
+    ).not.toThrow();
+    for (const node of [
+      { type: "footnoteReference", attrs: { definitionId: "note" } },
+      { type: "hardBreak" },
+      { ...text, marks: [{ type: "bold" }] },
+      { ...text, marks: [{ type: "link", attrs: { href: "https://example.com" } }] },
+    ]) {
+      expect(() => validateDocumentTree(page(block("code", { type: "codeBlock", content: [node] })))).toThrow(
+        /incompatible/,
+      );
+    }
+  });
 
   it.each([
     page(block("duplicate", { type: "paragraph" }), block("duplicate", { type: "paragraph" })),

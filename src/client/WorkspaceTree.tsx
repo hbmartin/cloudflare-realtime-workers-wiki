@@ -32,6 +32,15 @@ export function CreationMenu({
   );
 }
 
+function ancestorIds(nodes: PageNode[], id: string | null): string[] {
+  for (const node of nodes) {
+    if (node.id === id) return [];
+    const path = ancestorIds(node.children, id);
+    if (node.children.some((child) => child.id === id) || path.length) return [node.id, ...path];
+  }
+  return [];
+}
+
 export function WorkspaceTree({
   nodes: sourceNodes,
   selectedId,
@@ -43,6 +52,7 @@ export function WorkspaceTree({
   onMove,
   preferenceKey,
   revealRequest,
+  onRevealHandled,
 }: {
   nodes: PageNode[];
   selectedId: string | null;
@@ -54,6 +64,7 @@ export function WorkspaceTree({
   onMove: (id: string, parentId: string | null, beforeId: string | null, afterId: string | null) => void;
   preferenceKey: string;
   revealRequest?: { id: string; sequence: number } | undefined;
+  onRevealHandled?: (sequence: number) => void;
 }) {
   const [sorting, setSorting] = useState<Record<string, BranchSort>>(() =>
     readPreference(`${preferenceKey}:sorting`, {}),
@@ -85,42 +96,40 @@ export function WorkspaceTree({
   const [focused, setFocused] = useState<string | null>(selectedId);
   const ref = useRef<HTMLDivElement>(null);
   const typeahead = useRef({ text: "", at: 0 });
+  const handledReveal = useRef<number | null>(null);
   useEffect(() => {
     savePreference(preferenceKey, collapsed);
   }, [collapsed, preferenceKey]);
   useEffect(() => {
-    const path: string[] = [];
-    const find = (items: PageNode[]): boolean =>
-      items.some((node) => {
-        if (node.id === (revealRequest?.id ?? selectedId)) return true;
-        if (find(node.children)) {
-          path.push(node.id);
-          return true;
-        }
-        return false;
-      });
-    find(nodes);
+    const path = ancestorIds(nodes, selectedId);
     if (path.length)
       // Reveal the path when external navigation selects a nested page.
       // eslint-disable-next-line react/set-state-in-effect
       setCollapsed((current) =>
         current.some((id) => path.includes(id)) ? current.filter((id) => !path.includes(id)) : current,
       );
-  }, [nodes, selectedId, revealRequest]);
+  }, [nodes, selectedId]);
   useEffect(() => {
-    if (!revealRequest) return undefined;
-    if (collapsed.length && !ref.current?.querySelector(`[data-tree-page="${CSS.escape(revealRequest.id)}"]`))
+    if (!revealRequest || handledReveal.current === revealRequest.sequence) return undefined;
+    const path = ancestorIds(nodes, revealRequest.id);
+    if (path.some((id) => collapsed.includes(id))) {
+      // eslint-disable-next-line react/set-state-in-effect
+      setCollapsed((current) => current.filter((id) => !path.includes(id)));
       return undefined;
+    }
     const timer = requestAnimationFrame(() => {
       const item = ref.current?.querySelector<HTMLElement>(`[data-tree-page="${CSS.escape(revealRequest.id)}"]`);
-      item?.focus();
-      item?.scrollIntoView({ block: "nearest" });
-      item?.animate([{ backgroundColor: "var(--accent-soft, #dbeafe)" }, { backgroundColor: "transparent" }], {
+      if (!item) return;
+      item.focus();
+      item.scrollIntoView({ block: "nearest" });
+      item.animate([{ backgroundColor: "var(--accent-soft, #dbeafe)" }, { backgroundColor: "transparent" }], {
         duration: 1500,
       });
+      handledReveal.current = revealRequest.sequence;
+      onRevealHandled?.(revealRequest.sequence);
     });
     return () => cancelAnimationFrame(timer);
-  }, [revealRequest, collapsed]);
+  }, [revealRequest, collapsed, nodes, onRevealHandled]);
   const toggle = (id: string) =>
     setCollapsed((current) => (current.includes(id) ? current.filter((x) => x !== id) : [...current, id]));
   const visible: PageNode[] = [];
