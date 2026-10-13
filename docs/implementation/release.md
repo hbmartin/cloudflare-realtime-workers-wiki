@@ -61,6 +61,17 @@ The rendering experiment kept all native blocks mounted. At 10,000 blocks, edit 
 
 Local run logs: `/tmp/noteflare-full-check.log` and `/tmp/noteflare-browser-final2.log`. These are temporary execution evidence. Preserve them with the recorded implementation commit when preparing a release. No production deployment or migration application was performed.
 
+## Delivery record
+
+| Item                              | Recorded state                                                                                                      |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Implementation code commit        | `fe0484447a587ff691aba088590eae2776f3cb4f`                                                                          |
+| Review branch                     | `feat/editor-table-foundations`, based on `main` at `48c2239b00a8657a09181bff4dd9d5c9bff57880`                      |
+| Deployment SHA                    | Unassigned; no production deployment performed                                                                      |
+| Production migrations             | `0083`–`0089` and Durable Object `v3` pending application                                                           |
+| Production creation flags         | `EDITOR_BLOCKS_V2_ENABLED`, `TABLE_AUTHORITY_ENABLED`, `TABLE_BOARD_ENABLED`, `TABLE_CALENDAR_ENABLED` remain false |
+| Live acceptance and table cutover | Pending the closeout below                                                                                          |
+
 ## Required closeout
 
 Record the implementation SHA, deployment SHA, migration application results, creation flags and per-table authority generations before declaring this release shipped. Keep CI results, browser acceptance, rendering measurements and live acceptance distinct. Reader capability deployment must complete before insertion flags are enabled.
