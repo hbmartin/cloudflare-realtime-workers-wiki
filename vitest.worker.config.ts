@@ -13,6 +13,9 @@ export default defineConfig({
           TEST_MIGRATIONS: migrations,
           // Exercise Markdown writes independently of the portable deployment's default.
           NOTION_MARKDOWN_WRITES_ENABLED: "true",
+          TABLE_AUTHORITY_ENABLED: "true",
+          TABLE_BOARD_ENABLED: "true",
+          TABLE_CALENDAR_ENABLED: "true",
           BETTER_AUTH_SECRET: "worker-test-secret-with-at-least-32-characters",
           BETTER_AUTH_URL: "http://example.test",
           BOOTSTRAP_TOKEN: "worker-bootstrap-token",

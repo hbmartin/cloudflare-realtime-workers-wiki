@@ -38,6 +38,7 @@
   "durable_objects": {
     "bindings": [
       { "name": "DOCUMENT", "class_name": "Document" },
+      { "name": "TABLE", "class_name": "TableAuthority" },
       { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
     ],
   },
@@ -75,12 +76,17 @@
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Document"] },
     { "tag": "v2", "new_sqlite_classes": ["WorkspaceEvents"] },
+    { "tag": "v3", "new_sqlite_classes": ["TableAuthority"] },
   ],
   "triggers": { "crons": ["*/15 * * * *"] },
   "vars": {
     "BETTER_AUTH_URL": "auto",
     "CHATGPT_CONNECTION_ENABLED": "false",
     "EXPANDED_EMBEDS_ENABLED": "true",
+    "EDITOR_BLOCKS_V2_ENABLED": "false",
+    "TABLE_AUTHORITY_ENABLED": "false",
+    "TABLE_BOARD_ENABLED": "false",
+    "TABLE_CALENDAR_ENABLED": "false",
     "NOTION_MARKDOWN_WRITES_ENABLED": "false",
     "OFFLINE_EDITING_ENABLED": "true",
     "BLOCK_LINKS_ENABLED": "true",
@@ -121,6 +127,7 @@
       "durable_objects": {
         "bindings": [
           { "name": "DOCUMENT", "class_name": "Document" },
+          { "name": "TABLE", "class_name": "TableAuthority" },
           { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
         ],
       },
@@ -155,6 +162,10 @@
         "BETTER_AUTH_URL": "https://cloudflare-realtime-notes.harold-martin.workers.dev",
         "CHATGPT_CONNECTION_ENABLED": "false",
         "EXPANDED_EMBEDS_ENABLED": "false",
+        "EDITOR_BLOCKS_V2_ENABLED": "false",
+        "TABLE_AUTHORITY_ENABLED": "false",
+        "TABLE_BOARD_ENABLED": "false",
+        "TABLE_CALENDAR_ENABLED": "false",
         "NOTION_MARKDOWN_WRITES_ENABLED": "false",
         "OFFLINE_EDITING_ENABLED": "false",
         "BLOCK_LINKS_ENABLED": "false",
@@ -189,6 +200,7 @@
       "durable_objects": {
         "bindings": [
           { "name": "DOCUMENT", "class_name": "Document" },
+          { "name": "TABLE", "class_name": "TableAuthority" },
           { "name": "WORKSPACE_EVENTS", "class_name": "WorkspaceEvents" },
         ],
       },
@@ -224,6 +236,10 @@
         "WORKFLOW_INLINE": "true",
         "CHATGPT_CONNECTION_ENABLED": "false",
         "EXPANDED_EMBEDS_ENABLED": "true",
+        "EDITOR_BLOCKS_V2_ENABLED": "false",
+        "TABLE_AUTHORITY_ENABLED": "true",
+        "TABLE_BOARD_ENABLED": "true",
+        "TABLE_CALENDAR_ENABLED": "true",
         "NOTION_MARKDOWN_WRITES_ENABLED": "true",
         "OFFLINE_EDITING_ENABLED": "true",
         "BLOCK_LINKS_ENABLED": "true",

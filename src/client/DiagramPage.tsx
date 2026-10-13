@@ -95,6 +95,8 @@ function newNode(type: DiagramNodeType, index: number, assetId: string | null = 
     notes: "",
     color: "slate",
     assetId,
+    linkedPageId: null,
+    linkedViewId: null,
     references: [],
     mentions: [],
   };
@@ -377,13 +379,58 @@ function EntityPicker({
   );
 }
 
+function LinkedViewPicker({
+  pageId,
+  viewId,
+  onChange,
+}: {
+  pageId: string;
+  viewId: string | null;
+  onChange: (id: string | null) => void;
+}) {
+  const [loadedViews, setLoadedViews] = useState<{ pageId: string; views: { id: string; name: string }[] } | null>(
+    null,
+  );
+  const views = loadedViews?.pageId === pageId ? loadedViews.views : [];
+  useEffect(() => {
+    const controller = new AbortController();
+    void api<{ views: { id: string; name: string }[] }>(`/api/tables/${encodeURIComponent(pageId)}/query?limit=1`, {
+      signal: controller.signal,
+    })
+      .then((result) => {
+        if (!controller.signal.aborted) setLoadedViews({ pageId, views: result.views });
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [pageId]);
+  return views.length ? (
+    <label>
+      Saved table view
+      <select
+        aria-label="Saved table view"
+        value={viewId ?? ""}
+        onChange={(event) => onChange(event.target.value || null)}
+      >
+        <option value="">Default view</option>
+        {views.map((view) => (
+          <option key={view.id} value={view.id}>
+            {view.name}
+          </option>
+        ))}
+      </select>
+    </label>
+  ) : null;
+}
+
 function DiagramInspector({
   selectedNode,
   selectedEdge,
   frames,
   updateNode,
   updateEdge,
+  allowCards,
 }: {
+  allowCards: boolean;
   selectedNode: DiagramNode | null;
   selectedEdge: DiagramEdge | null;
   frames: DiagramNode[];
@@ -477,6 +524,36 @@ function DiagramInspector({
           </select>
         </label>
       ) : null}
+      {(allowCards || node.linkedPageId) && (
+        <>
+          <h4>Page card</h4>
+          <p className="muted">An empty node label follows the source title. Enter a label to use your own alias.</p>
+          <EntityPicker
+            kind="page"
+            onChoose={(suggestion) =>
+              updateNode(node.id, {
+                linkedPageId: suggestion.entityId,
+                linkedViewId: null,
+                label: "",
+                width: Math.max(260, node.width),
+                height: Math.max(180, node.height),
+              })
+            }
+          />
+          {node.linkedPageId && (
+            <>
+              <LinkedViewPicker
+                pageId={node.linkedPageId}
+                viewId={node.linkedViewId}
+                onChange={(linkedViewId) => updateNode(node.id, { linkedViewId })}
+              />
+              <button type="button" onClick={() => updateNode(node.id, { linkedPageId: null, linkedViewId: null })}>
+                Remove page card
+              </button>
+            </>
+          )}
+        </>
+      )}
       <h4>Page links</h4>
       <EntityPicker kind="page" onChoose={addLink} />
       <div className="diagram-chips">
@@ -630,11 +707,29 @@ function DiagramCanvas({
         height: record.height,
         zIndex: record.type === "frame" ? -1 : record.zIndex,
         selected: selectedNodes.current.has(record.id),
-        data: { record, editable, commentCount: counts.get(record.id) ?? 0, updateLabel },
+        data: {
+          account: `${member.user.id}:${member.workspace.id}`,
+          record,
+          editable,
+          commentCount: counts.get(record.id) ?? 0,
+          updateLabel,
+        },
       })),
     );
     setEdges(next.edges.map((record) => ({ ...flowEdge(record), selected: selectedEdges.current.has(record.id) })));
-  }, [bundle.doc, comments, editable, page.contentEpoch, page.id, setEdges, setNodes, setRecords, updateLabel]);
+  }, [
+    bundle.doc,
+    comments,
+    editable,
+    page.contentEpoch,
+    page.id,
+    member.user.id,
+    member.workspace.id,
+    setEdges,
+    setNodes,
+    setRecords,
+    updateLabel,
+  ]);
 
   useEffect(() => {
     roots.nodes.observeDeep(refresh);
@@ -712,7 +807,19 @@ function DiagramCanvas({
         if (!map) return;
         if (patch.label !== undefined) replaceYText(map, "label", patch.label);
         if (patch.notes !== undefined) replaceYText(map, "notes", patch.notes);
-        for (const key of ["x", "y", "width", "height", "zIndex", "type", "color", "assetId", "parentId"] as const) {
+        for (const key of [
+          "x",
+          "y",
+          "width",
+          "height",
+          "zIndex",
+          "type",
+          "color",
+          "assetId",
+          "parentId",
+          "linkedPageId",
+          "linkedViewId",
+        ] as const) {
           if (!(key in patch)) continue;
           const value = patch[key];
           if (value === null || value === undefined) map.delete(key);
@@ -777,8 +884,10 @@ function DiagramCanvas({
               }
             }
           } else if (change.type === "dimensions" && change.dimensions) {
-            map.set("width", change.dimensions.width);
-            map.set("height", change.dimensions.height);
+            // React Flow reports measured dimensions again after a model refresh.
+            // Avoid turning identical observer measurements into Yjs writes.
+            if (map.get("width") !== change.dimensions.width) map.set("width", change.dimensions.width);
+            if (map.get("height") !== change.dimensions.height) map.set("height", change.dimensions.height);
           } else if (change.type === "remove") {
             roots.nodes.delete(change.id);
             for (const [edgeId, edge] of roots.edges.entries()) {
@@ -949,6 +1058,7 @@ function DiagramCanvas({
           frames={records.nodes.filter((node) => node.type === "frame")}
           updateNode={updateNode}
           updateEdge={updateEdge}
+          allowCards={member.features?.editorBlocksV2 ?? false}
         />
       ) : (
         <aside className="diagram-inspector">
@@ -978,6 +1088,7 @@ export function DiagramPage({
   const [panel, setPanel] = useState<"comments" | "history" | "backlinks" | null>(null);
   const [anchor, setAnchor] = useState<CommentAnchor | null>(null);
   const [threads, setThreads] = useState<CommentThread[]>([]);
+  const [schemaUpgrade, setSchemaUpgrade] = useState(false);
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
   const title = titleEdit.pageId === page.id && titleEdit.revision === page.revision ? titleEdit.value : page.title;
   useEffect(() => {
@@ -986,6 +1097,7 @@ export function DiagramPage({
     const custom = (message: string) => {
       try {
         const value = JSON.parse(message) as { type?: unknown; bytes?: unknown; readOnly?: unknown };
+        if (value.type === "document-schema-upgrade") setSchemaUpgrade(true);
         if (value.type === "document-size" && typeof value.bytes === "number")
           setSizeWarning({ bytes: value.bytes, readOnly: value.readOnly === true });
       } catch {
@@ -1024,7 +1136,7 @@ export function DiagramPage({
   }, [commentsRevision, page.id]);
 
   const connected = status === "connected" && Boolean(bundle?.synced) && ready;
-  const editable = member.role !== "viewer" && connected && !sizeWarning?.readOnly;
+  const editable = member.role !== "viewer" && connected && !sizeWarning?.readOnly && !schemaUpgrade;
 
   async function saveTitle() {
     const normalized = title.trim() || "Untitled";
@@ -1063,6 +1175,14 @@ export function DiagramPage({
       {!connected ? (
         <div className="notice">This diagram is read-only until the server reconnects and finishes syncing.</div>
       ) : null}
+      {schemaUpgrade && (
+        <p className="notice notice-danger" role="alert">
+          Reload to edit linked page cards.
+          <button type="button" onClick={() => window.location.reload()}>
+            Reload diagram
+          </button>
+        </p>
+      )}
       {sizeWarning ? (
         <div className={`notice ${sizeWarning.readOnly ? "notice-danger" : ""}`}>
           This diagram is {(sizeWarning.bytes / 1024 / 1024).toFixed(1)} MiB.

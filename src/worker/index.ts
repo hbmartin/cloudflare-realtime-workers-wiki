@@ -1,3 +1,15 @@
+import { TableAuthority } from "./table-authority";
+import {
+  collaborativeTable,
+  tableRegistry,
+  tableFetch,
+  tableCommand,
+  queryTable,
+  enableTableAuthority,
+  repairTableProjection,
+  verifyTableProjection,
+} from "./table-service";
+import type { TableCommand } from "../shared/table-protocol";
 import { readComparison, pruneDocumentChanges } from "./document-changes";
 import { buildTableRowQuery, tableRowBinds, stableTableSnapshot, collectRowCells } from "./table-read";
 import { processDueSlackFileCleanup, slackFileCleanupHealth } from "./slack-file-cleanup";
@@ -118,6 +130,8 @@ import {
 } from "../shared/validation";
 import type {
   ClientMemberContext,
+  DocumentContentEnvelope,
+  DiagramContentEnvelope,
   CommentAnchor,
   ExportFormat,
   ImportPreview,
@@ -148,10 +162,13 @@ import {
 } from "../shared/import-space-mapping";
 import { constantTimeEqual } from "../shared/security";
 import { CLIENT_ERROR_EVENTS, isClientErrorName, isTelemetryIdentifier } from "../shared/client-telemetry-contract";
-import { serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
+import { projectDocument, serializeDocument, type ProseMirrorJson } from "../shared/document-projection";
 import { normalizeSearchValue } from "../shared/search-normalization";
 import { conditionalGetStatus, normalizeR2Range } from "./r2";
 import { pageJson, type PageJsonRow } from "./page-row";
+import { readPageInfo, versionContributors } from "./page-info";
+import { readRoomContent, readTableChunk } from "./ai-sources";
+import { checkWorkspaceIntegrity } from "./integrity";
 import { broadcastWorkspaceEvent, WorkspaceEvents } from "./workspace-events";
 import {
   createWebhookSubscription,
@@ -211,7 +228,7 @@ import {
   workspaceMcpSettings,
 } from "./oauth";
 import { mcpRequest, pruneStagedMcpPages } from "./mcp";
-import { parseSearchRequest, searchPages, searchTitles } from "./search";
+import { normalizeQueuedTitles, parseSearchRequest, searchPages, searchTitles } from "./search";
 import { refreshPageSearchV2Statements, refreshPageSearchV2SubtreeStatements } from "./search-index";
 import {
   createShare,
@@ -1023,7 +1040,15 @@ async function activeTablePage<T = unknown>(
     ...row,
     effective_role: effectiveSpaceRole(member.role, row.visibility!, row.space_role ?? null)!,
   };
-  if (edit) requirePageEditor(accessible);
+  if (edit) {
+    requirePageEditor(accessible);
+    if (await collaborativeTable(env, pageId))
+      throw new HttpError(
+        409,
+        "table_client_update",
+        "This table uses collaborative commands. Update the client before editing.",
+      );
+  }
   return accessible;
 }
 
@@ -1521,6 +1546,10 @@ app.get("/api/me", async (c) => {
       offlineEditing: c.env.OFFLINE_EDITING_ENABLED === "true",
       blockLinks: c.env.BLOCK_LINKS_ENABLED === "true",
       liveDiagramEmbeds: c.env.LIVE_DIAGRAM_EMBEDS_ENABLED === "true",
+      editorBlocksV2: c.env.EDITOR_BLOCKS_V2_ENABLED === "true",
+      tableAuthority: c.env.TABLE_AUTHORITY_ENABLED === "true",
+      tableBoard: c.env.TABLE_BOARD_ENABLED === "true",
+      tableCalendar: c.env.TABLE_CALENDAR_ENABLED === "true",
       diffDigests: c.env.DIFF_DIGESTS_ENABLED === "true",
       workspaceActivity: c.env.WORKSPACE_ACTIVITY_ENABLED === "true",
     },
@@ -3492,6 +3521,44 @@ app.get("/api/pages/:id", async (c) => {
   return c.json({ page: pageJson(page), sidebarHidden: hidden.length > 0 });
 });
 
+app.get("/api/pages/:id/info", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const info = await readPageInfo(c.env, member, c.req.param("id"), c.req.query("cursor"));
+  await pageForMember(c.env, await requireMember(c.req.raw, c.env), c.req.param("id"));
+  return c.json(info);
+});
+
+app.get("/api/admin/integrity", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const mode = c.req.query("mode") ?? "metadata";
+  if (mode !== "metadata" && mode !== "content")
+    throw new HttpError(400, "invalid_integrity_mode", "Invalid integrity mode");
+  const limit = c.req.query("limit");
+  const integrity = await checkWorkspaceIntegrity(c.env, member, {
+    mode,
+    ...(c.req.query("cursor") ? { cursor: c.req.query("cursor")! } : {}),
+    ...(limit ? { limit: Number(limit) } : {}),
+  });
+  requireOwner(await requireMember(c.req.raw, c.env));
+  return c.json(integrity);
+});
+
+app.post("/api/admin/search/rebuild", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  const pending = await c.env.DB.prepare(`SELECT 1 FROM page_title_normalization_queue q JOIN pages p ON p.id=q.page_id
+    WHERE p.workspace_id=? LIMIT 1`)
+    .bind(member.workspace.id)
+    .first();
+  if (!pending)
+    await c.env.DB.prepare(`INSERT OR IGNORE INTO page_title_normalization_queue
+    SELECT id FROM pages WHERE workspace_id=?`)
+      .bind(member.workspace.id)
+      .run();
+  return c.json(await normalizeQueuedTitles(c.env.DB, member.workspace.id));
+});
+
 app.get("/api/pages/:id/breadcrumbs", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const page = await pageForMember(c.env, member, c.req.param("id"));
@@ -4682,8 +4749,12 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   ]);
   const jobId = crypto.randomUUID();
   const timestamp = now();
-  const targets = new Map<string, { kind: "document_do" | "r2_object" | "r2_prefix"; target: string }>();
+  const targets = new Map<string, { kind: "document_do" | "table_do" | "r2_object" | "r2_prefix"; target: string }>();
   for (const item of subtree.results) {
+    if (item.kind === "table") {
+      targets.set(`table_do:${item.id}`, { kind: "table_do", target: item.id });
+      continue;
+    }
     if (item.kind !== "document" && item.kind !== "diagram") continue;
     const prefix = `${item.kind === "diagram" ? "diagrams" : "documents"}/${item.id}/`;
     targets.set(`r2_prefix:${prefix}`, { kind: "r2_prefix", target: prefix });
@@ -4695,6 +4766,37 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
     targets.set(`r2_object:${attachment.r2_key}`, { kind: "r2_object", target: attachment.r2_key });
   }
   const targetValues = [...targets.values()];
+  const rowDetails = await c.env.DB.prepare(
+    `SELECT link.row_id,row.page_id table_page_id FROM table_row_pages link JOIN table_rows row ON row.id=link.row_id
+     WHERE link.page_id IN (SELECT value FROM json_each(?))
+       AND row.page_id NOT IN (SELECT value FROM json_each(?))`,
+  )
+    .bind(
+      JSON.stringify(subtree.results.map((item) => item.id)),
+      JSON.stringify(subtree.results.map((item) => item.id)),
+    )
+    .all<{ row_id: string; table_page_id: string }>();
+  for (const detail of rowDetails.results) {
+    if (await collaborativeTable(c.env, detail.table_page_id)) {
+      const deleted = await tableCommand(
+        c.env,
+        member,
+        detail.table_page_id,
+        {
+          operationId: `permanent-delete:${page.id}:${detail.row_id}`,
+          kind: "delete_row",
+          payload: { rowId: detail.row_id },
+        },
+        { allowDeleteDetail: true, taskMutation: true },
+      );
+      if (deleted.projectionPending)
+        throw new HttpError(
+          503,
+          "table_projection_pending",
+          "Row removal is committed; retry deletion after its projection catches up.",
+        );
+    }
+  }
   try {
     await c.env.DB.prepare(
       `INSERT INTO deletion_jobs
@@ -4737,9 +4839,17 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
             ) SELECT id FROM subtree
           )`,
       ).bind(page.id),
+      // The context and metadata deletion are one transaction; no legacy writer can observe this fence.
+      c.env.DB.prepare(`INSERT OR REPLACE INTO table_projection_context(page_id,generation)
+        SELECT page_id,generation FROM table_authority WHERE page_id IN (SELECT value FROM json_each(?))`).bind(
+        JSON.stringify(subtree.results.map((item) => item.id)),
+      ),
       c.env.DB.prepare(`DELETE FROM pages WHERE id = ? AND workspace_id = ?`).bind(page.id, member.workspace.id),
+      c.env.DB.prepare("DELETE FROM table_projection_context WHERE page_id IN (SELECT value FROM json_each(?))").bind(
+        JSON.stringify(subtree.results.map((item) => item.id)),
+      ),
     ]);
-    if (!results[3]?.meta.changes) throw new Error("Page metadata changed during permanent deletion.");
+    if (!results[4]?.meta.changes) throw new Error("Page metadata changed during permanent deletion.");
   } catch (error) {
     try {
       await c.env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ?`).bind(jobId).run();
@@ -4850,6 +4960,170 @@ app.get("/api/pages/:id/preview", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const row = await pageForMember(c.env, member, c.req.param("id"));
   return c.json({ preview: { page: pageJson(row), excerpt: (row.plain_text ?? "").slice(0, 280) } });
+});
+
+const previewValue = (value: unknown): string | number | boolean | string[] | null => {
+  if (typeof value === "string") return Array.from(value).slice(0, 160).join("");
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (Array.isArray(value)) return value.slice(0, 3).map((item) => Array.from(String(item)).slice(0, 80).join(""));
+  return value === undefined ? null : "Formula error";
+};
+
+app.get("/api/pages/:id/card-preview", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const page = await pageForMember(c.env, member, c.req.param("id"));
+  const viewId = c.req.query("viewId");
+  if (viewId && page.kind !== "table") throw new HttpError(422, "table_required", "A saved view belongs to a table.");
+  const identity = { id: page.id, title: page.title, kind: page.kind };
+  if (page.kind === "document") {
+    const current = await readRoomContent<DocumentContentEnvelope>(c.env, member, page);
+    await pageForMember(c.env, await requireMember(c.req.raw, c.env), page.id);
+    return c.json({
+      page: identity,
+      text: Array.from(projectDocument(current.document).plainText).slice(0, 500).join(""),
+    });
+  }
+  if (page.kind === "diagram") {
+    const current = await readRoomContent<DiagramContentEnvelope>(c.env, member, page);
+    await pageForMember(c.env, await requireMember(c.req.raw, c.env), page.id);
+    return c.json({
+      page: identity,
+      text: Array.from(
+        current.nodes
+          .slice(0, 20)
+          .map((node) => node.label)
+          .join(" · "),
+      )
+        .slice(0, 500)
+        .join(""),
+    });
+  }
+  const parameters = new URLSearchParams({ limit: "5" });
+  if (viewId) parameters.set("viewId", viewId);
+  const migrated = await collaborativeTable(c.env, page.id);
+  if (viewId && !migrated) throw new HttpError(404, "view_not_found", "Saved view is unavailable.");
+  const table = migrated
+    ? await queryTable(c.env, member, page.id, parameters.toString())
+    : await readTableChunk(c.env, member, page.id, { limit: "5" });
+  const visibleColumns =
+    "view" in table && table.view && !table.invalidView
+      ? table.view.visibleColumnIds
+          .map((id) => table.columns.find((column) => column.id === id))
+          .filter((column) => column !== undefined)
+      : table.columns;
+  const columns = visibleColumns.slice(0, 8);
+  const previewRows =
+    "view" in table
+      ? table.rows.map((row) => ({
+          id: row.id,
+          cells: {
+            ...row.cells,
+            ...Object.fromEntries(
+              Object.entries(row.computedCells ?? {}).map(([id, computed]) => [id, computed.value]),
+            ),
+          },
+        }))
+      : table.rows;
+  await pageForMember(c.env, await requireMember(c.req.raw, c.env), page.id);
+  return c.json({
+    page: identity,
+    text: "",
+    table: {
+      viewId: "view" in table ? (table.view?.id ?? null) : null,
+      name: "view" in table ? (table.view?.name ?? "Table") : "Table",
+      columns: columns.map(({ id, name }) => ({ id, name })),
+      rows: previewRows.slice(0, 5).map((row) => ({
+        id: row.id,
+        cells: Object.fromEntries(columns.map((column) => [column.id, previewValue(row.cells[column.id])])),
+      })),
+      hasMore: "nextCursor" in table ? table.nextCursor !== null : table.hasMore,
+      truncatedColumns: visibleColumns.length > columns.length,
+    },
+  });
+});
+
+app.get("/api/pages/:id/linked-tables/:tableId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await pageForMember(c.env, member, c.req.param("id"));
+  const parameters = new URL(c.req.url).searchParams;
+  const table = await queryTable(c.env, member, c.req.param("tableId"), parameters.toString());
+  const current = await requireMember(c.req.raw, c.env);
+  await pageForMember(c.env, current, c.req.param("id"));
+  await pageForMember(c.env, current, c.req.param("tableId"));
+  return c.json(table);
+});
+
+function linkedHostAuthorization(host: PageRow, member: MemberContext) {
+  return {
+    sql: `SELECT 1 FROM pages host
+        JOIN spaces s ON s.id=host.space_id AND s.workspace_id=host.workspace_id
+        JOIN workspace_members member ON member.workspace_id=host.workspace_id AND member.user_id=?
+        LEFT JOIN space_members grant ON grant.space_id=s.id AND grant.user_id=member.user_id
+        WHERE host.id=? AND host.workspace_id=? AND host.archived_at IS NULL AND host.import_job_id IS NULL
+          AND (member.role='owner' OR (member.role<>'viewer'
+            AND (s.visibility='workspace' OR grant.user_id IS NOT NULL)
+            AND (grant.role IS NULL OR grant.role='editor')))`,
+    binds: [member.user.id, host.id, member.workspace.id],
+  };
+}
+
+app.post("/api/pages/:id/linked-tables/:tableId/commands", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const host = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(host);
+  const body = await limitedJsonBody(c.req.raw, TABLE_BULK_MAX_BODY_BYTES);
+  return c.json(
+    await tableCommand(c.env, member, c.req.param("tableId"), body as TableCommand, {
+      authorization: linkedHostAuthorization(host, member),
+    }),
+  );
+});
+
+app.post("/api/pages/:id/linked-tables/:tableId/tasks", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const host = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(host);
+  const tableId = c.req.param("tableId");
+  if (!(await collaborativeTable(c.env, tableId)))
+    throw new HttpError(409, "table_authority_required", "Enable collaboration for this table first.");
+  const body = await jsonBody(c.req.raw);
+  if (body.archived !== undefined)
+    throw new HttpError(422, "task_archive_requires_source", "Open the source task list to archive or restore tasks.");
+  const result = await mutateTask(c.env, member, tableId, null, body, linkedHostAuthorization(host, member));
+  sendWorkspaceEvent(c, member.workspace.id, {
+    type: "task-list-invalidated",
+    pageId: tableId,
+    ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
+  });
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json(result, 201);
+});
+
+app.patch("/api/pages/:id/linked-tables/:tableId/tasks/:rowId", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const host = await pageForMember(c.env, member, c.req.param("id"));
+  requirePageEditor(host);
+  const tableId = c.req.param("tableId");
+  if (!(await collaborativeTable(c.env, tableId)))
+    throw new HttpError(409, "table_authority_required", "Enable collaboration for this table first.");
+  const body = await jsonBody(c.req.raw);
+  if (body.archived !== undefined)
+    throw new HttpError(422, "task_archive_requires_source", "Open the source task list to archive or restore tasks.");
+  const result = await mutateTask(
+    c.env,
+    member,
+    tableId,
+    c.req.param("rowId"),
+    body,
+    linkedHostAuthorization(host, member),
+  );
+  sendWorkspaceEvent(c, member.workspace.id, {
+    type: "task-list-invalidated",
+    pageId: tableId,
+    ...(typeof body.operationId === "string" ? { operationId: body.operationId } : {}),
+  });
+  c.executionCtx.waitUntil(sweepOutbox(c.env));
+  return c.json(result);
 });
 
 app.get("/api/pages/:id/comparison", async (c) => {
@@ -5615,7 +5889,18 @@ app.get("/api/pages/:id/versions", async (c) => {
   )
     .bind(page.id)
     .all();
-  return c.json({ versions: versions.results });
+  const contributors = await versionContributors(
+    c.env,
+    member,
+    page.id,
+    versions.results.map((version) => String(version.id)),
+  );
+  return c.json({
+    versions: versions.results.map((version) => ({
+      ...version,
+      contributors: contributors.get(String(version.id)) ?? [],
+    })),
+  });
 });
 
 app.get("/api/versions/:id", async (c) => {
@@ -5753,6 +6038,45 @@ app.patch("/api/task-lists/:pageId/tasks/:rowId", async (c) => {
   return c.json({ ...result, pageIds, ...cleanup }, cleanup.cleanupPending ? 202 : 200);
 });
 
+app.get("/api/tables/:pageId/authority", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await activeTablePage(c.env, member, c.req.param("pageId"));
+  return c.json({ authority: await tableRegistry(c.env, c.req.param("pageId")) });
+});
+app.post("/api/tables/:pageId/authority", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  requireOwner(member);
+  if (c.env.TABLE_AUTHORITY_ENABLED !== "true")
+    throw new HttpError(503, "table_cutover_disabled", "Table migration is awaiting release acceptance.");
+  return c.json({ authority: await enableTableAuthority(c.env, member, c.req.param("pageId")) });
+});
+app.post("/api/tables/:pageId/commands", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json(
+    await tableCommand(c.env, member, c.req.param("pageId"), (await jsonBody(c.req.raw)) as unknown as TableCommand),
+  );
+});
+app.get("/api/tables/:pageId/query", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  const result = await queryTable(c.env, member, c.req.param("pageId"), new URL(c.req.url).searchParams.toString());
+  await pageForMember(c.env, await requireMember(c.req.raw, c.env), c.req.param("pageId"));
+  return c.json(result);
+});
+app.get("/api/tables/:pageId/socket", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return tableFetch(c.env, member, c.req.param("pageId"), "/socket");
+});
+app.post("/api/tables/:pageId/repair", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  return c.json({ verification: await repairTableProjection(c.env, member, c.req.param("pageId")) });
+});
+app.get("/api/tables/:pageId/authority/verification", async (c) => {
+  const member = await requireMember(c.req.raw, c.env);
+  await activeTablePage(c.env, member, c.req.param("pageId"));
+  if (member.role !== "owner") throw new HttpError(403, "owner_required", "Only an owner can verify a projection.");
+  return c.json({ verification: await verifyTableProjection(c.env, c.req.param("pageId")) });
+});
+
 app.get("/api/tables/:pageId", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   const wantsCount = c.req.query("count") === "true";
@@ -5808,6 +6132,7 @@ app.get("/api/tables/:pageId", async (c) => {
   return c.json({
     table: {
       pageId: page.id,
+      authority: (await collaborativeTable(c.env, page.id)) ? "do" : "d1",
       filter: (c.req.query("q") ?? "").trim().slice(0, 200),
       revision,
       columns: columns.results.map((column) => ({
@@ -6952,10 +7277,16 @@ export async function executeScheduledTasks(env: Env, context: ExecutionContext,
 export async function backfillTableSearchValues(env: Env) {
   const [cells, options] = await Promise.all([
     env.DB.prepare(
-      `SELECT row_id,column_id,text_value FROM table_cells WHERE text_value IS NOT NULL AND text_search_value IS NULL ORDER BY row_id,column_id LIMIT ${TABLE_SEARCH_BACKFILL_PER_KIND}`,
+      `SELECT cell.row_id,cell.column_id,cell.text_value FROM table_cells cell JOIN table_rows row ON row.id=cell.row_id
+       WHERE cell.text_value IS NOT NULL AND cell.text_search_value IS NULL
+       AND NOT EXISTS(SELECT 1 FROM table_authority authority WHERE authority.page_id=row.page_id AND authority.state<>'d1')
+       ORDER BY cell.row_id,cell.column_id LIMIT ${TABLE_SEARCH_BACKFILL_PER_KIND}`,
     ).all<{ row_id: string; column_id: string; text_value: string }>(),
     env.DB.prepare(
-      `SELECT id,label FROM table_select_options WHERE label_search_value IS NULL ORDER BY id LIMIT ${TABLE_SEARCH_BACKFILL_PER_KIND}`,
+      `SELECT opt.id,opt.label FROM table_select_options opt JOIN table_columns col ON col.id=opt.column_id
+       WHERE opt.label_search_value IS NULL
+       AND NOT EXISTS(SELECT 1 FROM table_authority authority WHERE authority.page_id=col.page_id AND authority.state<>'d1')
+       ORDER BY opt.id LIMIT ${TABLE_SEARCH_BACKFILL_PER_KIND}`,
     ).all<{
       id: string;
       label: string;
@@ -6964,12 +7295,16 @@ export async function backfillTableSearchValues(env: Env) {
   const statements = [
     ...cells.results.map((cell) =>
       env.DB.prepare(
-        "UPDATE table_cells SET text_search_value=? WHERE row_id=? AND column_id=? AND text_search_value IS NULL",
+        `UPDATE table_cells SET text_search_value=? WHERE row_id=? AND column_id=? AND text_search_value IS NULL
+         AND NOT EXISTS(SELECT 1 FROM table_authority authority JOIN table_rows row ON row.page_id=authority.page_id
+           WHERE row.id=table_cells.row_id AND authority.state<>'d1')`,
       ).bind(normalizeSearchValue(cell.text_value), cell.row_id, cell.column_id),
     ),
     ...options.results.map((option) =>
       env.DB.prepare(
-        "UPDATE table_select_options SET label_search_value=? WHERE id=? AND label_search_value IS NULL",
+        `UPDATE table_select_options SET label_search_value=? WHERE id=? AND label_search_value IS NULL
+         AND NOT EXISTS(SELECT 1 FROM table_authority authority JOIN table_columns col ON col.page_id=authority.page_id
+           WHERE col.id=table_select_options.column_id AND authority.state<>'d1')`,
       ).bind(normalizeSearchValue(option.label), option.id),
     ),
   ];
@@ -7107,7 +7442,10 @@ export default {
         security_state: () => pruneSecurityState(env),
         oauth_security_records: () => pruneOAuthSecurityRecords(env),
         mcp_staged_pages: () => pruneStagedMcpPages(env),
-        table_search_values: () => backfillTableSearchValues(env),
+        table_search_values: async () => {
+          await backfillTableSearchValues(env);
+          await normalizeQueuedTitles(env.DB);
+        },
         ai_history: () => pruneAi(env),
       };
       const tasks: ScheduledTask[] = SCHEDULED_TASK_NAMES.map((name) => ({ name, run: runners[name] }));
@@ -7168,4 +7506,4 @@ export default {
   },
 };
 
-export { Document, NotesJobWorkflow, WorkspaceEvents };
+export { Document, NotesJobWorkflow, WorkspaceEvents, TableAuthority };

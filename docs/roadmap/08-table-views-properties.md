@@ -1,6 +1,6 @@
 # Phase 8: table views and core properties
 
-Status: not started. Requires Phase 7's Table Durable Object and verified D1 projection.
+Status: local implementation and acceptance in progress; not merged or deployed. Requires Phase 7's Table Durable Object and verified D1 projection. Board and Calendar creation have separate release flags; see the [implementation release ledger](../implementation/release.md).
 
 ## User contract
 

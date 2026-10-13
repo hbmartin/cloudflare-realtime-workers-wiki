@@ -14,6 +14,9 @@ import {
   withOfflineDocumentLock,
 } from "./offline-catalog";
 
+const EDITOR_CAPABILITIES =
+  "native-tables-v1,tabs-v1,footnotes-v1,status-badges-v1,linked-table-views-v1,diagram-links-v1";
+
 export const OFFLINE_COPY_MISSING_MESSAGE = "This offline document copy is no longer on this device.";
 const OFFLINE_STORAGE_TIMEOUT_MESSAGE = "Offline document storage did not finish loading.";
 export class OfflineStorageTimeoutError extends Error {
@@ -105,6 +108,7 @@ export function createCollaboration(
   const indexeddb = new IndexeddbPersistence(key, doc);
   const provider = new YProvider(window.location.host, `${pageId}~${epoch}`, doc, {
     party: "document",
+    params: { editorCapabilities: EDITOR_CAPABILITIES },
     connect: false,
   });
   let hiddenTimer: number | undefined;
@@ -284,7 +288,7 @@ export function createNetworkCollaboration(
   const provider = new YProvider(window.location.host, `${pageId}~${epoch}`, doc, {
     party: "document",
     connect: false,
-    params: readOnly ? { mode: "read" } : {},
+    params: { ...(readOnly ? { mode: "read" } : {}), editorCapabilities: EDITOR_CAPABILITIES },
   });
   const durability = new CollaborationDurability();
   let destroyed = false;

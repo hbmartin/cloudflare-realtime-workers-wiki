@@ -1,0 +1,127 @@
+.table-live {
+  width: 100%;
+  min-width: 0;
+}
+.table-live .table-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+.table-live button,
+.table-live input,
+.table-live select {
+  font: inherit;
+  max-width: 100%;
+}
+.table-live input,
+.table-live select {
+  padding: 0.4rem;
+  border: 1px solid var(--border-color, #aaa);
+  border-radius: 5px;
+  background: var(--surface-color, transparent);
+  color: inherit;
+}
+.table-live label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.table-grid-scroll {
+  overflow: auto;
+}
+.table-grid-scroll table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.table-grid-scroll th,
+.table-grid-scroll td {
+  padding: 0.5rem;
+  border: 1px solid var(--border-color, #ddd);
+  text-align: left;
+  min-width: 130px;
+}
+.table-grid-scroll small {
+  display: block;
+  font-weight: normal;
+  opacity: 0.65;
+}
+.table-grid-scroll input:not([type="checkbox"]),
+.table-grid-scroll select {
+  width: 100%;
+}
+.table-settings {
+  padding: 1rem;
+  border: 1px solid var(--border-color, #bbb);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+.table-settings fieldset {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  border: 1px solid var(--border-color, #aaa);
+}
+.table-property {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  border-bottom: 1px solid var(--border-color, #aaa);
+  padding: 0.5rem 0;
+}
+.table-board {
+  display: flex;
+  gap: 0.75rem;
+  overflow: auto;
+  align-items: flex-start;
+}
+.table-board-group {
+  min-width: 240px;
+  flex: 1;
+  background: var(--surface-color, rgba(128, 128, 128, 0.08));
+  padding: 0.75rem;
+  border-radius: 8px;
+}
+.table-card {
+  border: 1px solid var(--border-color, #aaa);
+  padding: 0.6rem;
+  border-radius: 6px;
+  margin: 0.5rem 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  background: var(--surface-color, transparent);
+}
+.table-calendar {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(130px, 1fr));
+  overflow: auto;
+}
+.table-calendar > section {
+  min-height: 120px;
+  padding: 0.4rem;
+  border: 1px solid var(--border-color, #aaa);
+}
+.table-calendar h3 {
+  margin: 0.2rem 0;
+}
+.table-live-embedded {
+  padding: 0.5rem;
+  border: 1px solid var(--border-color, #ccc);
+  border-radius: 6px;
+  max-height: 650px;
+  overflow: auto;
+}
+@media (max-width: 650px) {
+  .table-board-group {
+    min-width: 210px;
+  }
+  .table-settings {
+    padding: 0.5rem;
+  }
+}

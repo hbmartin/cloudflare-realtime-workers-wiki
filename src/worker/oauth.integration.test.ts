@@ -20,6 +20,7 @@ import {
 } from "./oauth";
 import { mcpRequest, pruneStagedMcpPages } from "./mcp";
 import { sha256 } from "./http";
+import { seal, unseal } from "./ai-auth";
 import { sourceRateLimitKey } from "./source-rate-limit";
 import type { Env } from "./env";
 import { protectedCommentBlockIds } from "./comments";
@@ -1869,6 +1870,125 @@ describe("MCP durable update input identity", () => {
 });
 
 describe("MCP document limits", () => {
+  it("paginates complete canonical content with sealed snapshot guards and response budgets", async () => {
+    const cookie = await bootstrap();
+    const connection = await connect(cookie);
+    const room = env.DOCUMENT.getByName(`${connection.page.id}~1`);
+    await room.fetch(
+      new Request("https://document.internal/noop", { headers: { "x-notes-internal": env.BETTER_AUTH_SECRET } }),
+    );
+    await runInDurableObject(room, async (instance) => {
+      const instanceRoom = instance as unknown as { document: Y.Doc; compact(): Promise<void> };
+      const group = new Y.XmlElement("blockGroup");
+      group.insert(
+        0,
+        Array.from({ length: 1100 }, (_, index) => {
+          const container = new Y.XmlElement("blockContainer");
+          container.setAttribute("id", `read-${index}`);
+          const paragraph = new Y.XmlElement("paragraph");
+          const text = new Y.XmlText();
+          text.insert(0, index === 0 ? `📝${'"\\'.repeat(140000)}` : `Paragraph ${index}`);
+          paragraph.insert(0, [text]);
+          container.insert(0, [paragraph]);
+          return container;
+        }),
+      );
+      instanceRoom.document.transact(() => {
+        const fragment = instanceRoom.document.getXmlFragment("document-store");
+        if (fragment.length) fragment.delete(0, fragment.length);
+        fragment.insert(0, [group]);
+      });
+      await instanceRoom.compact();
+    });
+    let response = await toolCall(connection.token, "fetch_page", { page_id: connection.page.id });
+    const first = documentResultSchema.parse(response.result.structuredContent);
+    expect(first).toMatchObject({ offset: 0, complete: false, truncated: true });
+    expect(first.nextCursor).toBeTruthy();
+    const parts: string[] = [];
+    let current = first;
+    for (let count = 0; count < 200; count++) {
+      expect(new TextEncoder().encode(JSON.stringify(response.result)).length).toBeLessThanOrEqual(48000);
+      expect(current.markdown).not.toMatch(/^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/u);
+      parts.push(current.markdown);
+      if (current.complete) break;
+      response = await toolCall(connection.token, "fetch_page", {
+        page_id: connection.page.id,
+        cursor: current.nextCursor,
+      });
+      const next = documentResultSchema.parse(response.result.structuredContent);
+      expect(next.offset).toBe(current.nextOffset);
+      current = next;
+    }
+    expect(current.complete).toBe(true);
+    expect(parts.join("").length).toBe(first.textLength);
+    expect(parts.join("")).toContain("Paragraph 1099");
+    expect(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id, offset: 1 })).result,
+    ).toMatchObject({ isError: true, structuredContent: { error: { code: "snapshot_required" } } });
+    expect(
+      (
+        await toolCall(connection.token, "fetch_page", {
+          page_id: connection.page.id,
+          offset: 1,
+          expected_revision: first.revision,
+          expected_content_epoch: first.contentEpoch,
+          expected_sequence: first.sequence,
+        })
+      ).result,
+    ).toMatchObject({ isError: true, structuredContent: { error: { code: "invalid_offset" } } });
+    expect(
+      (
+        await toolCall(connection.token, "fetch_page", {
+          page_id: connection.page.id,
+          cursor: first.nextCursor,
+          limit: 32000,
+        })
+      ).result,
+    ).toMatchObject({ isError: true, structuredContent: { error: { code: "invalid_source_cursor" } } });
+    const secondConnection = await connect(cookie);
+    expect(
+      (await toolCall(secondConnection.token, "fetch_page", { page_id: connection.page.id, cursor: first.nextCursor }))
+        .result,
+    ).toMatchObject({ isError: true, structuredContent: { error: { code: "invalid_source_cursor" } } });
+    const binding = `document:${connection.workspace.id}:${connection.user.id}:${connection.grantId}:${connection.page.id}:16000`;
+    const cursorBody = await unseal<Record<string, unknown>>(env.BETTER_AUTH_SECRET, binding, first.nextCursor!);
+    const expiredCursor = await seal(env.BETTER_AUTH_SECRET, binding, { ...cursorBody, expiresAt: Date.now() - 1 });
+    const expired = (
+      await toolCall(connection.token, "fetch_page", { page_id: connection.page.id, cursor: expiredCursor })
+    ).result;
+    expect(expired).toMatchObject({ isError: true, structuredContent: { error: { code: "invalid_source_cursor" } } });
+    const updated = await toolCall(connection.token, "update_page", {
+      page_id: connection.page.id,
+      operation_id: "after-read",
+      expected_revision: first.revision,
+      expected_content_epoch: first.contentEpoch,
+      command: { type: "insert_content", insert_content: { content: "After snapshot", position: { type: "end" } } },
+    });
+    expect(updated.result.isError).not.toBe(true);
+    expect(
+      (await toolCall(connection.token, "fetch_page", { page_id: connection.page.id, cursor: first.nextCursor }))
+        .result,
+    ).toMatchObject({ isError: true, structuredContent: { error: { code: "source_changed" } } });
+    await env.DB.prepare("UPDATE oauth_grants SET revoked_at=? WHERE id=?").bind(Date.now(), connection.grantId).run();
+    const revoked = await SELF.fetch(RESOURCE, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${connection.token}`,
+        "content-type": "application/json",
+        accept: "application/json",
+        "mcp-protocol-version": "2026-07-28",
+        "mcp-method": "tools/call",
+        "mcp-name": "fetch_page",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "fetch_page", arguments: { page_id: connection.page.id, cursor: first.nextCursor } },
+      }),
+    });
+    expect(revoked.status).toBe(401);
+  });
   it("rejects an oversized editable draft before commit and accepts a corrected draft with the same version guards", async () => {
     const connection = await connect(await bootstrap());
     const room = env.DOCUMENT.getByName(`${connection.page.id}~1`);
@@ -2219,17 +2339,16 @@ describe("ChatGPT plugin contracts", () => {
     };
     const tableId = await create("table"),
       diagramId = await create("diagram");
-    await env.DB.prepare("INSERT INTO table_columns VALUES('typed-column',?,'Count','number',100)").bind(tableId).run();
+    await env.DB.prepare(
+      "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('typed-column',?,'Count','number',100)",
+    )
+      .bind(tableId)
+      .run();
     for (let index = 0; index < 55; index++)
       await env.DB.batch([
-        env.DB.prepare("INSERT INTO table_rows VALUES(?,?,?,?,?,?)").bind(
-          `typed-row-${index}`,
-          tableId,
-          index,
-          connection.user.id,
-          1,
-          1,
-        ),
+        env.DB.prepare(
+          "INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+        ).bind(`typed-row-${index}`, tableId, index, connection.user.id, 1, 1),
         env.DB.prepare(
           "INSERT INTO table_cells(row_id,column_id,number_value,updated_at) VALUES(?,'typed-column',?,1)",
         ).bind(`typed-row-${index}`, index),
@@ -2292,6 +2411,82 @@ describe("ChatGPT plugin contracts", () => {
       expect.stringContaining('error="invalid_token"'),
     ]);
   });
+
+  it.each(["grant revocation", "workspace membership removal"] as const)(
+    "withholds a document chunk after %s during its room read",
+    async (change) => {
+      const connection = await connect(await bootstrap());
+      const secret = "Content held until authorization is rechecked";
+      const created = await toolCall(connection.token, "create_page", {
+        space_id: connection.page.spaceId,
+        title: "Delayed private response",
+        markdown: secret,
+        operation_id: "delayed-read-page",
+      });
+      expect(created.result.isError).not.toBe(true);
+      const pageId = (JSON.parse(created.result.content[0]!.text) as { id: string }).id;
+      if (change === "workspace membership removal") {
+        // Preserve the final-owner constraint while removing only this reader's membership.
+        await env.DB.batch([
+          env.DB.prepare(
+            "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES ('remaining-read-owner','Owner','remaining-read-owner@example.test',1,1)",
+          ),
+          env.DB.prepare(
+            "INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES (?,'remaining-read-owner','owner',1)",
+          ).bind(connection.workspace.id),
+        ]);
+      }
+      let heldReads = 0;
+      let revokedAt: number | null = null;
+      const bindings: Env = {
+        ...env,
+        DOCUMENT: new Proxy(env.DOCUMENT, {
+          get(target, property, receiver) {
+            if (property === "getByName")
+              return (name: string) => {
+                const room = target.getByName(name);
+                return {
+                  fetch: async (request: Request) => {
+                    const response = await room.fetch(request);
+                    if (new URL(request.url).pathname === "/content") {
+                      heldReads++;
+                      expect(response.status).toBe(200);
+                      expect(JSON.stringify(await response.clone().json<DocumentContentEnvelope>())).toContain(secret);
+                      // Hold the successful room response until access has changed.
+                      if (change === "grant revocation") {
+                        revokedAt = Date.now();
+                        await env.DB.prepare("UPDATE oauth_grants SET revoked_at=? WHERE id=?")
+                          .bind(revokedAt, connection.grantId)
+                          .run();
+                      } else
+                        await env.DB.prepare("DELETE FROM workspace_members WHERE workspace_id=? AND user_id=?")
+                          .bind(connection.workspace.id, connection.user.id)
+                          .run();
+                    }
+                    return response;
+                  },
+                };
+              };
+            return Reflect.get(target, property, receiver);
+          },
+        }),
+      };
+      const response = await toolCall(connection.token, "fetch_page", { page_id: pageId }, bindings);
+      expect(heldReads).toBe(1);
+      expect(response.result).toMatchObject({
+        isError: true,
+        structuredContent: { error: { code: "mcp_access_denied" } },
+      });
+      expect(response.result.structuredContent).not.toHaveProperty("markdown");
+      expect(JSON.stringify(response.result)).not.toContain(secret);
+      expect(response.result["_meta"]?.["mcp/www_authenticate"]).toEqual([
+        expect.stringContaining('error="invalid_token"'),
+      ]);
+      expect(
+        await env.DB.prepare("SELECT revoked_at FROM oauth_grants WHERE id=?").bind(connection.grantId).first(),
+      ).toEqual({ revoked_at: revokedAt });
+    },
+  );
 
   it("declares output schemas, OAuth scopes, supported commands, and global and thread UI entrypoints", async () => {
     const connection = await connect(await bootstrap());

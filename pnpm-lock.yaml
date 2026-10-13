@@ -94,6 +94,9 @@ importers:
       prosemirror-state:
         specifier: 1.4.4
         version: 1.4.4
+      prosemirror-view:
+        specifier: 1.42.6
+        version: 1.42.6
       react:
         specifier: 19.3.0
         version: 19.3.0

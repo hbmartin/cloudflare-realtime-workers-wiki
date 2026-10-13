@@ -1,4 +1,8 @@
 import { pruneDocumentChanges } from "./document-changes";
+import { tableTemplateSnapshot, type TableSnapshot } from "./table-service";
+import { metadataColumns, type TableFilter, type TableValue, type TableView } from "../shared/table-protocol";
+import { normalizeSearchValue } from "../shared/search-normalization";
+import { TASK_STATUSES, taskColumns } from "../shared/tasks";
 import {
   slackOutboxSnapshotFields,
   slackConsumerOutboxFence,
@@ -301,6 +305,250 @@ async function templateAttachmentId(jobId: string, sourceId: string) {
   return sha256Hex(`${jobId}:${sourceId}`);
 }
 
+async function captureTemplateTable(env: Env, job: JobRow, options: TemplateCloneOptions) {
+  const key = `jobs/${job.id}/table-template.json`;
+  if (await env.BUCKET.head(key)) return;
+  const snapshot = await tableTemplateSnapshot(env, options.sourcePageId);
+  snapshot.views = snapshot.views.filter((view) => !view.ownerId || view.ownerId === job.requested_by);
+  await assertJobActive(env, job);
+  await env.BUCKET.put(key, JSON.stringify(snapshot), {
+    httpMetadata: { contentType: "application/json" },
+    customMetadata: { jobId: job.id, sourcePageId: options.sourcePageId },
+  });
+}
+
+/** Resume from a captured canonical snapshot, never from subsequently changed source projections. */
+async function cloneTemplateTable(env: Env, job: JobRow, options: TemplateCloneOptions) {
+  const completeKey = `jobs/${job.id}/table-clone.complete.json`;
+  if (await env.BUCKET.head(completeKey)) return;
+  await captureTemplateTable(env, job, options);
+  const object = await env.BUCKET.get(`jobs/${job.id}/table-template.json`);
+  if (!object) throw new Error("The captured table template is missing.");
+  const snapshot = await object.json<TableSnapshot>();
+  const target = options.targetPageId,
+    timestamp = Date.now();
+  const mappedId = async (kind: string, sourceId: string) =>
+    `${target}:${kind}:${(await sha256Hex(sourceId)).slice(0, 32)}`;
+  const sourceTaskColumns = taskColumns(options.sourcePageId),
+    targetTaskColumns = taskColumns(target);
+  const taskColumnMap = new Map(
+    Object.entries(sourceTaskColumns).map(([key, value]) => [
+      value,
+      targetTaskColumns[key as keyof typeof targetTaskColumns],
+    ]),
+  );
+  const columnIds = new Map(
+    await Promise.all(
+      snapshot.columns.map(
+        async (column) =>
+          [
+            column.id,
+            snapshot.taskList && taskColumnMap.has(column.id)
+              ? taskColumnMap.get(column.id)!
+              : await mappedId("column", column.id),
+          ] as const,
+      ),
+    ),
+  );
+  const optionSourceIds = new Set(snapshot.columns.flatMap((column) => column.options.map((option) => option.id)));
+  for (const column of snapshot.columns)
+    if (["select", "status", "multi_select"].includes(column.type)) {
+      for (const row of snapshot.rows) {
+        const value = row.cells[column.id];
+        if (typeof value === "string") optionSourceIds.add(value);
+        else if (Array.isArray(value)) for (const selected of value) optionSourceIds.add(selected);
+      }
+    }
+  const taskOptionIds = new Map(
+    TASK_STATUSES.map((status) => [`${options.sourcePageId}-${status}`, `${target}-${status}`]),
+  );
+  const optionIds = new Map(
+    await Promise.all(
+      [...optionSourceIds].map(
+        async (optionId) =>
+          [
+            optionId,
+            snapshot.taskList && taskOptionIds.has(optionId)
+              ? taskOptionIds.get(optionId)!
+              : await mappedId("option", optionId),
+          ] as const,
+      ),
+    ),
+  );
+  const rowIds = new Map(
+    await Promise.all(snapshot.rows.map(async (row) => [row.id, await mappedId("row", row.id)] as const)),
+  );
+  const remapConfig = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(remapConfig);
+    if (!value || typeof value !== "object") return value;
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(record).map(([key, child]) => [
+        key,
+        record.t === "prop" && key === "id" && typeof child === "string"
+          ? (columnIds.get(child) ?? child)
+          : key === "dependencies" && Array.isArray(child)
+            ? child.map((dependency) => columnIds.get(String(dependency)) ?? dependency)
+            : remapConfig(child),
+      ]),
+    );
+  };
+  const remapValue = (columnId: string, value: TableValue): TableValue => {
+    const column = snapshot.columns.find((candidate) => candidate.id === columnId);
+    if (column && ["select", "status", "multi_select"].includes(column.type))
+      return Array.isArray(value)
+        ? value.map((selected) => optionIds.get(selected) ?? selected)
+        : typeof value === "string"
+          ? (optionIds.get(value) ?? value)
+          : value;
+    return value;
+  };
+  const remapFilter = (filter: TableFilter): TableFilter =>
+    filter.kind === "group"
+      ? { ...filter, filters: filter.filters.map(remapFilter) }
+      : {
+          ...filter,
+          columnId: columnIds.get(filter.columnId) ?? filter.columnId,
+          ...(filter.value === undefined ? {} : { value: remapValue(filter.columnId, filter.value) }),
+        };
+  const views: TableView[] = await Promise.all(
+    snapshot.views.map(async (view) => ({
+      ...view,
+      id: await mappedId("view", view.id),
+      ownerId: view.ownerId ? job.requested_by : null,
+      columnId: view.columnId ? (columnIds.get(view.columnId) ?? view.columnId) : null,
+      filters: view.filters ? remapFilter(view.filters) : null,
+      sorts: view.sorts.map((sort) => ({ ...sort, columnId: columnIds.get(sort.columnId) ?? sort.columnId })),
+      visibleColumnIds: view.visibleColumnIds.map((columnId) => columnIds.get(columnId) ?? columnId),
+      calculations: Object.fromEntries(
+        Object.entries(view.calculations ?? {}).map(([columnId, calculation]) => [
+          columnIds.get(columnId) ?? columnId,
+          calculation,
+        ]),
+      ),
+    })),
+  );
+  const insertJson = (tableName: string, names: string[], records: unknown[][]) =>
+    env.DB.prepare(
+      `INSERT INTO ${tableName}(${names.join(",")}) SELECT ${names.map((_name, index) => `json_extract(value,'$[${index}]')`).join(",")} FROM json_each(?)`,
+    ).bind(JSON.stringify(records));
+  await assertJobActive(env, job);
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM table_rows WHERE page_id=?").bind(target),
+    env.DB.prepare("DELETE FROM table_columns WHERE page_id=?").bind(target),
+    env.DB.prepare("DELETE FROM table_views WHERE page_id=?").bind(target),
+    env.DB.prepare("DELETE FROM table_people WHERE page_id=?").bind(target),
+    env.DB.prepare(
+      "INSERT INTO table_state(page_id,revision) VALUES(?,?) ON CONFLICT(page_id) DO UPDATE SET revision=excluded.revision",
+    ).bind(target, snapshot.revision),
+    insertJson(
+      "table_columns",
+      ["id", "page_id", "name", "type", "position", "config_json", "property_revision", "property_generation"],
+      snapshot.columns.map((column) => [
+        columnIds.get(column.id),
+        target,
+        column.name,
+        column.type,
+        column.position,
+        JSON.stringify(remapConfig(column.config ?? {})),
+        column.revision,
+        column.generation ?? 1,
+      ]),
+    ),
+    insertJson(
+      "table_select_options",
+      ["id", "column_id", "label", "label_search_value", "position", "color"],
+      snapshot.columns.flatMap((column) =>
+        column.options.map((option) => [
+          optionIds.get(option.id),
+          columnIds.get(column.id),
+          option.label,
+          normalizeSearchValue(option.label),
+          option.position,
+          option.color ?? "gray",
+        ]),
+      ),
+    ),
+    insertJson(
+      "table_views",
+      ["page_id", "id", "owner_id", "value_json"],
+      views.map((view) => [target, view.id, view.ownerId, JSON.stringify(view)]),
+    ),
+    insertJson(
+      "table_people",
+      ["page_id", "user_id", "name"],
+      (snapshot.people ?? []).map((person) => [target, person.id, person.name]),
+    ),
+  ]);
+  for (let offset = 0; offset < snapshot.rows.length; offset += 50) {
+    await assertJobActive(env, job);
+    const rows = snapshot.rows.slice(offset, offset + 50),
+      cells: unknown[][] = [];
+    for (const row of rows)
+      for (const [sourceColumnId, sourceValue] of Object.entries(row.cells)) {
+        const column = snapshot.columns.find((candidate) => candidate.id === sourceColumnId);
+        if (!column || metadataColumns.has(column.type) || column.type === "formula") continue;
+        const value = remapValue(sourceColumnId, sourceValue);
+        cells.push([
+          rowIds.get(row.id),
+          columnIds.get(column.id),
+          ["text", "url"].includes(column.type) && typeof value === "string" ? value : null,
+          ["text", "url"].includes(column.type) && typeof value === "string" ? normalizeSearchValue(value) : null,
+          column.type === "number" && typeof value === "number" ? value : null,
+          column.type === "checkbox" && typeof value === "boolean" ? Number(value) : null,
+          column.type === "date" && typeof value === "string" ? value : null,
+          ["select", "status"].includes(column.type) &&
+          typeof sourceValue === "string" &&
+          column.options.some((option) => option.id === sourceValue)
+            ? value
+            : null,
+          JSON.stringify(value),
+          row.cellRevisions[sourceColumnId] ?? 1,
+          timestamp,
+        ]);
+      }
+    await env.DB.batch([
+      insertJson(
+        "table_rows",
+        ["id", "page_id", "position", "created_by", "created_at", "updated_at", "updated_by", "row_revision"],
+        rows.map((row) => [
+          rowIds.get(row.id),
+          target,
+          row.position,
+          job.requested_by,
+          timestamp,
+          timestamp,
+          job.requested_by,
+          snapshot.revision,
+        ]),
+      ),
+      insertJson(
+        "table_cells",
+        [
+          "row_id",
+          "column_id",
+          "text_value",
+          "text_search_value",
+          "number_value",
+          "boolean_value",
+          "date_value",
+          "select_value",
+          "json_value",
+          "cell_revision",
+          "updated_at",
+        ],
+        cells,
+      ),
+    ]);
+  }
+  await assertJobActive(env, job);
+  await env.BUCKET.put(
+    completeKey,
+    JSON.stringify({ sourceRevision: snapshot.revision, rowCount: snapshot.rows.length }),
+    { httpMetadata: { contentType: "application/json" } },
+  );
+}
+
 async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneOptions) {
   await assertJobActive(env, job);
   const existing = await env.DB.prepare(`SELECT * FROM pages WHERE id = ? AND workspace_id = ?`)
@@ -330,6 +578,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
       }
       existing.content_epoch = job.attempt;
     }
+    if (existing.kind === "table") await cloneTemplateTable(env, job, options);
     return { published: false, page: existing };
   }
   const source = await env.DB.prepare(
@@ -357,6 +606,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     : null;
   if (options.parentId && !parent)
     throw new HttpError(409, "job_failed", "The template destination is no longer available.");
+  if (source.kind === "table") await captureTemplateTable(env, job, options);
   const last = await env.DB.prepare(
     `SELECT position FROM pages WHERE space_id = ? AND parent_id IS ? AND archived_at IS NULL
       AND import_job_id IS NULL AND is_template = ? ORDER BY position DESC, id DESC LIMIT 1`,
@@ -367,9 +617,9 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
   await env.DB.batch([
     env.DB.prepare(
       `INSERT INTO pages
-        (id, workspace_id, space_id, parent_id, kind, position, title, icon, is_template, import_job_id,
+        (id, workspace_id, space_id, parent_id, kind, position, title, icon, is_template, is_task_list, import_job_id,
          content_epoch, created_by, updated_by, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).bind(
       options.targetPageId,
       job.workspace_id,
@@ -380,6 +630,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
       options.title,
       source.icon,
       options.isTemplate ? 1 : 0,
+      source.is_task_list,
       job.id,
       job.attempt,
       job.requested_by,
@@ -387,6 +638,11 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
       timestamp,
       timestamp,
     ),
+    env.DB.prepare(
+      `INSERT INTO page_tags (page_id, tag_id, created_by, created_at)
+       SELECT ?, pt.tag_id, ?, ? FROM page_tags pt JOIN tags t ON t.id = pt.tag_id
+       WHERE pt.page_id = ? AND t.workspace_id = ?`,
+    ).bind(options.targetPageId, job.requested_by, timestamp, source.id, job.workspace_id),
     env.DB.prepare(
       `INSERT INTO subscriptions
         (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
@@ -402,35 +658,7 @@ async function stageTemplateClone(env: Env, job: JobRow, options: TemplateCloneO
     ),
   ]);
   if (source.kind === "table") {
-    const target = options.targetPageId;
-    await env.DB.batch([
-      env.DB.prepare(
-        `INSERT INTO table_state (page_id, revision) SELECT ?, revision FROM table_state WHERE page_id = ?`,
-      ).bind(target, source.id),
-      env.DB.prepare(
-        `INSERT INTO table_columns (id, page_id, name, type, position)
-         SELECT ? || ':column:' || id, ?, name, type, position FROM table_columns WHERE page_id = ?`,
-      ).bind(target, target, source.id),
-      env.DB.prepare(
-        `INSERT INTO table_select_options (id, column_id, label, label_search_value, position)
-         SELECT ? || ':option:' || option.id, ? || ':column:' || option.column_id,
-                option.label, option.label_search_value, option.position
-           FROM table_select_options option JOIN table_columns column ON column.id = option.column_id
-          WHERE column.page_id = ?`,
-      ).bind(target, target, source.id),
-      env.DB.prepare(
-        `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at)
-         SELECT ? || ':row:' || id, ?, position, ?, ?, ? FROM table_rows WHERE page_id = ?`,
-      ).bind(target, target, job.requested_by, timestamp, timestamp, source.id),
-      env.DB.prepare(
-        `INSERT INTO table_cells
-          (row_id, column_id, text_value, text_search_value, number_value, boolean_value, date_value, select_value, updated_at)
-         SELECT ? || ':row:' || cell.row_id, ? || ':column:' || cell.column_id,
-                cell.text_value, cell.text_search_value, cell.number_value, cell.boolean_value, cell.date_value,
-                CASE WHEN cell.select_value IS NULL THEN NULL ELSE ? || ':option:' || cell.select_value END, ?
-           FROM table_cells cell JOIN table_rows row ON row.id = cell.row_id WHERE row.page_id = ?`,
-      ).bind(target, target, target, timestamp, source.id),
-    ]);
+    await cloneTemplateTable(env, job, options);
   }
   const page = await env.DB.prepare(`SELECT * FROM pages WHERE id = ?`)
     .bind(options.targetPageId)
@@ -621,7 +849,13 @@ export async function cleanupTemplateClone(env: Env, job: JobRow, stillOwned: ()
   }
   const keys = [
     ...new Set(
-      [job.input_key, `jobs/${job.id}/template-content.bin`, ...attachments.map((row) => row.r2_key)].filter(Boolean),
+      [
+        job.input_key,
+        `jobs/${job.id}/template-content.bin`,
+        `jobs/${job.id}/table-template.json`,
+        `jobs/${job.id}/table-clone.complete.json`,
+        ...attachments.map((row) => row.r2_key),
+      ].filter(Boolean),
     ),
   ] as string[];
   if (keys.length) await deleteR2Keys(env.BUCKET, keys, stillOwned);

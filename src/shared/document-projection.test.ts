@@ -13,6 +13,110 @@ function document(...content: ProseMirrorJson[]): ProseMirrorJson {
 }
 
 describe("structured document projection", () => {
+  it("flattens tabs, exports status and uses request-local stable footnote anchors", () => {
+    const doc = document({
+      type: "blockGroup",
+      content: [
+        {
+          type: "blockContainer",
+          attrs: { id: "tabs" },
+          content: [
+            { type: "tabs" },
+            {
+              type: "blockGroup",
+              content: [
+                {
+                  type: "blockContainer",
+                  attrs: { id: "panel-a" },
+                  content: [
+                    { type: "tabPanel", attrs: { label: "First" } },
+                    {
+                      type: "blockGroup",
+                      content: [
+                        {
+                          type: "blockContainer",
+                          attrs: { id: "paragraph" },
+                          content: [
+                            {
+                              type: "paragraph",
+                              content: [
+                                { type: "text", text: "Review " },
+                                { type: "statusBadge", attrs: { label: "Approved", color: "green" } },
+                                { type: "footnoteReference", attrs: { definitionId: "note-a" } },
+                              ],
+                            },
+                          ],
+                        },
+                      ],
+                    },
+                  ],
+                },
+                {
+                  type: "blockContainer",
+                  attrs: { id: "panel-b" },
+                  content: [
+                    { type: "tabPanel", attrs: { label: "Second" } },
+                    {
+                      type: "blockGroup",
+                      content: [
+                        {
+                          type: "blockContainer",
+                          attrs: { id: "hidden" },
+                          content: [{ type: "paragraph", content: [{ type: "text", text: "Hidden tab text" }] }],
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          type: "blockContainer",
+          attrs: { id: "defs" },
+          content: [
+            { type: "footnotes" },
+            {
+              type: "blockGroup",
+              content: [
+                {
+                  type: "blockContainer",
+                  attrs: { id: "definition" },
+                  content: [
+                    {
+                      type: "footnoteDefinition",
+                      attrs: { definitionId: "note-a" },
+                      content: [{ type: "text", text: "Evidence" }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          type: "blockContainer",
+          attrs: { id: "linked" },
+          content: [{ type: "linkedTableView", attrs: { tablePageId: "source-table", viewId: "saved-view" } }],
+        },
+      ],
+    });
+    const result = serializeDocument(doc);
+    expect(result.markdown).toContain("## First");
+    expect(result.markdown).toContain("## Second");
+    expect(result.markdown).toContain("Hidden tab text");
+    expect(result.markdown).toContain("Approved[^note-a]");
+    expect(result.markdown).toContain("[^note-a]: Evidence");
+    expect(result.html).toContain('href="#footnote-note-a"');
+    expect(result.html).toContain('id="footnote-note-a"');
+    expect(projectDocument(doc).pageReferences).toContainEqual(expect.objectContaining({ targetId: "source-table" }));
+    const another = serializeDocument(
+      document({ type: "paragraph", content: [{ type: "footnoteReference", attrs: { definitionId: "other" } }] }),
+    );
+    expect(another.html).toContain('href="#footnote-other">1</a>');
+  });
+
   it("extracts nested rich text, links, and literal angle brackets", () => {
     const projection = projectDocument(
       document(

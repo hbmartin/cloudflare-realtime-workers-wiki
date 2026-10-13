@@ -1,0 +1,204 @@
+.editor-feature-tools {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  margin-block: 0.5rem;
+}
+.page-info-popover {
+  position: relative;
+}
+.page-info-popover dialog {
+  position: absolute;
+  z-index: 50;
+  width: min(380px, 80vw);
+  max-height: 60vh;
+  overflow: auto;
+  padding: 1rem;
+  border: 1px solid var(--border, #aaa);
+  background: var(--mantine-color-body, #fff);
+  border-radius: 0.5rem;
+}
+.notes-find-replace [role="search"] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border, #aaa);
+  border-radius: 0.5rem;
+}
+.notes-search-result {
+  background: #ffe59b;
+  color: #171717;
+}
+.notes-search-current {
+  background: #ffb44d;
+  outline: 2px solid #966100;
+}
+.editor-tabs-strip {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  padding: 0.5rem;
+  border-bottom: 1px solid var(--border, #aaa);
+}
+.editor-tabs-strip [role="tablist"] {
+  display: flex;
+  gap: 0.25rem;
+}
+.editor-tabs-strip [aria-selected="true"] {
+  border-bottom: 3px solid #4386ed;
+  font-weight: 600;
+}
+.editor-tab-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+.editor-status {
+  display: inline-flex;
+  gap: 0.25rem;
+  border-radius: 0.4rem;
+  padding: 0.1rem 0.4rem;
+  background: #e4e4e7;
+  color: #18181b;
+  vertical-align: middle;
+}
+.editor-status input {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  width: 9ch;
+}
+.editor-status select {
+  font-size: 0.75em;
+  color: inherit;
+  background: transparent;
+  border: 0;
+}
+.status-blue {
+  background: #dbeafe;
+  color: #1e3a8a;
+}
+.status-green {
+  background: #dcfce7;
+  color: #14532d;
+}
+.status-yellow {
+  background: #fef9c3;
+  color: #713f12;
+}
+.status-red {
+  background: #fee2e2;
+  color: #7f1d1d;
+}
+.status-purple {
+  background: #f3e8ff;
+  color: #581c87;
+}
+.editor-footnote-definition {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+.editor-footnote-definition > div {
+  flex: 1;
+}
+.editor-footnotes-label {
+  font-size: 1rem;
+  border-top: 1px solid var(--border, #aaa);
+  padding-top: 1rem;
+}
+.notes-presentation {
+  margin: 0;
+  width: 100vw;
+  max-width: none;
+  height: 100vh;
+  max-height: none;
+  border: 0;
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  background: var(--mantine-color-body, #fff);
+  color: var(--mantine-color-text, #111);
+  display: flex;
+  flex-direction: column;
+}
+.notes-presentation header,
+.notes-presentation footer {
+  display: flex;
+  gap: 1rem;
+  padding: 1rem;
+  align-items: center;
+  justify-content: center;
+}
+.notes-presentation-stage {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 1.5rem max(2rem, calc((100vw - 1000px)/2));
+}
+.notes-presentation-stage > h1 {
+  text-align: center;
+  margin-top: 20vh;
+  font-size: clamp(2rem, 5vw, 5rem);
+}
+.notes-presentation .bn-editor {
+  font-size: 1.35rem;
+  background: transparent;
+}
+@media print {
+  .editor-feature-tools,
+  .editor-tabs-strip,
+  .editor-tab-actions {
+    display: none;
+  }
+  .bn-block-outer[aria-hidden="true"] {
+    display: block !important;
+  }
+}
+.editor-linked-table {
+  min-height: 160px;
+  border: 1px solid var(--mantine-color-default-border);
+  padding: 12px;
+}
+.diagram-card-preview {
+  position: relative;
+  font-size: 12px;
+  background: Canvas;
+  color: CanvasText;
+  overflow: auto;
+  max-height: calc(100% - 32px);
+  padding: 5px;
+  margin-top: 32px;
+}
+.diagram-card-preview p {
+  margin: 4px 0;
+}
+.diagram-card-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+.diagram-card-preview td,
+.diagram-card-preview th {
+  text-align: left;
+  border: 1px solid #8884;
+  padding: 3px;
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.diagram-node:has(.diagram-card-preview) {
+  overflow: hidden;
+}
+.diagram-node:has(.diagram-card-preview) > input {
+  top: 8px;
+  transform: none;
+}
+.notes-code-token {
+  color: var(--shiki-light);
+}
+[data-mantine-color-scheme="dark"] .notes-code-token {
+  color: var(--shiki-dark);
+}

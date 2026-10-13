@@ -13,7 +13,7 @@ Tables and diagrams are read-only source readers in the plugin. Rich collaborati
 
 ## Edit a document
 
-The embedded editor has a Markdown draft and preview. Edit the draft, review it, then choose Save. Saves are explicit; navigation and Cancel guard unsaved changes. Stale revisions require reading the current document and reconciling your draft before retrying.
+The embedded editor reads all document chunks from one consistent snapshot before allowing edits. Incomplete reads remain read-only. It has a Markdown draft and preview. Edit the draft, review it, then choose Save. Saves are explicit; navigation and Cancel guard unsaved changes. Stale revisions require reading the current document and reconciling your draft before retrying.
 
 After an uncertain save, preserve the editor's recovery state and retry the same operation. Do not create a second operation merely because the response was lost. A confirmed expired staged creation can start a new create while retaining its draft and destination. Oversized or protected rich documents open in NoteFlare for editing.
 

@@ -6,6 +6,8 @@ import type { Task, TaskResponse } from "../shared/tasks";
 import { api, ApiClientError } from "./api";
 import { TasksView } from "./TasksView";
 vi.mock("./api", async (original) => ({ ...(await original<typeof import("./api")>()), api: vi.fn() }));
+// Authority discovery and rollout are covered by TableAuthorityGate.test.tsx.
+vi.mock("./TableAuthorityGate", () => ({ TableAuthorityGate: ({ legacy }: { legacy: React.ReactNode }) => legacy }));
 const member: ClientMemberContext = {
   role: "editor",
   user: { id: "me", name: "Alex", email: "alex@example.test" },

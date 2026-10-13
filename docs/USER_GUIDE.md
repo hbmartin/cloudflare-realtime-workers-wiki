@@ -8,9 +8,17 @@ Create nested pages in a workspace or private space, use favorites/pins/tags to 
 
 Comments are anchored to document blocks or diagram elements. Watches and notification preferences control in-app, email, and configured Slack delivery. Search, backlinks, and mentions can lag edits until the next compaction.
 
+Use the sidebar branch menu to sort immediate children by title or update time. Sorting is personal; switching back to Manual restores the stored order. **Move to space root** moves a page and its descendants to the root of its space. **Reveal in sidebar** opens and focuses its location, including the containing table for hidden row-detail pages. Template copies retain the template's captured tags.
+
+Document Find searches across formatting and hidden tabs; editors can replace one match or all displayed matches and undo the action. Page information shows creator, last editor and contributors, with labels when historical coverage is partial. If a document cannot render, its recovery controls provide retry, version history and a recovery download.
+
+After an operator enables new block creation, documents can insert status badges, tabs, footnotes and linked table views. Tab selection is personal. Footnotes number themselves by reference order and retain unused definitions. Presentation opens a frozen read-only snapshot; changes to the source do not update its slides. Existing blocks remain readable and exportable when new creation is disabled.
+
 ## Tasks and reminders
 
-Task lists offer Table and Board views, assignees, due dates, status, and row-detail pages. They retain a single-editor lease; a Board view is not a saved collaborative database view. My Tasks gathers your assigned work.
+Task lists offer assignees, due dates, status and row-detail pages. My Tasks gathers your assigned work. Legacy tables retain the single-editor lease and fixed Table/Board toggle until an owner completes the verified collaborative-table migration.
+
+Migrated tables use saved Grid views, with Board and Calendar creation controlled separately. Views share the same rows and properties. Grouped row creation sets the selected group in one action. Property conversions preview converted, empty and invalid values while retaining originals until commit; clearing invalid values requires confirmation. Formula properties are read-only results, and view calculations cover all filtered rows. Linked table views and diagram page cards require access to their source page.
 
 Insert a date mention and choose its reminder settings. Delivery follows the installation's scheduled handler and channel preferences, so it need not arrive exactly at the selected minute. Ask an operator about cron or delivery queues when due reminders remain absent.
 

@@ -1132,7 +1132,7 @@ describe("round-two recovery boundaries", () => {
       ),
     ]);
     await event(m.id, "page", r.window_end - 1);
-    await env.DB.prepare("UPDATE slack_channel_events SET actor_id='bot'").run();
+    await env.DB.prepare("UPDATE slack_channel_events SET actor_id='bot',contributor_ids_json='[\"bot\"]'").run();
     const pages = await digestPages(
       runtime(),
       (await digestMapping(runtime(), m.id))!,
@@ -8226,4 +8226,39 @@ it.each([
   expect(events.results.every((item) => item.id.startsWith(activity ? "activity:page_edit:" : "page_edit:"))).toBe(
     true,
   );
+});
+
+it("keeps all captured contributors in channel events and digest display", async () => {
+  const m = await mapping();
+  await page();
+  const r = await receipt(m.id);
+  await env.DB.prepare(
+    "INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES('coauthor','Coauthor','coauthor@example.test',1,1)",
+  ).run();
+  await env.DB.batch(
+    notificationFanoutStatements(env.DB, {
+      workspaceId: "workspace",
+      spaceId: "workspace-general",
+      pageId: "page",
+      actorId: "owner",
+      eventType: "page_edit",
+      sourceId: "page:contributors",
+      recipientIds: [],
+      emitSlackChannel: true,
+      retainDigestChanges: true,
+      threadId: null,
+      createdAt: r.window_end - 10,
+      data: { contributorIds: ["owner", "coauthor"] },
+    }),
+  );
+  const eventRow = await env.DB.prepare(
+    "SELECT actor_id,contributor_ids_json FROM slack_channel_events WHERE event_type='page_edit'",
+  ).first<{ actor_id: string; contributor_ids_json: string }>();
+  expect(eventRow?.actor_id).toBe("owner");
+  expect(JSON.parse(eventRow!.contributor_ids_json)).toEqual(["owner", "coauthor"]);
+  const installation = (await round2Installation(runtime(), "installation", 1))!;
+  const currentMapping = (await digestMapping(runtime(), m.id))!;
+  const digest = await digestPages(runtime(), currentMapping, r, installation);
+  expect(digest[0]?.actors).toEqual(["Owner", "Coauthor"]);
+  expect(digest[0]?.actorCount).toBe(2);
 });

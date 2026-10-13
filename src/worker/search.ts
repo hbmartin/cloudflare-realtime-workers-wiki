@@ -11,10 +11,47 @@ import { ID_PATTERN } from "../shared/validation";
 import type { MemberContext } from "./env";
 import { HttpError } from "./http";
 import { pageJson, type PageJsonRow } from "./page-row";
+import { normalizedTitle, titleSimilarity, titleTrigramMatch } from "../shared/title-search";
 
 const SEARCH_LIMIT_DEFAULT = 20;
 const SEARCH_LIMIT_MAX = 50;
 const SEARCH_OFFSET_MAX = 1_000;
+
+/** Forward-only normalization repair. Triggers provide immediate substring reads;
+ * the queue handles Unicode NFKC unavailable in SQLite's built-in lower(). */
+export async function normalizeQueuedTitles(database: D1Database, workspaceId?: string) {
+  const rows = await database
+    .prepare(
+      `SELECT p.id,p.title,p.updated_at,p.is_template,p.import_job_id FROM page_title_normalization_queue q
+     JOIN pages p ON p.id=q.page_id WHERE (? IS NULL OR p.workspace_id=?) ORDER BY p.id LIMIT 500`,
+    )
+    .bind(workspaceId ?? null, workspaceId ?? null)
+    .all<{ id: string; title: string; updated_at: number; is_template: number; import_job_id: string | null }>();
+  for (let index = 0; index < rows.results.length; index += 25) {
+    await database.batch(
+      rows.results.slice(index, index + 25).flatMap((row) => [
+        database
+          .prepare(`DELETE FROM page_title_trigrams WHERE page_id=? AND EXISTS(
+        SELECT 1 FROM pages p WHERE p.id=? AND p.title=? AND p.updated_at=?)`)
+          .bind(row.id, row.id, row.title, row.updated_at),
+        database
+          .prepare(`INSERT INTO page_title_trigrams(page_id,normalized_title)
+        SELECT id,? FROM pages WHERE id=? AND title=? AND updated_at=? AND is_template=0 AND import_job_id IS NULL`)
+          .bind(normalizedTitle(row.title), row.id, row.title, row.updated_at),
+        database
+          .prepare(`DELETE FROM page_title_normalization_queue WHERE page_id=? AND EXISTS(
+        SELECT 1 FROM pages p WHERE p.id=? AND p.title=? AND p.updated_at=?)`)
+          .bind(row.id, row.id, row.title, row.updated_at),
+      ]),
+    );
+  }
+  const pending = await database
+    .prepare(`SELECT count(*) count FROM page_title_normalization_queue q
+    JOIN pages p ON p.id=q.page_id WHERE (? IS NULL OR p.workspace_id=?)`)
+    .bind(workspaceId ?? null, workspaceId ?? null)
+    .first<{ count: number }>();
+  return { inspected: rows.results.length, pending: pending?.count ?? 0, complete: pending?.count === 0 };
+}
 // Private-use sentinels, written as escapes so they survive editors and review.
 const SNIPPET_OPEN = "\uE000";
 const SNIPPET_CLOSE = "\uE001";
@@ -130,6 +167,7 @@ export async function searchPages(
 ): Promise<SearchResponse> {
   const match = searchMatch(request.query);
   if (!match) return { results: [], limit: request.limit, offset: request.offset, hasMore: false };
+  await normalizeQueuedTitles(database, member.workspace.id);
 
   const conditions = [
     "page_search_v2 MATCH ?",
@@ -201,6 +239,49 @@ export async function searchPages(
     .bind(normalized, prefix, member.user.id, ...whereBindings, request.limit + 1, request.offset)
     .all<SearchRow>();
   const hasMore = rows.results.length > request.limit;
+  if (!rows.results.length && Array.from(request.query).length >= 4) {
+    // An empty later page must not switch algorithms after primary results.
+    const primaryExists =
+      request.offset > 0
+        ? await database
+            .prepare(
+              `SELECT 1 FROM page_search_v2 JOIN pages p ON p.id=page_search_v2.page_id
+       JOIN spaces s ON s.id=p.space_id LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=?
+       WHERE ${conditions.join(" AND ")} LIMIT 1`,
+            )
+            .bind(member.user.id, ...whereBindings)
+            .first()
+        : null;
+    const trigramMatch = titleTrigramMatch(request.query);
+    if (!primaryExists && trigramMatch) {
+      const fuzzyConditions = ["page_title_trigrams MATCH ?", ...conditions.slice(1)];
+      const candidates = await database
+        .prepare(
+          `SELECT p.*,s.name space_name,s.icon space_icon FROM page_title_trigrams
+         JOIN pages p ON p.id=page_title_trigrams.page_id JOIN spaces s ON s.id=p.space_id
+         LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=?
+         WHERE ${fuzzyConditions.join(" AND ")}
+         ORDER BY bm25(page_title_trigrams),p.updated_at DESC,p.id LIMIT 500`,
+        )
+        .bind(member.user.id, trigramMatch, ...whereBindings.slice(1))
+        .all<TitleRow>();
+      const ranked = candidates.results
+        .map((row) => ({ row, score: titleSimilarity(request.query, row.title) }))
+        .filter((candidate) => candidate.score >= 0.2)
+        .sort((a, b) => b.score - a.score || b.row.updated_at - a.row.updated_at || a.row.id.localeCompare(b.row.id));
+      return {
+        results: ranked.slice(request.offset, request.offset + request.limit).map(({ row }) => ({
+          page: pageJson(row),
+          space: { id: row.space_id!, name: row.space_name, icon: row.space_icon },
+          snippet: { source: "title", text: row.title },
+        })),
+        limit: request.limit,
+        offset: request.offset,
+        hasMore: ranked.length > request.offset + request.limit,
+        matchMode: "title-typo",
+      };
+    }
+  }
   return {
     results: rows.results.slice(0, request.limit).map((row) => ({
       page: pageJson(row),

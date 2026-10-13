@@ -7,7 +7,16 @@ const MAX_INPUT_BYTES = 128 * 1024;
 const MAX_INPUT_BLOCKS = 1000;
 export const MAX_MARKDOWN_DELIMITERS = 4096;
 
-export class MarkdownWriteError extends Error {}
+export class MarkdownWriteError extends Error {
+  constructor(
+    message: string,
+    readonly code = "invalid_markdown",
+    readonly details?: unknown,
+  ) {
+    super(message);
+    this.name = "MarkdownWriteError";
+  }
+}
 
 export type MarkdownParseLimits = {
   maxCharacters?: number;

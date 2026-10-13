@@ -1043,11 +1043,136 @@ function markdownImage(value: string) {
   return { label: unescapeMarkdown(trimmed.slice(2, labelEnd)), href: image.href };
 }
 
+type ImportedFootnote = { id: string; body: string };
+function footnoteImportId(label: string, identities: Map<string, string>) {
+  let id = identities.get(label);
+  if (!id) {
+    id = `import-footnote-${crypto.randomUUID()}`;
+    identities.set(label, id);
+  }
+  return id;
+}
+function addImportedFootnotes<T extends ProseMirrorJson>(
+  document: T,
+  definitions: ImportedFootnote[],
+  identities: Map<string, string>,
+  issues: ImportIssue[],
+  references: string[],
+  html = false,
+  literals = new Map<string, string>(),
+) {
+  const restoreLiterals = (node: ProseMirrorJson) => {
+    if (node.text && literals.size)
+      for (const [marker, literal] of literals) node.text = node.text.replaceAll(marker, literal);
+    node.content?.forEach(restoreLiterals);
+  };
+  const visit = (node: ProseMirrorJson) => {
+    if (!node.content) return;
+    node.content = node.content.flatMap((child) => {
+      if (child.type !== "text" || child.marks?.some((mark) => mark.type === "code" || mark.type === "link")) {
+        visit(child);
+        return [child];
+      }
+      const output: ProseMirrorJson[] = [];
+      let start = 0;
+      for (const match of (child.text ?? "").matchAll(/\[\^([^\]\n]{1,200})\]/g)) {
+        if (match.index > start) output.push({ ...child, text: child.text!.slice(start, match.index) });
+        output.push({ type: "footnoteReference", attrs: { definitionId: footnoteImportId(match[1]!, identities) } });
+        start = match.index + match[0].length;
+      }
+      if (start < (child.text?.length ?? 0)) output.push({ ...child, text: child.text!.slice(start) });
+      return output.length ? output : [child];
+    });
+  };
+  visit(document);
+  if (!definitions.length) {
+    restoreLiterals(document);
+    return document;
+  }
+  const seen = new Set<string>();
+  const children: ProseMirrorJson[] = [];
+  for (const definition of definitions) {
+    if (seen.has(definition.id)) {
+      issues.push({ code: "duplicate_footnote", detail: definition.id.slice(0, 120) });
+      continue;
+    }
+    seen.add(definition.id);
+    const definitionId = footnoteImportId(definition.id, identities);
+    let content: ProseMirrorJson[];
+    if (html) {
+      const imported = htmlToDocument(definition.body);
+      issues.push(...imported.issues);
+      references.push(...imported.references);
+      content = [];
+      const collect = (node: ProseMirrorJson) => {
+        if (node.type === "blockContainer") {
+          const inlineNodes = node.content?.[0]?.content;
+          if (
+            inlineNodes?.length &&
+            inlineNodes.every((item) =>
+              ["text", "hardBreak", "footnoteReference", "statusBadge"].includes(item.type ?? ""),
+            )
+          ) {
+            if (content.length) content.push({ type: "hardBreak" });
+            content.push(...inlineNodes);
+          }
+          node.content?.slice(1).forEach(collect);
+        } else node.content?.forEach(collect);
+      };
+      collect(imported.document);
+    } else content = markdownInline(definition.body, issues, references);
+    const block: ProseMirrorJson = { type: "footnoteDefinition", attrs: { definitionId }, content };
+    visit(block);
+    children.push({
+      type: "blockContainer",
+      attrs: { id: `import-definition-${children.length + 1}` },
+      content: [block],
+    });
+  }
+  document.content?.[0]?.content?.push({
+    type: "blockContainer",
+    attrs: { id: "import-footnotes" },
+    content: [{ type: "footnotes" }, { type: "blockGroup", content: children }],
+  });
+  restoreLiterals(document);
+  return document;
+}
+
 export function markdownToDocument(source: string) {
   const issues: ImportIssue[] = [];
   const references: string[] = [];
   const blocks: ProseMirrorJson[] = [];
-  const lines = source.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n");
+  const definitions: ImportedFootnote[] = [];
+  const identities = new Map<string, string>();
+  const literals = new Map<string, string>();
+  const lines: string[] = [];
+  let fenced = false;
+  let activeDefinition: ImportedFootnote | undefined;
+  for (let line of source.replaceAll("\r\n", "\n").replaceAll("\r", "\n").split("\n")) {
+    if (line.startsWith("```")) fenced = !fenced;
+    if (!fenced) {
+      const codes = codeRanges(line) ?? [];
+      line = line.replace(
+        /(\\+)\[\^([^\]\n]{1,200})\]/g,
+        (match: string, slashes: string, label: string, at: number) => {
+          if (slashes.length % 2 === 0 || codes.some((code) => at >= code.start && at < code.end)) return match;
+          const marker = `\uE000${crypto.randomUUID()}\uE001`;
+          literals.set(marker, `[^${label}]`);
+          return slashes.slice(0, -1) + marker;
+        },
+      );
+    }
+    const definition = !fenced && /^\[\^([^\]\n]{1,200})\]:\s*(.*)$/.exec(line);
+    if (definition) {
+      activeDefinition = { id: definition[1]!, body: definition[2]! };
+      definitions.push(activeDefinition);
+      lines.push("");
+    } else if (!fenced && activeDefinition && /^ {4}\S/.test(line)) activeDefinition.body += `\n${line.slice(4)}`;
+    else {
+      if (line.trim()) activeDefinition = undefined;
+      lines.push(line);
+    }
+  }
   let paragraphLines: string[] = [];
   let codeLines: string[] | null = null;
   let codeLanguage = "";
@@ -1148,7 +1273,11 @@ export function markdownToDocument(source: string) {
     issues.push({ code: "unterminated_code_fence", detail: "The final code block had no closing fence." });
     blocks.push({ type: "codeBlock", attrs: { language: codeLanguage }, content: inline(codeLines.join("\n")) });
   }
-  return { document: blockDocument(blocks), issues, references };
+  return {
+    document: addImportedFootnotes(blockDocument(blocks), definitions, identities, issues, references, false, literals),
+    issues,
+    references,
+  };
 }
 
 function htmlAttributes(tag: string) {
@@ -1159,7 +1288,37 @@ function htmlAttributes(tag: string) {
   return output;
 }
 
+function decodeId(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 export function htmlToDocument(source: string) {
+  const definitions: ImportedFootnote[] = [];
+  const identities = new Map<string, string>();
+  source = source.replace(
+    /<(p|li)\b([^>]*)>([\s\S]*?)<\/\1\s*>/gi,
+    (whole, _name: string, rawAttrs: string, body: string) => {
+      const attrs = htmlAttributes(rawAttrs);
+      const id = attrs["data-footnote-id"] ?? (attrs.id?.startsWith("footnote-") ? decodeId(attrs.id.slice(9)) : null);
+      if (!id) return whole;
+      definitions.push({
+        id,
+        body: body.replace(/<a\b[^>]*href=["']#(?:fnref|footnote-reference)[^>]*>[\s\S]*?<\/a>/gi, ""),
+      });
+      return "";
+    },
+  );
+  source = source.replace(/<sup\b[^>]*>\s*<a\b([^>]*)>[\s\S]*?<\/a>\s*<\/sup>/gi, (whole, rawAttrs: string) => {
+    const attrs = htmlAttributes(rawAttrs);
+    const id =
+      attrs["data-footnote-reference"] ??
+      (attrs.href?.startsWith("#footnote-") ? decodeId(attrs.href.slice(10)) : null);
+    return id ? `[^${id.replaceAll("]", "%5D")}]` : whole;
+  });
   const issues: ImportIssue[] = [];
   const references: string[] = [];
   const blocks: ProseMirrorJson[] = [];
@@ -1295,7 +1454,12 @@ export function htmlToDocument(source: string) {
     }
   }
   flush();
-  return { document: blockDocument(blocks), title, issues, references };
+  return {
+    document: addImportedFootnotes(blockDocument(blocks), definitions, identities, issues, references, true),
+    title,
+    issues,
+    references,
+  };
 }
 
 function prosemirrorNodeToYjs(node: ProseMirrorJson): Y.XmlElement | Y.XmlText {

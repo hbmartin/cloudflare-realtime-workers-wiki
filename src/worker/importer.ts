@@ -1,3 +1,6 @@
+import { collaborativeTable, projectionStatementDatabase, tableCommand } from "./table-service";
+import type { ProjectionStatement } from "./table-authority";
+import type { MemberContext } from "./env";
 import { activityMutationStart, activityMutationEnd } from "./activity-mutations";
 import { slackCaptureAccessSql } from "./slack-identity";
 import { tracing, type WorkflowStep } from "cloudflare:workers";
@@ -1262,6 +1265,8 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
     throw new HttpError(409, "job_failed", "The import parent is invalid for this bundle.");
   const externalParentId = options.parentId ?? null;
   const task = options.task;
+  const durableTask = Boolean(task && (await collaborativeTable(env, task.listId)));
+  const publicationDb = durableTask ? projectionStatementDatabase() : env.DB;
   const taskRowId = task && options.captureId ? `${options.captureId}-task` : null;
   let externalPosition: string | null = null;
   if (externalPage && externalParentId) {
@@ -1301,8 +1306,9 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
           AND NOT EXISTS (SELECT 1 FROM table_leases lease
             WHERE lease.page_id=task_list.id AND lease.expires_at>?))`
     : "";
-  const publishPages = env.DB.prepare(
-    `UPDATE pages SET ${externalPage ? "parent_id = CASE WHEN id = ? THEN ? ELSE parent_id END, position = CASE WHEN id = ? THEN ? ELSE position END," : ""}
+  const publishPages = publicationDb
+    .prepare(
+      `UPDATE pages SET ${externalPage ? "parent_id = CASE WHEN id = ? THEN ? ELSE parent_id END, position = CASE WHEN id = ? THEN ? ELSE position END," : ""}
       import_job_id = NULL, updated_at = ?
      WHERE import_job_id = ? AND content_epoch = ? AND id IN (SELECT value FROM json_each(?))
        AND (SELECT COUNT(*) FROM pages WHERE import_job_id = ? AND content_epoch = ?) = ?
@@ -1315,54 +1321,57 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
            AND capture.workspace_id = ? AND capture.requested_by = ?
            AND installation.generation = capture.installation_generation
            AND installation.disconnected_at IS NULL AND ${slackCaptureAccessSql("capture")}
-       ))`,
-  ).bind(
-    ...(externalPage ? [externalPage.id, externalParentId, externalPage.id, externalPosition] : []),
-    timestamp,
-    job.id,
-    job.attempt,
-    pageIds,
-    job.id,
-    job.attempt,
-    bundle.pages.length,
-    job.id,
-    job.attempt,
-    destinationIds,
-    job.workspace_id,
-    job.requested_by,
-    job.requested_by,
-    ...(externalParentId ? [externalParentId, job.workspace_id, externalPage!.spaceId] : []),
-    ...(task ? [task.listId, timestamp] : []),
-    options.captureId ?? null,
-    options.captureId ?? "",
-    job.id,
-    job.workspace_id,
-    job.requested_by,
-  );
-  const committed = await env.DB.batch([
-    env.DB.prepare(
-      `INSERT OR REPLACE INTO page_import_sources
+       )) RETURNING id`,
+    )
+    .bind(
+      ...(externalPage ? [externalPage.id, externalParentId, externalPage.id, externalPosition] : []),
+      timestamp,
+      job.id,
+      job.attempt,
+      pageIds,
+      job.id,
+      job.attempt,
+      bundle.pages.length,
+      job.id,
+      job.attempt,
+      destinationIds,
+      job.workspace_id,
+      job.requested_by,
+      job.requested_by,
+      ...(externalParentId ? [externalParentId, job.workspace_id, externalPage!.spaceId] : []),
+      ...(task ? [task.listId, timestamp] : []),
+      options.captureId ?? null,
+      options.captureId ?? "",
+      job.id,
+      job.workspace_id,
+      job.requested_by,
+    );
+  const statements = [
+    publicationDb
+      .prepare(
+        `INSERT OR REPLACE INTO page_import_sources
         (page_id, job_id, source_path, notion_id, source_group, parent_source_path, source_role, created_at)
        SELECT json_extract(value, '$.pageId'), ?, json_extract(value, '$.source'),
               json_extract(value, '$.notionId'), json_extract(value, '$.groupKey'),
               json_extract(value, '$.parentSource'), json_extract(value, '$.sourceRole'), ?
          FROM json_each(?)`,
-    ).bind(
-      job.id,
-      timestamp,
-      JSON.stringify(
-        bundle.pages.map((page) => ({
-          pageId: page.id,
-          source: page.source,
-          notionId: page.notionId,
-          groupKey: page.groupKey,
-          parentSource: page.parentSource,
-          sourceRole: page.sourceRole,
-        })),
+      )
+      .bind(
+        job.id,
+        timestamp,
+        JSON.stringify(
+          bundle.pages.map((page) => ({
+            pageId: page.id,
+            source: page.source,
+            notionId: page.notionId,
+            groupKey: page.groupKey,
+            parentSource: page.parentSource,
+            sourceRole: page.sourceRole,
+          })),
+        ),
       ),
-    ),
     activityMutationStart(
-      env.DB,
+      publicationDb,
       "SELECT id FROM pages WHERE id IN (SELECT value FROM json_each(?))",
       [pageIds],
       job.id,
@@ -1370,26 +1379,30 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
       false,
     ),
     publishPages,
-    ...(task && taskRowId && publishedRootId
+    ...(task && !durableTask && taskRowId && publishedRootId
       ? [
-          env.DB.prepare(
-            `INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at)
+          publicationDb
+            .prepare(
+              `INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at)
              SELECT ?,?,(SELECT coalesce(max(position)+1,0) FROM table_rows WHERE page_id=?),?,?,?
               WHERE EXISTS (SELECT 1 FROM pages WHERE id=? AND parent_id=? AND import_job_id IS NULL)`,
-          ).bind(
-            taskRowId,
-            task.listId,
-            task.listId,
-            job.requested_by,
-            timestamp,
-            timestamp,
-            publishedRootId,
-            task.listId,
-          ),
-          env.DB.prepare(
-            `INSERT INTO table_row_pages(row_id,page_id,created_at)
+            )
+            .bind(
+              taskRowId,
+              task.listId,
+              task.listId,
+              job.requested_by,
+              timestamp,
+              timestamp,
+              publishedRootId,
+              task.listId,
+            ),
+          publicationDb
+            .prepare(
+              `INSERT INTO table_row_pages(row_id,page_id,created_at)
              SELECT ?,?,? WHERE EXISTS (SELECT 1 FROM table_rows WHERE id=? AND page_id=?)`,
-          ).bind(taskRowId, publishedRootId, timestamp, taskRowId, task.listId),
+            )
+            .bind(taskRowId, publishedRootId, timestamp, taskRowId, task.listId),
           ...(
             [
               [taskColumns(task.listId).title, externalPage!.title, null, null],
@@ -1398,40 +1411,48 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
               [taskColumns(task.listId).due, null, task.dueDate, null],
             ] as Array<[string, string | null, string | null, string | null]>
           ).map(([column, value, date, selected]) =>
-            env.DB.prepare(
-              `INSERT INTO table_cells(row_id,column_id,text_value,text_search_value,date_value,select_value,updated_at)
+            publicationDb
+              .prepare(
+                `INSERT INTO table_cells(row_id,column_id,text_value,text_search_value,date_value,select_value,updated_at)
                SELECT ?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM table_rows WHERE id=? AND page_id=?)`,
-            ).bind(
-              taskRowId,
-              column,
-              value,
-              value === null ? null : normalizeSearchValue(value),
-              date,
-              selected,
-              timestamp,
-              taskRowId,
-              task.listId,
-            ),
+              )
+              .bind(
+                taskRowId,
+                column,
+                value,
+                value === null ? null : normalizeSearchValue(value),
+                date,
+                selected,
+                timestamp,
+                taskRowId,
+                task.listId,
+              ),
           ),
-          env.DB.prepare(
-            `UPDATE table_state SET revision=revision+1 WHERE page_id=?
+          publicationDb
+            .prepare(
+              `UPDATE table_state SET revision=revision+1 WHERE page_id=?
               AND EXISTS (SELECT 1 FROM table_row_pages WHERE row_id=? AND page_id=?)`,
-          ).bind(task.listId, taskRowId, publishedRootId),
+            )
+            .bind(task.listId, taskRowId, publishedRootId),
         ]
       : []),
-    env.DB.prepare(
-      `INSERT OR IGNORE INTO subscriptions (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
+    publicationDb
+      .prepare(
+        `INSERT OR IGNORE INTO subscriptions (id, workspace_id, user_id, resource_type, resource_id, created_by, created_at)
        SELECT ? || ':' || id, workspace_id, ?, 'page', id, ?, ? FROM pages
         WHERE id IN (SELECT value FROM json_each(?)) AND import_job_id IS NULL`,
-    ).bind(job.id, job.requested_by, job.requested_by, timestamp, pageIds),
-    env.DB.prepare(
-      `INSERT INTO page_search (page_id, workspace_id, title, body)
+      )
+      .bind(job.id, job.requested_by, job.requested_by, timestamp, pageIds),
+    publicationDb
+      .prepare(
+        `INSERT INTO page_search (page_id, workspace_id, title, body)
        SELECT id, workspace_id, title, plain_text FROM pages
         WHERE id IN (SELECT value FROM json_each(?)) AND import_job_id IS NULL AND is_template = 0`,
-    ).bind(pageIds),
-    ...refreshPageSearchV2ForIdsStatements(env.DB, pageIdValues),
+      )
+      .bind(pageIds),
+    ...refreshPageSearchV2ForIdsStatements(publicationDb, pageIdValues),
     ...(task?.assigneeId && taskRowId && publishedRootId
-      ? notificationFanoutStatements(env.DB, {
+      ? notificationFanoutStatements(publicationDb, {
           workspaceId: job.workspace_id,
           spaceId: externalPage!.spaceId,
           pageId: publishedRootId,
@@ -1447,17 +1468,20 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
       : []),
     ...(options.captureId
       ? [
-          env.DB.prepare(
-            `UPDATE slack_captures SET state='succeeded', page_id=?, published_at=?, updated_at=?
+          publicationDb
+            .prepare(
+              `UPDATE slack_captures SET state='succeeded', page_id=?, published_at=?, updated_at=?
             WHERE id=? AND job_id=? AND state='running'
               AND EXISTS (SELECT 1 FROM pages WHERE id=? AND import_job_id IS NULL)`,
-          ).bind(publishedRootId, timestamp, timestamp, options.captureId, job.id, publishedRootId),
-          captureFeedbackStatement(env.DB, options.captureId, "succeeded", timestamp),
+            )
+            .bind(publishedRootId, timestamp, timestamp, options.captureId, job.id, publishedRootId),
+          captureFeedbackStatement(publicationDb, options.captureId, "succeeded", timestamp),
         ]
       : []),
-    activityMutationEnd(env.DB, job.id),
-    env.DB.prepare(
-      `UPDATE jobs SET status = 'succeeded', progress_current = 7, progress_total = 7,
+    activityMutationEnd(publicationDb, job.id),
+    publicationDb
+      .prepare(
+        `UPDATE jobs SET status = 'succeeded', progress_current = 7, progress_total = 7,
         progress_label = 'Complete', result_json = ?, expires_at = ?, error_code = NULL, error_message = NULL,
         updated_at = ? WHERE id = ? AND attempt = ? AND status = 'running'
         AND (SELECT COUNT(*) FROM pages WHERE id IN (SELECT value FROM json_each(?))
@@ -1468,24 +1492,94 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
         AND (? IS NULL OR EXISTS (
           SELECT 1 FROM table_row_pages WHERE row_id=? AND page_id=?
         ))`,
-    ).bind(
-      result,
-      timestamp + IMPORT_ARTIFACT_TTL_MS,
-      timestamp,
-      job.id,
-      job.attempt,
-      pageIds,
-      bundle.pages.length,
-      options.captureId ?? null,
-      options.captureId ?? "",
-      job.id,
-      publishedRootId ?? "",
-      taskRowId,
-      taskRowId ?? "",
-      publishedRootId ?? "",
-    ),
-  ]);
-  if (committed[2]?.meta.changes !== bundle.pages.length) {
+      )
+      .bind(
+        result,
+        timestamp + IMPORT_ARTIFACT_TTL_MS,
+        timestamp,
+        job.id,
+        job.attempt,
+        pageIds,
+        bundle.pages.length,
+        options.captureId ?? null,
+        options.captureId ?? "",
+        job.id,
+        publishedRootId ?? "",
+        taskRowId,
+        taskRowId ?? "",
+        publishedRootId ?? "",
+      ),
+  ];
+  let committed: D1Result[] | null = null;
+  if (durableTask && task && taskRowId && publishedRootId) {
+    const [identity, workspace] = await Promise.all([
+      env.DB.prepare("SELECT id,name,email FROM user WHERE id=?")
+        .bind(job.requested_by)
+        .first<{ id: string; name: string; email: string }>(),
+      env.DB.prepare(
+        "SELECT w.id,w.name,w.location_hint,m.role FROM workspaces w JOIN workspace_members m ON m.workspace_id=w.id WHERE w.id=? AND m.user_id=?",
+      )
+        .bind(job.workspace_id, job.requested_by)
+        .first<{ id: string; name: string; location_hint: string | null; role: MemberContext["role"] }>(),
+    ]);
+    if (!identity || !workspace)
+      throw new HttpError(403, "capture_publication_forbidden", "The requester no longer belongs to the workspace.");
+    const member: MemberContext = {
+      user: identity,
+      session: { id: `import:${job.id}`, expiresAt: new Date(Date.now() + 60000) },
+      workspace: { id: workspace.id, name: workspace.name, locationHint: workspace.location_hint },
+      role: workspace.role,
+    };
+    const owned = statements as unknown as ProjectionStatement[];
+    const effects = owned.slice(0, 3);
+    effects.push({
+      sql: "INSERT OR REPLACE INTO table_publication_guards(page_id,ok) SELECT ?,CASE WHEN (SELECT count(*) FROM pages WHERE id IN (SELECT value FROM json_each(?)) AND import_job_id IS NULL)=? THEN 1 ELSE 0 END",
+      binds: [task.listId, pageIds, bundle.pages.length],
+    });
+    const effectsAfter = owned.slice(3);
+    effectsAfter.push(
+      {
+        sql: "INSERT OR REPLACE INTO table_publication_guards(page_id,ok) SELECT ?,CASE WHEN EXISTS(SELECT 1 FROM jobs WHERE id=? AND attempt=? AND status='succeeded') THEN 1 ELSE 0 END",
+        binds: [task.listId, job.id, job.attempt],
+      },
+      { sql: "DELETE FROM table_publication_guards WHERE page_id=?", binds: [task.listId] },
+    );
+    const columns = taskColumns(task.listId);
+    const answer = await tableCommand(
+      env,
+      member,
+      task.listId,
+      {
+        operationId: `capture:${job.id}:${job.attempt}`,
+        kind: "create_row",
+        payload: {
+          id: taskRowId,
+          detailPageId: publishedRootId,
+          values: {
+            [columns.title]: externalPage!.title,
+            [columns.assignee]: task.assigneeId,
+            [columns.status]: `${task.listId}-${task.status}`,
+            [columns.due]: task.dueDate,
+          },
+        },
+      },
+      {
+        effects,
+        effectsAfter,
+        detailPageId: publishedRootId,
+        taskMutation: true,
+        cancelRowOnPublicationFailure: taskRowId,
+        authorization: {
+          sql: "EXISTS(SELECT 1 FROM jobs WHERE id=? AND attempt=? AND status='running')",
+          binds: [job.id, job.attempt],
+        },
+      },
+    );
+    if (answer.projectionPending)
+      throw new HttpError(503, "capture_projection_pending", "The captured task is saved and awaiting publication.");
+  } else committed = await env.DB.batch(statements);
+  // FTS/contributor triggers contribute to D1's change count; RETURNING counts only published pages.
+  if (committed && committed[2]?.results.length !== bundle.pages.length) {
     const staged = await env.DB.prepare(`SELECT COUNT(*) count FROM pages WHERE import_job_id=? AND content_epoch=?`)
       .bind(job.id, job.attempt)
       .first<{ count: number }>();
@@ -1497,7 +1591,7 @@ async function publishImport(env: Env, job: JobRow, bundle: ImportBundle, option
       "The import destination is unavailable. Restore access and retry, or upload again to another space.",
     );
   }
-  if (committed.at(-1)?.meta.changes !== 1)
+  if (committed && committed.at(-1)?.meta.changes !== 1)
     throw new Error("The imported pages were published without a completed job receipt.");
   // The pages are published and the job is already marked succeeded, so a broadcast
   // failure must not throw the step back to the workflow for a retry.

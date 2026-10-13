@@ -23,6 +23,7 @@ import {
   type ParagraphChild,
 } from "docx";
 import { dateMentionText } from "../shared/document-projection";
+import { footnoteCatalog, statusBadgeText, tabPanelLabel } from "../shared/editor-features";
 import type { ImportIssue } from "../shared/import-content";
 import type { ProseMirrorJson } from "../shared/types";
 import { readZip, ZipValidationError } from "../shared/zip";
@@ -335,6 +336,7 @@ function nodeText(node: ProseMirrorJson): string {
   if (node.type === "dateMention") return dateMentionText(node);
   if (node.type === "mention") return String(node.attrs?.label ?? "Mention");
   if (node.type === "inlineMath") return String(node.attrs?.formula ?? "");
+  if (node.type === "statusBadge") return statusBadgeText(node);
   return (node.content ?? []).map(nodeText).join("");
 }
 
@@ -347,6 +349,7 @@ export async function writeDocx(
   resolveImage: (url: string) => Promise<DocxImage | null>,
 ) {
   document = clean(document);
+  const footnotes = footnoteCatalog(document);
   title = sanitizeXmlText(title);
   const warnings = new Set<string>();
   const images = new Map<string, Promise<DocxImage | null>>();
@@ -370,8 +373,10 @@ export async function writeDocx(
   };
   function runs(nodes: ProseMirrorJson[]): ParagraphChild[] {
     return nodes.flatMap((node): ParagraphChild[] => {
+      if (node.type === "footnoteReference")
+        return textRuns(`[${footnotes.numbers.get(String(node.attrs?.definitionId)) ?? "?"}]`, { superScript: true });
       if (node.type === "hardBreak") return [new TextRun({ break: 1 })];
-      if (node.type === "text" || ["mention", "dateMention", "inlineMath"].includes(node.type ?? "")) {
+      if (node.type === "text" || ["mention", "dateMention", "inlineMath", "statusBadge"].includes(node.type ?? "")) {
         const marks = new Set((node.marks ?? []).map((mark) => mark.type));
         const content = textRuns(nodeText(node), {
           bold: marks.has("bold"),
@@ -431,6 +436,17 @@ export async function writeDocx(
   async function block(node: ProseMirrorJson, depth: number, orderedReference?: string): Promise<WordBlock[]> {
     const children = node.content ?? [];
     const type = node.type ?? "unknown";
+    if (type === "tabs" || type === "footnotes") return sequence(children, depth);
+    if (type === "tabPanel") return [paragraph(textRuns(tabPanelLabel(node), { bold: true }))];
+    if (type === "footnoteDefinition")
+      return [
+        paragraph([
+          ...textRuns(
+            `[${footnotes.numbers.get(String(node.attrs?.definitionId)) ?? String(node.attrs?.definitionId)}] `,
+          ),
+          ...runs(children),
+        ]),
+      ];
     if (["doc", "blockGroup", "syncedBlockSource", "columnList", "column"].includes(type))
       return sequence(children, depth);
     if (["tableOfContents", "breadcrumb"].includes(type)) return [];

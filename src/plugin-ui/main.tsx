@@ -3,6 +3,7 @@ import { App } from "@modelcontextprotocol/ext-apps";
 import { openResultSchema } from "../shared/plugin-contracts";
 import { pluginApi } from "./api";
 import { PluginApp } from "./PluginApp";
+import { RenderBoundary } from "../client/RenderBoundary";
 import "./style.css";
 
 const container = document.getElementById("root");
@@ -36,7 +37,9 @@ function render() {
           </div>
         ) : null}
         {linkError ? <p role="alert">{linkError}</p> : null}
-        <PluginApp api={api} initialPageId={initialPageId} />
+        <RenderBoundary resetKey={initialPageId} label="The page could not be displayed">
+          <PluginApp api={api} initialPageId={initialPageId} />
+        </RenderBoundary>
       </>,
     );
 }

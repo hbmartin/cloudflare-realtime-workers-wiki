@@ -1,3 +1,4 @@
+import { TableAuthorityGate } from "./TableAuthorityGate";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import type { ClientMemberContext, Page, TableData, TableLeaseResponse, TableLeaseTiming } from "../shared/types";
 import { TASK_STATUSES, TASK_STATUS_LABELS, type Task, type TaskFields, type TaskResponse } from "../shared/tasks";
@@ -41,7 +42,7 @@ function matchesTask(
   return true;
 }
 
-export function TasksView({
+function LegacyTasksView({
   page,
   member,
   metadata,
@@ -876,5 +877,19 @@ function TaskControls({
         }}
       />
     </div>
+  );
+}
+
+export function TasksView(props: Parameters<typeof LegacyTasksView>[0]) {
+  return props.page ? (
+    <TableAuthorityGate
+      page={props.page}
+      member={props.member}
+      {...(props.metadata === undefined ? {} : { metadata: props.metadata })}
+      onSelectPage={props.onSelectPage}
+      legacy={<LegacyTasksView {...props} />}
+    />
+  ) : (
+    <LegacyTasksView {...props} />
   );
 }

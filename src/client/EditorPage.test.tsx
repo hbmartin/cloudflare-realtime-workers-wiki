@@ -109,6 +109,7 @@ vi.mock("@blocknote/react", () => ({
   FormattingToolbar: () => null,
   getFormattingToolbarItems: () => [],
   useCreateBlockNote: () => ({
+    document: [{ id: "paragraph", type: "paragraph", content: "Snapshot document" }],
     insertInlineContent: vi.fn(),
     prosemirrorState: { doc: {}, selection: { from: 0, to: 0 } },
   }),
@@ -132,6 +133,12 @@ vi.mock("./editor-blocks", async () => ({
   safeBookmarkUrl: (value: string) => value,
 }));
 vi.mock("./mentions", () => ({ notesSchema: {}, notesCommentSchema: {} }));
+vi.mock("./editor-feature-blocks", () => ({ tabsExtension: {}, footnotesExtension: {}, insertFootnote: vi.fn() }));
+vi.mock("./deferred-syntax", () => ({ deferredSyntaxExtension: () => ({}) }));
+vi.mock("./find-replace", () => ({ findReplaceExtension: {}, FindReplace: () => null }));
+vi.mock("./Presentation", () => ({
+  Presentation: ({ title }: { title: string }) => <div data-testid="presentation-snapshot">{title}</div>,
+}));
 
 const page: Page = {
   id: "page-1",
@@ -189,6 +196,26 @@ describe("EditorPage close reconciliation", () => {
     mocks.writingPanel.mockClear();
     Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
     localStorage.clear();
+  });
+  it("discards a presentation snapshot when source permissions change", async () => {
+    mocks.api.mockResolvedValue({ page });
+    const props = {
+      page,
+      member,
+      onPageChanged: vi.fn(),
+      onPageUnavailable: vi.fn(),
+      onAccessDenied: vi.fn(),
+      onSelectPage: vi.fn(),
+      backlinksRevision: 0,
+    };
+    const view = render(<EditorPage {...props} />);
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByRole("button", { name: "Present page" }));
+    expect(screen.getByTestId("presentation-snapshot")).toHaveTextContent("Page");
+    await act(async () => view.rerender(<EditorPage {...props} page={{ ...page, title: "Renamed source" }} />));
+    expect(screen.getByTestId("presentation-snapshot")).toHaveTextContent("Page");
+    await act(async () => view.rerender(<EditorPage {...props} member={{ ...member, role: "viewer" }} />));
+    expect(screen.queryByTestId("presentation-snapshot")).toBeNull();
   });
 
   afterEach(() => {

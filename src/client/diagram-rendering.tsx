@@ -2,8 +2,11 @@ import { memo } from "react";
 import { Handle, MarkerType, NodeResizer, Position, type Node, type Edge, type NodeProps } from "@xyflow/react";
 import type { DiagramNode, DiagramEdge, DiagramNodeType } from "../shared/types";
 
+import { DiagramCard } from "./DiagramCard";
+
 export type DiagramNodeData = {
   record: DiagramNode;
+  account?: string;
   editable: boolean;
   commentCount: number;
   updateLabel: (id: string, label: string) => void;
@@ -45,6 +48,14 @@ const DiagramNodeView = memo(function DiagramNodeView({ id, data, selected }: No
         placeholder={record.type === "text" ? "Text" : record.type === "frame" ? "Frame" : "Label"}
         onChange={(event) => data.updateLabel(id, event.target.value)}
       />
+      {record.linkedPageId && data.account && (
+        <DiagramCard
+          account={data.account}
+          pageId={record.linkedPageId}
+          viewId={record.linkedViewId}
+          alias={record.label}
+        />
+      )}
       {data.commentCount ? <span className="diagram-comment-count">{data.commentCount}</span> : null}
       {(["top", "right", "bottom", "left"] as const).flatMap((handle) => {
         const position =

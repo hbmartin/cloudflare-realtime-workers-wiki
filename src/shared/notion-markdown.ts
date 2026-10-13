@@ -1,3 +1,4 @@
+import { MarkdownWriteError } from "./notion-markdown-write";
 import { serializeMarkdownNode, type DocumentSerializationOptions } from "./document-projection";
 import { documentBlocks, notionBlockRegistry, type NotionBlock } from "./notion-blocks";
 import { hasUrlControls } from "./text";
@@ -54,8 +55,27 @@ function container(block: NotionBlock): ProseMirrorJson {
   };
 }
 
+const protectedInline = (node: ProseMirrorJson): boolean =>
+  ["statusBadge", "footnoteReference"].includes(node.type ?? "") || (node.content ?? []).some(protectedInline);
+
+function boundedCanonicalDocument(document: ProseMirrorJson) {
+  const pending = [{ node: document, depth: 0 }];
+  let count = 0;
+  while (pending.length) {
+    const { node, depth } = pending.pop()!;
+    if (++count > 250_000 || depth > 64)
+      throw new MarkdownWriteError("Document traversal exceeds its structural limits.", "document_limits");
+    if (node === null || typeof node !== "object" || Array.isArray(node))
+      throw new MarkdownWriteError("Document node is malformed.", "invalid_document");
+    if (node.content !== undefined && !Array.isArray(node.content))
+      throw new MarkdownWriteError("Document content is malformed.", "invalid_document");
+    for (const child of node.content ?? []) pending.push({ node: child, depth: depth + 1 });
+  }
+}
+
 function representable(block: NotionBlock, options: DocumentSerializationOptions): boolean {
   if (!DIRECT_MARKDOWN_TYPES.has(block.type)) return false;
+  if (protectedInline(block.node)) return false;
   if ((block.type === "linkToPage" || block.type === "linkedDiagram") && !options.pageHref) return false;
   if (block.type === "math" && typeof block.node.attrs?.formula === "string" && block.node.attrs.formula.includes("$$"))
     return false;
@@ -76,6 +96,7 @@ export function projectNotionMarkdown(
   publicBlockIds: ReadonlyMap<string, string> = new Map(),
   options: DocumentSerializationOptions = {},
   additionalBlocks: NotionBlock[] = [],
+  limits: { complete?: boolean } = {},
 ): NotionMarkdownProjection {
   const parts: string[] = [];
   const spans: MarkdownBlockSpan[] = [];
@@ -83,6 +104,7 @@ export function projectNotionMarkdown(
   let bytes = 0;
   let truncated = false;
   const unknownBlockIds: string[] = [];
+  if (limits.complete) boundedCanonicalDocument(document);
   const blocks = [...documentBlocks(document), ...additionalBlocks];
   const encoder = new TextEncoder();
   const appendOmitted = (block: NotionBlock, id: string, marker: string) => {
@@ -104,7 +126,7 @@ export function projectNotionMarkdown(
       ? "child_page"
       : (notionBlockRegistry[block.type as keyof typeof notionBlockRegistry]?.notionType ?? block.type);
     const marker = `<unknown url="notion://blocks/${attribute(id)}" alt="${attribute(notionType)}"/>`;
-    if (truncated || spans.length >= MAX_MARKDOWN_BLOCKS) {
+    if (truncated || (!limits.complete && spans.length >= MAX_MARKDOWN_BLOCKS)) {
       truncated = true;
       appendOmitted(block, id, marker);
       continue;
@@ -116,7 +138,7 @@ export function projectNotionMarkdown(
       LIST_ITEM_TYPES.has(block.type) && next?.type === block.type && representable(next, options) ? "\n" : "\n\n";
     const text = content ? `${content}${suffix}` : "";
     const nextBytes = encoder.encode(text).length;
-    if (bytes + nextBytes > CONTENT_BUDGET_BYTES) {
+    if (!limits.complete && bytes + nextBytes > CONTENT_BUDGET_BYTES) {
       truncated = true;
       appendOmitted(block, id, marker);
       continue;
@@ -133,4 +155,44 @@ export function projectNotionMarkdown(
     span.to = Math.min(span.to, markdown.length);
   }
   return { markdown, spans, truncated, unknownBlockIds };
+}
+
+/** Read a window from canonical content without allocating a second full Markdown copy. */
+export function notionMarkdownWindow(
+  document: ProseMirrorJson,
+  options: DocumentSerializationOptions,
+  offset: number,
+  limit: number,
+) {
+  boundedCanonicalDocument(document);
+  const blocks = documentBlocks(document);
+  const unknownBlockIds: string[] = [];
+  let textLength = 0;
+  let markdown = "";
+  let pendingSuffix = "";
+  const append = (text: string) => {
+    const start = Math.max(0, offset - textLength);
+    const end = Math.min(text.length, offset + limit - textLength);
+    if (end > start) markdown += text.slice(start, end);
+    textLength += text.length;
+  };
+  for (let index = 0; index < blocks.length; index++) {
+    const block = blocks[index]!;
+    const supported = representable(block, options);
+    const content = supported
+      ? serializeMarkdownNode(container(block), options).trimEnd()
+      : `<unknown url="notion://blocks/${attribute(block.id)}" alt="${attribute(notionBlockRegistry[block.type as keyof typeof notionBlockRegistry]?.notionType ?? block.type)}"/>`;
+    if (!supported && unknownBlockIds.length < MAX_UNKNOWN_BLOCK_IDS) unknownBlockIds.push(block.id);
+    if (!content) continue;
+    if (pendingSuffix) append(pendingSuffix);
+    append(content);
+    const next = blocks[index + 1];
+    pendingSuffix =
+      LIST_ITEM_TYPES.has(block.type) && next?.type === block.type && representable(next, options) ? "\n" : "\n\n";
+  }
+  append("\n");
+  // A UTF-16 limit may land inside an emoji. Leave it intact for the next chunk.
+  const last = markdown.charCodeAt(markdown.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff && offset + markdown.length < textLength) markdown = markdown.slice(0, -1);
+  return { markdown, textLength, unknownBlockIds };
 }

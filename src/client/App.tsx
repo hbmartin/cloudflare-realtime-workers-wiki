@@ -1587,6 +1587,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
   );
   const [trash, setTrash] = useState<Page[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [revealRequest, setRevealRequest] = useState<{ id: string; sequence: number }>();
   const [view, setView] = useState<
     "pages" | "search" | "home" | "tasks" | "mentions" | "templates" | "trash" | "settings" | "activity" | "writing"
   >(() => {
@@ -4038,6 +4039,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               preferenceKey={`${preferencesKey}:tree:${currentSpaceId}`}
               nodes={tree}
               selectedId={resolvedSelectedId}
+              revealRequest={revealRequest}
               editable={canEditActiveSpace}
               canCreate={canCreatePage}
               onSelect={navigateToPage}
@@ -4284,12 +4286,49 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
                     Copy link
                   </button>
                   {!activeSelected.isTemplate && (
+                    <button
+                      data-close-menu
+                      onClick={() => {
+                        const revealPage = activeSelected;
+                        const reveal = (id: string) => {
+                          if (revealPage.spaceId) setActiveSpaceId(revealPage.spaceId);
+                          openSidebar();
+                          setRevealRequest((previous) => ({ id, sequence: (previous?.sequence ?? 0) + 1 }));
+                        };
+                        if (!sidebarHiddenPageIds.has(revealPage.id)) reveal(revealPage.id);
+                        else
+                          void api<{ breadcrumbs: Array<{ id: string }> }>(`/api/pages/${revealPage.id}/breadcrumbs`)
+                            .then(({ breadcrumbs: trail }) => {
+                              const container = trail
+                                .toReversed()
+                                .find((entry) => !sidebarHiddenPageIds.has(entry.id) && entry.id !== revealPage.id);
+                              if (container) reveal(container.id);
+                            })
+                            .catch((error) =>
+                              reportWorkspaceError(
+                                { source: "organization" },
+                                apiErrorMessage(error, "The page could not be revealed."),
+                              ),
+                            );
+                      }}
+                    >
+                      Reveal in sidebar
+                    </button>
+                  )}
+                  {!activeSelected.isTemplate && (
                     <button data-close-menu onClick={() => setExportOpen(true)}>
                       Export
                     </button>
                   )}
                   {canEditActiveSpace && (
                     <>
+                      <button
+                        disabled={!activeSelected.parentId || sidebarHiddenPageIds.has(activeSelected.id)}
+                        data-close-menu
+                        onClick={() => void move(activeSelected.id, null)}
+                      >
+                        Move to space root
+                      </button>
                       {!activeSelected.isTemplate && (
                         <>
                           <button

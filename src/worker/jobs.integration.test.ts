@@ -1721,6 +1721,7 @@ describe("job execution", () => {
     const legacyInputKey = `jobs/${jobId}/template-content.bin`;
     const documentKey = `documents/${targetPageId}/epochs/2/current.bin`;
     const timestamp = Date.now();
+    const tagId = crypto.randomUUID();
     const options = JSON.stringify({
       sourcePageId: installed.pageId,
       targetPageId,
@@ -1764,6 +1765,15 @@ describe("job execution", () => {
           (id, workspace_id, page_id, r2_key, name, mime, size, created_by, created_at)
          VALUES (?, ?, ?, ?, 'clone.txt', 'text/plain', 1, ?, ?)`,
       ).bind(attachmentId, installed.workspaceId, targetPageId, attachmentKey, installed.userId, timestamp),
+      env.DB.prepare(
+        "INSERT INTO tags(id,workspace_id,name,created_by,created_at,updated_at) VALUES(?,?,'Captured clone tag',?,?,?)",
+      ).bind(tagId, installed.workspaceId, installed.userId, timestamp, timestamp),
+      env.DB.prepare("INSERT INTO page_tags(page_id,tag_id,created_by,created_at) VALUES(?,?,?,?)").bind(
+        targetPageId,
+        tagId,
+        installed.userId,
+        timestamp,
+      ),
     ]);
     await Promise.all([
       env.BUCKET.put(oldAttachmentKey, "old attachment"),
@@ -1787,6 +1797,8 @@ describe("job execution", () => {
     expect(response.status).toBe(200);
     expect(await env.DB.prepare(`SELECT id FROM pages WHERE id = ?`).bind(targetPageId).first()).toBeNull();
     expect(await env.DB.prepare(`SELECT id FROM attachments WHERE id = ?`).bind(attachmentId).first()).toBeNull();
+    expect(await env.DB.prepare("SELECT page_id FROM page_tags WHERE page_id=?").bind(targetPageId).first()).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM tags WHERE id=?").bind(tagId).first()).toEqual({ id: tagId });
     expect(
       await Promise.all(
         [oldAttachmentKey, attachmentKey, oldInputKey, inputKey, legacyInputKey, documentKey].map((key) =>
@@ -2512,6 +2524,29 @@ describe("job execution", () => {
 
   it("publishes a document template atomically and rewrites cloned attachment references", async () => {
     const installed = await bootstrap();
+    const capturedTag = crypto.randomUUID(),
+      changedTag = crypto.randomUUID(),
+      foreignTag = crypto.randomUUID(),
+      foreignWorkspace = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO workspaces(id,name,created_at) VALUES(?,'Other',1)").bind(foreignWorkspace),
+      ...[
+        [capturedTag, installed.workspaceId, "Captured"],
+        [changedTag, installed.workspaceId, "Changed"],
+        [foreignTag, foreignWorkspace, "Foreign"],
+      ].map(([tagId, workspaceId, name]) =>
+        env.DB.prepare(
+          "INSERT INTO tags(id,workspace_id,name,created_by,created_at,updated_at) VALUES(?,?,?,?,1,1)",
+        ).bind(tagId, workspaceId, name, installed.userId),
+      ),
+      ...[capturedTag, foreignTag].map((tagId) =>
+        env.DB.prepare("INSERT INTO page_tags(page_id,tag_id,created_by,created_at) VALUES(?,?,?,1)").bind(
+          installed.pageId,
+          tagId,
+          installed.userId,
+        ),
+      ),
+    ]);
     const sourceAttachmentId = crypto.randomUUID();
     const sourceKey = `assets/${installed.workspaceId}/${sourceAttachmentId}/source`;
     await env.BUCKET.put(sourceKey, "attachment bytes", { httpMetadata: { contentType: "text/plain" } });
@@ -2533,7 +2568,12 @@ describe("job execution", () => {
     const source = new Y.Doc();
     const image = new Y.XmlElement("image");
     image.setAttribute("url", `/api/attachments/${sourceAttachmentId}`);
-    source.getXmlFragment("document-store").insert(0, [image]);
+    const imageBlock = new Y.XmlElement("blockContainer");
+    imageBlock.setAttribute("id", "template-image");
+    imageBlock.insert(0, [image]);
+    const imageGroup = new Y.XmlElement("blockGroup");
+    imageGroup.insert(0, [imageBlock]);
+    source.getXmlFragment("document-store").insert(0, [imageGroup]);
     await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, Y.encodeStateAsUpdate(source));
 
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
@@ -2556,8 +2596,20 @@ describe("job execution", () => {
     await env.DB.prepare(`UPDATE jobs SET status = 'running' WHERE id = ?`).bind(queuedJob.id).run();
     const row = (await env.DB.prepare(`SELECT * FROM jobs WHERE id = ?`).bind(queuedJob.id).first<JobRow>())!;
     const step = {
-      async do<T>(_name: string, callback: () => Promise<T>) {
-        return callback();
+      async do<T>(name: string, callback: () => Promise<T>) {
+        const result = await callback();
+        if (name === "stage template clone") {
+          await env.DB.batch([
+            env.DB.prepare("DELETE FROM page_tags WHERE page_id=?").bind(installed.pageId),
+            env.DB.prepare("INSERT INTO page_tags(page_id,tag_id,created_by,created_at) VALUES(?,?,?,1)").bind(
+              installed.pageId,
+              changedTag,
+              installed.userId,
+            ),
+          ]);
+          return callback(); // A resumed stage retains the associations captured at creation.
+        }
+        return result;
       },
     };
     await runTemplateClone(env, row, step as Parameters<typeof runTemplateClone>[2]);
@@ -2570,6 +2622,10 @@ describe("job execution", () => {
     const completedJob = (await completed.json<{ job: Job }>()).job;
     expect(completedJob).toMatchObject({ status: "succeeded", result: { pageId: expect.any(String) } });
     const templateId = completedJob.result!.pageId!;
+    expect(
+      (await env.DB.prepare("SELECT tag_id FROM page_tags WHERE page_id=? ORDER BY tag_id").bind(templateId).all())
+        .results,
+    ).toEqual([{ tag_id: capturedTag }]);
     const templates = await worker.fetch(request(installed.cookie, "/api/templates"), env, createExecutionContext());
     expect((await templates.json<{ templates: Array<{ id: string; title: string }> }>()).templates).toContainEqual(
       expect.objectContaining({ id: templateId, title: "Project brief" }),
@@ -2713,7 +2769,7 @@ describe("job execution", () => {
         `INSERT INTO table_columns (id, page_id, name, type, position) VALUES (?, ?, 'Status', 'select', 0)`,
       ).bind(columnId, sourcePageId),
       env.DB.prepare(
-        `INSERT INTO table_select_options (id, column_id, label, position) VALUES (?, ?, 'Ready', 0)`,
+        `INSERT INTO table_select_options (id, column_id, label, position,color) VALUES (?, ?, 'Ready', 0,'blue')`,
       ).bind(optionId, columnId),
       env.DB.prepare(
         `INSERT INTO table_rows (id, page_id, position, created_by, created_at, updated_at) VALUES (?, ?, 0, ?, ?, ?)`,
@@ -2725,6 +2781,82 @@ describe("job execution", () => {
         Date.now(),
       ),
     ]);
+    const enabled = await worker.fetch(
+      request(installed.cookie, `/api/tables/${sourcePageId}/authority`, { method: "POST" }),
+      env,
+      createExecutionContext(),
+    );
+    expect(enabled.status).toBe(200);
+    const command = async (kind: string, payload: Record<string, unknown>) => {
+      const response = await worker.fetch(
+        request(installed.cookie, `/api/tables/${sourcePageId}/commands`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ operationId: crypto.randomUUID(), kind, payload }),
+        }),
+        env,
+        createExecutionContext(),
+      );
+      expect(response.status).toBe(200);
+      return response.json<{ result: Record<string, unknown> }>();
+    };
+    await command("create_column", { id: "template-amount", name: "Amount", type: "number" });
+    await command("create_column", {
+      id: "template-twice",
+      name: "Twice",
+      type: "formula",
+      source: 'prop("Amount") * 2',
+    });
+    await command("create_column", { id: "template-labels", name: "Labels", type: "multi_select" });
+    await command("add_option", {
+      columnId: "template-labels",
+      id: "template-label",
+      label: "Important",
+      color: "red",
+    });
+    await command("create_row", { values: { "template-amount": 2, "template-labels": ["template-label"] } });
+    await command("save_view", {
+      id: "template-board",
+      name: "Ready board",
+      kind: "board",
+      columnId,
+      calculations: { "template-twice": "sum" },
+      filters: { kind: "condition", columnId, operator: "eq", value: optionId },
+    });
+    // A lagging/corrupt projection must not be copied once the table has an authority.
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO table_projection_context VALUES(?,1)").bind(sourcePageId),
+      env.DB.prepare("DELETE FROM table_rows WHERE id=?").bind(rowId),
+      env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(sourcePageId),
+    ]);
+    const exportContext = createExecutionContext();
+    const exportResponse = await worker.fetch(
+      request(installed.cookie, `/api/pages/${sourcePageId}/exports`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ format: "markdown", portable: false }),
+      }),
+      inlineBindings(),
+      exportContext,
+    );
+    expect(exportResponse.status).toBe(202);
+    const exportJob = (await exportResponse.json<{ job: Job }>()).job;
+    await waitOnExecutionContext(exportContext);
+    const exportStatus = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${exportJob.id}`),
+      env,
+      createExecutionContext(),
+    );
+    expect((await exportStatus.json<{ job: Job }>()).job.status).toBe("succeeded");
+    const exported = await worker.fetch(
+      request(installed.cookie, `/api/jobs/${exportJob.id}/download`),
+      env,
+      createExecutionContext(),
+    );
+    const exportedText = await exported.text();
+    expect(exportedText).toContain("Ready");
+    expect(exportedText).toContain("Important");
+    expect(exportedText).toContain("2 | 4");
 
     const create = vi.fn(async ({ id }: { id?: string }) => ({ id: id ?? "created" }));
     const bindings = bindingsWith({ NOTES_WORKFLOW: { create } });
@@ -2764,6 +2896,119 @@ describe("job execution", () => {
       .first<{ is_template: number; name: string; label: string; select_value: string }>();
     expect(cloned).toMatchObject({ is_template: 1, name: "Status", label: "Ready" });
     expect(cloned?.select_value).toContain(":option:");
+    const properties = (
+      await env.DB.prepare("SELECT id,name,config_json FROM table_columns WHERE page_id=?")
+        .bind(result.pageId)
+        .all<{ id: string; name: string; config_json: string }>()
+    ).results;
+    const clonedAmount = properties.find((property) => property.name === "Amount")!;
+    const formula = JSON.parse(properties.find((property) => property.name === "Twice")!.config_json) as {
+      dependencies: string[];
+    };
+    expect(formula.dependencies).toEqual([clonedAmount.id]);
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM table_rows WHERE page_id=?").bind(result.pageId).first(),
+    ).toEqual({ count: 2 });
+    expect(
+      await env.DB.prepare(
+        "SELECT color FROM table_select_options WHERE column_id IN (SELECT id FROM table_columns WHERE page_id=? AND name='Status')",
+      )
+        .bind(result.pageId)
+        .first(),
+    ).toEqual({ color: "blue" });
+    const clonedView = JSON.parse(
+      (await env.DB.prepare("SELECT value_json FROM table_views WHERE page_id=?")
+        .bind(result.pageId)
+        .first<{ value_json: string }>())!.value_json,
+    );
+    expect(clonedView.columnId).toBe(properties.find((property) => property.name === "Status")!.id);
+    expect(clonedView.calculations).toHaveProperty(properties.find((property) => property.name === "Twice")!.id, "sum");
+    const migratedClone = await worker.fetch(
+      request(installed.cookie, `/api/tables/${result.pageId}/authority`, { method: "POST" }),
+      env,
+      createExecutionContext(),
+    );
+    expect(migratedClone.status).toBe(200);
+    const clonedQuery = await worker.fetch(
+      request(installed.cookie, `/api/tables/${result.pageId}/query`),
+      env,
+      createExecutionContext(),
+    );
+    expect(
+      (await clonedQuery.json<{ rows: Array<{ computedCells: Record<string, { value: unknown }> }> }>()).rows.some(
+        (clonedRow) => Object.values(clonedRow.computedCells).some((value) => value.value === 4),
+      ),
+    ).toBe(true);
+  });
+
+  it("permanently deletes a migrated whole table and completes its authority purge receipt", async () => {
+    const installed = await bootstrap();
+    const created = await worker.fetch(
+      request(installed.cookie, "/api/pages", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "table", title: "Delete authority" }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    const pageId = (await created.json<{ page: { id: string } }>()).page.id;
+    expect(
+      (
+        await worker.fetch(
+          request(installed.cookie, `/api/tables/${pageId}/authority`, { method: "POST" }),
+          env,
+          createExecutionContext(),
+        )
+      ).status,
+    ).toBe(200);
+    const command = await worker.fetch(
+      request(installed.cookie, `/api/tables/${pageId}/commands`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          operationId: crypto.randomUUID(),
+          kind: "bulk",
+          payload: {
+            commands: [
+              { kind: "create_column", payload: { id: `delete-${pageId}`, name: "Title", type: "text" } },
+              { kind: "create_row", payload: { values: { [`delete-${pageId}`]: "Cleanup" } } },
+            ],
+          },
+        }),
+      }),
+      env,
+      createExecutionContext(),
+    );
+    expect(command.status).toBe(200);
+    const archive = createExecutionContext();
+    expect(
+      (await worker.fetch(request(installed.cookie, `/api/pages/${pageId}`, { method: "DELETE" }), env, archive))
+        .status,
+    ).toBe(200);
+    await waitOnExecutionContext(archive);
+    const context = createExecutionContext();
+    const deleted = await worker.fetch(
+      request(installed.cookie, `/api/pages/${pageId}/permanent-delete`, { method: "POST" }),
+      env,
+      context,
+    );
+    expect([200, 202]).toContain(deleted.status);
+    await waitOnExecutionContext(context);
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(pageId).first()).toBeNull();
+    expect(await env.DB.prepare("SELECT page_id FROM table_authority WHERE page_id=?").bind(pageId).first()).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM table_rows WHERE page_id=?").bind(pageId).first()).toBeNull();
+    expect(
+      await env.DB.prepare(
+        "SELECT target FROM deletion_targets WHERE kind='table_do' AND target=? AND completed_at IS NULL",
+      )
+        .bind(pageId)
+        .first(),
+    ).toBeNull();
+    const purged = await env.TABLE.getByName(pageId).fetch(
+      new Request("https://table.internal/verify", { headers: { "x-table-internal": env.BETTER_AUTH_SECRET } }),
+    );
+    expect([410, 503]).toContain(purged.status);
   });
 
   it("previews and confirms a Markdown import without exposing staged pages", async () => {

@@ -14,6 +14,109 @@ function bridge() {
   return { host, api: pluginApi(host as unknown as App) };
 }
 describe("MCP Apps data bridge", () => {
+  it("assembles only a consistent complete snapshot before enabling edits", async () => {
+    const { host, api } = bridge();
+    const base = {
+      id: "doc",
+      title: "Notes",
+      url: "https://notes.example/?page=doc",
+      revision: 4,
+      contentEpoch: 1,
+      sequence: 4,
+      spaceId: "space",
+      parentId: null,
+      canEdit: true,
+      unknownBlockIds: [],
+      textLength: 6,
+      truncated: true,
+    };
+    host.callServerTool
+      .mockResolvedValueOnce({
+        content: [],
+        structuredContent: {
+          ...base,
+          markdown: "abc",
+          offset: 0,
+          nextOffset: 3,
+          complete: false,
+          nextCursor: "sealed",
+        },
+      })
+      .mockResolvedValueOnce({
+        content: [],
+        structuredContent: {
+          ...base,
+          markdown: "def",
+          offset: 3,
+          nextOffset: null,
+          complete: true,
+          nextCursor: null,
+        },
+      });
+    expect(await api.document("doc")).toMatchObject({
+      markdown: "abcdef",
+      complete: true,
+      truncated: false,
+      canEdit: true,
+    });
+    expect(host.callServerTool).toHaveBeenLastCalledWith({
+      name: "fetch_page",
+      arguments: { page_id: "doc", cursor: "sealed" },
+    });
+    host.callServerTool.mockResolvedValueOnce({
+      content: [],
+      structuredContent: {
+        ...base,
+        markdown: "abc",
+        offset: 0,
+        nextOffset: 3,
+        complete: false,
+        nextCursor: null,
+      },
+    });
+    expect(await api.document("doc")).toMatchObject({ complete: false, truncated: true, canEdit: false });
+  });
+
+  it("rejects mixed snapshots even if the host supplies a continuation", async () => {
+    const { host, api } = bridge();
+    const base = {
+      id: "doc",
+      title: "Notes",
+      url: "https://notes.example/",
+      revision: 4,
+      contentEpoch: 1,
+      sequence: 4,
+      spaceId: "space",
+      parentId: null,
+      canEdit: true,
+      unknownBlockIds: [],
+      textLength: 6,
+      truncated: true,
+    };
+    host.callServerTool
+      .mockResolvedValueOnce({
+        content: [],
+        structuredContent: {
+          ...base,
+          markdown: "abc",
+          offset: 0,
+          nextOffset: 3,
+          complete: false,
+          nextCursor: "sealed",
+        },
+      })
+      .mockResolvedValueOnce({
+        content: [],
+        structuredContent: {
+          ...base,
+          revision: 5,
+          markdown: "def",
+          offset: 3,
+          complete: true,
+        },
+      });
+    await expect(api.document("doc")).rejects.toMatchObject({ code: "source_changed" });
+  });
   it("validates structured results and exposes tool errors", async () => {
     const { host, api } = bridge();
     expect((await api.spaces()).workspace.name).toBe("Wiki");

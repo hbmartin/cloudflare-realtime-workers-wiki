@@ -1,4 +1,5 @@
 import type { DigestComparison } from "../shared/block-diff";
+import { contributorsJsonSql } from "./contributor-identity";
 import { digestComparison, type ChangeCheckpoint } from "./document-changes";
 import { withSlackPrimaryError } from "./slack-delivery";
 import { verifyHistoryPage as reconcileBotPost, type HistoryVerificationOptions } from "./slack-history";
@@ -345,7 +346,8 @@ export async function digestPages(
   const rows =
     await env.DB.prepare(`SELECT page.id,page.title,page.plain_text,page.kind,page.content_epoch,page.archived_at,
     MAX(e.created_at) changed_at,${threads} unresolved_threads,${status} task_status,
-    json_group_array(json_object('eventId',e.id,'id',e.actor_id,'name',actor.name,'type',e.event_type)) events,
+    json_group_array(json_object('eventId',e.id,'id',e.actor_id,'name',actor.name,'type',e.event_type,
+      'contributors',json(${contributorsJsonSql("e.contributor_ids_json", "e.actor_id")}))) events,
     ${filter.selection}
     FROM slack_channel_events e JOIN pages page ON page.id=e.page_id LEFT JOIN user actor ON actor.id=e.actor_id
     WHERE ${filter.sql}
@@ -374,8 +376,17 @@ export async function digestPages(
       id: string | null;
       name: string | null;
       type: ChannelEventType;
+      contributors: Array<{ id: string; name: string }>;
     }>;
-    const actors = new Map(events.map((e) => [e.id, e.name ?? "Former collaborator"]));
+    const actors = new Map(
+      events.flatMap((event) =>
+        event.contributors.length
+          ? event.contributors.map((contributor) => [contributor.id, contributor.name] as const)
+          : event.id
+            ? [[event.id, event.name ?? "Former collaborator"] as const]
+            : [],
+      ),
+    );
     const item: DigestPage = {
       pageId: row.id,
       eventIds: events.map((e) => e.eventId),

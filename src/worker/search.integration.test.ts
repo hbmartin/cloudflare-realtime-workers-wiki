@@ -85,6 +85,52 @@ beforeEach(async () => {
 });
 
 describe("search v2", () => {
+  it("normalizes Unicode titles and clears the forward normalization queue without duplicating index rows", async () => {
+    const installed = await bootstrap();
+    const target = await createPage(installed.cookie, "Ａｒｃｈｉｔｅｃｔｕｒｅ", installed.generalId);
+    const found = await (
+      await SELF.fetch(request(installed.cookie, "/api/search?q=architecure"))
+    ).json<SearchResponse>();
+    expect(found.results.map((result) => result.page.id)).toEqual([target.id]);
+    expect(found.matchMode).toBe("title-typo");
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM page_title_trigrams WHERE page_id=?").bind(target.id).first(),
+    ).toEqual({ count: 1 });
+    const rebuild = await SELF.fetch(request(installed.cookie, "/api/admin/search/rebuild", { method: "POST" }));
+    expect(rebuild.status).toBe(200);
+    expect(await rebuild.json()).toMatchObject({ complete: true, pending: 0 });
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM page_title_trigrams WHERE page_id=?").bind(target.id).first(),
+    ).toEqual({ count: 1 });
+  });
+  it("falls back to overlapping title trigrams under the same permissions and filters", async () => {
+    const installed = await bootstrap();
+    const target = await createPage(installed.cookie, "Architecture", installed.generalId);
+    const first = await (
+      await SELF.fetch(request(installed.cookie, "/api/search?q=architecure"))
+    ).json<SearchResponse>();
+    expect(first).toMatchObject({ matchMode: "title-typo" });
+    expect(first.results.map((result) => result.page.id)).toEqual([target.id]);
+    const later = await (
+      await SELF.fetch(request(installed.cookie, "/api/search?q=Architecture&offset=20"))
+    ).json<SearchResponse>();
+    expect(later.results).toEqual([]);
+    expect(later.matchMode).not.toBe("title-typo");
+    await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(target.id).run();
+    const active = await (
+      await SELF.fetch(request(installed.cookie, "/api/search?q=architecure"))
+    ).json<SearchResponse>();
+    expect(active.results).toEqual([]);
+    const archived = await (
+      await SELF.fetch(request(installed.cookie, "/api/search?q=architecure&archive=archived"))
+    ).json<SearchResponse>();
+    expect(archived.results.map((result) => result.page.id)).toEqual([target.id]);
+    await env.DB.prepare("UPDATE pages SET title='Completely different' WHERE id=?").bind(target.id).run();
+    const renamed = await (
+      await SELF.fetch(request(installed.cookie, "/api/search?q=architecure&archive=all"))
+    ).json<SearchResponse>();
+    expect(renamed.results).toEqual([]);
+  });
   it("filters diagrams in full search and title suggestions", async () => {
     const installed = await bootstrap();
     const diagram = await createPage(installed.cookie, "Service topology", installed.generalId, "diagram");

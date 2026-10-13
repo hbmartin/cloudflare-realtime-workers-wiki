@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { BRANCH_SORT_LABELS, sortedTree, type BranchSort } from "../shared/tree-model";
 import type { Page, PageKind, PageNode } from "../shared/types";
 import { ActionMenu, Icon, readPreference, savePreference } from "./WorkspaceUI";
 
@@ -32,7 +33,7 @@ export function CreationMenu({
 }
 
 export function WorkspaceTree({
-  nodes,
+  nodes: sourceNodes,
   selectedId,
   editable,
   canCreate,
@@ -41,6 +42,7 @@ export function WorkspaceTree({
   onArchive,
   onMove,
   preferenceKey,
+  revealRequest,
 }: {
   nodes: PageNode[];
   selectedId: string | null;
@@ -51,7 +53,33 @@ export function WorkspaceTree({
   onArchive: (page: Page) => void;
   onMove: (id: string, parentId: string | null, beforeId: string | null, afterId: string | null) => void;
   preferenceKey: string;
+  revealRequest?: { id: string; sequence: number } | undefined;
 }) {
+  const [sorting, setSorting] = useState<Record<string, BranchSort>>(() =>
+    readPreference(`${preferenceKey}:sorting`, {}),
+  );
+  const nodes = useMemo(() => sortedTree(sourceNodes, sorting), [sourceNodes, sorting]);
+  const changeSort = (branch: string, mode: BranchSort) => {
+    const next = { ...sorting, [branch]: mode };
+    setSorting(next);
+    savePreference(`${preferenceKey}:sorting`, next);
+  };
+  const sortControl = (branch: string, label: string) => (
+    <label>
+      Sort {label}
+      <select
+        aria-label={`Sort ${label}`}
+        value={sorting[branch] ?? "manual"}
+        onChange={(event) => changeSort(branch, event.target.value as BranchSort)}
+      >
+        {Object.entries(BRANCH_SORT_LABELS).map(([value, text]) => (
+          <option key={value} value={value}>
+            {text}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
   const [collapsed, setCollapsed] = useState<string[]>(() => readPreference(preferenceKey, []));
   const [drop, setDrop] = useState<{ id: string; position: "before" | "inside" | "after" } | null>(null);
   const [focused, setFocused] = useState<string | null>(selectedId);
@@ -64,7 +92,7 @@ export function WorkspaceTree({
     const path: string[] = [];
     const find = (items: PageNode[]): boolean =>
       items.some((node) => {
-        if (node.id === selectedId) return true;
+        if (node.id === (revealRequest?.id ?? selectedId)) return true;
         if (find(node.children)) {
           path.push(node.id);
           return true;
@@ -78,7 +106,21 @@ export function WorkspaceTree({
       setCollapsed((current) =>
         current.some((id) => path.includes(id)) ? current.filter((id) => !path.includes(id)) : current,
       );
-  }, [nodes, selectedId]);
+  }, [nodes, selectedId, revealRequest]);
+  useEffect(() => {
+    if (!revealRequest) return undefined;
+    if (collapsed.length && !ref.current?.querySelector(`[data-tree-page="${CSS.escape(revealRequest.id)}"]`))
+      return undefined;
+    const timer = requestAnimationFrame(() => {
+      const item = ref.current?.querySelector<HTMLElement>(`[data-tree-page="${CSS.escape(revealRequest.id)}"]`);
+      item?.focus();
+      item?.scrollIntoView({ block: "nearest" });
+      item?.animate([{ backgroundColor: "var(--accent-soft, #dbeafe)" }, { backgroundColor: "transparent" }], {
+        duration: 1500,
+      });
+    });
+    return () => cancelAnimationFrame(timer);
+  }, [revealRequest, collapsed]);
   const toggle = (id: string) =>
     setCollapsed((current) => (current.includes(id) ? current.filter((x) => x !== id) : [...current, id]));
   const visible: PageNode[] = [];
@@ -127,9 +169,13 @@ export function WorkspaceTree({
             return;
           }
           if (event.altKey && editable) {
-            if (event.key === "ArrowUp" && index > 0)
+            if (event.key === "ArrowUp" && index > 0 && (sorting[node.parentId ?? "root"] ?? "manual") === "manual")
               onMove(node.id, node.parentId, items[index - 1]!.id, items[index - 2]?.id ?? null);
-            else if (event.key === "ArrowDown" && index < items.length - 1)
+            else if (
+              event.key === "ArrowDown" &&
+              index < items.length - 1 &&
+              (sorting[node.parentId ?? "root"] ?? "manual") === "manual"
+            )
               onMove(node.id, node.parentId, items[index + 2]?.id ?? null, items[index + 1]!.id);
             else if (event.key === "ArrowRight" && index > 0) {
               const previousId = items[index - 1]!.id;
@@ -187,7 +233,17 @@ export function WorkspaceTree({
             event.stopPropagation();
             const bounds = event.currentTarget.getBoundingClientRect();
             const y = (event.clientY - bounds.top) / bounds.height;
-            setDrop({ id: node.id, position: y < 0.25 ? "before" : y > 0.75 ? "after" : "inside" });
+            setDrop({
+              id: node.id,
+              position:
+                (sorting[node.parentId ?? "root"] ?? "manual") !== "manual"
+                  ? "inside"
+                  : y < 0.25
+                    ? "before"
+                    : y > 0.75
+                      ? "after"
+                      : "inside",
+            });
           }}
           onDrop={(event) => {
             event.preventDefault();
@@ -218,21 +274,31 @@ export function WorkspaceTree({
             <span>{node.icon || <Icon name={node.kind === "document" ? "page" : node.kind} />}</span>
             <span>{node.title}</span>
           </span>
-          {editable && (
+          {
             <div className="tree-actions" id={`page-actions-${node.id}`}>
-              <CreationMenu
-                label={`Add child to ${node.title}`}
-                disabled={!canCreate}
-                onCreate={(kind) => onCreate(node.id, kind)}
-              />
+              {editable && (
+                <CreationMenu
+                  label={`Add child to ${node.title}`}
+                  disabled={!canCreate}
+                  onCreate={(kind) => onCreate(node.id, kind)}
+                />
+              )}
               <ActionMenu label={`Actions for ${node.title}`}>
-                <button aria-label={`Archive ${node.title}`} data-close-menu onClick={() => onArchive(node)}>
-                  <Icon name="trash" />
-                  Move to trash
-                </button>
+                {sortControl(node.id, `children of ${node.title}`)}
+                {editable && (
+                  <button disabled={!node.parentId} data-close-menu onClick={() => onMove(node.id, null, null, null)}>
+                    Move to space root
+                  </button>
+                )}
+                {editable && (
+                  <button aria-label={`Archive ${node.title}`} data-close-menu onClick={() => onArchive(node)}>
+                    <Icon name="trash" />
+                    Move to trash
+                  </button>
+                )}
               </ActionMenu>
             </div>
-          )}
+          }
         </div>
         {node.children.length > 0 && !collapsed.includes(node.id) && (
           /* Nested ARIA trees require a group inside the parent tree item. */
@@ -244,8 +310,11 @@ export function WorkspaceTree({
       </div>
     ));
   return (
-    <div ref={ref} role="tree" aria-label="Pages">
-      {render(nodes, 1)}
-    </div>
+    <>
+      {sortControl("root", "space pages")}
+      <div ref={ref} role="tree" aria-label="Pages">
+        {render(nodes, 1)}
+      </div>
+    </>
   );
 }

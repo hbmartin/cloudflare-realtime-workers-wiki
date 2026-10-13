@@ -1,4 +1,5 @@
 import { MarkdownWriteError, parseWritableMarkdown } from "./notion-markdown-write";
+import { closestMarkdownMatch } from "./markdown-match";
 
 export type MarkdownEdit = { from: number; to: number; text: string };
 export type MarkdownCommand = {
@@ -77,8 +78,16 @@ export function parseMarkdownCommand(input: unknown, markdown: string): Markdown
       const newStr = string(update.new_str, "new_str");
       const found = matches(markdown, oldStr);
       const replaceAll = update.replace_all_matches === true || command.replace_all_matches === true;
-      if (!found.length || (found.length > 1 && !replaceAll))
-        throw new MarkdownWriteError("An old_str is missing or ambiguous.");
+      if (!found.length || (found.length > 1 && !replaceAll)) {
+        const suggestion = found.length ? undefined : closestMarkdownMatch(markdown, oldStr);
+        throw new MarkdownWriteError(
+          found.length
+            ? "An old_str is ambiguous. Use replace_all_matches or a longer exact selection."
+            : "An old_str is missing. Read the current Markdown and retry with an exact selection.",
+          found.length ? "old_str_ambiguous" : "old_str_not_found",
+          { matchCount: found.length, ...(suggestion === undefined ? {} : { suggestion }) },
+        );
+      }
       validateReplacement(newStr);
       return found.map((from) => ({ from, to: from + oldStr.length, text: newStr }));
     });

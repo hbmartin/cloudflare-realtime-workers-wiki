@@ -80,6 +80,35 @@ export function pluginApi(app: App): PluginApi {
     }
     return schema.parse(response.structuredContent);
   }
+  async function document(page_id: string): Promise<PluginDocument> {
+    const first = await call("fetch_page", { page_id }, documentResultSchema);
+    if (first.complete === undefined || first.complete) return first;
+    const parts = [first.markdown];
+    let current = first;
+    // Bound host requests as well as local memory. An incomplete snapshot stays read-only.
+    for (let count = 0; count < 1024 && current.nextCursor; count++) {
+      const next = await call("fetch_page", { page_id, cursor: current.nextCursor }, documentResultSchema);
+      if (
+        next.revision !== first.revision ||
+        next.contentEpoch !== first.contentEpoch ||
+        next.sequence !== first.sequence ||
+        next.offset !== current.nextOffset ||
+        next.textLength !== first.textLength ||
+        next.markdown.length === 0
+      ) {
+        throw new PluginToolError("The document changed while reading. Open it again.", "source_changed", true);
+      }
+      parts.push(next.markdown);
+      current = next;
+      if (next.complete) {
+        const markdown = parts.join("");
+        if (markdown.length !== first.textLength) break;
+        return { ...first, markdown, complete: true, truncated: false, nextCursor: null, nextOffset: null };
+      }
+      if (parts.reduce((length, part) => length + part.length, 0) > 16 * 1024 * 1024) break;
+    }
+    return { ...first, canEdit: false, complete: false, truncated: true };
+  }
   return {
     spaces: () => call("list_spaces", {}, spacesResultSchema),
     pages: (space_id, parent_id, cursor) =>
@@ -89,7 +118,7 @@ export function pluginApi(app: App): PluginApi {
         pagesResultSchema,
       ),
     search: (query, cursor) => call("search_pages", { query, ...(cursor ? { cursor } : {}) }, searchResultSchema),
-    document: (page_id) => call("fetch_page", { page_id }, documentResultSchema),
+    document,
     create: (input) => call("create_page", input, pageMutationResultSchema),
     save: (input) => call("update_page", input, pageMutationResultSchema),
     context: async (page, selectedText = "") => {

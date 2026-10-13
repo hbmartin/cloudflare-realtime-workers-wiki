@@ -8,6 +8,8 @@ import { setTimeout as delay } from "node:timers/promises";
 import { unstable_readConfig } from "wrangler";
 import { emptyDatabaseSchema, emptyMigrationHistory, main as migrate, queryRows } from "./migrate-d1.mjs";
 
+import { metadataIntegrityCheck } from "./integrity.mjs";
+
 const require = createRequire(import.meta.url);
 const manifestPath = ".wrangler/noteflare-build.json";
 const secretKeys = ["BETTER_AUTH_SECRET", "WEBHOOK_ENCRYPTION_KEY", "OBSERVABILITY_PROBE_TOKEN", "BOOTSTRAP_TOKEN"];
@@ -634,7 +636,16 @@ export async function withSecretsFile(secrets, operation) {
 
 export async function deployPrepared(
   manifest,
-  { migrateDatabase, provisionResources, upload, inspectSecrets, isInitialized, health, random = randomBytes },
+  {
+    migrateDatabase,
+    integrityCheck,
+    provisionResources,
+    upload,
+    inspectSecrets,
+    isInitialized,
+    health,
+    random = randomBytes,
+  },
 ) {
   const secrets = {};
   if (!manifest.target) {
@@ -652,8 +663,18 @@ export async function deployPrepared(
     }
     for (const key of missingSecrets(names, initialized)) secrets[key] = random(32).toString("base64url");
   }
+  const verifyIntegrity = async (stage) => {
+    if (!integrityCheck) return;
+    const result = await integrityCheck(stage);
+    if (!result?.ok || !result.complete)
+      throw new Error(
+        `D1 metadata integrity ${stage} failed or was incomplete. Worker upload was not started; applied migrations and resources were preserved.`,
+      );
+  };
+  await verifyIntegrity("before migrations");
   if ((await migrateDatabase()) !== 0)
     throw new Error("D1 migration preflight/application failed. Worker upload was not started.");
+  await verifyIntegrity("after migrations");
   const generated = manifest.resources?.some((entry) => entry.provenance === "generated");
   try {
     if (generated) {
@@ -739,6 +760,10 @@ export async function main(argv) {
       if (names !== null && !Array.isArray(names)) throw new Error("Invalid Worker secret listing.");
       return (names ?? []).map((entry) => entry.name);
     },
+    integrityCheck: () =>
+      metadataIntegrityCheck((sql, stage) =>
+        queryRows(wrangler(["d1", "execute", "DB", ...configArgs, "--remote", "--json", "--command", sql]), stage),
+      ),
     migrateDatabase: () =>
       migrate(["--remote", ...configArgs], wrangler, {
         slackReviewMigrationSafe: process.env.SLACK_REVIEW_MIGRATION_SAFE === "true",

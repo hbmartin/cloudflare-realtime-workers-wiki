@@ -3,11 +3,7 @@ import type { ReactNode } from "react";
 
 import { ActionMenu, PageTools } from "./WorkspaceUI";
 import { CommentsExtension } from "@blocknote/core/comments";
-import {
-  filterSuggestionItems,
-  insertOrUpdateBlockForSlashMenu,
-  SyntaxHighlightingExtension,
-} from "@blocknote/core/extensions";
+import { filterSuggestionItems, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
 import { withCollaboration } from "@blocknote/core/yjs";
 import { BlockNoteView } from "@blocknote/mantine";
 import {
@@ -32,6 +28,14 @@ import {
   type WritingLaunchRequest,
 } from "./writing-target";
 import { collaborationUndoLifecycleExtension } from "./collaboration-undo";
+import { deferredSyntaxExtension } from "./deferred-syntax";
+import { FindReplace, findReplaceExtension } from "./find-replace";
+import { tabsExtension, footnotesExtension, insertFootnote } from "./editor-feature-blocks";
+import { Presentation } from "./Presentation";
+import { RenderBoundary } from "./RenderBoundary";
+import { EditorFeatureContext } from "./editor-feature-context";
+import { PageInfoPopover } from "./PageInfoPopover";
+import "./editor-features.css";
 import { yUndoPluginKey, yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import * as Y from "yjs";
 import type { ClientMemberContext, Space } from "../shared/types";
@@ -253,6 +257,7 @@ export function EditorPage({
   }, [member.features?.diffDigests, page.id]);
   const [attachmentsOpen, setAttachmentsOpen] = useState(false);
   const [backlinksOpen, setBacklinksOpen] = useState(false);
+  const [schemaUpgrade, setSchemaUpgrade] = useState(false);
   const [sizeWarning, setSizeWarning] = useState<{ bytes: number; readOnly: boolean } | null>(null);
   const recoveryKey = `notes:recovery:${member.user.id}:${member.workspace.id}:${page.id}`;
   const [recovery, setRecovery] = useState<RecoveryEntry[]>(() => {
@@ -391,6 +396,7 @@ export function EditorPage({
   const editable =
     member.role !== "viewer" &&
     !sizeWarning?.readOnly &&
+    !schemaUpgrade &&
     !storageError &&
     !recoveryPersistenceFailed &&
     !writeRecovery &&
@@ -764,6 +770,7 @@ export function EditorPage({
       if (!active) return;
       try {
         const value = JSON.parse(message) as { type: string; bytes: number; readOnly: boolean };
+        if (value.type === "document-schema-upgrade") setSchemaUpgrade(true);
         if (value.type === "document-size") setSizeWarning(value);
         if (value.type === "document-update-ack" && !next.hasUnsyncedChanges) writePending(false);
       } catch {
@@ -919,6 +926,7 @@ export function EditorPage({
   return (
     <main className={`page-canvas ${page.fullWidth ? "full-width" : ""}`}>
       <PageTools>
+        <PageInfoPopover pageId={page.id} />
         {status !== "connected" && (
           <output className={`sync-state sync-${status}`}>{status === "connecting" ? "Connecting…" : "Offline"}</output>
         )}
@@ -999,6 +1007,14 @@ export function EditorPage({
           </button>
         </ActionMenu>
       </PageTools>
+      {schemaUpgrade && (
+        <div className="notice notice-danger" role="alert">
+          This page uses a newer editor feature. Reload to continue editing.
+          <button type="button" onClick={() => window.location.reload()}>
+            Reload editor
+          </button>
+        </div>
+      )}
       {sizeWarning && (
         <div className={`notice ${sizeWarning.readOnly ? "notice-danger" : ""}`}>
           This document is {(sizeWarning.bytes / 1024 / 1024).toFixed(1)} MiB.
@@ -1274,31 +1290,40 @@ export function EditorPage({
             </p>
           )}
           {bundle ? (
-            <CollaborativeEditor
-              bundle={bundle}
-              member={member}
-              editable={editable}
-              offline={status === "offline"}
-              panelTarget={panelTarget}
-              commentsOpen={commentsVisible}
-              pageId={page.id}
-              isTemplate={page.isTemplate}
-              commentsRevision={commentsRevision}
-              onPageCreated={onPageChanged}
-              onError={setEditorError}
-              contentEpoch={page.contentEpoch}
-              writingOpen={writingOpen}
-              writingLaunchRequest={pendingWritingLaunch}
-              onWritingLaunchDelivered={writingLaunchDelivered}
-              onWritingOpen={() => {
-                setWritingOpen(true);
-                setCommentsOpen(false);
-                setAttachmentsOpen(false);
-                setHistoryOpen(false);
-                setBacklinksOpen(false);
+            <RenderBoundary
+              resetKey={`${page.id}:${page.contentEpoch}`}
+              onHistory={() => setHistoryOpen(true)}
+              onExport={() => {
+                downloadOfflineMarkdown(offlineCopyMarkdown(bundle.doc, page.title), `${page.title}-recovery.md`);
               }}
-              onWritingClose={() => setWritingOpen(false)}
-            />
+            >
+              <CollaborativeEditor
+                bundle={bundle}
+                member={member}
+                editable={editable}
+                offline={status === "offline"}
+                panelTarget={panelTarget}
+                commentsOpen={commentsVisible}
+                pageId={page.id}
+                isTemplate={page.isTemplate}
+                commentsRevision={commentsRevision}
+                onPageCreated={onPageChanged}
+                onError={setEditorError}
+                contentEpoch={page.contentEpoch}
+                title={page.title}
+                writingOpen={writingOpen}
+                writingLaunchRequest={pendingWritingLaunch}
+                onWritingLaunchDelivered={writingLaunchDelivered}
+                onWritingOpen={() => {
+                  setWritingOpen(true);
+                  setCommentsOpen(false);
+                  setAttachmentsOpen(false);
+                  setHistoryOpen(false);
+                  setBacklinksOpen(false);
+                }}
+                onWritingClose={() => setWritingOpen(false)}
+              />
+            </RenderBoundary>
           ) : storageError ? (
             <div className="editor-loading">
               This document cannot be opened safely until offline storage is available.
@@ -1439,9 +1464,12 @@ function editorOptions(
       showCursorLabels: "activity" as const,
     },
     extensions: [
+      findReplaceExtension,
+      tabsExtension,
+      footnotesExtension,
       collaborationUndoLifecycleExtension(),
       dateMentionPasteExtension(member.user.id),
-      SyntaxHighlightingExtension({
+      deferredSyntaxExtension({
         createHighlighter: async () => {
           const [{ createHighlighterCore }, { createJavaScriptRegexEngine }, light, dark, ...langs] = await Promise.all(
             [
@@ -1495,6 +1523,7 @@ function CollaborativeEditor({
   onWritingLaunchDelivered,
   onWritingOpen,
   onWritingClose,
+  title,
 }: {
   bundle: CollaborationBundle;
   member: ClientMemberContext;
@@ -1513,7 +1542,17 @@ function CollaborativeEditor({
   onWritingLaunchDelivered: (id: string) => void;
   onWritingOpen: () => void;
   onWritingClose: () => void;
+  title: string;
 }) {
+  const [presentation, setPresentation] = useState<{
+    content: readonly unknown[];
+    title: string;
+    sourceKey: string;
+  } | null>(null);
+  const presentationSourceKey = `${pageId}:${contentEpoch}:${editable}`;
+  // Permission/epoch changes discard the private snapshot before committing a
+  // new view. Complete access loss removes this editor through App's page tree.
+  if (presentation && presentation.sourceKey !== presentationSourceKey) setPresentation(null);
   const [commentError, setCommentError] = useState("");
   const [pasteChoice, setPasteChoice] = useState<{ url: string; blockId: string } | null>(null);
   const [pasteNotice, setPasteNotice] = useState("");
@@ -1671,6 +1710,55 @@ function CollaborativeEditor({
     filterSuggestionItems(
       [
         ...getDefaultReactSlashMenuItems(editor),
+        ...(member.features?.editorBlocksV2
+          ? [
+              {
+                title: "Status badge",
+                subtext: "A labelled inline status",
+                aliases: ["status", "badge"],
+                group: "NoteFlare",
+                icon: <span>●</span>,
+                onItemClick: () => {
+                  insertOrUpdateBlockForSlashMenu(editor, { type: "paragraph" });
+                  editor.insertInlineContent([{ type: "statusBadge", props: { label: "Status", color: "gray" } }]);
+                },
+              },
+              {
+                title: "Footnote",
+                subtext: "Add a reference and definition",
+                aliases: ["footnote", "reference"],
+                group: "NoteFlare",
+                icon: <span>¹</span>,
+                onItemClick: () => {
+                  insertOrUpdateBlockForSlashMenu(editor, { type: "paragraph" });
+                  insertFootnote(editor);
+                },
+              },
+              {
+                title: "Tabs",
+                subtext: "Group content into tabs",
+                aliases: ["tabs"],
+                group: "NoteFlare",
+                icon: <span>▤</span>,
+                onItemClick: () =>
+                  insertOrUpdateBlockForSlashMenu(editor, {
+                    type: "tabs",
+                    children: [
+                      { type: "tabPanel", props: { label: "Tab 1" }, children: [{ type: "paragraph" }] },
+                      { type: "tabPanel", props: { label: "Tab 2" }, children: [{ type: "paragraph" }] },
+                    ],
+                  }),
+              },
+              {
+                title: "Linked database",
+                subtext: "Show a saved view of a source table",
+                aliases: ["database", "linked table", "table view"],
+                group: "NoteFlare",
+                icon: <span>▦</span>,
+                onItemClick: () => insertOrUpdateBlockForSlashMenu(editor, { type: "linkedTableView" }),
+              },
+            ]
+          : []),
         {
           title: "AI writing",
           subtext: "Draft or edit with the writing sidebar",
@@ -1713,8 +1801,8 @@ function CollaborativeEditor({
             ["tasks", "Task List"],
             ["diagram", "Diagram page"],
           ] as const
-        ).map(([kind, title]) => ({
-          title,
+        ).map(([kind, menuTitle]) => ({
+          title: menuTitle,
           subtext: "Create inside this page and insert a link",
           aliases: [kind, "child page", "page inside"],
           group: "NoteFlare blocks",
@@ -1869,162 +1957,205 @@ function CollaborativeEditor({
     return parsed ? [...dateItems, ...mentions] : [...mentions, ...dateItems];
   };
   return (
-    <DateMentionContext.Provider value={dateMentionContext}>
-      <DiagramEmbedContext.Provider
-        value={member.features?.liveDiagramEmbeds ? `${member.user.id}:${member.workspace.id}` : null}
-      >
-        <EmbedFeatureContext.Provider value={member.features?.expandedEmbeds ?? false}>
-          <div
-            ref={editorShellRef}
-            data-block-link-document={member.features?.blockLinks ? pageId : undefined}
-            onPasteCapture={(event) => {
-              if (!editable || event.clipboardData.files.length || event.isDefaultPrevented()) return;
-              if (
-                !(event.target instanceof Element) ||
-                !editorShellRef.current?.contains(event.target) ||
-                !event.target.closest('.bn-editor[contenteditable="true"]')
-              )
-                return;
-              const value = event.clipboardData.getData("text/plain").trim();
-              if (!safeBookmarkUrl(value) || /\s/.test(value)) return;
-              if (
-                !(
-                  (member.features?.expandedEmbeds && value.startsWith("https://")) ||
-                  resolveEmbed(value, member.features?.expandedEmbeds)
+    <EditorFeatureContext.Provider
+      value={{
+        hostId: pageId,
+        member,
+        onSelectPage: (id) => window.dispatchEvent(new CustomEvent("notes:navigate-page", { detail: id })),
+      }}
+    >
+      <DateMentionContext.Provider value={dateMentionContext}>
+        <DiagramEmbedContext.Provider
+          value={member.features?.liveDiagramEmbeds ? `${member.user.id}:${member.workspace.id}` : null}
+        >
+          <EmbedFeatureContext.Provider value={member.features?.expandedEmbeds ?? false}>
+            <div
+              ref={editorShellRef}
+              data-block-link-document={member.features?.blockLinks ? pageId : undefined}
+              onPasteCapture={(event) => {
+                if (!editable || event.clipboardData.files.length || event.isDefaultPrevented()) return;
+                if (
+                  !(event.target instanceof Element) ||
+                  !editorShellRef.current?.contains(event.target) ||
+                  !event.target.closest('.bn-editor[contenteditable="true"]')
                 )
-              )
-                return;
-              const block = editor.getTextCursorPosition().block;
-              if (block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) return;
-              event.preventDefault();
-              event.stopPropagation();
-              setPasteNotice("");
-              setPasteChoice({ url: value, blockId: block.id });
-            }}
-          >
-            <BlockNoteView
-              editor={editor}
-              editable={editable}
-              className="notes-editor"
-              theme={colorScheme}
-              slashMenu={false}
-              formattingToolbar={false}
-              sideMenu={member.features?.blockLinks ? false : undefined}
+                  return;
+                const value = event.clipboardData.getData("text/plain").trim();
+                if (!safeBookmarkUrl(value) || /\s/.test(value)) return;
+                if (
+                  !(
+                    (member.features?.expandedEmbeds && value.startsWith("https://")) ||
+                    resolveEmbed(value, member.features?.expandedEmbeds)
+                  )
+                )
+                  return;
+                const block = editor.getTextCursorPosition().block;
+                if (block.type !== "paragraph" || (Array.isArray(block.content) && block.content.length)) return;
+                event.preventDefault();
+                event.stopPropagation();
+                setPasteNotice("");
+                setPasteChoice({ url: value, blockId: block.id });
+              }}
             >
-              {member.features?.blockLinks && <SideMenuController sideMenu={BlockLinkSideMenu} />}
-              <WritingLaunchContext.Provider value={launchWriting}>
-                <FormattingToolbarController formattingToolbar={WritingFormattingToolbar} />
-              </WritingLaunchContext.Provider>
-              {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
-              {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
-              {commentsOpen &&
+              <div className="editor-feature-tools" contentEditable={false}>
+                <FindReplace editor={editor} editable={editable} />
+                <button
+                  type="button"
+                  onClick={(event) => {
+                    // Safari does not focus buttons on pointer clicks. Give the
+                    // dialog a deterministic launcher to restore on close.
+                    event.currentTarget.focus();
+                    setPresentation({
+                      content: structuredClone(editor.document),
+                      title,
+                      sourceKey: presentationSourceKey,
+                    });
+                  }}
+                >
+                  Present page
+                </button>
+              </div>
+              {presentation && (
+                <RenderBoundary
+                  resetKey={presentation.content.length}
+                  label="The presentation could not be displayed"
+                  onRetry={() => setPresentation(null)}
+                >
+                  <Presentation
+                    title={presentation.title}
+                    content={presentation.content}
+                    onClose={() => setPresentation(null)}
+                  />
+                </RenderBoundary>
+              )}
+              <BlockNoteView
+                editor={editor}
+                editable={editable}
+                className="notes-editor"
+                theme={colorScheme}
+                slashMenu={false}
+                formattingToolbar={false}
+                sideMenu={member.features?.blockLinks ? false : undefined}
+              >
+                {member.features?.blockLinks && <SideMenuController sideMenu={BlockLinkSideMenu} />}
+                <WritingLaunchContext.Provider value={launchWriting}>
+                  <FormattingToolbarController formattingToolbar={WritingFormattingToolbar} />
+                </WritingLaunchContext.Provider>
+                {editable && <SuggestionMenuController triggerCharacter="/" getItems={getSlashItems} />}
+                {editable && <SuggestionMenuController triggerCharacter="@" getItems={getMentionItems} />}
+                {commentsOpen &&
+                  panelTarget &&
+                  createPortal(
+                    <div ref={commentsPanel} className="comments-panel">
+                      <h2>Comments</h2>
+                      <p className="muted">
+                        {editable
+                          ? "Select text and use the formatting toolbar to start a thread."
+                          : "You can comment and reply even while the document is read-only."}
+                      </p>
+                      {commentError && <p className="form-error">{commentError}</p>}
+                      <ThreadsSidebar filter="all" sort="position" />
+                    </div>,
+                    panelTarget,
+                  )}
+              </BlockNoteView>
+              {writingTarget &&
                 panelTarget &&
                 createPortal(
-                  <div ref={commentsPanel} className="comments-panel">
-                    <h2>Comments</h2>
-                    <p className="muted">
-                      {editable
-                        ? "Select text and use the formatting toolbar to start a thread."
-                        : "You can comment and reply even while the document is read-only."}
-                    </p>
-                    {commentError && <p className="form-error">{commentError}</p>}
-                    <ThreadsSidebar filter="all" sort="position" />
+                  <div hidden={!writingOpen}>
+                    <WritingPanel
+                      pageId={pageId}
+                      initialTarget={writingTarget}
+                      launchRequest={panelLaunch}
+                      visible={writingOpen}
+                      onBusyChange={writingBusyChanged}
+                      editable={editable}
+                      ready={writingReady}
+                      subscribeReadiness={subscribeWritingReadiness}
+                      onCapture={captureWriting}
+                      onApply={(target, markdown, mode, epoch, protectedIds) => {
+                        if (!editable || !editor.isEditable)
+                          throw new WritingTargetError("This document is read-only. You can copy the result.");
+                        if (epoch !== contentEpoch)
+                          throw new WritingTargetError(
+                            "The page was restored. Reopen its current document before inserting.",
+                          );
+                        const undo = yUndoPluginKey.getState(editor.prosemirrorState)?.undoManager;
+                        undo?.stopCapturing();
+                        editor.transact((tr) => applyWriting(tr, target, epoch, markdown, mode, protectedIds));
+                        undo?.stopCapturing();
+                        editor.focus();
+                      }}
+                      onClose={onWritingClose}
+                    />
                   </div>,
                   panelTarget,
                 )}
-            </BlockNoteView>
-            {writingTarget &&
-              panelTarget &&
-              createPortal(
-                <div hidden={!writingOpen}>
-                  <WritingPanel
-                    pageId={pageId}
-                    initialTarget={writingTarget}
-                    launchRequest={panelLaunch}
-                    visible={writingOpen}
-                    onBusyChange={writingBusyChanged}
-                    editable={editable}
-                    ready={writingReady}
-                    subscribeReadiness={subscribeWritingReadiness}
-                    onCapture={captureWriting}
-                    onApply={(target, markdown, mode, epoch, protectedIds) => {
-                      if (!editable || !editor.isEditable)
-                        throw new WritingTargetError("This document is read-only. You can copy the result.");
-                      if (epoch !== contentEpoch)
-                        throw new WritingTargetError(
-                          "The page was restored. Reopen its current document before inserting.",
-                        );
-                      const undo = yUndoPluginKey.getState(editor.prosemirrorState)?.undoManager;
-                      undo?.stopCapturing();
-                      editor.transact((tr) => applyWriting(tr, target, epoch, markdown, mode, protectedIds));
-                      undo?.stopCapturing();
-                      editor.focus();
-                    }}
-                    onClose={onWritingClose}
-                  />
-                </div>,
-                panelTarget,
-              )}
-            {pasteChoice && (
-              <fieldset ref={pasteChoiceRef} className="paste-url-choice">
-                <legend>Paste as</legend>
-                <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("link")}>
-                  Link
-                </button>
-                {member.features?.expandedEmbeds && pasteChoice.url.startsWith("https://") && (
+              {pasteChoice && (
+                <fieldset ref={pasteChoiceRef} className="paste-url-choice">
+                  <legend>Paste as</legend>
+                  <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("link")}>
+                    Link
+                  </button>
+                  {member.features?.expandedEmbeds && pasteChoice.url.startsWith("https://") && (
+                    <button
+                      type="button"
+                      disabled={!editable || !editor.isEditable}
+                      onClick={() => choosePaste("preview")}
+                    >
+                      Preview card
+                    </button>
+                  )}
+                  {resolveEmbed(pasteChoice.url, member.features?.expandedEmbeds) && (
+                    <button
+                      type="button"
+                      disabled={!editable || !editor.isEditable}
+                      onClick={() => choosePaste("embed")}
+                    >
+                      Embed
+                    </button>
+                  )}
                   <button
                     type="button"
-                    disabled={!editable || !editor.isEditable}
-                    onClick={() => choosePaste("preview")}
+                    onClick={() => {
+                      setPasteChoice(null);
+                      setPasteNotice("");
+                      editor.focus();
+                    }}
                   >
-                    Preview card
+                    Cancel
                   </button>
-                )}
-                {resolveEmbed(pasteChoice.url, member.features?.expandedEmbeds) && (
-                  <button type="button" disabled={!editable || !editor.isEditable} onClick={() => choosePaste("embed")}>
-                    Embed
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPasteChoice(null);
-                    setPasteNotice("");
+                </fieldset>
+              )}
+              {member.features?.blockLinks && (
+                <BlockLinkControls root={editorShellRef} pageId={pageId} bundle={bundle} offline={offline} />
+              )}
+              <output className="muted" aria-live="polite" aria-label="Paste status">
+                {pasteNotice}
+              </output>
+              {dateInsert && (
+                <DateMentionPicker
+                  key={dateInsert.tokenId}
+                  initial={dateInsert}
+                  label="Insert date mention"
+                  onSave={(next) => {
+                    if (!editable || !editor.isEditable) return "This document is read only.";
+                    editor.insertInlineContent([{ type: "dateMention", props: dateMentionWireProps(next) }, " "], {
+                      updateSelection: true,
+                    });
+                    return null;
+                  }}
+                  onClose={() => {
+                    setDateInsert(null);
                     editor.focus();
                   }}
-                >
-                  Cancel
-                </button>
-              </fieldset>
-            )}
-            {member.features?.blockLinks && (
-              <BlockLinkControls root={editorShellRef} pageId={pageId} bundle={bundle} offline={offline} />
-            )}
-            <output className="muted" aria-live="polite" aria-label="Paste status">
-              {pasteNotice}
-            </output>
-            {dateInsert && (
-              <DateMentionPicker
-                key={dateInsert.tokenId}
-                initial={dateInsert}
-                label="Insert date mention"
-                onSave={(next) => {
-                  if (!editable || !editor.isEditable) return "This document is read only.";
-                  editor.insertInlineContent([{ type: "dateMention", props: dateMentionWireProps(next) }, " "], {
-                    updateSelection: true,
-                  });
-                  return null;
-                }}
-                onClose={() => {
-                  setDateInsert(null);
-                  editor.focus();
-                }}
-              />
-            )}
-          </div>
-        </EmbedFeatureContext.Provider>
-      </DiagramEmbedContext.Provider>
-    </DateMentionContext.Provider>
+                />
+              )}
+            </div>
+          </EmbedFeatureContext.Provider>
+        </DiagramEmbedContext.Provider>
+      </DateMentionContext.Provider>
+    </EditorFeatureContext.Provider>
   );
 }
 

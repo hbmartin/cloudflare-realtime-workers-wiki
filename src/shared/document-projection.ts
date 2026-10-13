@@ -1,6 +1,13 @@
 import { collapseWhitespace as normalizeText, hasUrlControls } from "./text.ts";
 import type { ProseMirrorJson } from "./types";
 import { dateMentionFromProps, readableDateMention, type DateMention } from "./date-mentions.ts";
+import {
+  footnoteAnchor,
+  footnoteCatalog,
+  statusBadgeText,
+  tabPanelLabel,
+  type FootnoteCatalog,
+} from "./editor-features.ts";
 
 export type { ProseMirrorJson } from "./types";
 
@@ -56,6 +63,9 @@ export function dateMentionText(node: ProseMirrorJson) {
 
 /** Match the readable atom text and separators used by the document projection. */
 export function projectionLeafText(node: ProseMirrorJson): string {
+  if (node.type === "statusBadge") return `${statusBadgeText(node)} `;
+  if (node.type === "tabPanel") return `${tabPanelLabel(node)} `;
+  if (node.type === "footnoteReference") return `Footnote ${stringAttr(node, "definitionId") ?? ""} `;
   if (node.type === "mention") {
     const type = stringAttr(node, "entityType"),
       label = stringAttr(node, "label");
@@ -180,6 +190,7 @@ function markedText(node: ProseMirrorJson, format: "markdown" | "html") {
 function nodeText(node: ProseMirrorJson): string {
   if (typeof node.text === "string") return node.text;
   if (node.type === "mention") return stringAttr(node, "label") ?? "";
+  if (node.type === "statusBadge") return statusBadgeText(node);
   if (node.type === "dateMention") {
     return dateMentionText(node);
   }
@@ -190,8 +201,22 @@ const LIST_ITEM_TYPES = new Set(["bulletListItem", "numberedListItem", "checkLis
 // A list item's own line stops here; these carry its nested structure instead.
 const NESTED_BLOCK_TYPES = new Set(["bulletList", "numberedList", "blockGroup"]);
 
-function serializeInline(node: ProseMirrorJson, format: "markdown" | "html"): string {
+function serializeInline(
+  node: ProseMirrorJson,
+  format: "markdown" | "html",
+  options: DocumentSerializationOptions = {},
+): string {
   if (typeof node.text === "string") return markedText(node, format);
+  if (node.type === "statusBadge")
+    return format === "html"
+      ? `<span class="status-badge">${escapeHtml(statusBadgeText(node))}</span>`
+      : escapeMarkdownInline(statusBadgeText(node));
+  if (node.type === "footnoteReference") {
+    const id = stringAttr(node, "definitionId") ?? "missing";
+    return format === "html"
+      ? `<sup><a href="#${escapeHtml(footnoteAnchor(id))}">${options.footnotes?.numbers.get(id) ?? "?"}</a></sup>`
+      : `[^${encodeURIComponent(id)}]`;
+  }
   if (node.type === "mention") {
     const label = stringAttr(node, "label") ?? "Mention";
     const id = stringAttr(node, "entityId");
@@ -211,7 +236,7 @@ function serializeInline(node: ProseMirrorJson, format: "markdown" | "html"): st
       ? `<span class="math" data-formula="${escapeHtml(formula)}">${escapeHtml(formula)}</span>`
       : `$${formula.replaceAll("$", "\\$")}$`;
   }
-  return (node.content ?? []).map((child) => serializeInline(child, format)).join("");
+  return (node.content ?? []).map((child) => serializeInline(child, format, options)).join("");
 }
 
 // BlockNote keeps list items as plain siblings with no list node around them, so
@@ -230,6 +255,7 @@ function listTagFor(node: ProseMirrorJson): "ul" | "ol" | null {
 }
 
 export type DocumentSerializationOptions = {
+  footnotes?: FootnoteCatalog;
   pageHref?: (pageId: string, nodeType: "linkToPage" | "linkedDiagram") => string | null;
   linkedDiagramThumbnailHref?: (pageId: string) => string | null;
   mediaHref?: (url: string) => string | null;
@@ -311,7 +337,7 @@ function serializeNode(
   options: DocumentSerializationOptions = {},
 ): string {
   const children = node.content ?? [];
-  const inline = children.map((child) => serializeInline(child, format)).join("");
+  const inline = children.map((child) => serializeInline(child, format, options)).join("");
   const blockChildren = () => children.map((child) => serializeNode(child, format, depth + 1, options)).join("");
   const transparentChildren = () => children.map((child) => serializeNode(child, format, depth, options)).join("");
   const type = node.type ?? "unknown";
@@ -327,8 +353,19 @@ function serializeNode(
     return transparentChildren();
   }
   if (type === "doc" || type === "blockGroup") return serializeSequence(children, format, depth, options);
-  if (type === "text" || type === "mention" || type === "dateMention" || type === "inlineMath")
-    return serializeInline(node, format);
+  if (["text", "mention", "dateMention", "inlineMath", "statusBadge", "footnoteReference"].includes(type))
+    return serializeInline(node, format, options);
+  if (type === "tabs" || type === "footnotes") return transparentChildren();
+  if (type === "tabPanel")
+    return format === "html"
+      ? `<h2>${escapeHtml(tabPanelLabel(node))}</h2>`
+      : `## ${escapeMarkdownInline(tabPanelLabel(node))}\n\n`;
+  if (type === "footnoteDefinition") {
+    const id = stringAttr(node, "definitionId") ?? "missing";
+    return format === "html"
+      ? `<p id="${escapeHtml(footnoteAnchor(id))}">${inline}</p>`
+      : `[^${encodeURIComponent(id)}]: ${inline.replaceAll("\n", "\n    ")}\n\n`;
+  }
   if (type === "paragraph") return format === "html" ? `<p>${inline}</p>` : `${inline}\n\n`;
   if (type === "heading" || /^heading[1-6]$/.test(type)) {
     const level = Math.min(6, Math.max(1, Number(node.attrs?.level ?? type.slice(7) ?? 1)));
@@ -526,6 +563,12 @@ export function projectDocument(root: ProseMirrorJson): DocumentProjection {
     if (node.type === "dateMention") {
       append(projectionLeafText(node));
     }
+    if (["statusBadge", "tabPanel", "footnoteReference"].includes(node.type ?? "")) append(projectionLeafText(node));
+    if (node.type === "linkedTableView") {
+      const id = stringAttr(node, "tablePageId");
+      if (id && !pageOffsets.has(id)) pageOffsets.set(id, textLength);
+      append("Linked table ");
+    }
 
     if (node.type === "linkedDiagram") {
       const entityId = stringAttr(node, "pageId");
@@ -559,6 +602,7 @@ export function serializeDocument(
   root: ProseMirrorJson,
   options: DocumentSerializationOptions = {},
 ): SerializedDocument {
+  options = { ...options, footnotes: footnoteCatalog(root) };
   return {
     ...projectDocument(root),
     markdown: serializeNode(root, "markdown", 0, options).trimEnd() + "\n",

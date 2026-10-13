@@ -11,6 +11,7 @@ import {
   recordPermanentDeliveryFailure,
 } from "./slack-delivery";
 import { DeliveryInProgressError } from "./notifications";
+import { contributorsJsonSql, eventContributors } from "./contributor-identity";
 import type { Env } from "./env";
 import type { ChannelEventType } from "../shared/activity";
 import { ACTIVITY_LABELS } from "../shared/activity";
@@ -172,6 +173,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
     const load = () =>
       env.DB.prepare(`SELECT e.*,m.installation_id,m.channel_id,m.space_id mapping_space,m.page_id mapping_page,m.muted_at,m.snoozed_until,
       m.notification_blocked_at,m.created_by,m.validation_state,m.validation_error,m.validation_revision,
+      ${contributorsJsonSql("e.contributor_ids_json", "e.actor_id")} contributors_json,
       ${mappingDeliveryPauseSql("m", Date.now())} delivery_paused,
       EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type) event_enabled,
       EXISTS(SELECT 1 FROM slack_thread_links mirror WHERE mirror.installation_id=i.id AND mirror.channel_id=m.channel_id
@@ -207,6 +209,7 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
           snoozed_until: number | null;
           title: string;
           actor_name: string | null;
+          contributors_json: string;
           event_type: ChannelEventType;
           actor_access: number;
           actor_authority: number;
@@ -377,7 +380,18 @@ export async function deliverRound2ChannelEvent(env: Env, eventId: string, recon
             const currentDeparture = current.archived_at !== null || current.current_space !== current.mapping_space;
             const available = Boolean(current.actor_access && current.mapped);
             const title = available ? safeSlackText(current.title, 200) : "A page is no longer available";
-            const actor = available ? safeSlackText(current.actor_name ?? "A collaborator", 80) : "A collaborator";
+            const contributors = eventContributors(current.contributors_json);
+            const actor = available
+              ? safeSlackText(
+                  contributors.length
+                    ? `${contributors
+                        .slice(0, 5)
+                        .map((contributor) => contributor.name)
+                        .join(", ")}${contributors.length > 5 ? ` and ${contributors.length - 5} others` : ""}`
+                    : (current.actor_name ?? "A collaborator"),
+                  400,
+                )
+              : "A collaborator";
             const text = `${actor} · ${ACTIVITY_LABELS[current.event_type]} · ${title}`;
             return {
               channel: current.channel_id,

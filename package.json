@@ -86,6 +86,7 @@
     "partyserver": "0.5.10",
     "prosemirror-model": "1.25.12",
     "prosemirror-state": "1.4.4",
+    "prosemirror-view": "1.42.6",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "react-qr-code": "2.2.0",

@@ -9,6 +9,7 @@ import {
   type DateMention,
 } from "./date-mentions";
 import { dateMentionText } from "./document-projection";
+import { normalizeDocumentTables } from "./document-validation";
 
 export const NOTION_VERSION = "2026-03-11";
 export const NOTION_PAGE_SIZE_MAX = 100;
@@ -127,7 +128,13 @@ export function documentBlocks(root: ProseMirrorJson): NotionBlock[] {
       internalId: id,
       type: node.type ?? "unsupported",
       node,
-      children: (childGroup(container)?.content ?? []).map(visit).filter((item): item is NotionBlock => Boolean(item)),
+      children:
+        node.type === "table" && node.content?.length
+          ? node.content.map((row, index) => {
+              const rowId = string(row.attrs?.apiRowId, `${id}:row:${index}`);
+              return { id: rowId, internalId: rowId, type: "tableRow", node: row, children: [] };
+            })
+          : (childGroup(container)?.content ?? []).map(visit).filter((item): item is NotionBlock => Boolean(item)),
     };
   };
   return (group.content ?? []).map(visit).filter((item): item is NotionBlock => Boolean(item));
@@ -445,11 +452,21 @@ export function notionPayloadForBlock(block: NotionBlock): { type: string; paylo
   if (["image", "video", "audio", "file", "pdf"].includes(type)) return { type, payload: mediaPayload(node) };
   if (type === "table") {
     const rows = block.children.map((child) => child.node).filter((row) => row.type === "tableRow");
-    const width = Math.max(1, ...rows.map((row) => row.content?.length ?? 0));
-    const hasColumnHeader = Boolean(
-      rows[0]?.content?.length && rows[0].content.every((cell) => cell.type === "tableHeader"),
+    const width = Math.max(
+      1,
+      ...rows.map((row) =>
+        (row.content ?? []).reduce((columns, cell) => columns + Number(cell.attrs?.colspan ?? 1), 0),
+      ),
     );
-    const hasRowHeader = Boolean(rows.length && rows.every((row) => row.content?.[0]?.type === "tableHeader"));
+    const hasColumnHeader =
+      typeof properties.hasColumnHeader === "boolean"
+        ? properties.hasColumnHeader
+        : Boolean(rows[0]?.content?.length && rows[0].content.every((cell) => cell.type === "tableHeader"));
+    const bodyRows = hasColumnHeader ? rows.slice(1) : rows;
+    const hasRowHeader =
+      typeof properties.hasRowHeader === "boolean"
+        ? properties.hasRowHeader
+        : Boolean(bodyRows.length && bodyRows.every((row) => row.content?.[0]?.type === "tableHeader"));
     return {
       type: "table",
       payload: {
@@ -462,7 +479,18 @@ export function notionPayloadForBlock(block: NotionBlock): { type: string; paylo
   if (type === "tableRow") {
     return {
       type: "table_row",
-      payload: { cells: (node.content ?? []).map((cell) => proseMirrorInlineToNotion(cell.content ?? [])) },
+      payload: {
+        cells: (node.content ?? []).map((cell) =>
+          proseMirrorInlineToNotion(
+            cell.content?.[0]?.type === "tableParagraph"
+              ? cell.content.flatMap((paragraph, index) => [
+                  ...(index ? [{ type: "hardBreak" }] : []),
+                  ...(paragraph.content ?? []),
+                ])
+              : (cell.content ?? []),
+          ),
+        ),
+      },
     };
   }
   return { type: "unsupported", payload: {} };
@@ -587,7 +615,10 @@ function blockNode(
     const cells = Array.isArray(payload.cells) ? payload.cells : [];
     return {
       type: "tableRow",
-      content: cells.map((cell) => ({ type: "tableCell", content: notionRichTextToProseMirror(cell, existingDates) })),
+      content: cells.map((cell) => ({
+        type: "tableCell",
+        content: [{ type: "tableParagraph", content: notionRichTextToProseMirror(cell, existingDates) }],
+      })),
     };
   }
   throw new Error(`Unsupported block type: ${type}`);
@@ -647,5 +678,6 @@ export function notionInputToBlockContainer(
       content: children,
     });
   }
-  return { type: "blockContainer", attrs: { id }, content };
+  const container = { type: "blockContainer", attrs: { id }, content };
+  return node.type === "table" && childrenInput.length ? normalizeDocumentTables(container) : container;
 }

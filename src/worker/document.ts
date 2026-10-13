@@ -9,6 +9,7 @@ import { collectTransclusions, dateTokens, projectDocument, type ProseMirrorJson
 import { dateMentionFromProps } from "../shared/date-mentions";
 import {
   diagramFromYDoc,
+  diagramRoots,
   DIAGRAM_NODES_ROOT,
   DIAGRAM_THUMBNAIL_HEIGHT,
   DIAGRAM_THUMBNAIL_WIDTH,
@@ -16,6 +17,13 @@ import {
   renderDiagramSvg,
 } from "../shared/diagram";
 import { flattenDocumentBlocks } from "../shared/notion-blocks";
+import {
+  DocumentValidationError,
+  normalizeDocumentTables,
+  requiredDocumentCapabilities,
+  validateDocumentTree,
+} from "../shared/document-validation";
+import { pageContributorStatements, versionContributorStatement } from "./page-info";
 import type { DocumentContentEnvelope } from "../shared/types";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import { joinBytes, splitBytes } from "../shared/bytes";
@@ -50,6 +58,8 @@ export interface ConnectionAuth {
   userId: string;
   role: "owner" | "editor" | "viewer";
   expiresAt: number;
+  editorCapabilities?: string[];
+  schemaWarning?: string;
   __ypsAwarenessIds?: number[];
 }
 
@@ -352,10 +362,32 @@ function findYContainer(
 }
 
 function applyApiMutation(document: Y.Doc, operation: ApiBlockMutation) {
+  const nativeRow = operation.type === "append_children" ? null : findYTableRow(document, operation.internalId);
+  if (nativeRow && operation.type !== "append_children") {
+    if (operation.type === "delete_block") {
+      nativeRow.table.delete(nativeRow.index, 1);
+      return;
+    }
+    const node = operation.type === "replace_block" ? operation.container.content?.[0] : operation.node;
+    if (node?.type !== "tableRow") throw new Error("invalid_table_row");
+    const previous = nativeRow.table.get(nativeRow.index) as Y.XmlElement;
+    const content = (node.content ?? []).map((cell, index) => ({
+      ...cell,
+      type: (previous.get(index) as Y.XmlElement | undefined)?.nodeName ?? cell.type ?? "tableCell",
+    }));
+    nativeRow.table.delete(nativeRow.index, 1);
+    nativeRow.table.insert(nativeRow.index, [
+      yNode({ ...node, content, attrs: { ...node.attrs, apiRowId: operation.internalId } }),
+    ]);
+    return;
+  }
   if (operation.type === "append_children") {
     const parent = operation.parentInternalId ? findYContainer(document, operation.parentInternalId)?.container : null;
     if (operation.parentInternalId && !parent) throw new Error("block_not_found");
-    const group = blockGroup(parent ?? document.getXmlFragment("document-store"), true)!;
+    const table = parent
+      ?.toArray()
+      .find((child): child is Y.XmlElement => child instanceof Y.XmlElement && child.nodeName === "table");
+    const group = table ?? blockGroup(parent ?? document.getXmlFragment("document-store"), true)!;
     const position = operation.position ?? { type: "end" as const };
     let index = group.length;
     if (position.type === "start") index = 0;
@@ -365,11 +397,35 @@ function applyApiMutation(document: Y.Doc, operation: ApiBlockMutation) {
         group
           .toArray()
           .findIndex(
-            (child) => child instanceof Y.XmlElement && child.getAttribute("id") === position.afterInternalId,
+            (child) =>
+              child instanceof Y.XmlElement &&
+              child.getAttribute(table ? "apiRowId" : "id") === position.afterInternalId,
           ) + 1;
       if (!index) throw new Error("invalid_position");
     }
-    group.insert(index, operation.children.map(yNode));
+    const existingRows = table?.toArray().filter((row): row is Y.XmlElement => row instanceof Y.XmlElement) ?? [];
+    const hasRowHeader =
+      String(table?.getAttribute("hasRowHeader")) === "true" ||
+      (table?.getAttribute("hasRowHeader") === undefined &&
+        existingRows.length > 1 &&
+        existingRows.slice(1).every((row) => (row.get(0) as Y.XmlElement | undefined)?.nodeName === "tableHeader"));
+    group.insert(
+      index,
+      operation.children.map((child) => {
+        if (!table) return yNode(child);
+        if (child.type !== "blockContainer" || child.content?.[0]?.type !== "tableRow" || child.content.length !== 1)
+          throw new Error("invalid_table_row");
+        const row = child.content[0];
+        return yNode({
+          ...row,
+          attrs: { ...row.attrs, apiRowId: child.attrs?.id },
+          content: (row.content ?? []).map((cell, column) => ({
+            ...cell,
+            type: hasRowHeader && column === 0 ? "tableHeader" : (cell.type ?? "tableCell"),
+          })),
+        });
+      }),
+    );
     return;
   }
   const found = findYContainer(document, operation.internalId);
@@ -386,11 +442,79 @@ function applyApiMutation(document: Y.Doc, operation: ApiBlockMutation) {
     return;
   }
   const children = found.container.toArray();
+  const table = children.find(
+    (child): child is Y.XmlElement => child instanceof Y.XmlElement && child.nodeName === "table",
+  );
+  if (operation.node.type === "table" && table && !operation.node.content?.length) {
+    for (const [key, value] of Object.entries(operation.node.attrs ?? {})) table.setAttribute(key, value as string);
+    const hasColumnHeader = operation.node.attrs?.hasColumnHeader === true;
+    const hasRowHeader = operation.node.attrs?.hasRowHeader === true;
+    for (const [rowIndex, child] of table.toArray().entries()) {
+      if (!(child instanceof Y.XmlElement)) continue;
+      for (const [columnIndex, cell] of child.toArray().entries()) {
+        if (!(cell instanceof Y.XmlElement)) continue;
+        const node = yXmlFragmentToProsemirrorJSON(cell) as ProseMirrorJson;
+        const type =
+          (hasColumnHeader && rowIndex === 0) || (hasRowHeader && columnIndex === 0) ? "tableHeader" : "tableCell";
+        if (cell.nodeName !== type) {
+          child.delete(columnIndex, 1);
+          child.insert(columnIndex, [yNode({ type, attrs: cell.getAttributes(), content: node.content ?? [] })]);
+        }
+      }
+    }
+    return;
+  }
   for (let index = children.length - 1; index >= 0; index -= 1) {
     const child = children[index];
     if (!(child instanceof Y.XmlElement) || child.nodeName !== "blockGroup") found.container.delete(index, 1);
   }
   found.container.insert(0, [yNode(operation.node)]);
+}
+
+function findYTableRow(document: Y.Doc, id: string) {
+  const visit = (parent: Y.XmlFragment | Y.XmlElement): { table: Y.XmlElement; index: number } | null => {
+    for (const child of parent.toArray()) {
+      if (!(child instanceof Y.XmlElement)) continue;
+      if (child.nodeName === "table") {
+        const index = child
+          .toArray()
+          .findIndex((row) => row instanceof Y.XmlElement && row.getAttribute("apiRowId") === id);
+        if (index >= 0) return { table: child, index };
+      }
+      const found = visit(child);
+      if (found) return found;
+    }
+    return null;
+  };
+  return visit(document.getXmlFragment("document-store"));
+}
+
+function normalizeYTables(parent: Y.XmlFragment | Y.XmlElement) {
+  for (const child of parent.toArray()) {
+    if (!(child instanceof Y.XmlElement)) continue;
+    if (child.nodeName === "blockContainer") {
+      const table = child
+        .toArray()
+        .find((node): node is Y.XmlElement => node instanceof Y.XmlElement && node.nodeName === "table");
+      if (table && blockGroup(child, false)) {
+        const json = yXmlFragmentToProsemirrorJSON(child) as ProseMirrorJson;
+        const normalized = normalizeDocumentTables({
+          type: "blockContainer",
+          attrs: child.getAttributes(),
+          content: json.content ?? [],
+        });
+        child.delete(0, child.length);
+        child.insert(0, (normalized.content ?? []).map(yNode));
+      }
+    }
+    if (child.nodeName === "tableRow" && !child.getAttribute("apiRowId"))
+      child.setAttribute("apiRowId", crypto.randomUUID());
+    normalizeYTables(child);
+  }
+}
+
+function normalizeYDocumentTables(document: Y.Doc) {
+  document.transact(() => normalizeYTables(document.getXmlFragment("document-store")), "table-normalize");
 }
 
 function collectLegacyColumns(document: ProseMirrorJson) {
@@ -514,6 +638,8 @@ export class Document extends YServer {
   private pendingUpdates: Uint8Array[] = [];
   private pendingOperationInputs = new Map<string, string>();
   private pendingAuthorId: string | null = null;
+  private pendingAuthors = new Set<string>();
+  private requiredCapabilities: string[] | null = null;
   private pendingMentionActors = new Map<string, string | null>();
   private mentionTracker: MentionTargetTracker | null = null;
   private observedMentionRoot: Y.XmlFragment | Y.Map<Y.Map<unknown>> | null = null;
@@ -604,8 +730,23 @@ export class Document extends YServer {
     sql.exec(`CREATE TABLE IF NOT EXISTS update_events (
       seq INTEGER PRIMARY KEY AUTOINCREMENT,
       author_id TEXT,
+      author_ids_json TEXT NOT NULL DEFAULT '[]',
       created_at INTEGER NOT NULL
     )`);
+    if (
+      !sql
+        .exec<{ name: string }>("PRAGMA table_info(update_events)")
+        .toArray()
+        .some((column) => column.name === "author_ids_json")
+    ) {
+      sql.exec("ALTER TABLE update_events ADD COLUMN author_ids_json TEXT NOT NULL DEFAULT '[]'");
+      sql.exec("UPDATE update_events SET author_ids_json=json_array(author_id) WHERE author_id IS NOT NULL");
+    }
+    sql.exec(`CREATE TABLE IF NOT EXISTS version_authors (
+      seq INTEGER NOT NULL,user_id TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(seq,user_id)
+    )`);
+    sql.exec(`INSERT OR IGNORE INTO version_authors SELECT seq,author.value,created_at
+      FROM update_events JOIN json_each(author_ids_json) author WHERE author.value IS NOT NULL`);
     sql.exec(`CREATE TABLE IF NOT EXISTS update_chunks (
       seq INTEGER NOT NULL REFERENCES update_events(seq) ON DELETE CASCADE,
       chunk_index INTEGER NOT NULL,
@@ -675,6 +816,20 @@ export class Document extends YServer {
     if (!this.metadata.retired && this.metadata.content_kind === "document" && migrateLegacyColumns(this.document)) {
       this.flushPendingUpdates();
     }
+    if (!this.metadata.retired && this.metadata.content_kind === "document") {
+      try {
+        normalizeYDocumentTables(this.document);
+        this.flushPendingUpdates();
+      } catch (error) {
+        logger.warn(
+          "document.table_compatibility.failed",
+          "document",
+          "Existing table requires recovery.",
+          { pageId: this.ids.pageId },
+          error,
+        );
+      }
+    }
     const pendingLog = sql
       .exec<{ pending: number }>(
         `SELECT EXISTS(SELECT 1 FROM update_events WHERE seq > ?) pending`,
@@ -723,9 +878,15 @@ export class Document extends YServer {
       connection.close(4401, "Authorization missing.");
       return;
     }
-    connection.setState({ userId, role, expiresAt });
+    const editorCapabilities = (new URL(context.request.url).searchParams.get("editorCapabilities") ?? "")
+      .slice(0, 2000)
+      .split(",")
+      .filter((value) => /^[a-z0-9-]{1,80}$/.test(value))
+      .slice(0, 50);
+    connection.setState({ userId, role, expiresAt, editorCapabilities });
     await this.scheduleAlarm(expiresAt);
     await super.onConnect(connection, context);
+    this.warnMissingCapabilities(connection);
     if (this.metadata.read_only || this.metadata.snapshot_bytes >= WARN_BYTES) {
       this.sendCustomMessage(
         connection,
@@ -745,8 +906,48 @@ export class Document extends YServer {
       this.transition ||
       this.metadata.read_only ||
       connection.state?.role === "viewer" ||
+      this.missingCapabilities(connection).length ||
       !connection.state ||
       connection.state.expiresAt <= Date.now(),
+    );
+  }
+
+  private missingCapabilities(connection: Connection<ConnectionAuth>) {
+    if (!this.requiredCapabilities) {
+      try {
+        this.requiredCapabilities =
+          this.metadata.content_kind === "document"
+            ? requiredDocumentCapabilities(
+                yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson,
+              )
+            : [...diagramRoots(this.document, false).nodes.values()].some(
+                  (node) => node instanceof Y.Map && (node.has("linkedPageId") || node.has("linkedViewId")),
+                )
+              ? ["diagram-links-v1"]
+              : [];
+      } catch {
+        this.requiredCapabilities = ["unsupported:document-structure"];
+      }
+    }
+    const advertised = new Set(connection.state?.editorCapabilities ?? []);
+    return this.requiredCapabilities.filter((capability) => !advertised.has(capability));
+  }
+
+  private warnMissingCapabilities(connection: Connection<ConnectionAuth>) {
+    const requiredCapabilities = this.missingCapabilities(connection);
+    const warning = requiredCapabilities.join(",");
+    if (!warning || connection.state?.schemaWarning === warning) return;
+    const state = connection.state;
+    if (state)
+      connection.setState({
+        ...state,
+        editorCapabilities: [...(state.editorCapabilities ?? [])],
+        __ypsAwarenessIds: [...(state["__ypsAwarenessIds"] ?? [])],
+        schemaWarning: warning,
+      });
+    this.sendCustomMessage(
+      connection,
+      JSON.stringify({ type: "document-schema-upgrade", requiredCapabilities, readOnly: true }),
     );
   }
 
@@ -764,6 +965,7 @@ export class Document extends YServer {
       connection.close(4412, "This page was archived.");
       return;
     }
+    this.warnMissingCapabilities(connection);
     return super.onMessage(connection, message);
   }
 
@@ -1083,16 +1285,35 @@ export class Document extends YServer {
       const clone = new Y.Doc();
       Y.applyUpdate(clone, Y.encodeStateAsUpdate(this.document));
       try {
+        normalizeYDocumentTables(clone);
         clone.transact(() => {
           for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(clone, operation);
           if (operationId && requestHash) clone.getMap<string>("api-operation-receipts").set(operationId, requestHash);
         }, "api-validation");
+        normalizeYDocumentTables(clone);
       } catch (error) {
         const code = error instanceof Error ? error.message : "invalid_mutation";
         clone.destroy();
         return Response.json({ error: code }, { status: code === "block_not_found" ? 404 : 422 });
       }
       const document = yXmlFragmentToProsemirrorJSON(clone.getXmlFragment("document-store")) as ProseMirrorJson;
+      const blockCount = flattenDocumentBlocks(document).length;
+      if (blockCount > 10_000) {
+        clone.destroy();
+        return Response.json({ error: "Document block limit exceeded." }, { status: 413 });
+      }
+      try {
+        validateDocumentTree(document);
+      } catch (error) {
+        clone.destroy();
+        return Response.json(
+          {
+            error: error instanceof DocumentValidationError ? error.message : "Invalid document.",
+            code: error instanceof DocumentValidationError ? error.code : "invalid_document",
+          },
+          { status: 422 },
+        );
+      }
       const incomingDateIds = new Set<string>();
       for (const operation of body.operations as ApiBlockMutation[]) {
         if (operation.type === "update_block") {
@@ -1106,23 +1327,16 @@ export class Document extends YServer {
         clone.destroy();
         return Response.json({ error: "duplicate_date_token" }, { status: 409 });
       }
-      const blockCount = flattenDocumentBlocks(document).length;
-      if (blockCount > 10_000) {
-        clone.destroy();
-        return Response.json({ error: "Document block limit exceeded." }, { status: 413 });
-      }
       const snapshot = Y.encodeStateAsUpdate(clone);
       if (snapshot.byteLength >= READ_ONLY_BYTES) {
         clone.destroy();
         return Response.json({ error: "Document size limit exceeded." }, { status: 413 });
       }
+      const validatedUpdate = Y.encodeStateAsUpdate(clone, Y.encodeStateVector(this.document));
       clone.destroy();
       this.pendingAuthorId = body.actorId;
       this.pendingNotifyEdit = false;
-      this.document.transact(() => {
-        for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(this.document, operation);
-        if (operationId && requestHash) receipts!.set(operationId, requestHash);
-      }, "api-mutation");
+      Y.applyUpdate(this.document, validatedUpdate, "api-mutation");
       if (operationId?.startsWith("mcp:v2:")) this.pendingOperationInputs.set(operationId, body.mcpInputHash as string);
       this.flushPendingUpdates();
       const committedSequence = operationId?.startsWith("mcp:v2:")
@@ -1250,10 +1464,29 @@ export class Document extends YServer {
       if (input.size > READ_ONLY_BYTES) {
         return Response.json({ error: "Initialization content is too large." }, { status: 413 });
       }
-      const update = new Uint8Array(await input.arrayBuffer());
+      let update: Uint8Array = new Uint8Array(await input.arrayBuffer());
+      if (this.metadata.content_kind === "document") {
+        const candidate = new Y.Doc();
+        try {
+          Y.applyUpdate(candidate, update);
+          migrateLegacyColumns(candidate);
+          normalizeYDocumentTables(candidate);
+          validateDocumentTree(yXmlFragmentToProsemirrorJSON(candidate.getXmlFragment("document-store")));
+          update = Y.encodeStateAsUpdate(candidate);
+        } catch (error) {
+          return Response.json(
+            {
+              error: error instanceof Error ? error.message : "Invalid initialization document.",
+              code: "invalid_document",
+            },
+            { status: 422 },
+          );
+        } finally {
+          candidate.destroy();
+        }
+      }
       this.pendingAuthorId = staged.requested_by;
-      Y.applyUpdate(this.document, update);
-      if (this.metadata.content_kind === "document") migrateLegacyColumns(this.document);
+      Y.applyUpdate(this.document, update, "api-initialize");
       this.flushPendingUpdates();
       // An empty update produces no Yjs event, but still needs a sequence so
       // compaction persists the canonical empty projection for the staged page.
@@ -1261,11 +1494,18 @@ export class Document extends YServer {
         this.state.storage.transactionSync(() => {
           const row = this.state.storage.sql
             .exec<{ seq: number }>(
-              `INSERT INTO update_events (author_id, created_at) VALUES (?, ?) RETURNING seq`,
+              `INSERT INTO update_events (author_id, author_ids_json, created_at) VALUES (?, ?, ?) RETURNING seq`,
               staged.requested_by,
+              JSON.stringify([staged.requested_by]),
               Date.now(),
             )
             .one();
+          this.state.storage.sql.exec(
+            "INSERT OR IGNORE INTO version_authors VALUES(?,?,?)",
+            row.seq,
+            staged.requested_by,
+            Date.now(),
+          );
           for (const [index, bytes] of splitBytes(update).entries()) {
             this.state.storage.sql.exec(
               `INSERT INTO update_chunks (seq, chunk_index, data) VALUES (?, ?, ?)`,
@@ -1339,6 +1579,7 @@ export class Document extends YServer {
       this.pendingUpdates = [];
       this.pendingOperationInputs.clear();
       this.pendingAuthorId = null;
+      this.pendingAuthors.clear();
       this.pendingMentionActors.clear();
       this.pendingNotifyEdit = false;
       for (const connection of this.getConnections()) {
@@ -1451,28 +1692,40 @@ export class Document extends YServer {
   }
 
   private bufferUpdate(update: Uint8Array, origin: unknown, _transaction?: Y.Transaction) {
+    this.requiredCapabilities = null;
     if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) return;
     const connection = origin && typeof origin === "object" ? (origin as Connection<ConnectionAuth>) : null;
     this.pendingUpdates.push(update);
-    this.pendingAuthorId = connection?.state?.userId ?? this.pendingAuthorId;
+    const authorId =
+      connection?.state?.userId ??
+      (["api-mutation", "api-initialize", "comment-anchor"].includes(String(origin)) ? this.pendingAuthorId : null);
+    if (authorId) {
+      this.pendingAuthors.delete(authorId);
+      this.pendingAuthors.add(authorId);
+      this.pendingAuthorId = authorId;
+    }
     this.pendingNotifyEdit ||= Boolean(connection?.state?.userId);
   }
 
   private flushPendingUpdates() {
     if (!this.pendingUpdates.length || this.purged) return;
     const updates = this.pendingUpdates;
-    const authorId = this.pendingAuthorId;
+    const authors = [...this.pendingAuthors];
+    const authorId = authors.at(-1) ?? null;
     const notifyEdit = this.pendingNotifyEdit;
     const mentions = [...this.pendingMentionActors];
     const merged = updates.length === 1 ? updates[0]! : Y.mergeUpdates(updates);
     this.state.storage.transactionSync(() => {
       const row = this.state.storage.sql
         .exec<{ seq: number }>(
-          `INSERT INTO update_events (author_id, created_at) VALUES (?, ?) RETURNING seq`,
+          `INSERT INTO update_events (author_id, author_ids_json, created_at) VALUES (?, ?, ?) RETURNING seq`,
           authorId,
+          JSON.stringify(authors),
           Date.now(),
         )
         .one();
+      for (const id of authors)
+        this.state.storage.sql.exec("INSERT INTO version_authors VALUES(?,?,?)", row.seq, id, Date.now());
       for (const [index, bytes] of splitBytes(merged).entries()) {
         this.state.storage.sql.exec(
           `INSERT INTO update_chunks (seq, chunk_index, data) VALUES (?, ?, ?)`,
@@ -1508,6 +1761,7 @@ export class Document extends YServer {
     this.pendingUpdates = [];
     this.pendingOperationInputs.clear();
     this.pendingAuthorId = null;
+    this.pendingAuthors.clear();
     this.pendingMentionActors.clear();
     this.pendingNotifyEdit = false;
     this.metadata.dirty = 1;
@@ -1556,6 +1810,37 @@ export class Document extends YServer {
     return tracked;
   }
 
+  private contributorsThrough(maximum: number) {
+    const authors = new Map<string, { id: string; firstEditedAt: number; lastEditedAt: number }>();
+    for (const row of this.state.storage.sql.exec<{ author_ids_json: string; created_at: number }>(
+      "SELECT author_ids_json,created_at FROM update_events WHERE seq<=? ORDER BY seq",
+      maximum,
+    )) {
+      for (const id of JSON.parse(row.author_ids_json) as string[]) {
+        if (typeof id === "string" && id) {
+          const previous = authors.get(id);
+          authors.delete(id);
+          authors.set(id, {
+            id,
+            firstEditedAt: Math.min(previous?.firstEditedAt ?? row.created_at, row.created_at),
+            lastEditedAt: Math.max(previous?.lastEditedAt ?? row.created_at, row.created_at),
+          });
+        }
+      }
+    }
+    return [...authors.values()];
+  }
+
+  private versionContributorsThrough(maximum: number) {
+    return this.state.storage.sql
+      .exec<{ user_id: string }>(
+        "SELECT user_id FROM version_authors WHERE seq<=? GROUP BY user_id ORDER BY max(seq),user_id",
+        maximum,
+      )
+      .toArray()
+      .map((row) => row.user_id);
+  }
+
   private mentionActorsThrough(sequence: number) {
     return new Map(
       this.state.storage.sql
@@ -1569,6 +1854,21 @@ export class Document extends YServer {
   }
 
   private async compactOnce(forceVersion = false, suppressExternalEffects = false) {
+    if (this.metadata.content_kind === "document") {
+      try {
+        normalizeYDocumentTables(this.document);
+      } catch (error) {
+        // A legacy websocket tree must remain durable and recoverable even when
+        // it cannot yet be rendered by the current editor schema.
+        logger.warn(
+          "document.table_compatibility.failed",
+          "document",
+          "Legacy table normalization failed.",
+          { pageId: this.ids.pageId },
+          error,
+        );
+      }
+    }
     if (this.metadata.content_kind === "document") {
       migrateLegacyColumns(this.document);
       let duplicates = duplicateDateTokens(this.document);
@@ -1613,6 +1913,9 @@ export class Document extends YServer {
     }
 
     const metadataAtStart = { ...this.metadata };
+    const contributorEvidence = this.contributorsThrough(maximum);
+    const contributorIds = contributorEvidence.map((author) => author.id);
+    const versionContributorIds = this.versionContributorsThrough(maximum);
     const mentionActors = this.mentionActorsThrough(maximum);
     const snapshot = Y.encodeStateAsUpdate(this.document);
     const json = yXmlFragmentToProsemirrorJSON(this.document.getXmlFragment("document-store")) as ProseMirrorJson;
@@ -1702,6 +2005,7 @@ export class Document extends YServer {
       let versionAt = metadataAtStart.last_version_at;
       let versionKey: string | null = null;
       let versionStatementIndex = -1;
+      let versionSaved = false;
       let pageProjected = false;
       const effectsSuppressed =
         suppressExternalEffects &&
@@ -1744,7 +2048,9 @@ export class Document extends YServer {
           maximum,
         );
         const newMentionIds = mentionState.introducedIds;
-        const watcherIds = watcherRows.results.map((row) => row.id).filter((id) => !newMentionIds.includes(id));
+        const watcherIds = watcherRows.results
+          .map((row) => row.id)
+          .filter((id) => !newMentionIds.includes(id) && !contributorIds.includes(id));
         const makeVersion = Boolean(
           forceVersion ||
           !metadataAtStart.last_version_at ||
@@ -1936,7 +2242,7 @@ export class Document extends YServer {
                 contentEpoch: epoch,
                 actorId: metadataAtStart.last_editor_id,
                 sourceKey: `page.content_updated:${pageId}:${epoch}:${maximum}`,
-                data: { sequence: maximum },
+                data: { sequence: maximum, contributorIds },
                 createdAt: timestamp,
               })),
           ...(effectsSuppressed || !metadataAtStart.notify_edit
@@ -1971,7 +2277,7 @@ export class Document extends YServer {
                 sourceId: `${pageId}:${epoch}:${maximum}`,
                 recipientIds: metadataAtStart.notify_edit ? watcherIds : [],
                 emitSlackChannel: Boolean(metadataAtStart.notify_edit && metadataAtStart.last_editor_id),
-                data: { sequence: maximum },
+                data: { sequence: maximum, contributorIds },
                 createdAt: timestamp,
               })),
         ];
@@ -2017,7 +2323,12 @@ export class Document extends YServer {
               epoch,
             ),
           );
+          statements.push(versionContributorStatement(this.bindings.DB, versionId, versionContributorIds));
         }
+
+        statements.push(
+          ...pageContributorStatements(this.bindings.DB, pageId, epoch, contributorIds, timestamp, contributorEvidence),
+        );
 
         if (!effectsSuppressed)
           statements.push(
@@ -2028,11 +2339,13 @@ export class Document extends YServer {
               afterKey: structuredKey,
               before: supersededProjection,
               actorId: metadataAtStart.last_editor_id,
+              contributorIds,
               recipients: metadataAtStart.notify_edit ? watcherIds : [],
               timestamp,
             }),
           );
         const results = await this.bindings.DB.batch(statements);
+        versionSaved = versionStatementIndex >= 0 && Boolean(results[versionStatementIndex]?.meta.changes);
         pageProjected = Boolean(results[0]?.meta.changes);
         if (pageProjected && (this.priorDateBlocks || structuredJson.includes('"dateMention"')))
           this.priorDateBlocks = dateTokenBlocks(json);
@@ -2129,6 +2442,7 @@ export class Document extends YServer {
       this.state.storage.transactionSync(() => {
         this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
         this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
+        if (versionSaved) this.state.storage.sql.exec("DELETE FROM version_authors WHERE seq<=?", maximum);
         this.state.storage.sql.exec(`DELETE FROM mention_introductions WHERE seq <= ?`, maximum);
         this.state.storage.sql.exec(
           `UPDATE document_meta SET snapshot_seq = ?, last_version_at = ? WHERE id = 1`,
@@ -2188,6 +2502,9 @@ export class Document extends YServer {
   private async compactDiagram(maximum: number, forceVersion: boolean) {
     const { pageId, epoch } = this.ids;
     const metadataAtStart = { ...this.metadata };
+    const contributorEvidence = this.contributorsThrough(maximum);
+    const contributorIds = contributorEvidence.map((author) => author.id);
+    const versionContributorIds = this.versionContributorsThrough(maximum);
     const mentionActors = this.mentionActorsThrough(maximum);
     const snapshot = Y.encodeStateAsUpdate(this.document);
     const envelope = diagramFromYDoc(this.document, { pageId, contentEpoch: epoch, sequence: maximum });
@@ -2252,6 +2569,7 @@ export class Document extends YServer {
       let versionAt = metadataAtStart.last_version_at;
       let versionKey: string | null = null;
       let versionStatementIndex = -1;
+      let versionSaved = false;
       let pageProjected = false;
 
       if (page) {
@@ -2290,7 +2608,9 @@ export class Document extends YServer {
           maximum,
         );
         const newMentionIds = mentionState.introducedIds;
-        const watcherIds = watcherRows.results.map((row) => row.id).filter((id) => !newMentionIds.includes(id));
+        const watcherIds = watcherRows.results
+          .map((row) => row.id)
+          .filter((id) => !newMentionIds.includes(id) && !contributorIds.includes(id));
         const makeVersion = Boolean(
           forceVersion ||
           !metadataAtStart.last_version_at ||
@@ -2432,7 +2752,7 @@ export class Document extends YServer {
             contentEpoch: epoch,
             actorId: metadataAtStart.last_editor_id,
             sourceKey: `page.content_updated:${pageId}:${epoch}:${maximum}`,
-            data: { sequence: maximum },
+            data: { sequence: maximum, contributorIds },
             createdAt: timestamp,
           }),
           ...(metadataAtStart.notify_edit
@@ -2464,7 +2784,7 @@ export class Document extends YServer {
             sourceId: `${pageId}:${epoch}:${maximum}`,
             recipientIds: metadataAtStart.notify_edit ? watcherIds : [],
             emitSlackChannel: Boolean(metadataAtStart.notify_edit && metadataAtStart.last_editor_id),
-            data: { sequence: maximum },
+            data: { sequence: maximum, contributorIds },
             createdAt: timestamp,
           }),
         ];
@@ -2508,9 +2828,15 @@ export class Document extends YServer {
               epoch,
             ),
           );
+          statements.push(versionContributorStatement(this.bindings.DB, versionId, versionContributorIds));
         }
 
+        statements.push(
+          ...pageContributorStatements(this.bindings.DB, pageId, epoch, contributorIds, timestamp, contributorEvidence),
+        );
+
         const results = await this.bindings.DB.batch(statements);
+        versionSaved = versionStatementIndex >= 0 && Boolean(results[versionStatementIndex]?.meta.changes);
         pageProjected = Boolean(results[0]?.meta.changes);
         if (pageProjected) {
           const oldObjects = [supersededProjection?.r2_key, supersededProjection?.thumbnail_r2_key].filter(
@@ -2598,6 +2924,7 @@ export class Document extends YServer {
       this.state.storage.transactionSync(() => {
         this.state.storage.sql.exec(`DELETE FROM update_chunks WHERE seq <= ?`, maximum);
         this.state.storage.sql.exec(`DELETE FROM update_events WHERE seq <= ?`, maximum);
+        if (versionSaved) this.state.storage.sql.exec("DELETE FROM version_authors WHERE seq<=?", maximum);
         this.state.storage.sql.exec(`DELETE FROM mention_introductions WHERE seq <= ?`, maximum);
         this.state.storage.sql.exec(
           `UPDATE document_meta SET snapshot_seq = ?, last_version_at = ? WHERE id = 1`,
@@ -2857,6 +3184,26 @@ export class Document extends YServer {
         const selected = await this.bindings.BUCKET.get(version.r2_key);
         if (!selected) return Response.json({ error: "Version snapshot is missing." }, { status: 404 });
         selectedBytes = new Uint8Array(await selected.arrayBuffer());
+        if (this.metadata.content_kind === "document") {
+          const candidate = new Y.Doc();
+          try {
+            Y.applyUpdate(candidate, selectedBytes);
+            migrateLegacyColumns(candidate);
+            normalizeYDocumentTables(candidate);
+            validateDocumentTree(yXmlFragmentToProsemirrorJSON(candidate.getXmlFragment("document-store")));
+            selectedBytes = Y.encodeStateAsUpdate(candidate);
+          } catch (error) {
+            return Response.json(
+              {
+                error: error instanceof Error ? error.message : "Saved document is invalid.",
+                code: "invalid_document",
+              },
+              { status: 422 },
+            );
+          } finally {
+            candidate.destroy();
+          }
+        }
       } catch (error) {
         logger.error(
           "document.restore_validation.failed",
@@ -2910,12 +3257,21 @@ export class Document extends YServer {
         if (hadPendingLog) await this.compact(true);
 
         const statements: D1PreparedStatement[] = [];
-        let preVersion: { id: string; snapshot: Uint8Array } | null = null;
+        let preVersion: { id: string; snapshot: Uint8Array; contributors: string[] } | null = null;
         if (!hadPendingLog) {
           const currentSnapshot = Y.encodeStateAsUpdate(this.document);
           const preId = crypto.randomUUID();
           preKey = this.versionKey(pageId, preId);
-          preVersion = { id: preId, snapshot: currentSnapshot };
+          const observed = this.versionContributorsThrough(this.metadata.snapshot_seq);
+          preVersion = {
+            id: preId,
+            snapshot: currentSnapshot,
+            contributors: observed.length
+              ? observed
+              : this.metadata.last_editor_id
+                ? [this.metadata.last_editor_id]
+                : [],
+          };
         }
 
         this.recordRestoreRecovery({
@@ -2941,27 +3297,30 @@ export class Document extends YServer {
               this.metadata.snapshot_seq,
               preKey,
               preVersion.snapshot.byteLength,
-              userId,
+              this.metadata.last_editor_id,
               Date.now(),
               pageId,
               epoch,
             ),
           );
+          statements.push(versionContributorStatement(this.bindings.DB, preVersion.id, preVersion.contributors));
         }
 
         await this.bindings.BUCKET.put(newKey, selectedBytes, {
           httpMetadata: { contentType: "application/octet-stream" },
           customMetadata: { pageId, epoch: String(newEpoch), restoredFrom: versionId },
         });
+        const epochStatementIndex = statements.length;
         statements.push(
           this.bindings.DB.prepare(
             `UPDATE pages
-              SET content_epoch = ?, revision = revision + 1, indexed_seq = 0, updated_at = ?
+              SET content_epoch = ?, revision = revision + 1, indexed_seq = 0, updated_at = ?, updated_by = ?
             WHERE id = ? AND content_epoch = ? AND archived_at IS NULL`,
-          ).bind(newEpoch, Date.now(), pageId, epoch),
+          ).bind(newEpoch, Date.now(), userId, pageId, epoch),
         );
+        statements.push(...pageContributorStatements(this.bindings.DB, pageId, newEpoch, [userId], Date.now()));
         const results = await this.bindings.DB.batch(statements);
-        if (!results.at(-1)?.meta.changes) {
+        if (!results[epochStatementIndex]?.meta.changes) {
           commitState = "not-committed";
           await cleanupUncommittedRestore();
           return Response.json({ error: "The page epoch changed during restore." }, { status: 409 });

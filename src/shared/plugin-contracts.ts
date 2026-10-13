@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { ID_PATTERN, PAGE_TITLE_MAX } from "./validation.ts";
+import { TABLE_COLUMN_TYPES } from "./table-protocol.ts";
 
 export const PLUGIN_UI_URI = "ui://noteflare/v1/editor.html";
 export const MCP_MAX_REQUEST_BYTES = 64 * 1024;
@@ -15,6 +16,12 @@ export const documentResultSchema = z.object({
   truncated: z.boolean(),
   unknownBlockIds: z.array(z.string()),
   canEdit: z.boolean(),
+  offset: z.number().int().nonnegative().optional(),
+  nextOffset: z.number().int().nonnegative().nullable().optional(),
+  textLength: z.number().int().nonnegative().optional(),
+  complete: z.boolean().optional(),
+  sequence: z.number().int().nonnegative().optional(),
+  nextCursor: z.string().nullable().optional(),
 });
 export type PluginDocument = z.infer<typeof documentResultSchema>;
 
@@ -99,7 +106,17 @@ const markdownCommandSchema = z.discriminatedUnion("type", [
 ]);
 
 const OPERATION_ID = /^[A-Za-z0-9:_-]{1,128}$/;
-const typedCells = z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()]));
+const typedCells = z.record(
+  z.string(),
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.array(z.string()),
+    z.object({ __err: z.string(), msg: z.string(), v: z.literal(1) }),
+  ]),
+);
 const diagramLink = z.object({ id: z.string(), label: z.string() });
 const diagramEntity = z.discriminatedUnion("entity", [
   z.object({
@@ -146,7 +163,7 @@ export const pluginToolContracts = {
         z.object({
           id: z.string(),
           name: z.string(),
-          type: z.enum(["text", "number", "checkbox", "date", "select"]),
+          type: z.enum(TABLE_COLUMN_TYPES),
           position: z.number(),
           options: z.array(z.object({ id: z.string(), label: z.string(), position: z.number() })),
         }),
@@ -173,8 +190,16 @@ export const pluginToolContracts = {
   },
   fetch_page: {
     description:
-      "Read a document as Markdown. Use its revision and contentEpoch when updating it. Use fetch_table or fetch_diagram for other page types.",
-    inputSchema: z.object({ page_id: z.string().regex(ID_PATTERN) }),
+      "Read a document as paginated Markdown. Follow nextCursor with the same page and limit until complete. Restart if the source changes. Use revision and contentEpoch for writes; fetch_table or fetch_diagram reads other page types.",
+    inputSchema: z.object({
+      page_id: z.string().regex(ID_PATTERN),
+      offset: z.number().int().nonnegative().optional(),
+      limit: z.number().int().min(2).max(32_000).optional(),
+      cursor: z.string().max(2048).optional(),
+      expected_revision: z.number().int().nonnegative().optional(),
+      expected_content_epoch: z.number().int().nonnegative().optional(),
+      expected_sequence: z.number().int().nonnegative().optional(),
+    }),
     outputSchema: documentResultSchema,
   },
   list_spaces: {
