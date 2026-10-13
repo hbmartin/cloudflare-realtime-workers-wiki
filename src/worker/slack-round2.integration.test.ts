@@ -3004,6 +3004,65 @@ describe("review delivery regressions", () => {
     expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(2);
   });
 
+  it.each(["msg_too_long", "channel_not_found"])(
+    "finishes digest retirement despite failed %s diagnostics",
+    async (code) => {
+      const m = await mapping();
+      const r = await receipt(m.id);
+      await page("diagnostic-page");
+      await event(m.id, "diagnostic-page", r.window_start + 1);
+      await env.DB.prepare(
+        "CREATE TRIGGER fail_digest_diagnostic BEFORE UPDATE OF last_error ON slack_digest_messages WHEN NEW.last_error IS NOT NULL BEGIN SELECT RAISE(ABORT,'diagnostic unavailable'); END",
+      ).run();
+      responses["chat.postMessage"] = { ok: false, error: code };
+      await deliverDigest(runtime(), r.id);
+      expect(
+        await env.DB.prepare("SELECT state FROM slack_digest_messages WHERE receipt_id=?").bind(r.id).first(),
+      ).toEqual({ state: "retired" });
+      const health = await env.DB.prepare(
+        code === "msg_too_long"
+          ? "SELECT reason error FROM slack_delivery_failures WHERE subscription_id=?"
+          : "SELECT notification_error error FROM slack_channel_subscriptions WHERE id=?",
+      )
+        .bind(m.id)
+        .first();
+      expect(health).toEqual({ error: code });
+    },
+  );
+
+  it.each(["channel", "digest"])(
+    "recovers recorded access-token rejection for %s delivery without a personal notification",
+    async (kind) => {
+      const m = await mapping(kind === "channel" ? "immediate" : "digest");
+      await page("auth-recovery-page");
+      const r = kind === "digest" ? await receipt(m.id) : null;
+      if (r) await event(m.id, "auth-recovery-page", r.window_start + 1);
+      await env.DB.prepare(
+        "UPDATE slack_installations SET auth_error='token_revoked',auth_error_at=1,token_expires_at=?,bot_refresh_token_ciphertext=?",
+      )
+        .bind(Date.now() + 3_600_000, await encryptSlackToken(runtime(), "refresh"))
+        .run();
+      responses["oauth.v2.access"] = {
+        ok: true,
+        access_token: "new-token",
+        refresh_token: "new-refresh",
+        expires_in: 3600,
+      };
+      if (r) await deliverDigest(runtime(), r.id);
+      else {
+        const e = (await env.DB.prepare(
+          "SELECT id FROM slack_channel_events WHERE page_id='auth-recovery-page'",
+        ).first<{ id: string }>())!;
+        await deliverRound2ChannelEvent(runtime(), e.id);
+      }
+      expect(calls.filter((call) => call.method === "oauth.v2.access")).toHaveLength(1);
+      expect(calls.filter((call) => call.method === "chat.postMessage")).toHaveLength(1);
+      expect(
+        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
+      ).toEqual({ auth_error: null });
+    },
+  );
+
   it("fails an oversized digest partition independently and resets redrive on subsequent confirmed progress", async () => {
     const m = await mapping();
     const r = await receipt(m.id);
@@ -4472,8 +4531,10 @@ describe("review follow-up permissions and recovery", () => {
       expect(recovered?.slack_redrive_count).toBe(7);
       expect(recovered?.slack_redrive_due_at === 9999999999999).toBe(!authError);
       expect(
-        await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
-      ).toEqual({ auth_error: null });
+        await env.DB.prepare(
+          "SELECT auth_error,auth_error_at FROM slack_installations WHERE id='installation'",
+        ).first(),
+      ).toEqual({ auth_error: null, auth_error_at: null });
     },
   );
 });
@@ -4492,6 +4553,33 @@ describe("durable abandoned thumbnail cleanup", () => {
       .bind(id)
       .run();
   }
+  it("recovers paused file cleanup from recorded access rejection through maintenance", async () => {
+    const id = await allocation();
+    await abandon();
+    await env.DB.prepare(
+      "UPDATE slack_file_cleanup_jobs SET state='paused',next_attempt_at=NULL,last_error='token_revoked' WHERE id=?",
+    )
+      .bind(id)
+      .run();
+    await env.DB.prepare(
+      "UPDATE slack_installations SET auth_error='token_revoked',auth_error_at=1,token_expires_at=?,bot_refresh_token_ciphertext=?",
+    )
+      .bind(Date.now() + 3_600_000, await encryptSlackToken(runtime(), "refresh"))
+      .run();
+    responses["oauth.v2.access"] = {
+      ok: true,
+      access_token: "new-token",
+      refresh_token: "new-refresh",
+      expires_in: 3600,
+    };
+    await processDueSlackFileCleanup(runtime());
+    expect(calls.filter((call) => call.method === "oauth.v2.access")).toHaveLength(1);
+    expect(calls.filter((call) => call.method === "files.delete")).toHaveLength(1);
+    expect(
+      await env.DB.prepare("SELECT state,attempt_count FROM slack_file_cleanup_jobs WHERE id=?").bind(id).first(),
+    ).toEqual({ state: "completed", attempt_count: 1 });
+  });
+
   it.each(["invalid_auth", "token_revoked", "account_inactive"])(
     "records cleanup authentication failure %s and resumes without resetting attempts",
     async (code) => {
@@ -4533,7 +4621,7 @@ describe("durable abandoned thumbnail cleanup", () => {
       await processSlackFileCleanup(runtime(), id);
       expect(
         await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='installation'").first(),
-      ).toEqual({ auth_error: reason === "no_refresh_token" ? "invalid_auth" : "token_revoked" });
+      ).toEqual({ auth_error: "invalid_refresh_token" });
       expect(
         await env.DB.prepare("SELECT state,attempt_count FROM slack_file_cleanup_jobs WHERE id=?").bind(id).first(),
       ).toEqual({ state: "paused", attempt_count: 0 });

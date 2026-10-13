@@ -49,7 +49,7 @@ export async function deliverThumbnail(env: Env, id: string) {
   }>();
   if (!row || ["uploaded", "failed", "retired"].includes(row.state)) return;
   const eligibility = await env.DB.prepare(
-    `SELECT ${thumbnailEligibilitySql()} eligibility FROM slack_file_artifacts r WHERE r.id=?`,
+    `SELECT ${thumbnailEligibilitySql("r", Date.now(), true)} eligibility FROM slack_file_artifacts r WHERE r.id=?`,
   )
     .bind(id)
     .first<{ eligibility: "ready" | "paused" | "obsolete" }>();

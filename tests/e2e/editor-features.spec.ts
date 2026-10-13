@@ -70,6 +70,27 @@ test("native API tables reopen and collaborative editing preserves stable row id
   const other = await context.newPage();
   await other.goto(`/?page=${created.id}`);
   await expect(other.locator(".bn-editor table")).toContainText("Cell A");
+  await page.locator(".bn-editor table td").last().hover();
+  await page.locator(".bn-extend-button-add-remove-rows").click();
+  await expect(page.locator(".bn-editor table tr")).toHaveCount(3);
+  await expect(other.locator(".bn-editor table tr")).toHaveCount(3);
+  await expect
+    .poll(async () => {
+      const response = await page.request.get(`/v1/blocks/${tableId}/children`, { headers });
+      expect(response.ok()).toBeTruthy();
+      return (await response.json()).results.length;
+    })
+    .toBe(3);
+  const extended = await (await page.request.get(`/v1/blocks/${tableId}/children`, { headers })).json();
+  expect(extended.results.slice(0, 2).map((row: { id: string }) => row.id)).toEqual(
+    rows.results.map((row: { id: string }) => row.id),
+  );
+  expect(new Set(extended.results.map((row: { id: string }) => row.id)).size).toBe(3);
+  for (const row of rows.results as Array<{ id: string }>) {
+    const response = await page.request.get(`/v1/blocks/${row.id}`, { headers });
+    expect(response.ok(), `Original native row ${row.id} remains addressable after row extension`).toBeTruthy();
+    expect((await response.json()).id).toBe(row.id);
+  }
   const cell = page.locator(".bn-editor table td").filter({ hasText: "Cell A" }).first();
   await cell.click();
   await cell.evaluate(async (element) => {
@@ -89,7 +110,9 @@ test("native API tables reopen and collaborative editing preserves stable row id
   await page.keyboard.insertText("Edited ");
   await expect(other.locator(".bn-editor table")).toContainText(/Edited .*Cell A/);
   const after = await (await page.request.get(`/v1/blocks/${tableId}/children`, { headers })).json();
-  expect(after.results.map((row: { id: string }) => row.id)).toEqual(rows.results.map((row: { id: string }) => row.id));
+  expect(after.results.map((row: { id: string }) => row.id)).toEqual(
+    extended.results.map((row: { id: string }) => row.id),
+  );
   await page.reload();
   await expect(page.locator(".bn-editor table")).toContainText(/Edited .*Cell A/);
   await other.close();
@@ -104,11 +127,43 @@ test("find replacement reveals hidden tabs, supports undo and converges remotely
   await page.keyboard.type("/tabs", { delay: 80 });
   await page.getByText("Tabs", { exact: true }).last().click();
   await expect(page.getByRole("tab", { name: "Tab 1", exact: true })).toBeVisible();
-  const empty = editor.locator(".bn-inline-content:visible").first();
+  const panelParagraph = () =>
+    editor
+      .locator('[data-content-type="tabPanel"]')
+      .locator('xpath=ancestor::*[@data-node-type="blockContainer"][1]')
+      .locator('[data-content-type="paragraph"]:visible')
+      .first();
+  const empty = panelParagraph();
   await empty.click();
+  await empty.evaluate(async (element) => {
+    const content = element.querySelector("p") ?? element;
+    (element.closest("[contenteditable=true]") as HTMLElement)?.focus();
+    const range = document.createRange();
+    range.selectNodeContents(content);
+    range.collapse(true);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+  });
+  await page.keyboard.type("/tabs", { delay: 80 });
+  await expect(page.getByText("Tabs", { exact: true })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  for (let index = 0; index < 5; index++) await page.keyboard.press("Backspace");
   await page.keyboard.insertText("Alpha needle");
   await page.getByRole("tab", { name: "Tab 2", exact: true }).click();
-  await editor.locator(".bn-inline-content:visible").first().click();
+  await panelParagraph().click();
+  await panelParagraph().evaluate(async (element) => {
+    const range = document.createRange();
+    range.selectNodeContents(element.querySelector("p") ?? element);
+    range.collapse(true);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    await new Promise(requestAnimationFrame);
+    await new Promise(requestAnimationFrame);
+  });
   await page.keyboard.insertText("Beta needle");
   await page.getByRole("tab", { name: "Tab 1", exact: true }).click();
   const other = await context.newPage();

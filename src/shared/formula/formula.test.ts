@@ -18,6 +18,26 @@ function run(source: string, row: Record<string, unknown> = {}) {
   return evaluateFormula(compileFormula(source, properties, "result"), row, properties);
 }
 describe("shared deterministic formulas", () => {
+  it("resolves explicit option labels while keeping prop IDs and rejecting missing options", () => {
+    const options: FormulaProperty[] = [
+      { id: "status", name: "Status", type: "status", options: [{ id: "opaque-done", label: "Done" }] },
+      { id: "tags", name: "Tags", type: "multi_select", options: [{ id: "tag", label: "Tag" }] },
+    ];
+    const label = compileFormula('OptionLabel(prop("Status"))', options, "label");
+    expect(evaluateFormula(label, { status: "opaque-done" }, options)).toBe("Done");
+    expect(
+      evaluateFormula(
+        compileFormula('prop("Status") == "Done"', options, "comparison"),
+        { status: "opaque-done" },
+        options,
+      ),
+    ).toBe(false);
+    expect(evaluateFormula(label, { status: null }, options)).toBeNull();
+    expect(evaluateFormula(label, { status: "deleted-option" }, options)).toMatchObject({ __err: "MISSING_PROP" });
+    expect(evaluateFormula(compileFormula('OptionLabel("tag")', options, "label"), {}, options)).toMatchObject({
+      __err: "MISSING_PROP",
+    });
+  });
   it.each(FORMULA_GOLDENS)("evaluates %s", (source, expected) => expect(run(source, { price: 4 })).toEqual(expected));
   it("binds stable IDs and reformats renamed properties", () => {
     const compiled = compileFormula('prop("Price") + 1', properties, "result");

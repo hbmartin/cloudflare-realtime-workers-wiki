@@ -5,6 +5,9 @@ import type { Env } from "./env";
 
 type TestDocument = {
   document: Y.Doc;
+  isReadOnly(connection: {
+    state: { userId: string; role: "editor"; expiresAt: number; editorCapabilities: string[] };
+  }): boolean;
   onRequest(request: Request): Promise<Response>;
   compact(forceVersion?: boolean): Promise<void>;
   flushPendingUpdates(): void;
@@ -102,6 +105,81 @@ afterEach(async () => {
 });
 
 describe("document mutation response barriers", () => {
+  it("mutates a document containing Yjs-normalized paragraph and code comment annotations", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as TestDocument;
+      const annotated = documentBlock("annotated-paragraph", "Commented text");
+      const code = new Y.XmlElement("blockContainer");
+      code.setAttribute("id", "annotated-code");
+      const codeBlock = new Y.XmlElement("codeBlock");
+      codeBlock.setAttribute("language", "javascript");
+      const codeText = new Y.XmlText();
+      codeText.insert(0, "const value = 1;");
+      codeBlock.insert(0, [codeText]);
+      code.insert(0, [codeBlock]);
+      installDocumentBlocks(room.document, annotated.container, code);
+      for (const text of [annotated.text, codeText]) {
+        text.format(0, text.length, { "comment--0123abcd": { threadId: "thread", orphan: false } });
+      }
+      const response = await room.onRequest(protectedMutation(installed.userId));
+      expect(response.status).toBe(200);
+      const result = await response.json<{ document: unknown }>();
+      expect(JSON.stringify(result.document)).toContain("Protected append");
+      expect(JSON.stringify(result.document).match(/"type":"comment"/g)).toHaveLength(2);
+      expect(annotated.text.toDelta()[0]!.attributes).toEqual({
+        "comment--0123abcd": { threadId: "thread", orphan: false },
+      });
+      expect(codeText.toDelta()[0]!.attributes).toEqual(annotated.text.toDelta()[0]!.attributes);
+    });
+  });
+
+  it("retains cached capabilities during typing and invalidates them when a feature atom is inserted", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as TestDocument;
+      const blocks = Array.from({ length: 200 }, (_, index) => documentBlock(`cached-${index}`, "Some text"));
+      installDocumentBlocks(room.document, ...blocks.map((block) => block.container));
+      const connection = {
+        state: {
+          userId: installed.userId,
+          role: "editor" as const,
+          expiresAt: Date.now() + 60_000,
+          editorCapabilities: [],
+        },
+      };
+      expect(room.isReadOnly(connection)).toBe(false);
+      const toArray = vi.spyOn(Y.XmlFragment.prototype, "toArray");
+      try {
+        const first = blocks[0]!;
+        first.text.insert(0, "Typing ");
+        first.text.format(0, 1, { "comment--0123abcd": { threadId: "thread" } });
+        const paragraph = first.container.get(0) as Y.XmlElement;
+        paragraph.setAttribute("textColor", "red");
+        room.document.getMap("api-operation-receipts").set("unrelated", "receipt");
+        expect(room.isReadOnly(connection)).toBe(false);
+        expect(toArray).not.toHaveBeenCalled();
+
+        const reference = new Y.XmlElement("footnoteReference");
+        reference.setAttribute("definitionId", "note");
+        paragraph.insert(1, [reference]);
+        expect(room.isReadOnly(connection)).toBe(true);
+        expect(toArray).toHaveBeenCalled();
+        expect(room.isReadOnly({ state: { ...connection.state, editorCapabilities: ["footnotes-v1"] } })).toBe(false);
+        paragraph.delete(1, 1);
+        expect(room.isReadOnly(connection)).toBe(false);
+        paragraph.insert(1, [new Y.XmlElement("futureBlock")]);
+        expect(room.isReadOnly(connection)).toBe(true);
+      } finally {
+        toArray.mockRestore();
+      }
+    });
+  });
+
   it.each([
     "fresh",
     "existing",

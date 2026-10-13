@@ -6,6 +6,8 @@ NoteFlare is licensed under AGPL-3.0. It depends on or adapts ideas from the fol
 
 BlockNote core, React, and Mantine packages are used as dependencies under MPL-2.0. No `@blocknote/xl-*` package is used.
 
+Core 0.55.0 includes a local [source and runtime patch](patches/@blocknote__core@0.55.0.patch) under the same license. It preserves native table row identities through table conversions and controls, and assigns fresh identities to inserted copies.
+
 Copyright BlockNote contributors. Source: <https://github.com/TypeCellOS/BlockNote>
 
 ## PartyServer and y-partyserver

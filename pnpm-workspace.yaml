@@ -23,3 +23,5 @@ minimumReleaseAgeExclude:
   - "@modelcontextprotocol/core@2.2.0"
   - "@modelcontextprotocol/server@2.2.0"
   - "@cloudflare/vitest-plugin@1.4.0"
+patchedDependencies:
+  "@blocknote/core@0.55.0": patches/@blocknote__core@0.55.0.patch

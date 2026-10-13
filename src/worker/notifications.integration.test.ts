@@ -1847,8 +1847,20 @@ describe("notification feed and subscriptions", () => {
     recovered = true;
     expect(
       await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='rate-installation-one'").first(),
-    ).toEqual({ auth_error: ["invalid_auth", "token_revoked"].includes(reason) ? reason : null });
-    if (["invalid_auth", "token_revoked"].includes(reason))
+    ).toEqual({
+      auth_error:
+        reason === "recovery"
+          ? "invalid_refresh_token"
+          : ["invalid_auth", "token_revoked"].includes(reason)
+            ? reason
+            : null,
+    });
+    const anyRefreshCount = expect.any(Number);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("oauth.v2.access")).length).toEqual(
+      reason === "recovery" ? 1 : anyRefreshCount,
+    );
+    // Terminal refresh errors require relinking before the next digest can use credentials.
+    if (["invalid_auth", "token_revoked", "recovery"].includes(reason))
       await env.DB.prepare(
         "UPDATE slack_installations SET auth_error=NULL,auth_error_at=NULL WHERE id='rate-installation-one'",
       ).run();

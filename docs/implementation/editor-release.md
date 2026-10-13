@@ -10,6 +10,8 @@ Document clients advertise `native-tables-v1,tabs-v1,footnotes-v1,status-badges-
 
 The native BlockNote table row schema includes non-rendered `apiRowId`, so tables created through the Notion API reopen and retain row identity through collaborative edits. Editor and offline render boundaries preserve history/recovery-copy controls and report `client.render_failed`. Startup, plugin and presentation boundaries contain failures at their own view boundary.
 
+A pinned pnpm patch for BlockNote core 0.55.0 carries `apiRowId` through high-level table conversions, occupancy-grid edits and cropping in both shipped runtime formats. Table edits and moves retain surviving IDs; inserted copies receive fresh IDs. The patch includes source and declarations and is recorded in the lockfile.
+
 ## User behavior and formats
 
 Find and replace searches literal body text across formatting runs and hidden tab content. Match-case and Unicode whole-word options are supported. Inline atoms and paragraph boundaries stop matching. Navigation reveals the selected tab; replacements inherit the first matched text's marks and replace ranges from the end. Replace and replace-all form separate Yjs undo groups. Search UI state is local, and closing it clears decorations. Queries are capped at 200 characters and results at 10,000; the UI states when replacement covers only the displayed set.
@@ -17,6 +19,8 @@ Find and replace searches literal body text across formatting runs and hidden ta
 Status badges are inline atoms with a label up to 200 characters and gray, blue, green, yellow, red or purple color. Tabs have stable block IDs, one to twenty panels, editable labels, local active-panel state and keyboard navigation. Rename, reorder, duplicate and confirmed removal are implemented; removing the last panel is blocked. Hidden content remains in the canonical document. Copies get fresh block identities and remap carried footnote definitions/references; standalone references retain their targets. Internal drag moves and tab reorder preserve identities. Tab operations retain actual ProseMirror nodes so native table row IDs in untouched panels survive add, reorder, duplicate and removal; copied rows receive new API identities.
 
 Footnotes store stable `definitionId` values instead of mutable numbers. Numbers follow first-reference order across the complete document, including hidden tabs. Definitions use rich inline content. Reference and back-reference buttons navigate to each other; missing definitions can be created from their references, and unreferenced definitions remain labelled unused. Markdown and HTML imports allocate request-local identities and preserve repeated references, formatting, escaped Markdown syntax and multiline definition content.
+
+Footnote-like text inside code blocks stays literal. Headless code-block validation matches the editor's text-only content while retaining comment annotations. Local insertion, paste, drop and indentation cannot introduce nested tabs; received Yjs updates retain their collaboration semantics.
 
 Markdown export flattens all tabs with their labels, emits readable status text and stable `[^id]` footnote references/definitions. HTML provides labelled tab content and matching footnote anchors. Word exports preserve readable status, tab and footnote content. Native editor/Yjs round trips retain full structure. Portable exports do not promise restoration of interactive tab/status controls from their readable representation.
 
@@ -51,6 +55,8 @@ Browser acceptance exercises native Notion table create/reopen and stable rows, 
 A Firefox test interception race was corrected by draining active `/api/me` route handlers before reloading with creation disabled. The trace showed an old handler completing after reload had begun. That test-only fix passed nine repetitions across the three browsers, with retries disabled, before the final aggregate run.
 
 Final command: `pnpm exec playwright test tests/e2e/editor-features.spec.ts tests/e2e/table-authority.spec.ts --project=chromium --project=firefox --project=webkit`. The editor scoped unit run passed 198 tests across five suites; scoped lint and client/config checks passed. Repository-wide evidence is recorded in [release.md](release.md).
+
+The PR #253 review-fix rerun on 2026-10-13 also passed **24/24** browser scenarios, including the shipped native table row-extension control, stable API row IDs after collaborative reopening, and slash insertion inside a tab panel. Additional real-editor regressions cover blank collaborative startup, identical-content row moves, copy remapping, undo/redo, code-block import validation and local nested-tab prevention. Final repository client checks passed **2,404 unit tests** with one existing skip; the preceding `pnpm check` passed **1,970 Worker tests**, static checks and both production builds. See [table-authority-release.md](table-authority-release.md) for the authority and control regression evidence.
 
 Browser logs still contain BlockNote viewport and non-textblock selection warnings, navigation-time canceled-request diagnostics, and an intermittent ResizeObserver notification warning. Acceptance assertions passed; this evidence does not claim clean browser diagnostics or production acceptance.
 

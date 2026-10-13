@@ -1,10 +1,13 @@
 import { spawnSync } from "node:child_process";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import { evaluateMetadataIntegrity, INTEGRITY_PAGE_COLUMNS, integrityMetadataSql } from "../src/shared/integrity.ts";
 import { emptyDatabaseSchema, queryRows } from "./migrate-d1.mjs";
 
 /** Read-only metadata check usable by REST or Wrangler deployment adapters. */
-export function metadataIntegrityCheck(query, { limit = 100_000 } = {}) {
+export function metadataIntegrityCheck(query, { batchSize = 1_000 } = {}) {
+  if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > 100_000)
+    throw new Error("Integrity batch size is invalid.");
   const tables = query("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name", "integrity schema");
   if (emptyDatabaseSchema(tables))
     return {
@@ -36,7 +39,7 @@ export function metadataIntegrityCheck(query, { limit = 100_000 } = {}) {
       incomplete: [{ code: "unsupported_page_schema" }],
       classifications: {},
     };
-  const statements = integrityMetadataSql(limit);
+  const statements = integrityMetadataSql(batchSize);
   const supported = {
     workspaces: true,
     pages: true,
@@ -57,24 +60,79 @@ export function metadataIntegrityCheck(query, { limit = 100_000 } = {}) {
     .filter(([, enabled]) => enabled)
     .map(([key]) => `SELECT '${key}' source,count(*) rows FROM ${sourceTables[key]}`)
     .join(" UNION ALL ");
-  const counts = query(summarySql, "integrity coverage counts");
-  if (
-    counts.some((row) => !supported[row.source] || !Number.isSafeInteger(row.rows) || row.rows < 0) ||
-    counts.length !== Object.values(supported).filter(Boolean).length
-  )
-    throw new Error("Invalid integrity coverage counts.");
-  const baselineSql =
-    "SELECT count(*) pages,cast(coalesce(sum(revision),0) AS TEXT) revisions,cast(coalesce(sum(content_epoch),0) AS TEXT) epochs,cast(coalesce(sum(updated_at),0) AS TEXT) updates FROM pages";
-  const baseline = query(baselineSql, "integrity initial revision");
-  const data = { complete: true };
-  for (const [key, sql] of Object.entries(statements)) {
-    const rows = supported[key] ? query(sql, `integrity ${key}`) : [];
-    if (rows.length > limit || (supported[key] && rows.length !== counts.find((row) => row.source === key)?.rows))
-      data.complete = false;
-    data[key] = rows.slice(0, limit);
-  }
+  const readCounts = () => {
+    const counts = query(summarySql, "integrity coverage counts");
+    if (
+      counts.some((row) => !supported[row.source] || !Number.isSafeInteger(row.rows) || row.rows < 0) ||
+      counts.length !== Object.values(supported).filter(Boolean).length ||
+      new Set(counts.map((row) => row.source)).size !== Object.values(supported).filter(Boolean).length
+    )
+      throw new Error("Invalid integrity coverage counts.");
+    return Object.fromEntries(counts.map((row) => [row.source, row.rows]));
+  };
+  const keys = {
+    workspaces: "id",
+    pages: "id",
+    spaces: "id",
+    rowPages: "link.page_id",
+    sources: "page_id",
+    artifacts: "id",
+  };
+  // Page writers bump these clocks even if a late write preserves collection
+  // counts after that collection's second fingerprint has already been read.
+  const watermarkSql =
+    "SELECT count(*) pages,cast(coalesce(sum(revision),0) AS TEXT) revisions,cast(coalesce(sum(content_epoch),0) AS TEXT) epochs,cast(coalesce(sum(indexed_seq),0) AS TEXT) sequences,cast(coalesce(sum(updated_at),0) AS TEXT) updates FROM pages";
+  const watermark = query(watermarkSql, "integrity initial revision");
+  const scan = (counts, collect) => {
+    const data = { complete: true };
+    const fingerprint = createHash("sha256");
+    for (const [key, sql] of Object.entries(statements)) {
+      data[key] = [];
+      if (!supported[key]) continue;
+      fingerprint.update(key);
+      const field = keys[key].split(".").at(-1);
+      const base = sql.replace(/\s+ORDER BY[\s\S]*$/, "");
+      let cursor;
+      let read = 0;
+      for (;;) {
+        const where = cursor === undefined ? "" : ` WHERE ${keys[key]} > '${cursor.replaceAll("'", "''")}'`;
+        const rows = query(`${base}${where} ORDER BY ${keys[key]} LIMIT ${batchSize}`, `integrity ${key}`);
+        if (rows.length > batchSize) throw new Error("Invalid integrity batch coverage.");
+        for (const row of rows) {
+          const id = row[field];
+          if (
+            typeof id !== "string" ||
+            !id ||
+            (cursor !== undefined && Buffer.compare(Buffer.from(id), Buffer.from(cursor)) <= 0)
+          )
+            throw new Error("Integrity cursor did not advance.");
+          cursor = id;
+          fingerprint.update(JSON.stringify(row)).update("\n");
+        }
+        read += rows.length;
+        if (collect) data[key].push(...rows);
+        if (read > counts[key]) {
+          data.complete = false;
+          break;
+        }
+        if (rows.length < batchSize) break;
+      }
+      if (read !== counts[key]) data.complete = false;
+    }
+    return { data, fingerprint: fingerprint.digest("hex") };
+  };
+  const counts = readCounts();
+  const first = scan(counts, true);
+  const second = scan(readCounts(), false);
+  const data = first.data;
   const result = evaluateMetadataIntegrity(data);
-  if (JSON.stringify(baseline) !== JSON.stringify(query(baselineSql, "integrity final revision"))) {
+  const finalCounts = readCounts();
+  if (
+    !second.data.complete ||
+    first.fingerprint !== second.fingerprint ||
+    JSON.stringify(watermark) !== JSON.stringify(query(watermarkSql, "integrity final revision")) ||
+    Object.keys(counts).some((key) => counts[key] !== finalCounts[key])
+  ) {
     result.incomplete.push({ code: "workspace_revision_changed" });
     result.complete = false;
     result.ok = false;

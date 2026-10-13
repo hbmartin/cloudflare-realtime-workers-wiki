@@ -156,6 +156,8 @@ export async function readAiSource(env: Env, member: MemberContext, source: AiSo
         ...query,
         afterId: last.id,
         afterPosition: String(last.position),
+        authorityOffset: String(rows.length),
+        authorityRevision: String(revision),
       });
       if (chunk.revision !== revision)
         throw new HttpError(

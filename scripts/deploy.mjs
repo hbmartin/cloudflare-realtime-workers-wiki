@@ -243,27 +243,22 @@ export function portableResources(config, settings, name) {
     ...config.queues.producers.map((entry) => resolveResource("queue", entry.binding, entry.queue)),
   ];
   for (const [index, consumer] of config.queues.consumers.entries()) {
-    for (const [role, template, binding, label] of [
-      ["queue", "noteflare-delivery", "DELIVERY_QUEUE", "consumer"],
-      ["dead_letter_queue", "noteflare-delivery-dlq", "DELIVERY_DEAD_LETTER_QUEUE", "dead-letter"],
-    ]) {
-      const queue = consumer[role];
-      if (!queue || config.queues.producers.some((producer) => producer.queue === queue)) continue;
-      if (queue === template) {
-        if (config.queues.producers.some((producer) => producer.binding === binding)) continue;
-        throw new Error(
-          `The template ${label} queue requires a producer binding. Restore ${binding} or configure a custom, existing ${label} queue before retrying.`,
-        );
-      }
-      resources.push({
-        type: "queue",
-        binding: `${role}:${index}`,
-        name: queue,
-        provenance: "configured",
-        consumerOnly: true,
-        role,
-      });
+    const queue = consumer.dead_letter_queue;
+    if (!queue || config.queues.producers.some((producer) => producer.queue === queue)) continue;
+    if (queue === "noteflare-delivery-dlq") {
+      if (config.queues.producers.some((producer) => producer.binding === "DELIVERY_DEAD_LETTER_QUEUE")) continue;
+      throw new Error(
+        "The template dead-letter queue requires a producer binding. Restore DELIVERY_DEAD_LETTER_QUEUE or configure a custom, existing dead-letter queue before retrying.",
+      );
     }
+    resources.push({
+      type: "queue",
+      binding: `dead_letter_queue:${index}`,
+      name: queue,
+      provenance: "configured",
+      consumerOnly: true,
+      role: "dead_letter_queue",
+    });
   }
   return resources;
 }
@@ -645,6 +640,7 @@ export async function deployPrepared(
     isInitialized,
     health,
     random = randomBytes,
+    repairIntegrity = false,
   },
 ) {
   const secrets = {};
@@ -666,10 +662,22 @@ export async function deployPrepared(
   const verifyIntegrity = async (stage) => {
     if (!integrityCheck) return;
     const result = await integrityCheck(stage);
-    if (!result?.ok || !result.complete)
+    if (!result?.ok || !result.complete) {
+      const unsupportedSchema =
+        result?.incomplete?.length > 0 &&
+        result.incomplete.every((finding) =>
+          ["unsupported_core_schema", "unsupported_page_schema"].includes(finding.code),
+        );
+      if (repairIntegrity && stage === "before migrations" && (result?.complete || unsupportedSchema)) {
+        console.warn(
+          `Explicit integrity repair: ${result.failures?.length ?? 0} existing metadata failures; ${unsupportedSchema ? "pre-migration schema unsupported" : "coverage complete"}. A clean post-migration check is required.`,
+        );
+        return;
+      }
       throw new Error(
         `D1 metadata integrity ${stage} failed or was incomplete. Worker upload was not started; applied migrations and resources were preserved.`,
       );
+    }
   };
   await verifyIntegrity("before migrations");
   if ((await migrateDatabase()) !== 0)
@@ -718,10 +726,13 @@ export async function main(argv) {
   const [action, ...options] = argv;
   if (
     !["build", "deploy"].includes(action) ||
-    options.some((option) => !["--one-click", "--production", "--dry-run"].includes(option)) ||
+    options.some((option) => !["--one-click", "--production", "--dry-run", "--repair-integrity"].includes(option)) ||
+    (action !== "deploy" && options.includes("--repair-integrity")) ||
     (options.includes("--one-click") && options.includes("--production"))
   )
-    throw new Error("Usage: deploy.mjs build|deploy [--one-click|--production] [--dry-run]");
+    throw new Error(
+      "Usage: deploy.mjs build|deploy [--one-click|--production] [--dry-run] [--repair-integrity (deploy only)]",
+    );
   const forced = options.includes("--one-click")
     ? "portable"
     : options.includes("--production")
@@ -753,6 +764,7 @@ export async function main(argv) {
     return;
   }
   await deployPrepared(manifest, {
+    repairIntegrity: options.includes("--repair-integrity"),
     isInitialized: () => initializedDatabase(manifest.configPath),
     inspectSecrets: async () => {
       const connection = await cloudflare();
@@ -810,7 +822,10 @@ export function deploymentErrorMessage(error) {
     .replace(/(https?:\/\/[^\s?#]+)[?#][^\s]*/gi, "$1?[redacted]")
     .replace(/\b(?:Bearer|Basic)\s+[^\s,;]+/gi, "[redacted]")
     .replace(/\b(?:xox[baprs]-|xoxe[.-]|ghp_|github_pat_|sk_|secret_)[A-Za-z0-9_.-]+/g, "[redacted]")
-    .replace(/\b((?:[a-z_]*(?:secret|token|password|api_key))\s*[:=]\s*)[^\s,;]+/gi, "$1[redacted]")
+    .replace(
+      /\b([a-z_]*(?:secret|token|password|api_key)(?:\\*["'])?\s*[:=]\s*)(?:(\\+)"[\s\S]*?(?<!\\)\2"|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}]+)/gi,
+      "$1[redacted]",
+    )
     .slice(0, 4_000);
 }
 

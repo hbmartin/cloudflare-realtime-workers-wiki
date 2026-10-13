@@ -33,6 +33,7 @@ import { sweepOutbox } from "./jobs";
 import { notificationFanoutStatements } from "./notifications";
 import { reconcileDateRemindersForPage } from "./date-reminders";
 import { MentionTargetTracker } from "./mention-targets";
+import { documentCapabilitiesChanged } from "./document-capabilities";
 import { refreshPageSearchV2Statements } from "./search-index";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { webhookEventStatements } from "./webhooks";
@@ -796,6 +797,7 @@ export class Document extends YServer {
     }
 
     await super.onStart();
+    this.requiredCapabilities = null;
     this.mentionTracker = new MentionTargetTracker(this.document, this.metadata.content_kind);
     this.currentMentionTargets = this.mentionTracker.targets;
     const mentionRoot =
@@ -1691,8 +1693,9 @@ export class Document extends YServer {
     this.currentMentionTargets = nextTargets;
   }
 
-  private bufferUpdate(update: Uint8Array, origin: unknown, _transaction?: Y.Transaction) {
-    this.requiredCapabilities = null;
+  private bufferUpdate(update: Uint8Array, origin: unknown, transaction?: Y.Transaction) {
+    if (documentCapabilitiesChanged(this.document, this.metadata.content_kind, transaction))
+      this.requiredCapabilities = null;
     if (this.metadata.retired || this.metadata.restore_pending || this.purged || this.transition) return;
     const connection = origin && typeof origin === "object" ? (origin as Connection<ConnectionAuth>) : null;
     this.pendingUpdates.push(update);

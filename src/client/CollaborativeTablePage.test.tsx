@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ClientMemberContext } from "../shared/types";
 import type { CollaborativeColumn, TableCommand, TableQueryResult, TableView } from "../shared/table-protocol";
@@ -39,10 +40,12 @@ let data: TableQueryResult;
 let failure: Error | null;
 let deniedRead: boolean;
 let writes: TableCommand[];
+let commandDelay: Promise<void> | null;
 beforeEach(() => {
   writes = [];
   failure = null;
   deniedRead = false;
+  commandDelay = null;
   data = {
     protocolVersion: 1,
     pageId: "table",
@@ -64,7 +67,7 @@ beforeEach(() => {
       column("Due", "date"),
       column("Check", "checkbox"),
       column("Link", "url"),
-      column("Twice", "formula"),
+      { ...column("Twice", "formula"), config: { resultType: "number", source: 'prop("Amount") * 2' } },
     ],
     views: [grid, board, calendar],
     people: [
@@ -110,12 +113,48 @@ beforeEach(() => {
       if (path.endsWith("/commands")) {
         const command = JSON.parse(String(init?.body)) as TableCommand;
         writes.push(command);
+        if (commandDelay) {
+          const pending = commandDelay;
+          commandDelay = null;
+          await pending;
+        }
         if (failure) {
           const problem = failure;
           failure = null;
           throw problem;
         }
         if (command.kind === "update_cells") Object.assign(data.rows[0]!.cells, command.payload.values);
+        if (command.kind === "save_view") {
+          const previous = data.views.find((view) => view.id === command.payload.id);
+          if (previous && previous.revision !== command.payload.revision)
+            throw new ApiClientError(409, "table_revision_conflict", "View changed.");
+          const saved = {
+            ...grid,
+            ...previous,
+            ...command.payload,
+            id: previous?.id ?? "saved-view",
+            revision: (previous?.revision ?? 0) + 1,
+          } as TableView;
+          data.views = [...data.views.filter((view) => view.id !== saved.id), saved];
+        }
+        if (command.kind === "update_column") {
+          const previous = data.columns.find((property) => property.id === command.payload.columnId)!;
+          if (previous.revision !== command.payload.revision)
+            throw new ApiClientError(409, "table_revision_conflict", "Property changed.");
+          data.columns = data.columns.map((property) =>
+            property.id === previous.id
+              ? {
+                  ...property,
+                  name: String(command.payload.name ?? property.name),
+                  revision: property.revision + 1,
+                  config:
+                    command.payload.source === undefined
+                      ? property.config
+                      : { ...property.config, source: command.payload.source },
+                }
+              : property,
+          );
+        }
         if (command.kind === "prepare_type")
           data.columns.find((property) => property.id === command.payload.columnId)!.conversion = {
             id: "conversion",
@@ -141,6 +180,13 @@ beforeEach(() => {
     });
 });
 afterEach(() => vi.useRealTimers());
+function delayNextCommand() {
+  let release!: () => void;
+  commandDelay = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return release;
+}
 function show(initialViewId = "", context = member, onSelectPage = vi.fn(), taskList = false, onViewChanged = vi.fn()) {
   render(
     <CollaborativeTablePage
@@ -315,6 +361,273 @@ describe("collaborative table UI", () => {
       expect(writes[0]).toMatchObject({
         kind: "save_view",
         payload: { name: "Team view", kind: "grid", personal: false },
+      }),
+    );
+  });
+  it("keeps a view draft's revision through refresh and conflict until explicitly reloaded", async () => {
+    show("grid");
+    fireEvent.click(await screen.findByRole("button", { name: "Views" }));
+    fireEvent.change(screen.getByLabelText("View name"), { target: { value: "My draft" } });
+    data.views = data.views.map((view) => (view.id === "grid" ? { ...view, name: "Remote view", revision: 2 } : view));
+    await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+    expect(screen.getByLabelText("View name")).toHaveValue("My draft");
+    fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    await waitFor(() => expect(writes[0]?.payload).toMatchObject({ name: "My draft", revision: 1 }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reload latest settings" })).toBeEnabled());
+    expect(screen.getByLabelText("View name")).toHaveValue("My draft");
+    fireEvent.click(screen.getByRole("button", { name: "Reload latest settings" }));
+    expect(screen.getByLabelText("View name")).toHaveValue("Remote view");
+    fireEvent.change(screen.getByLabelText("View name"), { target: { value: "Reviewed view" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    await waitFor(() => expect(screen.queryByLabelText("View name")).toBeNull());
+    expect(writes[1]?.payload).toMatchObject({ name: "Reviewed view", revision: 2 });
+    fireEvent.click(screen.getByRole("button", { name: "Views" }));
+    expect(screen.getByLabelText("View name")).toHaveValue("Reviewed view");
+  });
+  it("updates pristine view settings when a collaborator changes them", async () => {
+    show("grid");
+    fireEvent.click(await screen.findByRole("button", { name: "Views" }));
+    data.views = data.views.map((view) => (view.id === "grid" ? { ...view, name: "Remote view", revision: 2 } : view));
+    await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+    expect(screen.getByLabelText("View name")).toHaveValue("Remote view");
+    fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    await waitFor(() => expect(writes[0]?.payload).toMatchObject({ name: "Remote view", revision: 2 }));
+  });
+  it("disables every view authoring control until the submitted settings finish saving", async () => {
+    const user = userEvent.setup();
+    show("board");
+    fireEvent.click(await screen.findByRole("button", { name: "Views" }));
+    const name = screen.getByLabelText("View name");
+    fireEvent.change(name, { target: { value: "Submitted view" } });
+    fireEvent.change(screen.getByLabelText("Filter property"), { target: { value: "Title" } });
+    fireEvent.change(screen.getByLabelText("Filter value"), { target: { value: "Alpha" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+    fireEvent.change(screen.getByLabelText("Add sort property"), { target: { value: "Title" } });
+    const release = delayNextCommand();
+    fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    for (const control of name.closest("form")!.querySelectorAll("input,select,button")) expect(control).toBeDisabled();
+    await user.type(name, " later edit");
+    await user.click(screen.getAllByRole("button", { name: "Remove" })[0]!);
+    expect(name).toHaveValue("Submitted view");
+    expect(writes[0]?.payload).toMatchObject({
+      name: "Submitted view",
+      filters: { filters: [{ columnId: "Title", value: "Alpha" }] },
+      sorts: [{ columnId: "Title", direction: "asc" }],
+    });
+    await act(async () => release());
+    await waitFor(() => expect(screen.queryByLabelText("View name")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Views" }));
+    expect(screen.getByLabelText("View name")).toHaveValue("Submitted view");
+  });
+  it("protects new property fields while creation is pending and clears only the submitted draft", async () => {
+    const user = userEvent.setup();
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Properties" }));
+    const name = screen.getByLabelText("New property name"),
+      type = screen.getByLabelText("New property type");
+    fireEvent.change(name, { target: { value: "Submitted property" } });
+    fireEvent.change(type, { target: { value: "formula" } });
+    const source = screen.getByLabelText("New formula");
+    fireEvent.change(source, { target: { value: "1" } });
+    const release = delayNextCommand();
+    fireEvent.click(screen.getByRole("button", { name: "Add property" }));
+    for (const control of [name, type, source]) expect(control).toBeDisabled();
+    await user.type(name, " later edit");
+    await user.type(source, " + 2");
+    expect(name).toHaveValue("Submitted property");
+    expect(source).toHaveValue("1");
+    expect(writes[0]?.payload).toEqual({ name: "Submitted property", type: "formula", source: "1" });
+    await act(async () => release());
+    await waitFor(() => expect(name).toBeEnabled());
+    expect(name).toHaveValue("");
+    expect(source).toHaveValue("");
+    await user.type(name, "Next property");
+    expect(name).toHaveValue("Next property");
+  });
+  it("protects the option draft while adding an option and re-enables it after success", async () => {
+    const user = userEvent.setup();
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Properties" }));
+    const input = screen.getByLabelText("New option for State");
+    fireEvent.change(input, { target: { value: "Submitted option" } });
+    const release = delayNextCommand();
+    fireEvent.click(within(input.parentElement!).getByRole("button", { name: "Add option" }));
+    expect(input).toBeDisabled();
+    await user.type(input, " later edit");
+    expect(input).toHaveValue("Submitted option");
+    expect(writes[0]?.payload).toEqual({ columnId: "State", label: "Submitted option" });
+    await act(async () => release());
+    await waitFor(() => expect(input).toBeEnabled());
+    expect(input).toHaveValue("");
+    await user.type(input, "Next option");
+    expect(input).toHaveValue("Next option");
+  });
+  it("keeps property names and their base revision together across conflicts and successful edits", async () => {
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Properties" }));
+    fireEvent.change(screen.getByLabelText("Name for Title"), { target: { value: "My name" } });
+    data.columns = data.columns.map((property) =>
+      property.id === "Title" ? { ...property, name: "Remote name", revision: 2 } : property,
+    );
+    await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+    const input = screen.getByLabelText("Name for Remote name");
+    expect(input).toHaveValue("My name");
+    fireEvent.blur(input);
+    await waitFor(() => expect(writes[0]?.payload).toMatchObject({ name: "My name", revision: 1 }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reload latest settings" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Reload latest settings" }));
+    expect(input).toHaveValue("Remote name");
+    fireEvent.blur(input);
+    expect(writes).toHaveLength(1);
+    fireEvent.change(input, { target: { value: "Reviewed name" } });
+    fireEvent.blur(input);
+    const renamed = await screen.findByLabelText("Name for Reviewed name");
+    await waitFor(() => expect(renamed).toBeEnabled());
+    fireEvent.change(renamed, { target: { value: "Second name" } });
+    fireEvent.blur(renamed);
+    await screen.findByLabelText("Name for Second name");
+    expect(writes[1]?.payload).toMatchObject({ name: "Reviewed name", revision: 2 });
+    expect(writes[2]?.payload).toMatchObject({ name: "Second name", revision: 3 });
+  });
+  it("syncs pristine property fields without writing and retains unsaved formula fields", async () => {
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Properties" }));
+    data.columns = data.columns.map((property) =>
+      property.id === "Title" ? { ...property, name: "Remote name", revision: 2 } : property,
+    );
+    await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+    const pristine = screen.getByLabelText("Name for Remote name");
+    expect(pristine).toHaveValue("Remote name");
+    fireEvent.blur(pristine);
+    expect(writes).toHaveLength(0);
+    fireEvent.change(screen.getByLabelText("Formula for Twice"), { target: { value: "8" } });
+    data.columns = data.columns.map((property) =>
+      property.id === "Twice" ? { ...property, config: { ...property.config, source: "6" }, revision: 2 } : property,
+    );
+    await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+    expect(screen.getByLabelText("Formula for Twice")).toHaveValue("8");
+    fireEvent.click(screen.getByRole("button", { name: "Update formula" }));
+    await waitFor(() => expect(writes[0]?.payload).toMatchObject({ source: "8", revision: 1 }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reload latest settings" })).toBeEnabled());
+    expect(screen.getByLabelText("Formula for Twice")).toHaveValue("8");
+    fireEvent.click(screen.getByRole("button", { name: "Reload latest settings" }));
+    expect(screen.getByLabelText("Formula for Twice")).toHaveValue("6");
+    fireEvent.change(screen.getByLabelText("Formula for Twice"), { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "Update formula" }));
+    await waitFor(() => expect(writes[1]?.payload).toMatchObject({ source: "10", revision: 2 }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Update formula" })).toBeEnabled());
+    fireEvent.change(screen.getByLabelText("Formula for Twice"), { target: { value: "12" } });
+    fireEvent.click(screen.getByRole("button", { name: "Update formula" }));
+    await waitFor(() => expect(writes[2]?.payload).toMatchObject({ source: "12", revision: 3 }));
+  });
+  it.each([
+    ["Twice", "number", "gt", "4", 4],
+    ["Twice", "boolean", "eq", "true", true],
+    ["Check", "checkbox", "neq", "false", false],
+    ["Due", "date", "gte", "2026-10-13", "2026-10-13"],
+    ["Created", "created_time", "lt", "2026-10-13T02:00:00Z", Date.parse("2026-10-13T02:00:00Z")],
+  ] as const)("serializes %s %s filters with their effective type", async (id, type, operator, input, value) => {
+    if (id === "Created") data.columns.push(column(id, type));
+    if (id === "Twice")
+      data.columns = data.columns.map((property) =>
+        property.id === id ? { ...property, config: { ...property.config, resultType: type } } : property,
+      );
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Views" }));
+    fireEvent.change(screen.getByLabelText("Filter property"), { target: { value: id } });
+    fireEvent.change(screen.getByLabelText("Filter operator"), { target: { value: operator } });
+    fireEvent.change(screen.getByLabelText("Filter value"), { target: { value: input } });
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]?.payload.filters).toEqual({
+      kind: "group",
+      operator: "and",
+      filters: [{ kind: "condition", columnId: id, operator, value }],
+    });
+  });
+  it.each(["People", "Tags"])("uses labeled collection arrays for %s equality and scalar membership", async (id) => {
+    if (id === "Tags")
+      data.columns.push({
+        ...column(id, "multi_select"),
+        options: [
+          { id: "red", label: "Red", position: 0 },
+          { id: "blue", label: "Blue", position: 1 },
+        ],
+      });
+    const ids = id === "People" ? ["owner", "former"] : ["red", "blue"];
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Views" }));
+    fireEvent.change(screen.getByLabelText("Filter property"), { target: { value: id } });
+    expect(within(screen.getByLabelText("Filter operator")).queryByRole("option", { name: "gt" })).toBeNull();
+    for (const operator of ["eq", "neq", "contains"]) {
+      fireEvent.change(screen.getByLabelText("Filter operator"), { target: { value: operator } });
+      const picker = screen.getByLabelText("Filter value");
+      expect(
+        within(picker).getByRole("option", { name: id === "People" ? "Pat (former member)" : "Red" }),
+      ).toBeInTheDocument();
+      if (!(picker instanceof HTMLSelectElement)) throw new Error("Expected the filter picker.");
+      expect(picker.multiple).toBe(operator !== "contains");
+      if (operator === "contains") {
+        fireEvent.change(picker, { target: { value: ids[0] } });
+      } else {
+        for (const option of picker.options) option.selected = ids.includes(option.value);
+        fireEvent.change(picker);
+      }
+      fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+    }
+    fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]?.payload.filters).toEqual({
+      kind: "group",
+      operator: "and",
+      filters: [
+        { kind: "condition", columnId: id, operator: "eq", value: [...ids].sort() },
+        { kind: "condition", columnId: id, operator: "neq", value: [...ids].sort() },
+        { kind: "condition", columnId: id, operator: "contains", value: ids[0] },
+      ],
+    });
+  });
+  it("rejects invalid filter input locally and omits values for empty conditions", async () => {
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Views" }));
+    fireEvent.change(screen.getByLabelText("Filter property"), { target: { value: "Twice" } });
+    expect(within(screen.getByLabelText("Filter operator")).queryByRole("option", { name: "contains" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a finite number");
+    fireEvent.change(screen.getByLabelText("Filter property"), { target: { value: "Due" } });
+    fireEvent.change(screen.getByLabelText("Filter value"), { target: { value: "not a date" } });
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter an ISO date");
+    fireEvent.change(screen.getByLabelText("Filter operator"), { target: { value: "empty" } });
+    expect(screen.queryByLabelText("Filter value")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Add filter" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save view" }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]?.payload.filters).toEqual({
+      kind: "group",
+      operator: "and",
+      filters: [{ kind: "condition", columnId: "Due", operator: "empty" }],
+    });
+  });
+  it("sends the viewer timezone with calendar drops", async () => {
+    data.rows[0]!.cells.Due = "2026-10-13";
+    data.rows[0]!.cellRevisions.Due = 7;
+    show("calendar");
+    fireEvent.change(await screen.findByLabelText("Calendar month"), { target: { value: "2026-10" } });
+    await screen.findByRole("button", { name: "Alpha" });
+    const target = screen.getByRole("heading", { name: "14" }).parentElement!;
+    fireEvent.drop(target, { dataTransfer: { getData: () => "row" } });
+    await waitFor(() =>
+      expect(writes[0]).toMatchObject({
+        kind: "move_row",
+        payload: {
+          rowId: "row",
+          viewId: "calendar",
+          expectedCellRevision: 7,
+          targetDate: "2026-10-14",
+          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        },
       }),
     );
   });

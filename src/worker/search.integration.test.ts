@@ -3,6 +3,7 @@ import { applyD1Migrations, env, reset, SELF } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { Page, SearchResponse, SearchTitleSuggestion, Space, Tag } from "../shared/types";
 import { refreshPageSearchV2Statements } from "./search-index";
+import { normalizeQueuedTitles } from "./search";
 
 function request(cookie: string, path: string, init: RequestInit = {}) {
   const headers = new Headers(init.headers);
@@ -85,6 +86,73 @@ beforeEach(async () => {
 });
 
 describe("search v2", () => {
+  it("migrates existing normalized titles and the queue while preserving the public trigram index", async () => {
+    await reset();
+    const migration = env.TEST_MIGRATIONS!.find((item) => item.name.startsWith("0090_"))!;
+    await applyD1Migrations(
+      env.DB,
+      env.TEST_MIGRATIONS!.filter((item) => item.name < migration.name),
+    );
+    const installed = await bootstrap();
+    const target = await createPage(installed.cookie, "Ａｒｃｈｉｔｅｃｔｕｒｅ", installed.generalId);
+    await env.DB.prepare("UPDATE page_title_trigrams SET normalized_title='architecture' WHERE page_id=?")
+      .bind(target.id)
+      .run();
+    const queue = await env.DB.prepare("SELECT page_id FROM page_title_normalization_queue ORDER BY page_id").all();
+    await applyD1Migrations(env.DB, [migration]);
+    expect(
+      (await env.DB.prepare("SELECT page_id FROM page_title_normalization_queue ORDER BY page_id").all()).results,
+    ).toEqual(queue.results);
+    const content = await env.DB.prepare("SELECT id,normalized_title FROM page_title_titles WHERE page_id=?")
+      .bind(target.id)
+      .first<{ id: number; normalized_title: string }>();
+    expect(content?.normalized_title).toBe("architecture");
+    expect(
+      (
+        await env.DB.prepare(
+          "SELECT page_id FROM page_title_trigrams WHERE page_title_trigrams MATCH 'architec' ",
+        ).all()
+      ).results,
+    ).toEqual([{ page_id: target.id }]);
+    await normalizeQueuedTitles(env.DB);
+    expect(
+      await env.DB.prepare("SELECT id,normalized_title FROM page_title_titles WHERE page_id=?").bind(target.id).first(),
+    ).toEqual(content);
+    const plan = await env.DB.prepare(
+      "EXPLAIN QUERY PLAN UPDATE page_title_titles SET normalized_title=? WHERE page_id=?",
+    )
+      .bind("architecture", target.id)
+      .all<{ detail: string }>();
+    expect(plan.results.some((row) => row.detail.includes("USING INDEX") && row.detail.includes("page_id=?"))).toBe(
+      true,
+    );
+    const found = await (
+      await SELF.fetch(request(installed.cookie, "/api/search?q=architecure"))
+    ).json<SearchResponse>();
+    expect(found.results.map((result) => result.page.id)).toEqual([target.id]);
+  });
+
+  it("keeps trigram content synchronized through staging, publication, template changes and deletion", async () => {
+    const installed = await bootstrap();
+    const target = await createPage(installed.cookie, "Architecture", installed.generalId);
+    const matches = async () =>
+      (await env.DB.prepare("SELECT page_id FROM page_title_trigrams WHERE page_title_trigrams MATCH 'architec'").all())
+        .results;
+    expect(await matches()).toEqual([{ page_id: target.id }]);
+    await env.DB.prepare("UPDATE pages SET import_job_id='mcp:create:staged' WHERE id=?").bind(target.id).run();
+    expect(await matches()).toEqual([]);
+    await env.DB.prepare("UPDATE pages SET import_job_id=NULL WHERE id=?").bind(target.id).run();
+    expect(await matches()).toEqual([{ page_id: target.id }]);
+    await env.DB.prepare("UPDATE pages SET is_template=1 WHERE id=?").bind(target.id).run();
+    expect(await matches()).toEqual([]);
+    await env.DB.prepare("UPDATE pages SET is_template=0 WHERE id=?").bind(target.id).run();
+    expect(await matches()).toEqual([{ page_id: target.id }]);
+    await env.DB.prepare("DELETE FROM pages WHERE id=?").bind(target.id).run();
+    expect(await matches()).toEqual([]);
+    expect(await env.DB.prepare("SELECT id FROM page_title_titles WHERE page_id=?").bind(target.id).first()).toBeNull();
+    await env.DB.prepare("INSERT INTO page_title_trigrams(page_title_trigrams,rank) VALUES('integrity-check',1)").run();
+  });
+
   it("normalizes Unicode titles and clears the forward normalization queue without duplicating index rows", async () => {
     const installed = await bootstrap();
     const target = await createPage(installed.cookie, "Ａｒｃｈｉｔｅｃｔｕｒｅ", installed.generalId);

@@ -1,4 +1,11 @@
 import { slackAccessAuthorization, SlackInstallationAuthError } from "./slack-identity";
+import {
+  slackRefreshableAuthError,
+  slackCredentialError,
+  slackCredentialErrorSql,
+  slackStoredError,
+} from "./slack-auth-policy";
+export { slackRefreshableAuthError, slackRecoveryEligibleSql } from "./slack-auth-policy";
 export { SlackInstallationAuthError } from "./slack-identity";
 import type { ChannelEventType } from "../shared/activity";
 import { defaultDigestTimezone, digestWindow, channelInvalidReason } from "./slack-schedule";
@@ -178,13 +185,9 @@ export class SlackInstallationHealthPersistenceError extends Error {
   }
 }
 
-const slackRefreshableAuthError = (
-  installation: Pick<SlackInstallation, "auth_error" | "bot_refresh_token_ciphertext">,
-) =>
-  ["invalid_auth", "token_revoked"].includes(installation.auth_error ?? "") &&
-  Boolean(installation.bot_refresh_token_ciphertext);
-export const personalSlackInstallationSql = `(installation.auth_error IS NULL OR
-  (installation.auth_error IN ('invalid_auth','token_revoked') AND installation.bot_refresh_token_ciphertext IS NOT NULL))`;
+function requireUsableSlackHealth(installation: SlackInstallation) {
+  if (installation.auth_error) throw new SlackInstallationAuthError(installation.auth_error);
+}
 
 export const slackTokenPreparationFailure = (error: unknown): boolean =>
   (error instanceof SlackApiError && error.method === "oauth.v2.access") ||
@@ -193,6 +196,7 @@ export const slackTokenPreparationFailure = (error: unknown): boolean =>
   (error instanceof SlackRateLimitError && error.method === "oauth.v2.access");
 
 const INSTALLATION_ERRORS = new Set(["invalid_auth", "token_revoked", "account_inactive", "invalid_refresh_token"]);
+const recordedRefreshErrors = new WeakSet<SlackApiError>();
 const CHANNEL_ERRORS = new Set([
   "channel_not_found",
   "not_in_channel",
@@ -218,13 +222,16 @@ export async function recordSlackInstallationError(
   generation?: number,
   condition?: { sql: string; binds: (string | number | null)[] },
 ) {
+  // Delivery error handlers may observe the same refresh rejection after a
+  // competing rotation or health update. Its fenced write already completed.
+  if (recordedRefreshErrors.has(error)) return true;
   const result = await env.DB.prepare(
     `UPDATE slack_installations SET auth_error=?, auth_error_at=COALESCE(auth_error_at,?)
       WHERE id=? AND disconnected_at IS NULL AND credential_revision=? AND (? IS NULL OR generation=?)
         ${condition ? `AND (${condition.sql})` : ""}`,
   )
     .bind(
-      error.code,
+      slackStoredError(error),
       Date.now(),
       installationId,
       error.credentialRevision,
@@ -233,7 +240,9 @@ export async function recordSlackInstallationError(
       ...(condition?.binds ?? []),
     )
     .run();
-  return result.meta.changes > 0;
+  const saved = result.meta.changes > 0;
+  if (saved && error.method === "oauth.v2.access") recordedRefreshErrors.add(error);
+  return saved;
 }
 
 export async function recordSlackFileScopeError(env: Env, installation: SlackInstallation, error: SlackApiError) {
@@ -1481,6 +1490,9 @@ export async function usableBotToken(
   forceRefresh = false,
 ) {
   signal?.throwIfAborted();
+  const recovery = slackRefreshableAuthError(installation);
+  if (installation.auth_error && !recovery) requireUsableSlackHealth(installation);
+  forceRefresh ||= recovery;
   if (
     !forceRefresh &&
     (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000)
@@ -1489,14 +1501,24 @@ export async function usableBotToken(
   }
   if (!Number.isSafeInteger(installation.generation))
     throw new Error("Slack installation generation is unavailable for token refresh.");
-  beforeRefresh?.(
-    Boolean(installation.auth_error && !["missing_scope", "account_inactive"].includes(installation.auth_error)),
-  );
+  beforeRefresh?.(recovery);
   await checkSlackCooldown(env, installation, "oauth.v2.access");
   if (!installation.bot_refresh_token_ciphertext) {
-    throw new SlackTokenRefreshError("invalid_auth", 401, installation.credential_revision);
+    const error = new SlackTokenRefreshError("invalid_auth", 401, installation.credential_revision);
+    if (
+      !(await recordSlackInstallationError(env, installation.id, error, installation.generation, {
+        sql: "bot_token_ciphertext=? AND bot_refresh_token_ciphertext IS NULL AND auth_error IS ?",
+        binds: [installation.bot_token_ciphertext, installation.auth_error ?? null],
+      }))
+    )
+      throw new SlackInstallationChangedError();
+    installation.auth_error = slackStoredError(error);
+    throw error;
   }
   const oldCiphertext = installation.bot_token_ciphertext;
+  const oldRefreshCiphertext = installation.bot_refresh_token_ciphertext;
+  const oldRevision = installation.credential_revision;
+  const oldAuthError = installation.auth_error ?? null;
   const leaseToken = crypto.randomUUID();
   let claimed = false;
   for (let attempt = 0; attempt < (tokenRefreshMode === "defer" ? 1 : 15); attempt++) {
@@ -1504,8 +1526,19 @@ export async function usableBotToken(
     const now = Date.now();
     const lease = await env.DB.prepare(`UPDATE slack_installations SET refresh_lease_token=?,refresh_lease_until=?
       WHERE id=? AND generation=? AND disconnected_at IS NULL AND bot_token_ciphertext=?
+        AND bot_refresh_token_ciphertext=? AND credential_revision=? AND auth_error IS ?
         AND (refresh_lease_token IS NULL OR refresh_lease_until<=?)`)
-      .bind(leaseToken, now + 30_000, installation.id, installation.generation, oldCiphertext, now)
+      .bind(
+        leaseToken,
+        now + 30_000,
+        installation.id,
+        installation.generation,
+        oldCiphertext,
+        oldRefreshCiphertext,
+        oldRevision,
+        oldAuthError,
+        now,
+      )
       .run();
     if (lease.meta.changes) {
       claimed = true;
@@ -1517,8 +1550,12 @@ export async function usableBotToken(
     if (!current || current.generation !== installation.generation) throw new SlackInstallationChangedError();
     if (current.bot_token_ciphertext !== oldCiphertext) {
       Object.assign(installation, current);
+      requireUsableSlackHealth(installation);
       return decryptSlackToken(env, current.bot_token_ciphertext);
     }
+    if (current.credential_revision !== oldRevision || current.bot_refresh_token_ciphertext !== oldRefreshCiphertext)
+      throw new SlackInstallationChangedError();
+    if (current.auth_error !== oldAuthError) requireUsableSlackHealth(current);
     if (tokenRefreshMode === "defer") break;
     await new Promise<void>((resolve, reject) => {
       const onAbort = () => {
@@ -1586,7 +1623,7 @@ export async function usableBotToken(
         await saveSlackCooldown(env, installation, error);
         throw error;
       }
-      if (result.error === "invalid_refresh_token") {
+      if (result.error && (slackCredentialError(result.error) || result.error === "account_inactive")) {
         // A worker from the previous deployment may still have won the refresh.
         for (let attempt = 0; attempt < (tokenRefreshMode === "defer" ? 1 : 15); attempt++) {
           const current = await env.DB.prepare(
@@ -1594,21 +1631,44 @@ export async function usableBotToken(
           )
             .bind(installation.id)
             .first<SlackInstallation>();
-          if (current?.generation === installation.generation && current.bot_token_ciphertext !== oldCiphertext) {
+          if (!current || current.generation !== installation.generation) throw new SlackInstallationChangedError();
+          if (current.bot_token_ciphertext !== oldCiphertext) {
             Object.assign(installation, current);
+            requireUsableSlackHealth(installation);
             return decryptSlackToken(env, current.bot_token_ciphertext);
           }
+          if (
+            current.credential_revision !== oldRevision ||
+            current.bot_refresh_token_ciphertext !== oldRefreshCiphertext
+          )
+            throw new SlackInstallationChangedError();
+          if (current.auth_error !== oldAuthError) requireUsableSlackHealth(current);
           if (tokenRefreshMode === "wait") await new Promise((resolve) => setTimeout(resolve, 200));
         }
-        const error = new SlackTokenRefreshError(
-          "invalid_refresh_token",
-          response.status,
-          installation.credential_revision,
-        );
-        // A competing refresh may still be persisting its token. An abbreviated
-        // recovery check cannot establish that the installation needs relinking.
-        if (tokenRefreshMode === "wait")
-          await recordSlackInstallationError(env, installation.id, error, installation.generation);
+        const error = new SlackTokenRefreshError(result.error, response.status, installation.credential_revision);
+        // Fence terminal health to the credentials and lease that Slack rejected.
+        // A late successful rotation can still replace them and clear this error.
+        if (
+          !(await recordSlackInstallationError(env, installation.id, error, installation.generation, {
+            sql: "bot_token_ciphertext=? AND bot_refresh_token_ciphertext=? AND refresh_lease_token=? AND auth_error IS ?",
+            binds: [oldCiphertext, oldRefreshCiphertext, leaseToken, oldAuthError],
+          }))
+        ) {
+          const current = await env.DB.prepare(
+            `SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL`,
+          )
+            .bind(installation.id)
+            .first<SlackInstallation>();
+          if (!current || current.generation !== installation.generation) throw new SlackInstallationChangedError();
+          if (current.bot_token_ciphertext === oldCiphertext) {
+            if (current.auth_error !== oldAuthError) requireUsableSlackHealth(current);
+            throw new SlackInstallationChangedError();
+          }
+          Object.assign(installation, current);
+          requireUsableSlackHealth(installation);
+          return decryptSlackToken(env, current.bot_token_ciphertext);
+        }
+        installation.auth_error = slackStoredError(error);
         throw error;
       }
       throw new SlackTokenRefreshError(
@@ -1641,18 +1701,19 @@ export async function usableBotToken(
       );
     const [before, updated] = await env.DB.batch([
       env.DB.prepare(
-        `SELECT auth_error FROM slack_installations WHERE id=? AND generation=? AND bot_token_ciphertext=?`,
-      ).bind(installation.id, installation.generation, oldCiphertext),
+        `SELECT auth_error FROM slack_installations WHERE id=? AND generation=? AND credential_revision=? AND bot_token_ciphertext=? AND bot_refresh_token_ciphertext=?`,
+      ).bind(installation.id, installation.generation, oldRevision, oldCiphertext, oldRefreshCiphertext),
       env.DB.prepare(
         `UPDATE slack_installations SET bot_token_ciphertext = ?, bot_refresh_token_ciphertext = ?,
       token_expires_at = ?, updated_at = ?, refresh_lease_token=NULL, refresh_lease_until=NULL,
-      auth_error=CASE WHEN auth_error IN ('missing_scope','account_inactive') THEN auth_error ELSE NULL END,
-      auth_error_at=CASE WHEN auth_error IN ('missing_scope','account_inactive') THEN auth_error_at ELSE NULL END,
+      auth_error=CASE WHEN auth_error IN (${slackCredentialErrorSql}) THEN NULL ELSE auth_error END,
+      auth_error_at=CASE WHEN auth_error IS NULL OR auth_error IN (${slackCredentialErrorSql}) THEN NULL ELSE auth_error_at END,
       auth_paused_ms=auth_paused_ms+CASE
-        WHEN auth_error IN ('missing_scope','account_inactive') OR auth_error_at IS NULL THEN 0
+        WHEN auth_error NOT IN (${slackCredentialErrorSql}) OR auth_error_at IS NULL THEN 0
         ELSE MAX(0,?-auth_error_at) END,
       credential_revision=credential_revision+1
-      WHERE id = ? AND generation=? AND disconnected_at IS NULL AND bot_token_ciphertext = ?`,
+      WHERE id = ? AND generation=? AND disconnected_at IS NULL AND bot_token_ciphertext = ?
+        AND bot_refresh_token_ciphertext=? AND credential_revision=?`,
       ).bind(
         accessTokenCiphertext,
         refreshTokenCiphertext,
@@ -1661,7 +1722,9 @@ export async function usableBotToken(
         updatedAt,
         installation.id,
         installation.generation,
-        installation.bot_token_ciphertext,
+        oldCiphertext,
+        oldRefreshCiphertext,
+        oldRevision,
       ),
     ]);
     if (!updated!.meta.changes) {
@@ -1671,6 +1734,7 @@ export async function usableBotToken(
       if (!current || current.generation !== installation.generation) throw new SlackInstallationChangedError();
       if (current.bot_token_ciphertext === oldCiphertext) throw new Error("Slack token refresh was not persisted.");
       Object.assign(installation, current);
+      requireUsableSlackHealth(installation);
       return decryptSlackToken(env, current.bot_token_ciphertext);
     }
     installation.bot_token_ciphertext = accessTokenCiphertext;
@@ -1678,8 +1742,8 @@ export async function usableBotToken(
     installation.token_expires_at = expiresAt;
     installation.credential_revision += 1;
     const priorAuth = (before?.results[0] as { auth_error: string | null } | undefined)?.auth_error;
-    installation.auth_error = priorAuth && ["missing_scope", "account_inactive"].includes(priorAuth) ? priorAuth : null;
-    if (priorAuth && !["missing_scope", "account_inactive"].includes(priorAuth)) {
+    installation.auth_error = priorAuth && !slackCredentialError(priorAuth) ? priorAuth : null;
+    if (priorAuth && slackCredentialError(priorAuth)) {
       try {
         await round2WakeStatement(env, null, installation.id, installation.generation).run();
         await resumeSlackFileCleanup(env, installation.workspace_id);
@@ -1695,6 +1759,7 @@ export async function usableBotToken(
         );
       }
     }
+    requireUsableSlackHealth(installation);
     return result.access_token!;
   } finally {
     await env.DB.prepare(`UPDATE slack_installations SET refresh_lease_token=NULL,refresh_lease_until=NULL
@@ -1713,7 +1778,7 @@ export type SlackApiOptions<Method extends SlackApiMethod> = {
   onDispatch?: () => void;
 };
 
-async function checkSlackCooldown(env: Env, installation: SlackInstallation, method: string) {
+export async function checkSlackCooldown(env: Env, installation: SlackInstallation, method: string) {
   const cooldown = await env.DB.prepare(`SELECT retry_at FROM slack_method_cooldowns
     WHERE installation_id=? AND installation_generation=? AND method=? AND retry_at>?`)
     .bind(installation.id, installation.generation, method, Date.now())
@@ -2181,16 +2246,12 @@ export async function preparePersonalSlackNotification(
 ): Promise<PreparedPersonalSlackNotification | null> {
   const installation = await personalSlackRecipient(env, userId, workspaceId);
   if (!installation) return null;
-  const recover = slackRefreshableAuthError(installation);
-  if (installation.auth_error && !recover) throw new SlackInstallationAuthError(installation.auth_error);
-  const token = await usableBotToken(
-    env,
-    installation,
-    undefined,
-    options.tokenRefreshMode,
-    options.beforeRefresh,
-    recover,
-  );
+  if (
+    slackRefreshableAuthError(installation) ||
+    (installation.token_expires_at !== null && installation.token_expires_at <= Date.now() + 60_000)
+  )
+    await checkSlackCooldown(env, installation, "chat.postMessage");
+  const token = await usableBotToken(env, installation, undefined, options.tokenRefreshMode, options.beforeRefresh);
   if (installation.auth_error) throw new SlackInstallationAuthError(installation.auth_error);
   return { userId, installation, token };
 }
@@ -2563,7 +2624,7 @@ export async function deliverSlackUnfurl(env: Env, unfurlId: string, outboxId: s
             installation.id, installation.generation, installation.workspace_id, installation.team_id, installation.team_name,
             installation.bot_user_id, installation.bot_token_ciphertext,
             installation.bot_refresh_token_ciphertext, installation.token_expires_at, installation.disconnected_at,
-            installation.credential_revision
+            installation.credential_revision, installation.auth_error
        FROM slack_unfurls unfurl
        JOIN slack_installations installation ON installation.id = unfurl.installation_id
          AND installation.generation = unfurl.installation_generation

@@ -31,13 +31,9 @@ export async function normalizeQueuedTitles(database: D1Database, workspaceId?: 
     await database.batch(
       rows.results.slice(index, index + 25).flatMap((row) => [
         database
-          .prepare(`DELETE FROM page_title_trigrams WHERE page_id=? AND EXISTS(
-        SELECT 1 FROM pages p WHERE p.id=? AND p.title=? AND p.updated_at=?)`)
-          .bind(row.id, row.id, row.title, row.updated_at),
-        database
-          .prepare(`INSERT INTO page_title_trigrams(page_id,normalized_title)
-        SELECT id,? FROM pages WHERE id=? AND title=? AND updated_at=? AND is_template=0 AND import_job_id IS NULL`)
-          .bind(normalizedTitle(row.title), row.id, row.title, row.updated_at),
+          .prepare(`UPDATE page_title_titles SET normalized_title=? WHERE page_id=? AND EXISTS(
+        SELECT 1 FROM pages p WHERE p.id=? AND p.title=? AND p.updated_at=? AND p.is_template=0 AND p.import_job_id IS NULL)`)
+          .bind(normalizedTitle(row.title), row.id, row.id, row.title, row.updated_at),
         database
           .prepare(`DELETE FROM page_title_normalization_queue WHERE page_id=? AND EXISTS(
         SELECT 1 FROM pages p WHERE p.id=? AND p.title=? AND p.updated_at=?)`)

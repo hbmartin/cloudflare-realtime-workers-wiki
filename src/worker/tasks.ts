@@ -22,6 +22,7 @@ import { logger } from "./observability";
 import { collaborativeTable, tableCommand, queryTable } from "./table-service";
 import { tableFilterDefaults } from "../shared/table-protocol";
 import type { ProjectionStatement } from "./table-authority";
+import { requireTaskRestorable, TASK_DELETION_PENDING_SQL } from "./cleanup";
 
 // Compile the existing pure D1 statement builders into the durable projector event.
 // The adapter never executes SQL; only Worker-owned builders may supply it.
@@ -272,6 +273,7 @@ export async function mutateTask(
   const page = await pageForMember(env, member, listId);
   if (!page.is_task_list) throw new HttpError(422, "task_list_required", "Choose a task list.");
   if (page.effective_role === "viewer") throw new HttpError(403, "editor_required", "Editing access is required.");
+  if (body.archived === false && requestedRowId) await requireTaskRestorable(env, requestedRowId);
   const operationId = body.operationId;
   if (typeof operationId !== "string" || !ID_PATTERN.test(operationId))
     throw new HttpError(422, "operation_id_required", "A stable operation ID is required.");
@@ -324,7 +326,7 @@ export async function mutateTask(
     );
     const view = snapshot.view;
     if (!view || view.invalid) throw new HttpError(422, "invalid_task_view", "Repair the view before adding tasks.");
-    const defaults: Record<string, unknown> = { ...tableFilterDefaults(view.filters) };
+    const defaults: Record<string, unknown> = { ...tableFilterDefaults(view.filters, snapshot.columns) };
     if (view.kind === "board" && view.columnId && Object.hasOwn(body, "groupId"))
       defaults[view.columnId] = body.groupId;
     if (view.kind === "calendar" && view.columnId && Object.hasOwn(body, "date")) defaults[view.columnId] = body.date;
@@ -431,16 +433,22 @@ export async function mutateTask(
         ...durableStatements((db) => [activityMutationEnd(db, operationId)]),
       );
     } else if (body.archived === false) {
+      const deleting = await env.DB.prepare(
+        `SELECT 1 FROM deletion_job_pages target JOIN deletion_jobs job ON job.id=target.job_id WHERE job.phase='rows' AND target.page_id IN (${subtree}) LIMIT 1`,
+      )
+        .bind(detailPageId)
+        .first();
+      if (deleting) throw new HttpError(409, "deletion_pending", "This task is being permanently deleted.");
       const archived = await env.DB.prepare("SELECT archive_operation_id,archived_at FROM pages WHERE id=?")
         .bind(detailPageId)
         .first<{ archive_operation_id: string | null; archived_at: number | null }>();
       effects.push(
         {
-          sql: `DELETE FROM archive_disconnect_targets WHERE page_id IN (SELECT id FROM pages WHERE id IN (${subtree}) AND archive_operation_id IS ? AND archived_at IS ?)`,
+          sql: `DELETE FROM archive_disconnect_targets WHERE page_id IN (SELECT id FROM pages WHERE id IN (${subtree}) AND archive_operation_id IS ? AND archived_at IS ?) AND NOT EXISTS (SELECT 1 FROM deletion_job_pages target JOIN deletion_jobs job ON job.id=target.job_id WHERE job.phase='rows' AND target.page_id=archive_disconnect_targets.page_id)`,
           binds: [detailPageId, archived?.archive_operation_id ?? null, archived?.archived_at ?? null],
         },
         {
-          sql: `UPDATE pages SET archived_at=NULL,archived_by=NULL,archive_operation_id=NULL,revision=revision+1,updated_by=?,updated_at=? WHERE id IN (${subtree}) AND archive_operation_id IS ? AND archived_at IS ?`,
+          sql: `UPDATE pages SET archived_at=NULL,archived_by=NULL,archive_operation_id=NULL,revision=revision+1,updated_by=?,updated_at=? WHERE id IN (${subtree}) AND archive_operation_id IS ? AND archived_at IS ? AND NOT EXISTS (SELECT 1 FROM deletion_job_pages target JOIN deletion_jobs job ON job.id=target.job_id WHERE job.phase='rows' AND target.page_id=pages.id)`,
           binds: [
             member.user.id,
             now,
@@ -548,7 +556,8 @@ export async function mutateTask(
           LEFT JOIN space_members sm ON sm.space_id=s.id AND sm.user_id=wm.user_id
           WHERE wm.workspace_id=p.workspace_id AND wm.user_id=? AND wm.role<>'viewer'
           AND (wm.role='owner' OR (s.visibility='workspace' AND coalesce(sm.role,'editor')='editor') OR sm.role='editor')))
-      AND NOT EXISTS(SELECT 1 FROM task_mutation_receipts WHERE workspace_id=? AND actor_id=? AND operation_id=?) ${authorization ? `AND ${authorization.sql}` : ""}`;
+      AND NOT EXISTS(SELECT 1 FROM task_mutation_receipts WHERE workspace_id=? AND actor_id=? AND operation_id=?) ${authorization ? `AND ${authorization.sql}` : ""}
+      ${body.archived === false ? `AND NOT (${TASK_DELETION_PENDING_SQL})` : ""}`;
     const guards = [
       listId,
       expectedRevision,
@@ -560,6 +569,7 @@ export async function mutateTask(
       member.user.id,
       operationId,
       ...(authorization?.binds ?? []),
+      ...(body.archived === false ? [id, id] : []),
     ];
     const statements: D1PreparedStatement[] = [];
     const c = taskColumns(listId);
@@ -786,12 +796,14 @@ export async function mutateTask(
     if (subtreeIndex !== -1) statements.push(env.DB.prepare(ARCHIVED_TASK_DETAIL_SUBTREE_SQL).bind(detailId));
     const batch = await env.DB.batch<Record<string, unknown>>(statements);
     const receipt = batch[receiptIndex]?.results[0] as { request_hash: string; revision: number } | undefined;
-    if (!receipt)
+    if (!receipt) {
+      if (body.archived === false) await requireTaskRestorable(env, id);
       throw new HttpError(
         409,
         "task_conflict",
         "The table changed or its edit lock expired. Refresh and retry your change.",
       );
+    }
     if (receipt.request_hash !== hash)
       throw new HttpError(409, "idempotency_key_reused", "That operation ID describes another change.");
     const pageIds = subtreeIndex === -1 ? undefined : batch[subtreeIndex]?.results.map((row) => String(row.id));

@@ -12,6 +12,8 @@ import { logger } from "./observability";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import {
   slackTokenPreparationFailure,
+  slackRefreshableAuthError,
+  checkSlackCooldown,
   slackApi,
   definiteSlackRejection,
   recordSlackInstallationError,
@@ -791,6 +793,13 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
   )
     return;
   const table = payload.action === true ? "slack_interaction_receipts" : "slack_inbound_receipts";
+  if (
+    !(await env.DB.prepare(`SELECT 1 FROM ${table} WHERE id=?
+    AND outcome IN ('denied','invalid_content','content_unavailable','expired') AND denial_sent_at IS NULL`)
+      .bind(payload.receiptId)
+      .first())
+  )
+    return;
   let installation: SlackInstallation;
   const logPermanentFailure = (code: string) =>
     logger.warn(
@@ -800,44 +809,28 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
       { receiptId: payload.receiptId, installationId: payload.installationId, generation: payload.generation, code },
     );
   const stopPermanentFailure = async (error: unknown) => {
+    if (error instanceof SlackInstallationAuthError) {
+      if (slackRefreshableAuthError({ ...installation, auth_error: error.code })) return false;
+      logPermanentFailure(error.code);
+      return true;
+    }
     if (!(error instanceof SlackApiError) || !slackInstallationError(error)) return false;
-    const missingRefresh = error.method === "oauth.v2.access" && error.code === "invalid_auth";
-    const recoverable =
-      ["invalid_auth", "token_revoked"].includes(error.code) && installation.bot_refresh_token_ciphertext;
-    if (recoverable && error.method === "oauth.v2.access") return false;
-    if (
-      !(await recordSlackInstallationError(
-        env,
-        installation.id,
-        error,
-        installation.generation,
-        missingRefresh ? { sql: "bot_refresh_token_ciphertext IS NULL", binds: [] } : undefined,
-      ))
-    )
+    if (error.method === "oauth.v2.access") {
+      // Token preparation already fenced and persisted terminal refresh errors.
+      logPermanentFailure(error.code);
+      return true;
+    }
+    if (!(await recordSlackInstallationError(env, installation.id, error, installation.generation)))
       throw new SlackInstallationChangedError();
-    if (recoverable) throw new SlackInstallationAuthError(error.code);
+    if (slackRefreshableAuthError({ ...installation, auth_error: error.code }))
+      throw new SlackInstallationAuthError(error.code);
     logPermanentFailure(error.code);
     return true;
   };
   try {
     installation = await installationFor(env, payload.installationId, payload.generation);
-    if (installation.auth_error) {
-      if (
-        ["invalid_auth", "token_revoked"].includes(installation.auth_error) &&
-        installation.bot_refresh_token_ciphertext
-      ) {
-        await usableBotToken(env, installation, undefined, "wait", undefined, true);
-      } else if (
-        ["invalid_auth", "token_revoked", "account_inactive", "invalid_refresh_token"].includes(installation.auth_error)
-      ) {
-        if (
-          await stopPermanentFailure(
-            new SlackApiError("oauth.v2.access", installation.auth_error, 401, installation.credential_revision),
-          )
-        )
-          return;
-      } else throw new SlackInstallationAuthError(installation.auth_error);
-    }
+    await checkSlackCooldown(env, installation, "chat.postEphemeral");
+    if (installation.auth_error) await usableBotToken(env, installation);
     await validateChannel(env, installation, payload.channelId);
   } catch (error) {
     if (await stopPermanentFailure(error)) return;
@@ -876,6 +869,12 @@ export async function deliverSlackDenial(env: Env, payload: Record<string, unkno
                   : DENIED,
       },
       {
+        beforeDispatch: async () => {
+          const current = await installationFor(env, installation.id, installation.generation);
+          if (current.credential_revision !== installation.credential_revision)
+            throw new SlackInstallationChangedError();
+          if (current.auth_error) throw new SlackInstallationAuthError(current.auth_error);
+        },
         onDispatch: () => {
           dispatched = true;
         },

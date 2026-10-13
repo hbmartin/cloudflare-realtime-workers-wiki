@@ -1067,7 +1067,7 @@ function addImportedFootnotes<T extends ProseMirrorJson>(
     node.content?.forEach(restoreLiterals);
   };
   const visit = (node: ProseMirrorJson) => {
-    if (!node.content) return;
+    if (!node.content || node.type === "codeBlock") return;
     node.content = node.content.flatMap((child) => {
       if (child.type !== "text" || child.marks?.some((mark) => mark.type === "code" || mark.type === "link")) {
         visit(child);

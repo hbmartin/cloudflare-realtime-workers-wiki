@@ -30,7 +30,7 @@ import {
 import { collaborationUndoLifecycleExtension } from "./collaboration-undo";
 import { deferredSyntaxExtension } from "./deferred-syntax";
 import { FindReplace, findReplaceExtension } from "./find-replace";
-import { tabsExtension, footnotesExtension, insertFootnote } from "./editor-feature-blocks";
+import { tabsExtension, footnotesExtension, insertFootnote, selectionInsideTabs } from "./editor-feature-blocks";
 import { Presentation } from "./Presentation";
 import { RenderBoundary } from "./RenderBoundary";
 import { EditorFeatureContext } from "./editor-feature-context";
@@ -1740,14 +1740,16 @@ function CollaborativeEditor({
                 aliases: ["tabs"],
                 group: "NoteFlare",
                 icon: <span>▤</span>,
-                onItemClick: () =>
+                onItemClick: () => {
+                  if (selectionInsideTabs(editor.prosemirrorState.selection)) return;
                   insertOrUpdateBlockForSlashMenu(editor, {
                     type: "tabs",
                     children: [
                       { type: "tabPanel", props: { label: "Tab 1" }, children: [{ type: "paragraph" }] },
                       { type: "tabPanel", props: { label: "Tab 2" }, children: [{ type: "paragraph" }] },
                     ],
-                  }),
+                  });
+                },
               },
               {
                 title: "Linked database",
@@ -1854,7 +1856,7 @@ function CollaborativeEditor({
               updateSelection: true,
             }),
         },
-      ],
+      ].filter((item) => item.title !== "Tabs" || !selectionInsideTabs(editor.prosemirrorState.selection)),
       query,
     );
   const getMentionItems = async (query: string) => {

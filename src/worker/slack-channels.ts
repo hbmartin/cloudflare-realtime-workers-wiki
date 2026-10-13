@@ -10,14 +10,19 @@ import {
   SlackRateLimitError,
   recordSlackInstallationError,
   slackInstallationError,
+  slackRecoveryEligibleSql,
+  slackRefreshableAuthError,
+  usableBotToken,
   type SlackInstallation,
 } from "./slack";
 
 export async function round2Installation(env: Env, id: string, generation?: number) {
-  return env.DB.prepare(`SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL
-    AND auth_error IS NULL AND (? IS NULL OR generation=?)`)
+  const installation = await env.DB.prepare(`SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL
+    AND ${slackRecoveryEligibleSql("slack_installations")} AND (? IS NULL OR generation=?)`)
     .bind(id, generation ?? null, generation ?? null)
     .first<SlackInstallation>();
+  if (installation && slackRefreshableAuthError(installation)) await usableBotToken(env, installation);
+  return installation;
 }
 export class StaleSlackValidationError extends Error {
   constructor() {
@@ -190,8 +195,8 @@ export async function syncRound2Configuration(env: Env) {
 export async function revalidateMappings(env: Env, dryRun = false, workspaceId?: string) {
   if (env.SLACK_CHANNEL_VALIDATION_ENABLED !== "true" && !dryRun) return [];
   const rows =
-    await env.DB.prepare(`SELECT m.id,m.installation_id,m.channel_id,i.auth_error FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
-    WHERE i.disconnected_at IS NULL AND (i.auth_error IS NULL OR ?=1) AND (? IS NULL OR i.workspace_id=?) AND (?=1 OR (m.validation_scope_error_revision IS NULL OR m.validation_scope_error_revision<>i.credential_revision)) AND (?=1 OR coalesce(m.validated_at,0)<? OR m.validation_scope_error_revision<>i.credential_revision) ORDER BY coalesce(m.validated_at,0),m.id`)
+    await env.DB.prepare(`SELECT m.id,m.installation_id,m.channel_id,i.auth_error,i.bot_refresh_token_ciphertext FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
+    WHERE i.disconnected_at IS NULL AND (${slackRecoveryEligibleSql("i")} OR ?=1) AND (? IS NULL OR i.workspace_id=?) AND (?=1 OR (m.validation_scope_error_revision IS NULL OR m.validation_scope_error_revision<>i.credential_revision)) AND (?=1 OR coalesce(m.validated_at,0)<? OR m.validation_scope_error_revision<>i.credential_revision) ORDER BY coalesce(m.validated_at,0),m.id`)
       .bind(
         dryRun ? 1 : 0,
         workspaceId ?? null,
@@ -200,11 +205,17 @@ export async function revalidateMappings(env: Env, dryRun = false, workspaceId?:
         dryRun ? 1 : 0,
         Date.now() - 15 * 60_000,
       )
-      .all<{ id: string; installation_id: string; channel_id: string; auth_error: string | null }>();
+      .all<{
+        id: string;
+        installation_id: string;
+        channel_id: string;
+        auth_error: string | null;
+        bot_refresh_token_ciphertext: string | null;
+      }>();
   const report: Array<{ id: string; valid: boolean; reason: string | null }> = [];
   const limited = new Set<string>();
   for (const row of rows.results) {
-    if (row.auth_error) {
+    if (row.auth_error && (dryRun || !slackRefreshableAuthError(row))) {
       report.push({ id: row.id, valid: false, reason: row.auth_error });
       continue;
     }
@@ -212,9 +223,9 @@ export async function revalidateMappings(env: Env, dryRun = false, workspaceId?:
       if (dryRun) report.push({ id: row.id, valid: false, reason: "rate_limited" });
       continue;
     }
-    const installation = await round2Installation(env, row.installation_id);
-    if (!installation) continue;
     try {
+      const installation = await round2Installation(env, row.installation_id);
+      if (!installation) continue;
       if (dryRun) {
         await validatedChannel(env, installation, row.channel_id);
         report.push({ id: row.id, valid: true, reason: null });

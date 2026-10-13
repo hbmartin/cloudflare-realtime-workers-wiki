@@ -31,6 +31,7 @@ import {
   SlackApiError,
   SlackRateLimitError,
   slackTokenPreparationFailure,
+  slackRecoveryEligibleSql,
   type SlackInstallation,
   channelActivityActorAccessSql,
   channelActivityActorAuthoritySql,
@@ -72,7 +73,7 @@ export type Mapping = {
 };
 export async function digestMapping(env: Env, id: string) {
   return env.DB.prepare(`SELECT m.*,${mappingDeliveryPauseSql("m", Date.now())} delivery_paused FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
-    WHERE m.id=? AND i.disconnected_at IS NULL AND i.auth_error IS NULL AND EXISTS(SELECT 1 FROM workspace_members w
+    WHERE m.id=? AND i.disconnected_at IS NULL AND ${slackRecoveryEligibleSql("i")} AND EXISTS(SELECT 1 FROM workspace_members w
       WHERE w.workspace_id=i.workspace_id AND w.user_id=m.created_by AND w.role='owner')`)
     .bind(id)
     .first<Mapping>();
@@ -256,7 +257,7 @@ export async function dueRound2Digests(env: Env, timestamp = Date.now()) {
   const mappings =
     await env.DB.prepare(`SELECT m.id,i.generation FROM slack_channel_subscriptions m JOIN slack_installations i ON i.id=m.installation_id
     WHERE m.cadence='digest' AND m.digest_timezone IS NOT NULL AND m.muted_at IS NULL AND coalesce(m.snoozed_until,0)<=?
-    AND m.notification_blocked_at IS NULL AND i.disconnected_at IS NULL AND i.auth_error IS NULL
+    AND m.notification_blocked_at IS NULL AND i.disconnected_at IS NULL AND ${slackRecoveryEligibleSql("i")}
     ORDER BY m.digest_not_before,m.id`)
       .bind(timestamp)
       .all<{ id: string; generation: number }>();
@@ -982,7 +983,7 @@ export async function deliverDigest(
           const errorCode =
             error instanceof SlackApiError ? error.code : error instanceof SlackRateLimitError ? "rate_limited" : null;
           if (errorCode && !slackTokenPreparationFailure(error))
-            await withSlackPrimaryError(error, "handle_error", { id }, () =>
+            await recordSecondarySlackError("digest_diagnostic", { id }, () =>
               env.DB.prepare(`UPDATE slack_digest_messages SET last_error=?
               WHERE id=? AND state IN ('pending','sending') AND (claim_token IS NULL OR claim_token=?)
                 AND EXISTS(SELECT 1 FROM slack_digest_receipts WHERE id=? AND claim_token=?)`)

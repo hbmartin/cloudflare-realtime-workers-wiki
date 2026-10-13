@@ -342,7 +342,9 @@ export function CollaborativeTablePage({
       rowId: row.id,
       viewId: view.id,
       expectedCellRevision: row.cellRevisions[view.columnId] ?? 0,
-      ...(view.kind === "board" ? { targetOptionId: target || null } : { targetDate: target }),
+      ...(view.kind === "board"
+        ? { targetOptionId: target || null }
+        : { targetDate: target, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone }),
     });
   };
   return (
@@ -420,13 +422,18 @@ export function CollaborativeTablePage({
           key={data.view?.id ?? "new"}
           view={data.view}
           columns={data.columns}
+          people={data.people ?? []}
           enabledKinds={[
             "grid",
             ...(member.features?.tableBoard ? ["board" as const] : []),
             ...(member.features?.tableCalendar ? ["calendar" as const] : []),
           ]}
           busy={busy}
-          save={(payload) => void command("save_view", payload)}
+          save={async (payload) => {
+            const saved = await command("save_view", payload);
+            if (saved) setPanel(null);
+            return saved;
+          }}
           remove={() =>
             data.view &&
             void command("delete_view", { viewId: data.view.id }).then((saved) => {
@@ -772,9 +779,27 @@ function Cell({
   );
 }
 
+function viewDraft(view: TableView | null, columns: CollaborativeColumn[]) {
+  return {
+    revision: view?.revision,
+    name: view?.name ?? "New view",
+    kind: view?.kind ?? ("grid" as const),
+    columnId: view?.columnId ?? "",
+    personal: Boolean(view?.ownerId),
+    filters: view?.filters?.kind === "group" ? view.filters.filters : view?.filters ? [view.filters] : [],
+    join: view?.filters?.kind === "group" ? view.filters.operator : ("and" as const),
+    sorts: view?.sorts ?? [],
+    visible:
+      view?.visibleColumnIds.filter((id) => columns.some((column) => column.id === id)) ??
+      columns.map((column) => column.id),
+    calculations: view?.calculations ?? {},
+  };
+}
+
 function ViewEditor({
   view,
   columns,
+  people,
   enabledKinds,
   busy,
   save,
@@ -782,50 +807,102 @@ function ViewEditor({
 }: {
   view: TableView | null;
   columns: CollaborativeColumn[];
+  people: NonNullable<TableQueryResult["people"]>;
   enabledKinds: TableView["kind"][];
   busy: boolean;
-  save: (payload: Record<string, unknown>) => void;
+  save: (payload: Record<string, unknown>) => Promise<boolean>;
   remove: () => void;
 }) {
-  const [name, setName] = useState(view?.name ?? "New view"),
-    [kind, setKind] = useState<TableView["kind"]>(view?.kind ?? "grid"),
-    [columnId, setColumnId] = useState(view?.columnId ?? ""),
-    [personal, setPersonal] = useState(Boolean(view?.ownerId));
+  const [editedDraft, setDraft] = useState<ReturnType<typeof viewDraft> | null>(null);
+  const draft = editedDraft ?? viewDraft(view, columns);
+  const updateDraft = (change: Partial<typeof draft>) => {
+    setDraft((current) => ({ ...(current ?? viewDraft(view, columns)), ...change }));
+  };
+  const { name, kind, columnId, personal, filters, join, sorts, visible, calculations } = draft;
   const [filterColumn, setFilterColumn] = useState(""),
     [filterValue, setFilterValue] = useState(""),
-    [filterOperator, setFilterOperator] = useState("eq"),
-    [filters, setFilters] = useState<TableFilter[]>(
-      view?.filters?.kind === "group" ? view.filters.filters : view?.filters ? [view.filters] : [],
-    ),
-    [join, setJoin] = useState<"and" | "or">(view?.filters?.kind === "group" ? view.filters.operator : "and");
-  const [sorts, setSorts] = useState(view?.sorts ?? []),
-    [visible, setVisible] = useState(view?.visibleColumnIds ?? columns.map((column) => column.id)),
-    [calculations, setCalculations] = useState(view?.calculations ?? {});
+    [filterIds, setFilterIds] = useState<string[]>([]),
+    [filterOperator, setFilterOperator] = useState<Extract<TableFilter, { kind: "condition" }>["operator"]>("eq"),
+    [filterError, setFilterError] = useState("");
+  const filterProperty = columns.find((column) => column.id === filterColumn),
+    filterType = filterProperty?.type === "formula" ? filterProperty.config?.resultType : filterProperty?.type,
+    collection = filterType === "person" || filterType === "multi_select",
+    numeric = filterType === "number",
+    timestamp = filterType === "created_time" || filterType === "last_edited_time",
+    boolean = filterType === "checkbox" || filterType === "boolean",
+    noValue = filterOperator === "empty" || filterOperator === "not_empty";
+  const filterOperators = [
+    ...(filterType === "null" ? [] : ["eq", "neq"]),
+    ...([
+      "text",
+      "string",
+      "url",
+      "select",
+      "status",
+      "created_by",
+      "last_edited_by",
+      "person",
+      "multi_select",
+    ].includes(String(filterType))
+      ? ["contains"]
+      : []),
+    "empty",
+    "not_empty",
+    ...(numeric || timestamp || filterType === "date" ? ["gt", "gte", "lt", "lte"] : []),
+  ];
+  const filterOptions =
+    filterType === "person" || ["created_by", "last_edited_by"].includes(String(filterType))
+      ? people.map((person) => ({ id: person.id, label: `${person.name}${person.active ? "" : " (former member)"}` }))
+      : (filterProperty?.options ?? []);
   return (
     <form
       className="table-settings"
       onSubmit={(event) => {
         event.preventDefault();
-        save({
-          ...(view ? { id: view.id, revision: view.revision } : {}),
+        void save({
+          ...(view ? { id: view.id, revision: draft.revision } : {}),
           name,
           kind,
           columnId: kind === "grid" ? null : columnId,
           personal,
           filters: { kind: "group", operator: join, filters },
           sorts,
-          visibleColumnIds: visible,
+          visibleColumnIds: visible.filter((id) => columns.some((column) => column.id === id)),
           calculations,
         });
       }}
     >
+      {editedDraft && view && draft.revision !== view.revision && (
+        <p role="alert">
+          These settings changed while you were editing.
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setDraft(null);
+            }}
+          >
+            Reload latest settings
+          </button>
+        </p>
+      )}
       <label>
         View name
-        <input value={name} onChange={(event) => setName(event.target.value)} required maxLength={200} />
+        <input
+          value={name}
+          disabled={busy}
+          onChange={(event) => updateDraft({ name: event.target.value })}
+          required
+          maxLength={200}
+        />
       </label>
       <label>
         Layout
-        <select value={kind} onChange={(event) => setKind(event.target.value as TableView["kind"])}>
+        <select
+          value={kind}
+          disabled={busy}
+          onChange={(event) => updateDraft({ kind: event.target.value as TableView["kind"] })}
+        >
           {[...new Set([...enabledKinds, ...(view ? [view.kind] : [])])].map((layoutKind) => (
             <option key={layoutKind}>{layoutKind}</option>
           ))}
@@ -834,7 +911,12 @@ function ViewEditor({
       {kind !== "grid" && (
         <label>
           {kind === "board" ? "Group property" : "Date property"}
-          <select required value={columnId} onChange={(event) => setColumnId(event.target.value)}>
+          <select
+            required
+            value={columnId}
+            disabled={busy}
+            onChange={(event) => updateDraft({ columnId: event.target.value })}
+          >
             <option value="">Choose property</option>
             {columns
               .filter((column) =>
@@ -849,15 +931,20 @@ function ViewEditor({
         </label>
       )}
       <label>
-        <input type="checkbox" checked={personal} onChange={(event) => setPersonal(event.target.checked)} />
+        <input
+          type="checkbox"
+          checked={personal}
+          disabled={busy}
+          onChange={(event) => updateDraft({ personal: event.target.checked })}
+        />
         Personal view
       </label>
-      <fieldset>
+      <fieldset disabled={busy}>
         <legend>Filters</legend>
         <select
           aria-label="Filter combination"
           value={join}
-          onChange={(event) => setJoin(event.target.value as "and" | "or")}
+          onChange={(event) => updateDraft({ join: event.target.value as "and" | "or" })}
         >
           <option value="and">Match all</option>
           <option value="or">Match any</option>
@@ -867,7 +954,7 @@ function ViewEditor({
             {filter.kind === "condition"
               ? `${columns.find((column) => column.id === filter.columnId)?.name ?? "Removed property"} ${filter.operator} ${JSON.stringify(filter.value ?? "")}`
               : "Filter group"}
-            <button type="button" onClick={() => setFilters(filters.filter((_, i) => i !== index))}>
+            <button type="button" onClick={() => updateDraft({ filters: filters.filter((_, i) => i !== index) })}>
               Remove
             </button>
           </p>
@@ -875,7 +962,14 @@ function ViewEditor({
         <select
           aria-label="Filter property"
           value={filterColumn}
-          onChange={(event) => setFilterColumn(event.target.value)}
+          onChange={(event) => {
+            const next = columns.find((column) => column.id === event.target.value);
+            setFilterColumn(event.target.value);
+            setFilterOperator(next?.type === "formula" && next.config?.resultType === "null" ? "empty" : "eq");
+            setFilterValue("");
+            setFilterIds([]);
+            setFilterError("");
+          }}
         >
           <option value="">Choose property</option>
           {columns.map((column) => (
@@ -887,43 +981,111 @@ function ViewEditor({
         <select
           aria-label="Filter operator"
           value={filterOperator}
-          onChange={(event) => setFilterOperator(event.target.value)}
+          onChange={(event) => {
+            setFilterOperator(event.target.value as typeof filterOperator);
+            setFilterValue("");
+            setFilterIds([]);
+            setFilterError("");
+          }}
         >
-          {["eq", "neq", "contains", "empty", "not_empty", "gt", "gte", "lt", "lte"].map((operator) => (
+          {filterOperators.map((operator) => (
             <option key={operator}>{operator}</option>
           ))}
         </select>
-        <input
-          aria-label="Filter value"
-          value={filterValue}
-          onChange={(event) => setFilterValue(event.target.value)}
-          placeholder="Value or option ID"
-        />
+        {!noValue &&
+          (boolean ||
+          collection ||
+          ["select", "status", "created_by", "last_edited_by"].includes(String(filterType)) ? (
+            <select
+              key={`${filterColumn}:${filterOperator}`}
+              aria-label="Filter value"
+              multiple={collection && filterOperator !== "contains"}
+              value={collection && filterOperator !== "contains" ? filterIds : filterValue}
+              onChange={(event) => {
+                if (collection && filterOperator !== "contains")
+                  setFilterIds([...event.target.selectedOptions].map((option) => option.value));
+                else setFilterValue(event.target.value);
+              }}
+            >
+              {(!collection || filterOperator === "contains") && <option value="">Choose value</option>}
+              {boolean
+                ? ["true", "false"].map((value) => <option key={value}>{value}</option>)
+                : filterOptions.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+            </select>
+          ) : (
+            <input
+              aria-label="Filter value"
+              type={numeric ? "number" : "text"}
+              step={numeric ? "any" : undefined}
+              value={filterValue}
+              onChange={(event) => setFilterValue(event.target.value)}
+              maxLength={10_000}
+              placeholder={timestamp || filterType === "date" ? "ISO date or timestamp" : "Value"}
+            />
+          ))}
+        {filterError && <p role="alert">{filterError}</p>}
         <button
           type="button"
-          disabled={!filterColumn}
+          disabled={!filterColumn || filterType === undefined}
           onClick={() => {
-            const column = columns.find((candidate) => candidate.id === filterColumn)!;
-            setFilters([
-              ...filters,
-              {
-                kind: "condition",
-                columnId: filterColumn,
-                operator: filterOperator as "eq",
-                value:
-                  column.type === "number"
-                    ? Number(filterValue)
-                    : column.type === "checkbox"
-                      ? filterValue === "true"
-                      : filterValue,
-              },
-            ]);
+            let value: TableValue | undefined;
+            if (!noValue) {
+              if (numeric) {
+                value = Number(filterValue);
+                if (!filterValue.trim() || !Number.isFinite(value)) {
+                  setFilterError("Enter a finite number.");
+                  return;
+                }
+              } else if (timestamp || filterType === "date") {
+                if (!/^\d{4}-\d{2}-\d{2}(?:T.*)?$/.test(filterValue) || !Number.isFinite(Date.parse(filterValue))) {
+                  setFilterError("Enter an ISO date or timestamp.");
+                  return;
+                }
+                value = timestamp ? Date.parse(filterValue) : filterValue;
+              } else if (boolean) {
+                if (!filterValue) {
+                  setFilterError("Choose true or false.");
+                  return;
+                }
+                value = filterValue === "true";
+              } else if (collection && filterOperator !== "contains") {
+                if (filterIds.length > 100) {
+                  setFilterError("Choose at most 100 values.");
+                  return;
+                }
+                value = [...new Set(filterIds)].sort();
+              } else value = filterValue;
+              if (
+                !filterValue &&
+                ((collection && filterOperator === "contains") ||
+                  ["select", "status", "created_by", "last_edited_by"].includes(String(filterType)))
+              ) {
+                setFilterError("Choose a value.");
+                return;
+              }
+            }
+            setFilterError("");
+            updateDraft({
+              filters: [
+                ...filters,
+                {
+                  kind: "condition",
+                  columnId: filterColumn,
+                  operator: filterOperator,
+                  ...(value === undefined ? {} : { value }),
+                },
+              ],
+            });
           }}
         >
           Add filter
         </button>
       </fieldset>
-      <fieldset>
+      <fieldset disabled={busy}>
         <legend>Sort order</legend>
         {sorts.map((sort, index) => (
           <label key={index}>
@@ -931,15 +1093,17 @@ function ViewEditor({
             <select
               value={sort.direction}
               onChange={(event) =>
-                setSorts(
-                  sorts.map((s, i) => (i === index ? { ...s, direction: event.target.value as "asc" | "desc" } : s)),
-                )
+                updateDraft({
+                  sorts: sorts.map((s, i) =>
+                    i === index ? { ...s, direction: event.target.value as "asc" | "desc" } : s,
+                  ),
+                })
               }
             >
               <option value="asc">Ascending</option>
               <option value="desc">Descending</option>
             </select>
-            <button type="button" onClick={() => setSorts(sorts.filter((_, i) => i !== index))}>
+            <button type="button" onClick={() => updateDraft({ sorts: sorts.filter((_, i) => i !== index) })}>
               Remove
             </button>
           </label>
@@ -947,7 +1111,7 @@ function ViewEditor({
         <select
           aria-label="Add sort property"
           value=""
-          onChange={(event) => setSorts([...sorts, { columnId: event.target.value, direction: "asc" }])}
+          onChange={(event) => updateDraft({ sorts: [...sorts, { columnId: event.target.value, direction: "asc" }] })}
         >
           <option value="">Add sort…</option>
           {columns.map((column) => (
@@ -957,7 +1121,7 @@ function ViewEditor({
           ))}
         </select>
       </fieldset>
-      <fieldset>
+      <fieldset disabled={busy}>
         <legend>Visible properties and calculations</legend>
         {columns.map((column) => (
           <label key={column.id}>
@@ -965,7 +1129,9 @@ function ViewEditor({
               type="checkbox"
               checked={visible.includes(column.id)}
               onChange={(event) =>
-                setVisible(event.target.checked ? [...visible, column.id] : visible.filter((id) => id !== column.id))
+                updateDraft({
+                  visible: event.target.checked ? [...visible, column.id] : visible.filter((id) => id !== column.id),
+                })
               }
             />
             {column.name}
@@ -976,7 +1142,7 @@ function ViewEditor({
                 const next = { ...calculations };
                 if (event.target.value) next[column.id] = event.target.value as CalculationKind;
                 else delete next[column.id];
-                setCalculations(next);
+                updateDraft({ calculations: next });
               }}
             >
               <option value="">No calculation</option>
@@ -994,7 +1160,7 @@ function ViewEditor({
             type="button"
             disabled={busy}
             onClick={() =>
-              save({
+              void save({
                 name: `${name} copy`,
                 kind,
                 columnId: kind === "grid" ? null : columnId,
@@ -1044,18 +1210,28 @@ function PropertyEditor({
       <form
         onSubmit={(event) => {
           event.preventDefault();
-          void command("create_column", { name, type, ...(type === "formula" ? { source } : {}) });
-          setName("");
+          void command("create_column", { name, type, ...(type === "formula" ? { source } : {}) }).then((saved) => {
+            if (saved) {
+              setName("");
+              setSource("");
+            }
+          });
         }}
       >
         <input
           aria-label="New property name"
           required
           value={name}
+          disabled={busy}
           maxLength={200}
           onChange={(event) => setName(event.target.value)}
         />
-        <select aria-label="New property type" value={type} onChange={(event) => setType(event.target.value)}>
+        <select
+          aria-label="New property type"
+          value={type}
+          disabled={busy}
+          onChange={(event) => setType(event.target.value)}
+        >
           {TABLE_COLUMN_TYPES.map((columnType) => (
             <option key={columnType}>{columnType}</option>
           ))}
@@ -1064,6 +1240,7 @@ function PropertyEditor({
           <input
             aria-label="New formula"
             value={source}
+            disabled={busy}
             required
             placeholder='prop("Amount") * 2'
             onChange={(event) => setSource(event.target.value)}
@@ -1085,35 +1262,59 @@ function Property({
   busy: boolean;
   command: (kind: TableCommand["kind"], payload: Record<string, unknown>, globalRevision?: boolean) => Promise<boolean>;
 }) {
-  const [name, setName] = useState(column.name),
-    [type, setType] = useState(column.type),
+  const currentSource = column.config?.ast
+    ? format(
+        (column.config as unknown as FormulaTypeOptions).ast,
+        new Map(columns.map((property) => [property.id, property.name])),
+      )
+    : String(column.config?.source ?? "");
+  const [editedName, setNameDraft] = useState<ReturnType<typeof propertyDraft> | null>(null),
+    [editedSource, setSourceDraft] = useState<ReturnType<typeof propertyDraft> | null>(null),
     [option, setOption] = useState(""),
-    [source, setSource] = useState(
-      column.config?.ast
-        ? format(
-            (column.config as unknown as FormulaTypeOptions).ast,
-            new Map(columns.map((property) => [property.id, property.name])),
-          )
-        : String(column.config?.source ?? ""),
-    ),
     [clearInvalid, setClearInvalid] = useState(false);
+  const nameDraft = editedName ?? propertyDraft(column.name, column.revision),
+    sourceDraft = editedSource ?? propertyDraft(currentSource, column.revision);
+  const conflict =
+    (editedName && nameDraft.revision !== column.revision) ||
+    (editedSource && sourceDraft.revision !== column.revision);
   return (
     <div className="table-property">
+      {conflict && (
+        <p role="alert">
+          These settings changed while you were editing.
+          <button
+            disabled={busy}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              setNameDraft(null);
+              setSourceDraft(null);
+            }}
+          >
+            Reload latest settings
+          </button>
+        </p>
+      )}
       <input
         aria-label={`Name for ${column.name}`}
-        value={name}
-        onChange={(event) => setName(event.target.value)}
+        value={nameDraft.value}
+        disabled={busy}
+        onChange={(event) => setNameDraft((current) => ({ ...(current ?? nameDraft), value: event.target.value }))}
         onBlur={() => {
-          if (name !== column.name)
-            void command("update_column", { columnId: column.id, name, revision: column.revision });
+          if (nameDraft.value !== nameDraft.original)
+            void command("update_column", {
+              columnId: column.id,
+              name: nameDraft.value,
+              revision: nameDraft.revision,
+            }).then((saved) => {
+              if (saved) setNameDraft(null);
+            });
         }}
       />
       <select
         aria-label={`Type for ${column.name}`}
-        value={type}
+        value={column.conversion?.type ?? column.type}
         disabled={busy || Boolean(column.conversion) || column.type === "formula"}
         onChange={(event) => {
-          setType(event.target.value as CollaborativeColumn["type"]);
           void command("prepare_type", { columnId: column.id, type: event.target.value, revision: column.revision });
         }}
       >
@@ -1125,12 +1326,23 @@ function Property({
         <>
           <input
             aria-label={`Formula for ${column.name}`}
-            value={source}
-            onChange={(event) => setSource(event.target.value)}
+            value={sourceDraft.value}
+            disabled={busy}
+            onChange={(event) =>
+              setSourceDraft((current) => ({ ...(current ?? sourceDraft), value: event.target.value }))
+            }
           />
           <button
             disabled={busy}
-            onClick={() => void command("update_column", { columnId: column.id, revision: column.revision, source })}
+            onClick={() =>
+              void command("update_column", {
+                columnId: column.id,
+                revision: sourceDraft.revision,
+                source: sourceDraft.value,
+              }).then((saved) => {
+                if (saved) setSourceDraft(null);
+              })
+            }
           >
             Update formula
           </button>
@@ -1146,6 +1358,7 @@ function Property({
               <input
                 type="checkbox"
                 checked={clearInvalid}
+                disabled={busy}
                 onChange={(event) => setClearInvalid(event.target.checked)}
               />
               Clear these values
@@ -1162,7 +1375,6 @@ function Property({
           <button
             disabled={busy}
             onClick={() => {
-              setType(column.type);
               void command("cancel_type", { columnId: column.id, conversionId: column.conversion!.id });
             }}
           >
@@ -1187,13 +1399,15 @@ function Property({
           <input
             aria-label={`New option for ${column.name}`}
             value={option}
+            disabled={busy}
             onChange={(event) => setOption(event.target.value)}
           />
           <button
             disabled={busy || !option}
             onClick={() => {
-              void command("add_option", { columnId: column.id, label: option });
-              setOption("");
+              void command("add_option", { columnId: column.id, label: option }).then((saved) => {
+                if (saved) setOption("");
+              });
             }}
           >
             Add option
@@ -1205,4 +1419,8 @@ function Property({
       </button>
     </div>
   );
+}
+
+function propertyDraft(value: string, revision: number) {
+  return { value, original: value, revision };
 }

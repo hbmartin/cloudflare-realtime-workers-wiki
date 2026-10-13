@@ -13,7 +13,13 @@ export { format } from "./format";
 export { isErrorCell } from "./error";
 export type { FormulaTypeOptions, Value } from "./types";
 
-export type FormulaProperty = { id: string; name: string; type: string; config?: unknown };
+export type FormulaProperty = {
+  id: string;
+  name: string;
+  type: string;
+  config?: unknown;
+  options?: readonly { id: string; label: string }[];
+};
 export type ComputedSourceStamp = {
   version: 1;
   tableId: string;
@@ -106,16 +112,50 @@ export function evaluateFormula(
   row: Record<string, unknown>,
   properties: readonly FormulaProperty[],
 ): Value {
+  const prepared = prepareFormulaEvaluation(properties);
+  return evaluatePreparedFormula(retypeFormula(config, prepared.properties), row, prepared);
+}
+
+/** Prepare one schema once; each row keeps its own memo and values. */
+export function prepareFormulaEvaluation(properties: readonly FormulaProperty[]) {
+  const current = retypeFormulaProperties(properties);
+  return {
+    properties: current,
+    order: formulaDependencyOrder(current),
+    lookup: new Map(
+      current.map((property) => [property.id, { id: property.id, type: property.type, typeOptions: property.config }]),
+    ),
+    optionLabels: new Map(
+      current
+        .filter((property) => ["select", "status"].includes(property.type))
+        .flatMap((property) => (property.options ?? []).map((option) => [option.id, option.label] as const)),
+    ),
+    usesOptionLabels: current.some(
+      (property) =>
+        property.type === "formula" &&
+        JSON.stringify((property.config as FormulaTypeOptions).ast)
+          .toLowerCase()
+          .includes('"fn":"optionlabel"'),
+    ),
+  };
+}
+export type PreparedFormulaEvaluation = ReturnType<typeof prepareFormulaEvaluation>;
+
+export function evaluatePreparedFormula(
+  config: FormulaTypeOptions,
+  row: Record<string, unknown>,
+  prepared: PreparedFormulaEvaluation,
+  memo = new Map<string, Value>(),
+): Value {
   if (config.astVersion !== 1) return { __err: "TYPE_MISMATCH", msg: "Unsupported formula AST version", v: 1 };
-  const currentProperties = retypeFormulaProperties(properties);
-  const current = retypeFormula(config, currentProperties);
-  if (current.validationError) return { __err: "DEPENDENCY_ERROR", msg: current.validationError, v: 1 };
+  if (config.validationError) return { __err: "DEPENDENCY_ERROR", msg: config.validationError, v: 1 };
   return evaluate(config.ast, row, {
     registry,
-    properties: new Map(currentProperties.map((p) => [p.id, { id: p.id, type: p.type, typeOptions: p.config }])),
+    properties: prepared.lookup,
+    optionLabels: prepared.optionLabels,
     depth: 0,
     maxDepth: DEFAULT_MAX_DEPTH,
-    memo: new Map(),
+    memo,
   });
 }
 

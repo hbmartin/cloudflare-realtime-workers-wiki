@@ -1626,7 +1626,28 @@ describe("OAuth MCP foundation", () => {
     await env.DB.prepare("UPDATE pages SET import_job_id=?,updated_at=? WHERE id=?")
       .bind(`mcp:cleanup:${pageId}`, Date.now(), pageId)
       .run();
+    const firstClaimPageId = crypto.randomUUID();
+    await env.DB.prepare(`INSERT INTO pages
+      (id,workspace_id,space_id,kind,position,title,import_job_id,created_by,created_at,updated_at)
+      VALUES (?,?,?,'document','z1','First cleanup',?,?,?,?)`)
+      .bind(
+        firstClaimPageId,
+        me.workspace.id,
+        tree.pages[0]!.spaceId,
+        `mcp:create:${firstClaimPageId}`,
+        me.user.id,
+        createdAt,
+        createdAt,
+      )
+      .run();
+    expect(
+      await env.DB.prepare("SELECT page_id FROM page_title_normalization_queue WHERE page_id=?")
+        .bind(firstClaimPageId)
+        .first(),
+    ).toBeNull();
     await pruneStagedMcpPages(env);
+    // The claim also inserts a normalization-queue row: D1 meta.changes is greater than one.
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(firstClaimPageId).first()).toBeNull();
     expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(pageId).first()).not.toBeNull();
     await env.DB.prepare("UPDATE pages SET updated_at=? WHERE id=?")
       .bind(Date.now() - 2 * 60_000, pageId)

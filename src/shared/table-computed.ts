@@ -1,10 +1,11 @@
 import {
-  evaluateFormula,
-  formulaDependencyOrder,
+  evaluatePreparedFormula,
+  prepareFormulaEvaluation,
   isErrorCell,
   type ComputedValue,
   type FormulaProperty,
   type FormulaTypeOptions,
+  type PreparedFormulaEvaluation,
   type Value,
 } from "./formula/index";
 
@@ -16,13 +17,16 @@ export function computeRowFormulas(input: {
   rowRevision: number;
   cells: Record<string, unknown>;
   properties: readonly FormulaProperty[];
+  prepared?: PreparedFormulaEvaluation;
 }): Record<string, ComputedValue> {
+  const prepared = input.prepared ?? prepareFormulaEvaluation(input.properties);
+  const memo = new Map<string, Value>();
   const values = { ...input.cells };
   const computed: Record<string, ComputedValue> = {};
-  for (const id of formulaDependencyOrder(input.properties)) {
-    const property = input.properties.find((candidate) => candidate.id === id)!;
-    const config = property.config as FormulaTypeOptions;
-    const value = evaluateFormula(config, values, input.properties);
+  for (const id of prepared.order) {
+    const config = prepared.lookup.get(id)!.typeOptions as FormulaTypeOptions;
+    const value = evaluatePreparedFormula(config, values, prepared, memo);
+    memo.set(id, value);
     values[id] = value;
     computed[id] = {
       version: 1,
