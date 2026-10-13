@@ -2374,8 +2374,15 @@ describe("interactive Slack workspace", () => {
       `SELECT * FROM slack_installations WHERE id='installation'`,
     ).first<SlackInstallation>())!;
     const controller = new AbortController();
-    const pending = usableBotToken(runtime(), installed, controller.signal);
-    setTimeout(() => controller.abort(new Error("cancelled")), 20);
+    const bindings = {
+      ...runtime(),
+      DB: afterD1(
+        env.DB,
+        (sql) => sql.includes("SELECT * FROM slack_installations WHERE id=? AND disconnected_at IS NULL"),
+        async () => controller.abort(new Error("cancelled")),
+      ),
+    };
+    const pending = usableBotToken(bindings, installed, controller.signal);
     await expect(pending).rejects.toThrow("cancelled");
   });
 
