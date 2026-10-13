@@ -1241,385 +1241,510 @@ describe("notification feed and subscriptions", () => {
     ).toEqual({ delivered: 0 });
   });
 
-  it.each(["steady", "refresh", "recovery", "contention", "finalization", "cleanup", "diff"])(
-    "keeps a full email and Slack digest tick within the statement budget (%s)",
-    async (scenario) => {
-      const installed = await bootstrap();
-      const timestamp = Date.UTC(2026, 8, 5, 11, 5);
-      const configured: Env = { ...slackEnv(), DIFF_DIGESTS_ENABLED: scenario === "diff" ? "true" : "false" };
-      const token = await encryptSlackToken(configured, "xoxb-budget");
-      await env.DB.batch([
-        env.DB.prepare(
-          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+  it.each([
+    "steady",
+    "refresh",
+    "recovery",
+    "contention",
+    "finalization",
+    "cleanup",
+    "diff",
+    "heavy-diff",
+    "heavy-refresh",
+    "late-refresh",
+  ])("keeps a full email and Slack digest tick within the statement budget (%s)", async (scenario) => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 11, 5);
+    const diff = ["diff", "heavy-diff", "heavy-refresh"].includes(scenario);
+    const heavy = ["heavy-diff", "heavy-refresh"].includes(scenario);
+    const refreshing = ["refresh", "heavy-refresh"].includes(scenario);
+    const configured: Env = { ...slackEnv(), DIFF_DIGESTS_ENABLED: diff ? "true" : "false" };
+    const token = await encryptSlackToken(configured, "xoxb-budget");
+    await env.DB.batch([
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt)
          SELECT printf('budget-user-%02d', n), printf('Budget User %02d', n),
                 printf('budget-user-%02d@example.test', n), 1, ?, ? FROM sequence`,
-        ).bind(timestamp, timestamp),
-        env.DB.prepare(
-          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+      ).bind(timestamp, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO workspace_members (workspace_id, user_id, role, created_at)
          SELECT ?, printf('budget-user-%02d', n), 'viewer', ? FROM sequence`,
-        ).bind(installed.workspaceId, timestamp),
-        env.DB.prepare(
-          `INSERT INTO slack_installations
+      ).bind(installed.workspaceId, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
           (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
            installed_by, created_at, updated_at)
          VALUES ('digest-budget-installation', ?, 'TBUDGET', 'Budget', 'BBUDGET', ?,
                  'chat:write', ?, ?, ?)`,
-        ).bind(installed.workspaceId, token, installed.userId, timestamp, timestamp),
-        env.DB.prepare(
-          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+      ).bind(installed.workspaceId, token, installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation)
          SELECT 'digest-budget-installation', printf('budget-user-%02d', n), printf('UBUDGET%02d', n), ?,0
            FROM sequence`,
-        ).bind(timestamp),
-        env.DB.prepare(
-          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+      ).bind(timestamp),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone)
          SELECT printf('budget-user-%02d', n), 'mention', 1, 'digest', 'digest', 'UTC' FROM sequence`,
-        ),
-        env.DB.prepare(
-          `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
+      ),
+      env.DB.prepare(
+        `WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM sequence WHERE n < 10)
          INSERT INTO notifications
            (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
          SELECT printf('budget-notification-%02d', n), ?, printf('budget-user-%02d', n), 'mention', ?, ?, ?,
                 '{}', printf('budget-%02d', n), ? FROM sequence`,
-        ).bind(
-          installed.workspaceId,
-          installed.userId,
-          installed.page.spaceId,
-          installed.page.id,
-          timestamp - 3 * 60 * 60_000,
-        ),
-        env.DB.prepare(
-          `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+      ).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 3 * 60 * 60_000,
+      ),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
          SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
            FROM notifications WHERE id LIKE 'budget-notification-%'`,
-        ).bind(timestamp, timestamp),
+      ).bind(timestamp, timestamp),
+    ]);
+    if (heavy)
+      await env.DB.batch([
+        env.DB.prepare(`WITH RECURSIVE sequence(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM sequence WHERE n<15)
+          INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at)
+          SELECT printf('budget-page-%02d',n),?,?,'document','a0',printf('Comparison %02d',n),?,?,? FROM sequence`).bind(
+          installed.workspaceId,
+          installed.page.spaceId,
+          installed.userId,
+          timestamp,
+          timestamp,
+        ),
+        env.DB.prepare(`INSERT INTO page_change_checkpoints(id,page_id,workspace_id,content_epoch,sequence,after_key,actor_id,created_at)
+          SELECT 'checkpoint:'||id,id,workspace_id,1,1,'missing:'||id,?,? FROM pages WHERE id LIKE 'budget-page-%'`).bind(
+          installed.userId,
+          timestamp - 3 * 60 * 60_000,
+        ),
+        env.DB.prepare(`INSERT INTO page_change_recipients(id,checkpoint_id,user_id)
+          SELECT 'change:'||c.id||':'||u.id,c.id,u.id FROM page_change_checkpoints c CROSS JOIN user u
+          WHERE c.page_id LIKE 'budget-page-%' AND u.id LIKE 'budget-user-%'`),
+        env.DB.prepare(`INSERT INTO notification_preferences(user_id,event_type,in_app,email,slack,timezone)
+          SELECT id,'page_edit',1,'digest','digest','UTC' FROM user WHERE id LIKE 'budget-user-%'`),
+        env.DB.prepare(`INSERT INTO outbox(id,workspace_id,topic,payload_json,available_at,created_at)
+          SELECT 'outbox:'||r.id,c.workspace_id,'notification',json_object('notificationId',r.id),?,?
+          FROM page_change_recipients r JOIN page_change_checkpoints c ON c.id=r.checkpoint_id WHERE c.page_id LIKE 'budget-page-%'`).bind(
+          timestamp,
+          timestamp,
+        ),
       ]);
-      await verifySlackDigestRecipients(
-        Array.from({ length: 10 }, (_, n) => `budget-user-${String(n + 1).padStart(2, "0")}`),
-      );
-      if (["refresh", "recovery", "contention"].includes(scenario)) {
-        await env.DB.prepare(
-          `UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?,auth_error=?,auth_error_at=?,refresh_lease_token=?,refresh_lease_until=? WHERE id='digest-budget-installation'`,
+    await verifySlackDigestRecipients(
+      Array.from({ length: 10 }, (_, n) => `budget-user-${String(n + 1).padStart(2, "0")}`),
+    );
+    if (refreshing || ["recovery", "contention"].includes(scenario)) {
+      await env.DB.prepare(
+        `UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?,auth_error=?,auth_error_at=?,refresh_lease_token=?,refresh_lease_until=? WHERE id='digest-budget-installation'`,
+      )
+        .bind(
+          await encryptSlackToken(configured, "xoxr-budget"),
+          refreshing ? "token_revoked" : null,
+          refreshing ? Date.now() - 1000 : null,
+          scenario === "contention" ? "stuck" : null,
+          Date.now() + 30_000,
         )
-          .bind(
-            await encryptSlackToken(configured, "xoxr-budget"),
-            scenario === "refresh" ? "token_revoked" : null,
-            scenario === "refresh" ? Date.now() - 1000 : null,
-            scenario === "contention" ? "stuck" : null,
-            Date.now() + 30_000,
-          )
-          .run();
-      }
-      const batchMetadata = new WeakMap<D1PreparedStatement, { statement: D1PreparedStatement; sql: string }>();
-      const wrapBudgetStatement = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => {
-        const proxy = new Proxy(statement, {
-          get(target, property) {
-            if (property === "bind") return (...args: unknown[]) => wrapBudgetStatement(target.bind(...args), sql);
-            if (scenario === "cleanup" && property === "all" && sql.includes("UPDATE deliveries SET status = ?"))
-              return async () => {
-                throw new Error("D1 cleanup unavailable");
-              };
-            const value: unknown = Reflect.get(target, property, target);
-            return typeof value === "function" ? value.bind(target) : value;
-          },
-        });
-        batchMetadata.set(proxy, { statement, sql });
-        return proxy;
-      };
-      const failingDatabase = new Proxy(env.DB, {
+        .run();
+    }
+    const batchMetadata = new WeakMap<D1PreparedStatement, { statement: D1PreparedStatement; sql: string }>();
+    const wrapBudgetStatement = (statement: D1PreparedStatement, sql: string): D1PreparedStatement => {
+      const proxy = new Proxy(statement, {
         get(target, property) {
-          if (property === "batch")
-            return async (statements: D1PreparedStatement[]) => {
-              if (
-                scenario === "finalization" &&
-                batchMetadata.get(statements[0]!)?.sql.includes("UPDATE deliveries SET status = ?")
-              )
-                throw new Error("D1 finalization unavailable");
-              return target.batch(statements.map((statement) => batchMetadata.get(statement)!.statement));
+          if (property === "bind") return (...args: unknown[]) => wrapBudgetStatement(target.bind(...args), sql);
+          if (scenario === "cleanup" && property === "all" && sql.includes("UPDATE deliveries SET status = ?"))
+            return async () => {
+              throw new Error("D1 cleanup unavailable");
             };
-          if (property === "prepare") return (sql: string) => wrapBudgetStatement(target.prepare(sql), sql);
           const value: unknown = Reflect.get(target, property, target);
           return typeof value === "function" ? value.bind(target) : value;
         },
       });
-      const { database: countedDatabase, statements: queries } = countedD1(failingDatabase);
-      const send = vi.fn(async () => {
-        if (scenario === "cleanup") throw new Error("mailbox unavailable");
-        return { messageId: "budget-email" };
-      });
-      const bindings = new Proxy(configured, {
-        get(target, property, receiver) {
-          if (property === "DB") return countedDatabase;
-          if (property === "SEND_EMAIL") return { send };
-          if (property === "EMAIL_FROM") return "notes@example.test";
-          return Reflect.get(target, property, receiver);
-        },
-      });
-      let firstSlackPayload: Record<string, unknown> | undefined;
-      const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        if (String(input).endsWith("oauth.v2.access")) {
-          if (scenario === "recovery") return Response.json({ ok: false, error: "invalid_refresh_token" });
-          return Response.json({
-            ok: true,
-            access_token: "xoxb-refreshed",
-            refresh_token: "xoxr-refreshed",
-            expires_in: 3600,
-          });
-        }
-        firstSlackPayload ??= JSON.parse(String(init?.body)) as Record<string, unknown>;
-        return scenario === "cleanup"
-          ? Response.json({ ok: false, error: "channel_not_found" })
-          : Response.json({ ok: true });
-      });
-      vi.stubGlobal("fetch", fetchMock);
+      batchMetadata.set(proxy, { statement, sql });
+      return proxy;
+    };
+    const failingDatabase = new Proxy(env.DB, {
+      get(target, property) {
+        if (property === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            if (
+              scenario === "finalization" &&
+              batchMetadata.get(statements[0]!)?.sql.includes("UPDATE deliveries SET status = ?")
+            )
+              throw new Error("D1 finalization unavailable");
+            return target.batch(statements.map((statement) => batchMetadata.get(statement)!.statement));
+          };
+        if (property === "prepare") return (sql: string) => wrapBudgetStatement(target.prepare(sql), sql);
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const { database: countedDatabase, statements: queries } = countedD1(failingDatabase);
+    const send = vi.fn(async () => {
+      if (scenario === "cleanup") throw new Error("mailbox unavailable");
+      return { messageId: "budget-email" };
+    });
+    const bindings = new Proxy(configured, {
+      get(target, property, receiver) {
+        if (property === "DB") return countedDatabase;
+        if (property === "SEND_EMAIL") return { send };
+        if (property === "EMAIL_FROM") return "notes@example.test";
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    let firstSlackPayload: Record<string, unknown> | undefined;
+    let posts = 0;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("oauth.v2.access")) {
+        if (scenario === "recovery") return Response.json({ ok: false, error: "invalid_refresh_token" });
+        return Response.json({
+          ok: true,
+          access_token: "xoxb-refreshed",
+          refresh_token: "xoxr-refreshed",
+          expires_in: 3600,
+        });
+      }
+      posts++;
+      if (scenario === "late-refresh" && posts === 9)
+        await env.DB.prepare(
+          "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='digest-budget-installation'",
+        )
+          .bind(await encryptSlackToken(configured, "xoxr-budget"))
+          .run();
+      firstSlackPayload ??= JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return scenario === "cleanup"
+        ? Response.json({ ok: false, error: "channel_not_found" })
+        : Response.json({ ok: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
-      const error = await sendDueNotificationDigests(bindings, timestamp).then(
-        () => null,
-        (failure: unknown) => failure,
-      );
-      const expectedError = expect.any(Error);
-      expect(error).toEqual(["finalization", "cleanup"].includes(scenario) ? expectedError : null);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = await sendDueNotificationDigests(bindings, timestamp).then(
+      () => null,
+      (failure: unknown) => failure,
+    );
+    const expectedError = expect.any(Error);
+    expect(error).toEqual(["finalization", "cleanup"].includes(scenario) ? expectedError : null);
 
-      const slackDispatches = scenario === "diff" ? 5 : 6;
-      expect(send).toHaveBeenCalledTimes(scenario === "diff" ? 7 : 10);
-      expect(fetchMock).toHaveBeenCalledTimes(
-        scenario === "contention"
-          ? 0
-          : scenario === "recovery"
-            ? 1
-            : slackDispatches + (scenario === "refresh" ? 1 : 0),
-      );
-      expect(typeof firstSlackPayload?.text).toBe(
-        ["contention", "recovery"].includes(scenario) ? "undefined" : "string",
-      );
-      expect(queries.length).toBeLessThanOrEqual(240);
-      const slackStart = queries.findIndex(
-        (sql) => sql.startsWith("SELECT COALESCE(preference.timezone") && sql.includes("n.slack_at"),
-      );
-      expect(slackStart).toBeGreaterThan(0);
-      expect(slackStart).toBeLessThanOrEqual(120);
-      expect(queries.length - slackStart).toBeLessThanOrEqual(120);
-      expect(queries.some((query) => /page_change_(checkpoints|recipients)/.test(query))).toBe(scenario === "diff");
-      expect(queries.filter((query) => query.includes("SET refresh_lease_token=?,refresh_lease_until=?"))).toHaveLength(
-        ["contention", "refresh", "recovery"].includes(scenario) ? 1 : 0,
-      );
-    },
-  );
+    const slackDispatches = heavy
+      ? refreshing
+        ? 1
+        : 2
+      : scenario === "diff"
+        ? 7
+        : ["refresh", "late-refresh"].includes(scenario)
+          ? 9
+          : 10;
+    expect(send).toHaveBeenCalledTimes(heavy ? 2 : scenario === "diff" ? 7 : 10);
+    expect(fetchMock).toHaveBeenCalledTimes(
+      scenario === "contention" ? 0 : scenario === "recovery" ? 1 : slackDispatches + (refreshing ? 1 : 0),
+    );
+    expect(typeof firstSlackPayload?.text).toBe(["contention", "recovery"].includes(scenario) ? "undefined" : "string");
+    expect(await env.DB.prepare("SELECT COUNT(*) count FROM deliveries WHERE channel='slack'").first()).toEqual({
+      count: ["contention", "recovery"].includes(scenario) ? 0 : slackDispatches * (heavy ? 11 : 1),
+    });
+    expect(queries.length).toBeLessThanOrEqual(240);
+    const slackStart = queries.findIndex(
+      (sql) => sql.startsWith("SELECT COALESCE(preference.timezone") && sql.includes("n.slack_at"),
+    );
+    expect(slackStart).toBeGreaterThan(0);
+    expect(slackStart).toBeLessThanOrEqual(120);
+    expect(queries.length - slackStart).toBeLessThanOrEqual(120);
+    expect(queries.some((query) => /page_change_(checkpoints|recipients)/.test(query))).toBe(diff);
+    expect(queries.filter((query) => query.includes("SET refresh_lease_token=?,refresh_lease_until=?"))).toHaveLength(
+      refreshing || ["contention", "recovery"].includes(scenario) ? 1 : 0,
+    );
+    const secondary = log.mock.calls
+      .map(([record]) => record as Record<string, unknown>)
+      .filter((record) => record.stage === "cleanup");
+    const expectedCleanupLogs = ["email", "slack"].map((channel) =>
+      expect.objectContaining({
+        event: `notification.digest_${channel}.secondary_failed`,
+        channel,
+        timezone: "UTC",
+        stage: "cleanup",
+        userId: "budget-user-01",
+        workspaceId: installed.workspaceId,
+        errorMessage: "D1 cleanup unavailable",
+      }),
+    );
+    // Each failed recipient retains one original cleanup log with the legacy event.
+    expect(secondary.length).toBe(scenario === "cleanup" ? 20 : 0);
+    expect(secondary.slice(0, 1).concat(secondary.slice(10, 11))).toEqual(
+      scenario === "cleanup" ? expectedCleanupLogs : [],
+    );
+    let lateRetry;
+    if (scenario === "late-refresh") {
+      const cursor = await env.DB.prepare(
+        "SELECT user_id FROM digest_delivery_cursors WHERE channel='slack' AND timezone='UTC'",
+      ).first();
+      const claims = await env.DB.prepare(
+        "SELECT count(*) count FROM deliveries WHERE channel='slack' AND idempotency_key='outbox:budget-notification-10:slack'",
+      ).first();
+      await sendDueNotificationDigests(bindings, timestamp + 15 * 60_000);
+      lateRetry = {
+        cursor,
+        claims,
+        posts,
+        notification: await env.DB.prepare(
+          "SELECT slack_at IS NOT NULL delivered FROM notifications WHERE id='budget-notification-10'",
+        ).first(),
+      };
+    }
+    expect(lateRetry).toEqual(
+      scenario === "late-refresh"
+        ? { cursor: { user_id: "budget-user-09" }, claims: { count: 0 }, posts: 10, notification: { delivered: 1 } }
+        : undefined,
+    );
+  });
 
-  it.each(["rate", "contention", "installation-change", "network", "timeout", "http", "malformed", "recovery"])(
-    "defers only the affected Slack workspace (%s) and retries it on a later tick",
-    async (reason) => {
-      const installed = await bootstrap();
-      const timestamp = Date.UTC(2026, 8, 5, 9, 5);
-      const configured = slackEnv();
-      const [firstToken, secondToken] = await Promise.all([
-        encryptSlackToken(configured, "xoxb-rate-limited"),
-        encryptSlackToken(configured, "xoxb-available"),
-      ]);
-      await env.DB.batch([
-        env.DB.prepare(
-          `INSERT INTO workspaces (id, name, created_at) VALUES ('rate-workspace-two', 'Second workspace', ?)`,
-        ).bind(timestamp),
-        env.DB.prepare(
-          `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES
+  it.each([
+    "rate",
+    "contention",
+    "installation-change",
+    "network",
+    "timeout",
+    "http",
+    "malformed",
+    "recovery",
+    "invalid_auth",
+    "token_revoked",
+  ])("defers only the affected Slack workspace (%s) and retries it on a later tick", async (reason) => {
+    const installed = await bootstrap();
+    const timestamp = Date.UTC(2026, 8, 5, 9, 5);
+    const configured = slackEnv();
+    const [firstToken, secondToken] = await Promise.all([
+      encryptSlackToken(configured, "xoxb-rate-limited"),
+      encryptSlackToken(configured, "xoxb-available"),
+    ]);
+    await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO workspaces (id, name, created_at) VALUES ('rate-workspace-two', 'Second workspace', ?)`,
+      ).bind(timestamp),
+      env.DB.prepare(
+        `INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES
           ('rate-user-a', 'Rate A', 'rate-a@example.test', 1, ?, ?),
           ('rate-user-b', 'Rate B', 'rate-b@example.test', 1, ?, ?),
           ('rate-user-c', 'Rate C', 'rate-c@example.test', 1, ?, ?)`,
-        ).bind(timestamp, timestamp, timestamp, timestamp, timestamp, timestamp),
-        env.DB.prepare(
-          `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES
+      ).bind(timestamp, timestamp, timestamp, timestamp, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO workspace_members (workspace_id, user_id, role, created_at) VALUES
           (?, 'rate-user-a', 'viewer', ?),
           (?, 'rate-user-b', 'viewer', ?),
           ('rate-workspace-two', ?, 'owner', ?),
           ('rate-workspace-two', 'rate-user-c', 'viewer', ?)`,
-        ).bind(
-          installed.workspaceId,
-          timestamp,
-          installed.workspaceId,
-          timestamp,
-          installed.userId,
-          timestamp,
-          timestamp,
-        ),
-        env.DB.prepare(
-          `INSERT INTO pages
+      ).bind(
+        installed.workspaceId,
+        timestamp,
+        installed.workspaceId,
+        timestamp,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO pages
           (id, workspace_id, kind, position, title, created_by, created_at, updated_at, space_id)
          VALUES ('rate-page-two', 'rate-workspace-two', 'document', 'a0', 'Second page', ?, ?, ?,
                  'rate-workspace-two-general')`,
-        ).bind(installed.userId, timestamp, timestamp),
-        env.DB.prepare(
-          `INSERT INTO slack_installations
+      ).bind(installed.userId, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO slack_installations
           (id, workspace_id, team_id, team_name, bot_user_id, bot_token_ciphertext, scopes,
            installed_by, created_at, updated_at)
          VALUES
           ('rate-installation-one', ?, 'TRATE1', 'Rate limited', 'BRATE1', ?, 'chat:write', ?, ?, ?),
           ('rate-installation-two', 'rate-workspace-two', 'TRATE2', 'Available', 'BRATE2', ?, 'chat:write', ?, ?, ?)`,
-        ).bind(
-          installed.workspaceId,
-          firstToken,
-          installed.userId,
-          timestamp,
-          timestamp,
-          secondToken,
-          installed.userId,
-          timestamp,
-          timestamp,
-        ),
-        env.DB.prepare(
-          `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation) VALUES
+      ).bind(
+        installed.workspaceId,
+        firstToken,
+        installed.userId,
+        timestamp,
+        timestamp,
+        secondToken,
+        installed.userId,
+        timestamp,
+        timestamp,
+      ),
+      env.DB.prepare(
+        `INSERT INTO slack_user_links (installation_id, user_id, slack_user_id, linked_at,security_generation) VALUES
           ('rate-installation-one', 'rate-user-a', 'URATEA', ?,0),
           ('rate-installation-one', 'rate-user-b', 'URATEB', ?,0),
           ('rate-installation-two', 'rate-user-c', 'URATEC', ?,0)`,
-        ).bind(timestamp, timestamp, timestamp),
-        env.DB.prepare(
-          `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone) VALUES
+      ).bind(timestamp, timestamp, timestamp),
+      env.DB.prepare(
+        `INSERT INTO notification_preferences (user_id, event_type, in_app, email, slack, timezone) VALUES
           ('rate-user-a', 'mention', 1, 'digest', 'digest', 'UTC'),
           ('rate-user-b', 'mention', 1, 'digest', 'digest', 'UTC'),
           ('rate-user-c', 'mention', 1, 'digest', 'digest', 'UTC')`,
-        ),
-        env.DB.prepare(
-          `INSERT INTO notifications
+      ),
+      env.DB.prepare(
+        `INSERT INTO notifications
           (id, workspace_id, user_id, event_type, actor_id, space_id, page_id, data_json, dedupe_key, created_at)
          VALUES
           ('rate-notification-a', ?, 'rate-user-a', 'mention', ?, ?, ?, '{}', 'rate-a', ?),
           ('rate-notification-b', ?, 'rate-user-b', 'mention', ?, ?, ?, '{}', 'rate-b', ?),
           ('rate-notification-c', 'rate-workspace-two', 'rate-user-c', 'mention', ?,
            'rate-workspace-two-general', 'rate-page-two', '{}', 'rate-c', ?)`,
-        ).bind(
-          installed.workspaceId,
-          installed.userId,
-          installed.page.spaceId,
-          installed.page.id,
-          timestamp - 10 * 60_000,
-          installed.workspaceId,
-          installed.userId,
-          installed.page.spaceId,
-          installed.page.id,
-          timestamp - 10 * 60_000,
-          installed.userId,
-          timestamp - 10 * 60_000,
-        ),
-        env.DB.prepare(
-          `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
+      ).bind(
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 10 * 60_000,
+        installed.workspaceId,
+        installed.userId,
+        installed.page.spaceId,
+        installed.page.id,
+        timestamp - 10 * 60_000,
+        installed.userId,
+        timestamp - 10 * 60_000,
+      ),
+      env.DB.prepare(
+        `INSERT INTO outbox (id, workspace_id, topic, payload_json, available_at, created_at)
          SELECT 'outbox:' || id, workspace_id, 'notification', json_object('notificationId', id), ?, ?
            FROM notifications WHERE id LIKE 'rate-notification-%'`,
-        ).bind(timestamp, timestamp),
-      ]);
-      await verifySlackDigestRecipients(["rate-user-a", "rate-user-b", "rate-user-c"]);
-      const now = vi.spyOn(Date, "now").mockReturnValue(timestamp);
-      if (reason !== "rate")
-        await env.DB.prepare(
-          `UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?,refresh_lease_token=?,refresh_lease_until=? WHERE id='rate-installation-one'`,
+      ).bind(timestamp, timestamp),
+    ]);
+    await verifySlackDigestRecipients(["rate-user-a", "rate-user-b", "rate-user-c"]);
+    const now = vi.spyOn(Date, "now").mockReturnValue(timestamp);
+    if (!["rate", "invalid_auth", "token_revoked"].includes(reason))
+      await env.DB.prepare(
+        `UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=?,refresh_lease_token=?,refresh_lease_until=? WHERE id='rate-installation-one'`,
+      )
+        .bind(
+          await encryptSlackToken(configured, "xoxr-old"),
+          reason === "contention" ? "crashed" : null,
+          timestamp + 30_000,
         )
-          .bind(
-            await encryptSlackToken(configured, "xoxr-old"),
-            reason === "contention" ? "crashed" : null,
-            timestamp + 30_000,
-          )
-          .run();
-      const counter = countedD1(env.DB);
-      const email = vi.fn(async () => ({ messageId: "healthy-email" }));
-      const metric = vi.fn();
-      const bindings: Env = {
-        ...configured,
-        DB: counter.database,
-        SEND_EMAIL: { send: email } as NonNullable<Env["SEND_EMAIL"]>,
-        EMAIL_FROM: "notes@example.test",
-        OBSERVABILITY: { writeDataPoint: metric } as NonNullable<Env["OBSERVABILITY"]>,
-      };
-      const channels: string[] = [];
-      let recovered = false;
-      let changed = false;
-      const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        if (String(input).endsWith("oauth.v2.access")) {
-          if (!recovered) {
-            if (reason === "network") throw new TypeError("network unavailable");
-            if (reason === "timeout") throw new DOMException("timed out", "TimeoutError");
-            if (reason === "http") return Response.json({ ok: false, error: "service_unavailable" }, { status: 503 });
-            if (reason === "malformed") return Response.json(null);
-            if (reason === "recovery") return Response.json({ ok: false, error: "invalid_refresh_token" });
-            if (reason === "installation-change" && !changed) {
-              changed = true;
-              await env.DB.prepare(
-                "UPDATE slack_installations SET generation=generation+1 WHERE id='rate-installation-one'",
-              ).run();
-            }
+        .run();
+    const counter = countedD1(env.DB);
+    const email = vi.fn(async () => ({ messageId: "healthy-email" }));
+    const metric = vi.fn();
+    const bindings: Env = {
+      ...configured,
+      DB: counter.database,
+      SEND_EMAIL: { send: email } as NonNullable<Env["SEND_EMAIL"]>,
+      EMAIL_FROM: "notes@example.test",
+      OBSERVABILITY: { writeDataPoint: metric } as NonNullable<Env["OBSERVABILITY"]>,
+    };
+    const channels: string[] = [];
+    let recovered = false;
+    let changed = false;
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith("oauth.v2.access")) {
+        if (!recovered) {
+          if (reason === "network") throw new TypeError("network unavailable");
+          if (reason === "timeout") throw new DOMException("timed out", "TimeoutError");
+          if (reason === "http") return Response.json({ ok: false, error: "service_unavailable" }, { status: 503 });
+          if (reason === "malformed") return Response.json(null);
+          if (reason === "recovery") return Response.json({ ok: false, error: "invalid_refresh_token" });
+          if (reason === "installation-change" && !changed) {
+            changed = true;
+            await env.DB.prepare(
+              "UPDATE slack_installations SET generation=generation+1 WHERE id='rate-installation-one'",
+            ).run();
           }
-          return Response.json({
-            ok: true,
-            access_token: "xoxb-retried",
-            refresh_token: "xoxr-retried",
-            expires_in: 3600,
-          });
         }
-        channels.push(JSON.parse(String(init?.body)).channel as string);
-        const authorization = new Headers(init?.headers).get("authorization");
-        return reason === "rate" && authorization === "Bearer xoxb-rate-limited" && !recovered
-          ? Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } })
-          : Response.json({ ok: true });
-      });
-      vi.stubGlobal("fetch", fetchMock);
-      const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
-      await executeScheduledTasks(bindings, createExecutionContext(), [
-        { name: "notification_digests", run: () => sendDueNotificationDigests(bindings, timestamp) },
-      ]);
-      expect(email).toHaveBeenCalledTimes(3);
-      expect(counter.statements.length).toBeLessThanOrEqual(240);
-      expect(
-        counter.statements.filter((sql) => sql.includes("SET refresh_lease_token=?,refresh_lease_until=?")),
-      ).toHaveLength(reason === "rate" ? 0 : 1);
-      expect(
-        counter.statements.filter((sql) => sql.includes("SELECT * FROM slack_installations WHERE id=?")),
-      ).toHaveLength(["contention", "recovery"].includes(reason) ? 1 : 0);
-      const integration = metric.mock.calls
-        .map(([point]) => point as { indexes: string[]; blobs: string[] })
-        .filter((point) => point.indexes[0] === "integration.call" && point.blobs[1] === "notifications");
-      expect(integration).toHaveLength(1);
-      expect(integration[0]!.blobs[3]).toBe(
-        ["contention", "installation-change"].includes(reason) ? "skipped" : "failure",
-      );
+        return Response.json({
+          ok: true,
+          access_token: "xoxb-retried",
+          refresh_token: "xoxr-retried",
+          expires_in: 3600,
+        });
+      }
+      channels.push(JSON.parse(String(init?.body)).channel as string);
+      const authorization = new Headers(init?.headers).get("authorization");
+      if (authorization === "Bearer xoxb-rate-limited" && !recovered) {
+        if (reason === "rate")
+          return Response.json({ ok: false, error: "ratelimited" }, { status: 429, headers: { "retry-after": "30" } });
+        if (["invalid_auth", "token_revoked"].includes(reason)) return Response.json({ ok: false, error: reason });
+      }
+      return Response.json({ ok: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await executeScheduledTasks(bindings, createExecutionContext(), [
+      { name: "notification_digests", run: () => sendDueNotificationDigests(bindings, timestamp) },
+    ]);
+    expect(email).toHaveBeenCalledTimes(3);
+    expect(counter.statements.length).toBeLessThanOrEqual(240);
+    expect(
+      counter.statements.filter((sql) => sql.includes("SET refresh_lease_token=?,refresh_lease_until=?")),
+    ).toHaveLength(["rate", "invalid_auth", "token_revoked"].includes(reason) ? 0 : 1);
+    expect(
+      counter.statements.filter((sql) => sql.includes("SELECT * FROM slack_installations WHERE id=?")),
+    ).toHaveLength(["contention", "recovery"].includes(reason) ? 1 : 0);
+    const integration = metric.mock.calls
+      .map(([point]) => point as { indexes: string[]; blobs: string[] })
+      .filter((point) => point.indexes[0] === "integration.call" && point.blobs[1] === "notifications");
+    expect(integration).toHaveLength(1);
+    expect(integration[0]!.blobs[3]).toBe(
+      ["contention", "installation-change"].includes(reason) ? "skipped" : "failure",
+    );
 
-      expect(channels).toEqual(reason === "rate" ? ["URATEA", "URATEC"] : ["URATEC"]);
-      expect(
-        await env.DB.prepare(
-          `SELECT id, slack_at IS NOT NULL delivered FROM notifications
+    expect(channels).toEqual(
+      ["rate", "invalid_auth", "token_revoked"].includes(reason) ? ["URATEA", "URATEC"] : ["URATEC"],
+    );
+    expect(
+      await env.DB.prepare(
+        `SELECT id, slack_at IS NOT NULL delivered FROM notifications
           WHERE id LIKE 'rate-notification-%' ORDER BY id`,
-        ).all(),
-      ).toMatchObject({
-        results: [
-          { id: "rate-notification-a", delivered: 0 },
-          { id: "rate-notification-b", delivered: 0 },
-          { id: "rate-notification-c", delivered: 1 },
-        ],
-      });
+      ).all(),
+    ).toMatchObject({
+      results: [
+        { id: "rate-notification-a", delivered: 0 },
+        { id: "rate-notification-b", delivered: 0 },
+        { id: "rate-notification-c", delivered: 1 },
+      ],
+    });
 
-      now.mockReturnValue(timestamp + 15_000);
-      await sendDueNotificationDigests(bindings, timestamp + 15_000);
-      expect(channels).toEqual(reason === "rate" ? ["URATEA", "URATEC"] : ["URATEC"]);
+    now.mockReturnValue(timestamp + 15_000);
+    await sendDueNotificationDigests(bindings, timestamp + 15_000);
+    expect(channels).toEqual(
+      ["invalid_auth", "token_revoked"].includes(reason)
+        ? ["URATEA", "URATEC", "URATEA"]
+        : reason === "rate"
+          ? ["URATEA", "URATEC"]
+          : ["URATEC"],
+    );
+    recovered = true;
+    expect(
+      await env.DB.prepare("SELECT auth_error FROM slack_installations WHERE id='rate-installation-one'").first(),
+    ).toEqual({ auth_error: ["invalid_auth", "token_revoked"].includes(reason) ? reason : null });
+    if (["invalid_auth", "token_revoked"].includes(reason))
+      await env.DB.prepare(
+        "UPDATE slack_installations SET auth_error=NULL,auth_error_at=NULL WHERE id='rate-installation-one'",
+      ).run();
+    if (reason === "installation-change")
+      await env.DB.prepare(
+        `UPDATE slack_user_links SET installation_generation=(SELECT generation FROM slack_installations WHERE id=installation_id) WHERE installation_id='rate-installation-one'`,
+      ).run();
+    now.mockReturnValue(timestamp + 15 * 60_000);
+    await sendDueNotificationDigests(bindings, timestamp + 15 * 60_000);
 
-      recovered = true;
-      if (reason === "installation-change")
-        await env.DB.prepare(
-          `UPDATE slack_user_links SET installation_generation=(SELECT generation FROM slack_installations WHERE id=installation_id) WHERE installation_id='rate-installation-one'`,
-        ).run();
-      now.mockReturnValue(timestamp + 15 * 60_000);
-      await sendDueNotificationDigests(bindings, timestamp + 15 * 60_000);
-
-      expect(channels).toEqual(
-        reason === "rate" ? ["URATEA", "URATEC", "URATEA", "URATEB"] : ["URATEC", "URATEA", "URATEB"],
-      );
-      expect(
-        await env.DB.prepare(
-          `SELECT COUNT(*) delivered FROM notifications
+    expect(channels).toEqual(
+      ["invalid_auth", "token_revoked"].includes(reason)
+        ? ["URATEA", "URATEC", "URATEA", "URATEA", "URATEB"]
+        : reason === "rate"
+          ? ["URATEA", "URATEC", "URATEA", "URATEB"]
+          : ["URATEC", "URATEA", "URATEB"],
+    );
+    expect(
+      await env.DB.prepare(
+        `SELECT COUNT(*) delivered FROM notifications
           WHERE id LIKE 'rate-notification-%' AND slack_at IS NOT NULL`,
-        ).first(),
-      ).toEqual({ delivered: 3 });
-      log.mockRestore();
-    },
-  );
+      ).first(),
+    ).toEqual({ delivered: 3 });
+    log.mockRestore();
+  });
 
   it.each([
     ...(["email", "slack"] as const).flatMap((channel) =>
@@ -1628,6 +1753,7 @@ describe("notification feed and subscriptions", () => {
       ),
     ),
     { channel: "slack" as const, failure: "dispatch-database" as const },
+    { channel: "slack" as const, failure: "token-database" as const },
     { channel: "slack" as const, failure: "identity-revoked" as const },
     { channel: "slack" as const, failure: "identity-cleanup" as const },
   ])(
@@ -1743,7 +1869,9 @@ describe("notification feed and subscriptions", () => {
                 ((failure === "preparation" &&
                   sql.startsWith("WITH eligible") &&
                   sql.includes(channel === "email" ? "n.emailed_at" : "n.slack_at")) ||
-                  (failure === "dispatch-database" && sql.includes("SELECT link.slack_user_id,link.linked_at")))
+                  (failure === "dispatch-database" &&
+                    sql.includes("SELECT 1 FROM slack_authorized_user_links link WHERE")) ||
+                  (failure === "token-database" && sql.includes("SELECT link.slack_user_id,link.linked_at")))
               ) {
                 failed = true;
                 throw injected;
@@ -1834,7 +1962,7 @@ describe("notification feed and subscriptions", () => {
         .bind(`outbox:recovery-notification-recovery-a:${channel}`)
         .first();
       expect(first).toEqual(
-        failure === "preparation"
+        failure === "preparation" || failure === "token-database"
           ? null
           : {
               status:
@@ -1962,6 +2090,7 @@ describe("notification feed and subscriptions", () => {
           channel,
           timezone: "UTC",
           phase: "candidates",
+          event: `notification.digest_${channel}.infrastructure_failed`,
           message: "Digest candidate loading failed.",
           errorMessage: "candidate read unavailable",
         }),
@@ -1971,6 +2100,7 @@ describe("notification feed and subscriptions", () => {
           channel,
           timezone: "UTC",
           phase: "cursor",
+          event: `notification.digest_${channel}.secondary_failed`,
           message: "Digest cursor save failed.",
           errorMessage: "cursor write unavailable",
         }),

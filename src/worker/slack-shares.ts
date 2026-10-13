@@ -10,7 +10,7 @@ import { unfurlBlocks } from "./slack-blocks";
 import { round2Installation } from "./slack-channels";
 import { channelInvalidReason } from "./slack-schedule";
 import { reconcileBotPost } from "./slack-digests";
-import { slackApi, SlackApiError, SlackRateLimitError } from "./slack";
+import { slackTokenPreparationFailure, slackApi, SlackApiError, SlackRateLimitError } from "./slack";
 import { DeliveryInProgressError } from "./notifications";
 
 type Refresh = {
@@ -245,6 +245,7 @@ export async function deliverShareRefresh(
     } catch (error) {
       await recordSecondarySlackError("record", { id }, () => recordDeliveryError(env, installation, error));
       if (
+        slackTokenPreparationFailure(error) ||
         !(error instanceof SlackApiError) ||
         ["invalid_auth", "token_revoked", "account_inactive", "missing_scope"].includes(error.code)
       )
@@ -312,7 +313,11 @@ export async function deliverShareRefresh(
           unfurl_media: false,
         });
       } catch (postError) {
-        if (postError instanceof SlackRateLimitError || definiteSlackRejection(postError))
+        if (
+          postError instanceof SlackRateLimitError ||
+          slackTokenPreparationFailure(postError) ||
+          definiteSlackRejection(postError)
+        )
           await withSlackPrimaryError(postError, "handle_error", { id }, () =>
             env.DB.prepare(
               `UPDATE slack_share_refreshes SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,

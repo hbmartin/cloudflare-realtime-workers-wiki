@@ -158,6 +158,19 @@ export class SlackApiError extends Error {
   }
 }
 
+export class SlackTokenRefreshError extends SlackApiError {
+  constructor(code: string, status: number, credentialRevision: number, cause?: unknown) {
+    super("oauth.v2.access", code, status, credentialRevision, [], cause);
+    this.name = "SlackTokenRefreshError";
+  }
+}
+
+export const slackTokenPreparationFailure = (error: unknown): boolean =>
+  (error instanceof SlackApiError && error.method === "oauth.v2.access") ||
+  error instanceof SlackTokenRefreshInProgressError ||
+  error instanceof SlackInstallationChangedError ||
+  (error instanceof SlackRateLimitError && error.method === "oauth.v2.access");
+
 const INSTALLATION_ERRORS = new Set(["invalid_auth", "token_revoked", "account_inactive", "invalid_refresh_token"]);
 const CHANNEL_ERRORS = new Set([
   "channel_not_found",
@@ -169,13 +182,13 @@ const CHANNEL_ERRORS = new Set([
 export const slackInstallationError = (error: unknown): boolean =>
   error instanceof SlackApiError && INSTALLATION_ERRORS.has(error.code);
 export const slackMissingScope = (error: unknown): error is SlackApiError =>
-  error instanceof SlackApiError && error.code === "missing_scope";
+  error instanceof SlackApiError && error.method !== "oauth.v2.access" && error.code === "missing_scope";
 export const slackHasScopes = (scopes: string, required: readonly string[]): boolean => {
   const granted = new Set(scopes.split(",").map((scope) => scope.trim()));
   return required.every((scope) => granted.has(scope));
 };
 export const slackChannelError = (error: unknown): boolean =>
-  error instanceof SlackApiError && CHANNEL_ERRORS.has(error.code);
+  error instanceof SlackApiError && error.method !== "oauth.v2.access" && CHANNEL_ERRORS.has(error.code);
 
 export async function recordSlackInstallationError(
   env: Env,
@@ -436,6 +449,7 @@ async function encryptionKey(env: Env) {
 export function definiteSlackRejection(error: unknown): error is SlackApiError {
   return (
     error instanceof SlackApiError &&
+    error.method !== "oauth.v2.access" &&
     error.status < 500 &&
     ![
       "http_error",
@@ -1442,6 +1456,7 @@ export async function usableBotToken(
   installation: SlackInstallation,
   signal?: AbortSignal,
   tokenRefreshMode: TokenRefreshMode = "wait",
+  beforeRefresh?: () => void,
 ) {
   signal?.throwIfAborted();
   if (installation.token_expires_at === null || installation.token_expires_at > Date.now() + 60_000) {
@@ -1449,8 +1464,10 @@ export async function usableBotToken(
   }
   if (!Number.isSafeInteger(installation.generation))
     throw new Error("Slack installation generation is unavailable for token refresh.");
+  beforeRefresh?.();
+  await checkSlackCooldown(env, installation, "oauth.v2.access");
   if (!installation.bot_refresh_token_ciphertext) {
-    throw new SlackApiError("oauth.v2.access", "invalid_auth", 401, installation.credential_revision);
+    throw new SlackTokenRefreshError("invalid_auth", 401, installation.credential_revision);
   }
   const oldCiphertext = installation.bot_token_ciphertext;
   const leaseToken = crypto.randomUUID();
@@ -1507,17 +1524,20 @@ export async function usableBotToken(
       signal: AbortSignal.timeout(SLACK_FETCH_TIMEOUT_MS),
     }).catch((cause: unknown) => {
       if (isTimeoutAbort(cause) || cause instanceof TypeError)
-        throw new SlackApiError(
-          "oauth.v2.access",
+        throw new SlackTokenRefreshError(
           isTimeoutAbort(cause) ? "timeout" : "network_error",
           isTimeoutAbort(cause) ? 504 : 503,
           installation.credential_revision,
-          [],
           cause,
         );
       throw cause;
     });
-    let result: { ok: boolean; error?: string; access_token?: string; refresh_token?: string; expires_in?: number };
+    if (response.status === 429) {
+      const error = slackRateLimit(response, "oauth.v2.access");
+      await saveSlackCooldown(env, installation, error);
+      throw error;
+    }
+    let result: { ok: boolean; error?: string; access_token?: string; refresh_token?: string; expires_in?: unknown };
     try {
       result = await response.json<typeof result>();
       if (
@@ -1527,21 +1547,18 @@ export async function usableBotToken(
         typeof result.ok !== "boolean" ||
         (result.error !== undefined && (typeof result.error !== "string" || !/^[a-z0-9_]{1,64}$/.test(result.error))) ||
         (result.ok && (typeof result.access_token !== "string" || !result.access_token)) ||
-        (result.refresh_token !== undefined && (typeof result.refresh_token !== "string" || !result.refresh_token)) ||
-        (result.expires_in !== undefined && (!Number.isSafeInteger(result.expires_in) || result.expires_in <= 0))
+        (result.refresh_token !== undefined && (typeof result.refresh_token !== "string" || !result.refresh_token))
       )
         throw new Error("Invalid OAuth refresh response shape.");
     } catch (cause) {
-      throw new SlackApiError(
-        "oauth.v2.access",
-        "invalid_response",
-        response.status,
-        installation.credential_revision,
-        [],
-        cause,
-      );
+      throw new SlackTokenRefreshError("invalid_response", response.status, installation.credential_revision, cause);
     }
     if (!response.ok || !result.ok) {
+      if (result.error === "ratelimited") {
+        const error = slackRateLimit(response, "oauth.v2.access");
+        await saveSlackCooldown(env, installation, error);
+        throw error;
+      }
       if (result.error === "invalid_refresh_token") {
         // A worker from the previous deployment may still have won the refresh.
         for (let attempt = 0; attempt < (tokenRefreshMode === "defer" ? 1 : 15); attempt++) {
@@ -1556,8 +1573,7 @@ export async function usableBotToken(
           }
           if (tokenRefreshMode === "wait") await new Promise((resolve) => setTimeout(resolve, 200));
         }
-        const error = new SlackApiError(
-          "oauth.v2.access",
+        const error = new SlackTokenRefreshError(
           "invalid_refresh_token",
           response.status,
           installation.credential_revision,
@@ -1567,8 +1583,7 @@ export async function usableBotToken(
         if (tokenRefreshMode === "wait") await recordSlackInstallationError(env, installation.id, error);
         throw error;
       }
-      throw new SlackApiError(
-        "oauth.v2.access",
+      throw new SlackTokenRefreshError(
         result.error ?? (response.ok ? "invalid_response" : "http_error"),
         response.status,
         installation.credential_revision,
@@ -1579,7 +1594,19 @@ export async function usableBotToken(
     const refreshTokenCiphertext = result.refresh_token
       ? await encryptSlackToken(env, result.refresh_token)
       : installation.bot_refresh_token_ciphertext;
-    const expiresAt = result.expires_in ? updatedAt + result.expires_in * 1000 : null;
+    const validExpiry =
+      typeof result.expires_in === "number" &&
+      Number.isSafeInteger(result.expires_in) &&
+      result.expires_in > 0 &&
+      Number.isSafeInteger(updatedAt + result.expires_in * 1000);
+    const expiresAt = updatedAt + (validExpiry ? (result.expires_in as number) * 1000 : 300_000);
+    if (!validExpiry)
+      logger.warn(
+        "slack.token_refresh.expiry_invalid",
+        "slack",
+        "Slack refresh expiry is invalid; using five minutes.",
+        { installationId: installation.id, credentialRevision: installation.credential_revision },
+      );
     const [before, updated] = await env.DB.batch([
       env.DB.prepare(
         `SELECT auth_error FROM slack_installations WHERE id=? AND generation=? AND bot_token_ciphertext=?`,
@@ -1656,6 +1683,35 @@ export type SlackApiOptions<Method extends SlackApiMethod> = {
   onDispatch?: () => void;
 };
 
+async function checkSlackCooldown(env: Env, installation: SlackInstallation, method: string) {
+  const cooldown = await env.DB.prepare(`SELECT retry_at FROM slack_method_cooldowns
+    WHERE installation_id=? AND installation_generation=? AND method=? AND retry_at>?`)
+    .bind(installation.id, installation.generation, method, Date.now())
+    .first<{ retry_at: number }>();
+  if (cooldown)
+    throw new SlackRateLimitError(Math.ceil((cooldown.retry_at - Date.now()) / 1000), method, cooldown.retry_at);
+}
+
+function slackRateLimit(response: Response, method: string) {
+  const raw = response.headers.get("retry-after")?.trim() ?? "";
+  const seconds = /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : NaN;
+  const now = Date.now();
+  const date = /^[A-Za-z]{3}, /.test(raw) ? Date.parse(raw) : NaN;
+  const retryAt = Number.isFinite(seconds)
+    ? now + Math.max(1, seconds) * 1000
+    : Number.isFinite(date)
+      ? Math.max(now + 1000, date)
+      : now + 1000;
+  return new SlackRateLimitError(Math.max(1, Math.min(300, Math.ceil((retryAt - now) / 1000))), method, retryAt);
+}
+
+async function saveSlackCooldown(env: Env, installation: SlackInstallation, error: SlackRateLimitError) {
+  await env.DB.prepare(`INSERT INTO slack_method_cooldowns(installation_id,installation_generation,method,retry_at)
+    VALUES(?,?,?,?) ON CONFLICT(installation_id,installation_generation,method) DO UPDATE SET retry_at=max(retry_at,excluded.retry_at)`)
+    .bind(installation.id, installation.generation, error.method, error.retryAt)
+    .run();
+}
+
 export async function slackApi<Method extends SlackApiMethod>(
   env: Env,
   installation: SlackInstallation,
@@ -1663,12 +1719,7 @@ export async function slackApi<Method extends SlackApiMethod>(
   payload: SlackApiContracts[Method]["input"],
   options: SlackApiOptions<Method> = {},
 ): Promise<SlackApiContracts[Method]["output"]> {
-  const cooldown = await env.DB.prepare(`SELECT retry_at FROM slack_method_cooldowns
-    WHERE installation_id=? AND installation_generation=? AND method=? AND retry_at>?`)
-    .bind(installation.id, installation.generation, method, Date.now())
-    .first<{ retry_at: number }>();
-  if (cooldown)
-    throw new SlackRateLimitError(Math.ceil((cooldown.retry_at - Date.now()) / 1000), method, cooldown.retry_at);
+  await checkSlackCooldown(env, installation, method);
   const { timeoutMs = SLACK_FETCH_TIMEOUT_MS, signal, preparedToken, beforeDispatch, onDispatch } = options;
   const response = await traced(tracing, "notes.integration.slack", { "notes.operation": method }, async () => {
     const read = SLACK_READ_METHODS.has(method);
@@ -1702,25 +1753,9 @@ export async function slackApi<Method extends SlackApiMethod>(
   });
   const credentialRevision = installation.credential_revision;
   if (response.status === 429) {
-    const raw = response.headers.get("retry-after")?.trim() ?? "";
-    const seconds = /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : NaN;
-    const now = Date.now();
-    const date = /^[A-Za-z]{3}, /.test(raw) ? Date.parse(raw) : NaN;
-    const retryAt = Number.isFinite(seconds)
-      ? now + Math.max(1, seconds) * 1000
-      : Number.isFinite(date)
-        ? Math.max(now + 1000, date)
-        : now + 1000;
-    const error = new SlackRateLimitError(
-      Math.max(1, Math.min(300, Math.ceil((retryAt - now) / 1000))),
-      method,
-      retryAt,
-    );
+    const error = slackRateLimit(response, method);
     try {
-      await env.DB.prepare(`INSERT INTO slack_method_cooldowns(installation_id,installation_generation,method,retry_at)
-      VALUES(?,?,?,?) ON CONFLICT(installation_id,installation_generation,method) DO UPDATE SET retry_at=max(retry_at,excluded.retry_at)`)
-        .bind(installation.id, installation.generation, method, retryAt)
-        .run();
+      await saveSlackCooldown(env, installation, error);
     } catch (secondary) {
       logger.error(
         "slack.cooldown.record_failed",
@@ -2057,6 +2092,43 @@ export const slackBulkCandidateSql = `e.round2_state='pending' AND e.delivered_a
   AND (${channelActivityActorAccessSql.replaceAll("event.", "e.")} OR page.archived_at IS NOT NULL OR page.space_id<>m.space_id)
   AND EXISTS(SELECT 1 FROM json_each(m.event_types_json) WHERE value=e.event_type)`;
 
+export type PersonalSlackRecipient = SlackInstallation & {
+  slack_user_id: string;
+  linkedAt: number;
+  verifiedAt: number | null;
+  accountId: string | null;
+  securityGeneration: number;
+};
+
+async function personalSlackRecipient(env: Env, userId: string, workspaceId: string) {
+  // A user linked in several workspaces must only hear about a workspace through that workspace's installation.
+  return env.DB.prepare(
+    `SELECT link.slack_user_id,link.linked_at linkedAt,link.verified_at verifiedAt,link.better_auth_account_id accountId,link.security_generation securityGeneration, installation.* FROM slack_authorized_user_links link
+       JOIN slack_installations installation ON installation.id = link.installation_id
+      WHERE link.user_id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL`,
+  )
+    .bind(userId, workspaceId)
+    .first<PersonalSlackRecipient>();
+}
+
+export type PreparedPersonalSlackNotification = {
+  userId: string;
+  installation: PersonalSlackRecipient;
+  token: string;
+};
+
+export async function preparePersonalSlackNotification(
+  env: Env,
+  userId: string,
+  workspaceId: string,
+  options: { tokenRefreshMode?: TokenRefreshMode; beforeRefresh?: () => void } = {},
+): Promise<PreparedPersonalSlackNotification | null> {
+  const installation = await personalSlackRecipient(env, userId, workspaceId);
+  if (!installation) return null;
+  const token = await usableBotToken(env, installation, undefined, options.tokenRefreshMode, options.beforeRefresh);
+  return { userId, installation, token };
+}
+
 export async function sendPersonalSlackNotification(
   env: Env,
   userId: string,
@@ -2064,60 +2136,55 @@ export async function sendPersonalSlackNotification(
   text: string,
   pageId: string,
   presentation?: { escaped: boolean; sections?: string[] },
-  options: { tokenRefreshMode?: TokenRefreshMode } = {},
+  options: { tokenRefreshMode?: TokenRefreshMode; prepared?: PreparedPersonalSlackNotification } = {},
 ) {
-  // A user linked in several workspaces must only hear about a workspace through that workspace's installation.
-  const row = await env.DB.prepare(
-    `SELECT link.slack_user_id,link.linked_at linkedAt,link.verified_at verifiedAt,link.better_auth_account_id accountId,link.security_generation securityGeneration, installation.* FROM slack_authorized_user_links link
-       JOIN slack_installations installation ON installation.id = link.installation_id
-      WHERE link.user_id = ? AND installation.workspace_id = ? AND installation.disconnected_at IS NULL`,
-  )
-    .bind(userId, workspaceId)
-    .first<
-      SlackInstallation & {
-        slack_user_id: string;
-        linkedAt: number;
-        verifiedAt: number | null;
-        accountId: string | null;
-        securityGeneration: number;
-      }
-    >();
+  const prepared = options.prepared;
+  if (prepared && (prepared.userId !== userId || prepared.installation.workspace_id !== workspaceId))
+    throw new Error("Prepared Slack recipient does not match the notification.");
+  const row = prepared?.installation ?? (await personalSlackRecipient(env, userId, workspaceId));
   if (!row) return false;
   const safeText = presentation?.escaped ? text : escapeSlackMrkdwn(text);
-  await slackApi(
-    env,
-    row,
-    "chat.postMessage",
-    {
-      channel: row.slack_user_id,
-      text: safeText,
-      blocks: presentation?.sections
-        ? presentation.sections.map((section) => ({
-            type: "section",
-            text: { type: "mrkdwn", verbatim: true, text: section },
-          }))
-        : [
-            {
+  try {
+    await slackApi(
+      env,
+      row,
+      "chat.postMessage",
+      {
+        channel: row.slack_user_id,
+        text: safeText,
+        blocks: presentation?.sections
+          ? presentation.sections.map((section) => ({
               type: "section",
-              text: {
-                type: "mrkdwn",
-                text: `${safeText}\n<${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(pageId)}|Open in NoteFlare>`,
+              text: { type: "mrkdwn", verbatim: true, text: section },
+            }))
+          : [
+              {
+                type: "section",
+                text: {
+                  type: "mrkdwn",
+                  text: `${safeText}\n<${env.BETTER_AUTH_URL}/?page=${encodeURIComponent(pageId)}|Open in NoteFlare>`,
+                },
               },
-            },
-          ],
-    },
-    {
-      ...options,
-      beforeDispatch: slackAccessAuthorization(env, row, {
-        userId,
-        slackUserId: row.slack_user_id,
-        accountId: row.accountId,
-        verifiedAt: row.verifiedAt,
-        linkedAt: row.linkedAt,
-        securityGeneration: row.securityGeneration,
-      }),
-    },
-  );
+            ],
+      },
+      {
+        ...(options.tokenRefreshMode ? { tokenRefreshMode: options.tokenRefreshMode } : {}),
+        ...(prepared ? { preparedToken: prepared.token } : {}),
+        beforeDispatch: slackAccessAuthorization(env, row, {
+          userId,
+          slackUserId: row.slack_user_id,
+          accountId: row.accountId,
+          verifiedAt: row.verifiedAt,
+          linkedAt: row.linkedAt,
+          securityGeneration: row.securityGeneration,
+        }),
+      },
+    );
+  } catch (error) {
+    if (error instanceof SlackApiError && error.method === "chat.postMessage" && slackInstallationError(error))
+      await recordSlackInstallationError(env, row.id, error, row.generation);
+    throw error;
+  }
   return true;
 }
 

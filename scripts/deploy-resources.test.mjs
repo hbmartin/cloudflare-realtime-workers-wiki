@@ -64,20 +64,118 @@ describe("portable resource intent", () => {
       provenance: "saved",
     });
     config.d1_databases[0].database_id = databaseID;
+    expect(portableResources(config, settings, "worker").find((r) => r.binding === saved.name)).toMatchObject({
+      name: type === "bucket" ? "saved-bucket" : "saved-queue",
+      provenance: "saved",
+    });
+    if (type === "bucket") config.r2_buckets[0].bucket_name = "custom-bucket";
+    else config.queues.producers[0].queue = "custom-queue";
     expect(() => portableResources(config, settings, "worker")).toThrow("differs");
     config.d1_databases[0].database_id = "00000000-0000-0000-0000-000000000000";
     if (type === "bucket") config.r2_buckets[0].bucket_name = "custom-bucket";
     else config.queues.producers[0].queue = "custom-queue";
     expect(() => portableResources(config, settings, "worker")).toThrow("differs");
   });
-  it.each([true, false])("handles missing dead-letter producers (consumer setting=%s)", (configured) => {
+  it("omits unconfigured dead-letter destinations without a producer", () => {
     const config = root();
     config.queues.producers = config.queues.producers.slice(0, 1);
-    if (!configured) delete config.queues.consumers[0].dead_letter_queue;
+    delete config.queues.consumers[0].dead_letter_queue;
     const overrides = portableOverrides(config, null, "worker", "https://example.test", {});
     expect(overrides.queues.consumers[0].queue).toBe("worker-delivery");
-    expect(overrides.queues.consumers[0].dead_letter_queue).toBe(configured ? "noteflare-delivery-dlq" : undefined);
-    expect(Object.hasOwn(overrides.queues.consumers[0], "dead_letter_queue")).toBe(configured);
+    expect(Object.hasOwn(overrides.queues.consumers[0], "dead_letter_queue")).toBe(false);
+  });
+  it("retains all #248 generated bindings with concrete source D1 and template names", () => {
+    const config = root();
+    config.d1_databases[0].database_id = databaseID;
+    const bindings = [
+      { name: "BUCKET", type: "r2_bucket", bucket_name: "wiki-attachments" },
+      { name: "DELIVERY_QUEUE", type: "queue", queue_name: "wiki-delivery" },
+      { name: "DELIVERY_DEAD_LETTER_QUEUE", type: "queue", queue_name: "wiki-delivery-dlq" },
+    ];
+    const resources = portableResources(config, { bindings }, "wiki");
+    expect(resources.map((r) => [r.name, r.provenance])).toEqual([
+      ["wiki-attachments", "saved"],
+      ["wiki-delivery", "saved"],
+      ["wiki-delivery-dlq", "saved"],
+    ]);
+    const overrides = portableOverrides(
+      config,
+      { bindings },
+      "wiki",
+      "https://example.test",
+      { database_id: databaseID },
+      resources,
+    );
+    expect(overrides.queues.consumers[0]).toMatchObject({
+      queue: "wiki-delivery",
+      dead_letter_queue: "wiki-delivery-dlq",
+    });
+  });
+  it.each(["missing", "existing", "malformed", "ambiguous", "unavailable"])(
+    "strictly validates consumer-only custom dead-letter queues (%s) before D1",
+    async (state) => {
+      const config = root();
+      config.queues.producers = config.queues.producers.slice(0, 1);
+      config.queues.consumers[0].dead_letter_queue = "custom-dlq";
+      const api = vi.fn(async (path, options) => {
+        if (path.startsWith("/r2/")) return null;
+        if (path.startsWith("/queues?")) {
+          if (!path.includes("name=custom-dlq")) return pages();
+          if (state === "unavailable") throw new Error("lookup unavailable");
+          if (state === "malformed") return {};
+          const page = Number(new URL(`https://example.test${path}`).searchParams.get("page"));
+          if (page === 1) return pages([{ queue_id: "one", queue_name: "custom-dlq-near-match" }], 1, 2);
+          return pages(
+            state === "existing"
+              ? [{ queue_id: "two", queue_name: "custom-dlq" }]
+              : state === "ambiguous"
+                ? [
+                    { queue_id: "two", queue_name: "custom-dlq" },
+                    { queue_id: "three", queue_name: "custom-dlq" },
+                  ]
+                : [],
+            2,
+            2,
+          );
+        }
+        if (path.startsWith("/d1/database?")) return [];
+        if (options?.method === "POST") return { uuid: databaseID };
+        throw new Error("Unexpected request");
+      });
+      const outcome = await portablePreparation(config, null, "worker", api).then(
+        (prepared) => ({
+          resource: prepared.resources.at(-1),
+          deadLetter: portableOverrides(
+            config,
+            null,
+            "worker",
+            "https://example.test",
+            prepared.database,
+            prepared.resources,
+          ).queues.consumers[0].dead_letter_queue,
+        }),
+        (error) => ({ error: error.message }),
+      );
+      const expectedResource = expect.objectContaining({
+        name: "custom-dlq",
+        provenance: "configured",
+        consumerOnly: true,
+      });
+      const expectedError = expect.stringMatching(/does not exist|ambiguous|lookup unavailable/);
+      expect(outcome).toEqual(
+        state === "existing" ? { resource: expectedResource, deadLetter: "custom-dlq" } : { error: expectedError },
+      );
+      expect(api.mock.calls.some(([path]) => path.startsWith("/d1/"))).toBe(state === "existing");
+    },
+  );
+  it("rejects missing template dead-letter producers before any API requests", async () => {
+    const config = root();
+    config.queues.producers = config.queues.producers.slice(0, 1);
+    const api = vi.fn();
+    await expect(portablePreparation(config, null, "worker", api)).rejects.toThrow(
+      "custom, existing dead-letter queue",
+    );
+    expect(api).not.toHaveBeenCalled();
   });
   it("fingerprints provenance and rejects obsolete manifests", () => {
     const context = { origin: "https://example.test", resources: [generated("bucket", "worker-attachments")] };
@@ -119,7 +217,9 @@ describe("generated resource provisioning", () => {
           : null
         : pages([{ queue_name: "worker-delivery", queue_id: "existing" }]),
     );
-    await expect(portablePreparation(root(), null, "worker", api)).rejects.toThrow("Configure its name explicitly");
+    await expect(portablePreparation(root(), null, "worker", api)).rejects.toThrow(
+      "configure its name and the D1 ID explicitly",
+    );
     expect(api.mock.calls.some(([path]) => path.startsWith("/d1/"))).toBe(false);
   });
   it("finds a queue collision on a short non-final page", async () => {
@@ -199,7 +299,10 @@ describe("generated resource provisioning", () => {
         () => null,
         (cause) => cause,
       );
-      const expectedError = expect.objectContaining({ message: "creation conflict" });
+      const expectedError = expect.objectContaining({
+        message: expect.stringContaining("explicitly configure"),
+        cause: expect.objectContaining({ message: "creation conflict" }),
+      });
       expect(error).toEqual(failure ? expectedError : null);
       expect(deps.upload).toHaveBeenCalledTimes(failure ? 0 : 1);
       expect(deps.health).toHaveBeenCalledTimes(failure ? 0 : 1);
@@ -213,6 +316,45 @@ describe("generated resource provisioning", () => {
       expect(operations[0]).toBe("migrate");
     },
   );
+  it("requires explicit adoption after a failed first upload and then uses saved bindings", async () => {
+    const config = root();
+    const resources = portableResources(config, null, "worker");
+    const api = vi.fn(async (path, options) => {
+      if (options?.method === "POST")
+        return path === "/r2/buckets" ? options.body : { ...options.body, queue_id: options.body.queue_name };
+      if (path.startsWith("/r2/")) return { name: "worker-attachments" };
+      return pages();
+    });
+    await expect(
+      deployPrepared(
+        { target: "production", resources },
+        {
+          migrateDatabase: () => 0,
+          provisionResources: () => createGeneratedResources(resources, api),
+          upload: () => {
+            throw new Error("upload unavailable");
+          },
+          health: vi.fn(),
+        },
+      ),
+    ).rejects.toThrow("populated D1 database ID");
+    await expect(portablePreparation(config, null, "worker", api)).rejects.toThrow("already exists");
+    config.d1_databases[0].database_id = databaseID;
+    config.r2_buckets[0].bucket_name = "worker-attachments";
+    config.queues.producers[0].queue = config.queues.consumers[0].queue = "worker-delivery";
+    config.queues.producers[1].queue = config.queues.consumers[0].dead_letter_queue = "worker-delivery-dlq";
+    api.mockClear();
+    expect(
+      (await portablePreparation(config, null, "worker", api)).resources.every((r) => r.provenance === "configured"),
+    ).toBe(true);
+    expect(api).not.toHaveBeenCalled();
+    const bindings = resources.map((r) => ({
+      name: r.binding,
+      type: r.type === "bucket" ? "r2_bucket" : "queue",
+      [r.type === "bucket" ? "bucket_name" : "queue_name"]: r.name,
+    }));
+    expect(portableResources(root(), { bindings }, "worker").every((r) => r.provenance === "saved")).toBe(true);
+  });
   it("leaves saved/configured provisioning to Wrangler and rejects malformed creation", async () => {
     const api = vi.fn();
     await createGeneratedResources(

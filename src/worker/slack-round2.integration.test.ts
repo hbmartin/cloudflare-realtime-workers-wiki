@@ -45,6 +45,7 @@ import {
   createSlackOAuthUrl,
   finishSlackOAuth,
   SlackApiError,
+  SlackTokenRefreshError,
   upsertSlackChannelSubscription,
   setSlackChannelPause,
   repairSlackChannelNotifications,
@@ -747,6 +748,95 @@ describe("channel validation and scheduling", () => {
         .first(),
     ).toEqual({ validation_state: "valid", muted_at: 1, snoozed_until: 9999999999999, mirror_enabled: 1 });
   });
+  it.each(["ratelimited", "bad_client_secret", "invalid_client_id", "not_in_channel"])(
+    "clears only erroneous OAuth notification blocks after guarded revalidation (%s)",
+    async (code) => {
+      const m = await mapping();
+      await env.DB.prepare(
+        "UPDATE slack_channel_subscriptions SET notification_blocked_at=1,notification_error=?,validation_error=NULL,validated_at=0 WHERE id=?",
+      )
+        .bind(code, m.id)
+        .run();
+      await revalidateMappings(runtime());
+      expect(
+        await env.DB.prepare(
+          "SELECT notification_blocked_at,notification_error FROM slack_channel_subscriptions WHERE id=?",
+        )
+          .bind(m.id)
+          .first(),
+      ).toEqual(
+        code === "not_in_channel"
+          ? { notification_blocked_at: 1, notification_error: code }
+          : { notification_blocked_at: null, notification_error: null },
+      );
+    },
+  );
+
+  it("preserves a concurrent channel block during OAuth-block revalidation", async () => {
+    const m = await mapping();
+    await env.DB.prepare(
+      "UPDATE slack_channel_subscriptions SET notification_blocked_at=1,notification_error='bad_client_secret',validated_at=0 WHERE id=?",
+    )
+      .bind(m.id)
+      .run();
+    const remote = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (String(input).includes("conversations.info"))
+        await env.DB.prepare(
+          "UPDATE slack_channel_subscriptions SET notification_blocked_at=2,notification_error='not_in_channel' WHERE id=?",
+        )
+          .bind(m.id)
+          .run();
+      return remote(input, init);
+    });
+    await revalidateMappings(runtime());
+    expect(
+      await env.DB.prepare(
+        "SELECT notification_blocked_at,notification_error FROM slack_channel_subscriptions WHERE id=?",
+      )
+        .bind(m.id)
+        .first(),
+    ).toEqual({ notification_blocked_at: 2, notification_error: "not_in_channel" });
+  });
+
+  it.each(["bad_client_secret", "invalid_client_id", "invalid_response", "network_error"])(
+    "never turns OAuth %s failures into permanent channel rejection",
+    async (code) => {
+      const m = await mapping();
+      const installation = (await round2Installation(runtime(), "installation"))!;
+      await recordDeliveryError(
+        runtime(),
+        installation,
+        new SlackTokenRefreshError(code, 200, installation.credential_revision),
+        m.id,
+        m.channelId,
+      );
+      expect(
+        await env.DB.prepare(
+          "SELECT validation_state,notification_blocked_at FROM slack_channel_subscriptions WHERE id=?",
+        )
+          .bind(m.id)
+          .first(),
+      ).toEqual({ validation_state: "valid", notification_blocked_at: null });
+      await env.DB.prepare(
+        "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='installation'",
+      )
+        .bind(await encryptSlackToken(runtime(), "xoxr-old"))
+        .run();
+      responses["oauth.v2.access"] = { ok: false, error: code };
+      const refreshing = (await round2Installation(runtime(), "installation"))!;
+      await expect(validateMapping(runtime(), refreshing, m.id, m.channelId)).rejects.toBeInstanceOf(
+        SlackTokenRefreshError,
+      );
+      expect(
+        await env.DB.prepare(
+          "SELECT validation_state,notification_blocked_at FROM slack_channel_subscriptions WHERE id=?",
+        )
+          .bind(m.id)
+          .first(),
+      ).toEqual({ validation_state: "valid", notification_blocked_at: null });
+    },
+  );
   it("dry-run does not mutate validation health", async () => {
     const m = await mapping();
     responses["conversations.info"] = { ok: true, channel: { ...channel, is_archived: true } };
@@ -1326,6 +1416,62 @@ describe("digests and delivery receipts", () => {
       await env.DB.prepare("SELECT state,message_ts FROM slack_digest_receipts WHERE id=?").bind(r.id).first(),
     ).toEqual({ state: "sent", message_ts: historyTimestamp });
   });
+  it.each([false, true])(
+    "retries OAuth preparation without losing an uncertain send (dispatched=%s)",
+    async (dispatched) => {
+      await mapping("immediate");
+      await page();
+      const e = (await env.DB.prepare("SELECT id FROM slack_channel_events").first<{ id: string }>())!;
+      let firstFailure: unknown = null;
+      if (dispatched) {
+        responses["chat.postMessage"] = new TypeError("response lost");
+        firstFailure = await deliverRound2ChannelEvent(runtime(), e.id).then(
+          () => null,
+          (error: unknown) => error,
+        );
+        settlePosts();
+      }
+      expect(firstFailure instanceof Error ? firstFailure.message : firstFailure).toEqual(
+        dispatched ? "Slack chat.postMessage failed." : null,
+      );
+      await env.DB.prepare(
+        "UPDATE slack_installations SET token_expires_at=1,bot_refresh_token_ciphertext=? WHERE id='installation'",
+      )
+        .bind(await encryptSlackToken(runtime(), "xoxr-old"))
+        .run();
+      responses["oauth.v2.access"] = { ok: false, error: "bad_client_secret" };
+      await expect(deliverRound2ChannelEvent(runtime(), e.id)).rejects.toBeInstanceOf(SlackTokenRefreshError);
+      expect(
+        await env.DB.prepare(
+          "SELECT round2_state,attempted_at IS NOT NULL attempted FROM slack_channel_events WHERE id=?",
+        )
+          .bind(e.id)
+          .first(),
+      ).toEqual({ round2_state: dispatched ? "sending" : "pending", attempted: dispatched ? 1 : 0 });
+      expect(await env.DB.prepare("SELECT notification_blocked_at FROM slack_channel_subscriptions").first()).toEqual({
+        notification_blocked_at: null,
+      });
+      responses["oauth.v2.access"] = {
+        ok: true,
+        access_token: "xoxb-new",
+        refresh_token: "xoxr-new",
+        expires_in: 3600,
+      };
+      responses["chat.postMessage"] = { ok: true, ts: historyTimestamp };
+      if (dispatched)
+        responses["conversations.history"] = {
+          ok: true,
+          messages: [
+            { ts: historyTimestamp, user: "B123", metadata: { event_payload: { delivery_id: `channel:${e.id}` } } },
+          ],
+        };
+      await deliverRound2ChannelEvent(runtime(), e.id);
+      expect(calls.filter((c) => c.method === "chat.postMessage")).toHaveLength(1);
+      expect(
+        await env.DB.prepare("SELECT round2_state FROM slack_channel_events WHERE id=?").bind(e.id).first(),
+      ).toEqual({ round2_state: "sent" });
+    },
+  );
   it("reconciles immediate channel sends as well", async () => {
     await mapping("immediate");
     await page();

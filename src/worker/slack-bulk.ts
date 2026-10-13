@@ -16,7 +16,7 @@ import {
   recordPermanentDeliveryFailure,
   retireObsoleteReceipt,
 } from "./slack-delivery";
-import { slackApi, SlackApiError, SlackRateLimitError, slackBulkCandidateSql } from "./slack";
+import { slackTokenPreparationFailure, slackApi, SlackRateLimitError, slackBulkCandidateSql } from "./slack";
 
 type Summary = {
   id: string;
@@ -330,7 +330,7 @@ export async function deliverBulkSummary(
       await withSlackPrimaryError(error, "handle_error", { id }, () =>
         recordDeliveryError(env, installation, error, events.results[0]?.mapping_id, row!.channel_id),
       );
-      if (error instanceof SlackApiError && error.code === "msg_too_long") {
+      if (definiteSlackRejection(error) && error.code === "msg_too_long") {
         await withSlackPrimaryError(error, "handle_error", { id }, () =>
           recordPermanentDeliveryFailure(
             env,
@@ -348,7 +348,11 @@ export async function deliverBulkSummary(
         await withSlackPrimaryError(error, "handle_error", { id }, () => finish("retired"));
         return;
       }
-      if (error instanceof SlackRateLimitError || definiteSlackRejection(error)) {
+      if (
+        error instanceof SlackRateLimitError ||
+        slackTokenPreparationFailure(error) ||
+        definiteSlackRejection(error)
+      ) {
         await withSlackPrimaryError(error, "handle_error", { id }, () =>
           env.DB.prepare(
             `UPDATE slack_bulk_receipts SET state='pending',attempted_at=NULL WHERE id=? AND claim_token=?`,

@@ -7,6 +7,7 @@ import {
   recordSlackInstallationError,
   slackInstallationError,
   definiteSlackRejection,
+  slackTokenPreparationFailure,
   type SlackInstallation,
 } from "./slack";
 
@@ -20,6 +21,7 @@ export function permanentSlackValidationError(error: string | null | undefined) 
 }
 
 export function retryableSlackError(error: unknown) {
+  if (slackTokenPreparationFailure(error)) return !slackInstallationError(error);
   return error instanceof SlackRateLimitError || (error instanceof SlackApiError && !definiteSlackRejection(error));
 }
 
@@ -35,6 +37,7 @@ export async function recordDeliveryError(
     await recordSlackInstallationError(env, installation.id, error, installation.generation);
     return;
   }
+  if (slackTokenPreparationFailure(error)) return;
   if (["missing_scope", "msg_too_long"].includes(error.code)) return;
   if (mappingId && channelId && definiteSlackRejection(error)) {
     await env.DB.prepare(`UPDATE slack_channel_subscriptions SET notification_blocked_at=coalesce(notification_blocked_at,?),notification_error=?

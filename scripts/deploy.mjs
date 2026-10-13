@@ -6,13 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { unstable_readConfig } from "wrangler";
-import {
-  emptyDatabaseSchema,
-  emptyMigrationHistory,
-  internalTables,
-  main as migrate,
-  queryRows,
-} from "./migrate-d1.mjs";
+import { emptyDatabaseSchema, emptyMigrationHistory, main as migrate, queryRows } from "./migrate-d1.mjs";
 
 const require = createRequire(import.meta.url);
 const manifestPath = ".wrangler/noteflare-build.json";
@@ -213,7 +207,7 @@ export function portableResources(config, settings, name) {
     if (matches.length && (typeof saved !== "string" || !saved)) throw new Error(`Invalid saved ${binding} name.`);
     const suffix = templateSuffixes.get(`${type}:${configured}`);
     const explicit = provisioned || !suffix;
-    if (saved && explicit && saved !== configured)
+    if (saved && !suffix && saved !== configured)
       throw new Error(
         `${binding} differs from the existing deployment. Update the portable configuration explicitly before retrying.`,
       );
@@ -225,16 +219,34 @@ export function portableResources(config, settings, name) {
       ...(jurisdiction ? { jurisdiction } : {}),
     };
   };
-  return [
+  const resources = [
     ...config.r2_buckets.map((entry) =>
       resolveResource("bucket", entry.binding, entry.bucket_name, entry.jurisdiction),
     ),
     ...config.queues.producers.map((entry) => resolveResource("queue", entry.binding, entry.queue)),
   ];
+  for (const [index, consumer] of config.queues.consumers.entries()) {
+    const queue = consumer.dead_letter_queue;
+    if (!queue || config.queues.producers.some((producer) => producer.queue === queue)) continue;
+    if (queue === "noteflare-delivery-dlq") {
+      if (config.queues.producers.some((producer) => producer.binding === "DELIVERY_DEAD_LETTER_QUEUE")) continue;
+      throw new Error(
+        "The template dead-letter queue requires a producer binding. Restore DELIVERY_DEAD_LETTER_QUEUE or configure a custom, existing dead-letter queue before retrying.",
+      );
+    }
+    resources.push({
+      type: "queue",
+      binding: `dead_letter_queue:${index}`,
+      name: queue,
+      provenance: "configured",
+      consumerOnly: true,
+    });
+  }
+  return resources;
 }
 
 export async function preflightGeneratedResources(resources, api) {
-  for (const resource of resources.filter((entry) => entry.provenance === "generated")) {
+  for (const resource of resources.filter((entry) => entry.provenance === "generated" || entry.consumerOnly)) {
     let exists = false;
     if (resource.type === "bucket") {
       const bucket = await api(`/r2/buckets/${encodeURIComponent(resource.name)}`, {
@@ -289,9 +301,14 @@ export async function preflightGeneratedResources(resources, api) {
         if (page >= totalPages) break;
       }
     }
-    if (exists)
+    if (resource.consumerOnly) {
+      if (!exists)
+        throw new Error(
+          `Configured dead-letter queue ${resource.name} does not exist. Create it or restore its producer binding before retrying.`,
+        );
+    } else if (exists)
       throw new Error(
-        `Generated ${resource.type} ${resource.name} already exists. Configure its name explicitly to adopt it before retrying.`,
+        `Generated ${resource.type} ${resource.name} already exists. If a first deployment partially provisioned it, inspect and configure its name and the D1 ID explicitly to adopt those resources before retrying.`,
       );
   }
 }
@@ -562,7 +579,7 @@ export function initializedDatabase(configPath, execute = wrangler) {
   const tables = query("SELECT name FROM sqlite_master WHERE type='table';");
   if (tables.some((row) => !row || typeof row.name !== "string")) throw new Error("Invalid installation schema.");
   if (!tables.some((row) => row.name === "install_state")) {
-    if (tables.some((row) => !internalTables.has(row.name)))
+    if (!emptyDatabaseSchema(tables))
       throw new Error("Database contains unknown application tables. Refusing to initialize it.");
     return false;
   }
@@ -613,11 +630,20 @@ export async function deployPrepared(
   }
   if ((await migrateDatabase()) !== 0)
     throw new Error("D1 migration preflight/application failed. Worker upload was not started.");
-  if (manifest.resources?.some((entry) => entry.provenance === "generated")) {
-    if (!provisionResources) throw new Error("Resource provisioning is unavailable. Rebuild before deployment.");
-    await provisionResources();
+  const generated = manifest.resources?.some((entry) => entry.provenance === "generated");
+  try {
+    if (generated) {
+      if (!provisionResources) throw new Error("Resource provisioning is unavailable. Rebuild before deployment.");
+      await provisionResources();
+    }
+    await withSecretsFile(secrets, upload);
+  } catch (cause) {
+    if (!generated) throw cause;
+    throw new Error(
+      "Resource provisioning or Worker upload failed. Before retrying a first deployment, inspect any created resources and explicitly configure their names and the populated D1 database ID to adopt them. After a successful upload, retries reuse saved Worker bindings.",
+      { cause },
+    );
   }
-  await withSecretsFile(secrets, upload);
   await health();
 }
 
