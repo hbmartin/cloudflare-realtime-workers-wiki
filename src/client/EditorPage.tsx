@@ -36,7 +36,13 @@ import { RenderBoundary } from "./RenderBoundary";
 import { EditorFeatureContext } from "./editor-feature-context";
 import { PageInfoPopover } from "./PageInfoPopover";
 import "./editor-features.css";
-import { yUndoPluginKey, yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
+import {
+  assertSupportedCodeContent,
+  observeUnsupportedCodeContent,
+  type UnsupportedCodeContentError,
+  yUndoPluginKey,
+  yXmlFragmentToProsemirrorJSON,
+} from "y-prosemirror";
 import * as Y from "yjs";
 import type { ClientMemberContext, Space } from "../shared/types";
 import type { MentionSuggestion, Page } from "../shared/types";
@@ -1505,7 +1511,26 @@ function editorOptions(
   });
 }
 
-function CollaborativeEditor({
+function CollaborativeEditor(props: React.ComponentProps<typeof MountedCollaborativeEditor>) {
+  const [contentError, setContentError] = useState<UnsupportedCodeContentError | null>(null);
+  useEffect(() => {
+    const unsubscribe = observeUnsupportedCodeContent(props.bundle.doc, setContentError);
+    // Check again after subscribing: a received update can arrive before the
+    // binding or this effect is mounted. Both checks leave shared content intact.
+    try {
+      assertSupportedCodeContent(props.bundle.doc.getXmlFragment("document-store"));
+    } catch (error) {
+      unsubscribe();
+      throw error;
+    }
+    return unsubscribe;
+  }, [props.bundle]);
+  if (contentError) throw contentError;
+  assertSupportedCodeContent(props.bundle.doc.getXmlFragment("document-store"));
+  return <MountedCollaborativeEditor {...props} />;
+}
+
+function MountedCollaborativeEditor({
   bundle,
   member,
   editable,

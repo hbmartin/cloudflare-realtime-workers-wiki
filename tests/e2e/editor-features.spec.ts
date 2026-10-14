@@ -42,6 +42,27 @@ test("migrated code text converges through real disconnected editor bindings wit
   }
 });
 
+test("unsupported initial and received code embeds preserve shared bytes and block editor writes", async ({ page }) => {
+  await signInOwner(page);
+  const results = await page.evaluate(async () => {
+    const path = "/tests/e2e/fixtures/editor-code-reconciliation.mjs";
+    const { rejectUnsupportedCode } = await import(path);
+    return rejectUnsupportedCode();
+  });
+  expect(results).toEqual([
+    { received: false, controlledError: true, bytesRetained: true, identityRetained: true },
+    {
+      received: true,
+      controlledError: true,
+      bytesRetained: true,
+      writesBlocked: true,
+      identityRetained: true,
+      anchorRetained: true,
+      repaired: true,
+    },
+  ]);
+});
+
 test("HTML code imports preserve whitespace and reopen with plain text line breaks", async ({ page }) => {
   await signInOwner(page);
   const toggle = page.getByRole("button", { name: "Open navigation" });

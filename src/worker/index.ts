@@ -7,8 +7,10 @@ import {
   queryTable,
   enableTableAuthority,
   repairTableProjection,
+  tableRepairStatus,
   verifyTableProjection,
 } from "./table-service";
+import { ACCEPTED_PAGE_DELETION_SQL } from "./deletion-policy";
 import type { TableCommand } from "../shared/table-protocol";
 import { readComparison, pruneDocumentChanges } from "./document-changes";
 import { buildTableRowQuery, tableRowBinds, stableTableSnapshot, collectRowCells } from "./table-read";
@@ -56,7 +58,6 @@ import {
   UPLOAD_SESSION_TTL_MS,
 } from "./attachments";
 import {
-  ACCEPTED_PAGE_DELETION_SQL,
   acceptPageDeletion,
   acceptedDeletionJob,
   pendingPageDeletion,
@@ -5967,13 +5968,23 @@ app.get("/api/tables/:pageId/socket", async (c) => {
 });
 app.post("/api/tables/:pageId/repair", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
-  return c.json({ verification: await repairTableProjection(c.env, member, c.req.param("pageId")) });
+  const pageId = c.req.param("pageId");
+  const result = await repairTableProjection(c.env, member, pageId);
+  if ("repair" in result) {
+    c.header("Location", `/api/tables/${encodeURIComponent(pageId)}/authority/verification`);
+    c.header("Retry-After", "1");
+    return c.json(result, 202);
+  }
+  return c.json({ verification: result });
 });
 app.get("/api/tables/:pageId/authority/verification", async (c) => {
   const member = await requireMember(c.req.raw, c.env);
   await activeTablePage(c.env, member, c.req.param("pageId"));
   if (member.role !== "owner") throw new HttpError(403, "owner_required", "Only an owner can verify a projection.");
-  return c.json({ verification: await verifyTableProjection(c.env, c.req.param("pageId")) });
+  const pageId = c.req.param("pageId");
+  const repair = await tableRepairStatus(c.env, pageId);
+  if (repair.state !== "complete") return c.json({ repair, verification: null });
+  return c.json({ repair, verification: await verifyTableProjection(c.env, pageId) });
 });
 
 app.get("/api/tables/:pageId", async (c) => {

@@ -192,6 +192,20 @@ Two tabs of the same session can both acquire, because the acquire condition als
 `holder_session_id`. Each acquire rotates the token, so the older tab's next mutation fails with
 `table_lease_lost`. This is expected behavior, not a fault.
 
+## Table projection repair
+
+For a migrated table, an owner can start repair with `POST /api/tables/:pageId/repair`.
+A background repair returns HTTP 202 with `{ repair, verification: null }`, a `Location`
+header pointing to `/api/tables/:pageId/authority/verification`, and `Retry-After: 1`.
+Poll that GET endpoint rather than repeating POST: polling does not restart work or reset
+the verification retry budget. Pending and blocked responses expose generation, revision,
+phase, and a bounded blocked reason without scanning the whole table. Completed repair
+returns verification; a POST that completes existing work retains HTTP 200 `{ verification }`.
+
+Repair keeps table writes fenced until content parity succeeds. A second verification
+mismatch parks repair. Resolve the reported ownership or content issue before explicitly
+retrying POST. Accepted permanent deletion has its own stop intent and does not start repair.
+
 ## Document size and the sticky read-only flag
 
 Documents warn at 16 MiB and are forced read-only by the server at 24 MiB.
