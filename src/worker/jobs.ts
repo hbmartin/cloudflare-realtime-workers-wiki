@@ -68,9 +68,11 @@ import {
   deliverSlackUnfurl,
   retireObsoleteSlackUnfurl,
   SlackApiError,
+  SlackRateLimitError,
   slackMissingScope,
   slackInstallationError,
   slackRefreshableAuthError,
+  slackTokenPreparationFailure,
   usableBotToken,
   type SlackInstallation,
   SLACK_REDRIVE_STALE_MS,
@@ -2058,6 +2060,7 @@ async function redriveNonReceiptSlackOutbox(env: Env) {
       }
     >();
   let redriven = 0;
+  const failedRefreshes = new Map<string, number>();
   for (const row of rows.results) {
     try {
       const outboxFence = slackOutboxSnapshotSql;
@@ -2190,7 +2193,38 @@ async function redriveNonReceiptSlackOutbox(env: Env) {
         )
         .first<SlackInstallation & { auth_error_at: number | null; auth_paused_ms: number }>();
       if (installation && slackRefreshableAuthError(installation)) {
-        await usableBotToken(env, installation, undefined, "defer");
+        const credentials = JSON.stringify([
+          installation.id,
+          installation.generation,
+          installation.credential_revision,
+          installation.bot_token_ciphertext,
+          installation.bot_refresh_token_ciphertext,
+        ]);
+        let retryAt = failedRefreshes.get(credentials);
+        if (retryAt === undefined) {
+          try {
+            await usableBotToken(env, installation, undefined, "defer");
+          } catch (error) {
+            if (!slackTokenPreparationFailure(error)) throw error;
+            retryAt = Math.max(Date.now() + 60_000, error instanceof SlackRateLimitError ? error.retryAt : 0);
+            failedRefreshes.set(credentials, retryAt);
+            logger.error(
+              "slack.receipt_recovery_failed",
+              "slack",
+              "Receipt recovery failed; continuing other receipts.",
+              { outboxId: row.id },
+              error,
+            );
+          }
+        }
+        if (retryAt !== undefined) {
+          await env.DB.prepare(
+            `UPDATE outbox SET slack_redrive_due_at=max(slack_redrive_due_at,?) WHERE ${outboxFence}`,
+          )
+            .bind(retryAt, ...outboxBinds)
+            .run();
+          continue;
+        }
         Object.assign(
           installation,
           await env.DB.prepare(`SELECT auth_error_at,auth_paused_ms FROM slack_installations WHERE id=?`)

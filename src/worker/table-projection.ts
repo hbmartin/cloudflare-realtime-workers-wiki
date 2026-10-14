@@ -120,12 +120,7 @@ export type TableVerification = {
   rowCount: number;
 };
 
-export async function compareTableProjection(
-  env: Env,
-  pageId: string,
-  canonical: TableSnapshot,
-  current: TableVerification,
-) {
+export async function compareTableProjectionContent(env: Env, pageId: string, canonical: TableSnapshot) {
   const projected: TableSnapshot = {
     revision: canonical.revision,
     columns: await projectionColumns(env, pageId),
@@ -156,15 +151,17 @@ export async function compareTableProjection(
       .bind(pageId)
       .all<{ row_id: string; column_id: string; value_json: string; source_json: string }>()
   ).results;
-  for (const row of projected.rows)
-    row.computedCells = Object.fromEntries(
-      caches
-        .filter((cache) => cache.row_id === row.id)
-        .map((cache) => [
-          cache.column_id,
-          { version: 1 as const, value: JSON.parse(cache.value_json), source: JSON.parse(cache.source_json) },
-        ]),
-    );
+  const byRow = new Map<string, NonNullable<CollaborativeRow["computedCells"]>>();
+  for (const cache of caches) {
+    const cells = byRow.get(cache.row_id) ?? (Object.create(null) as NonNullable<CollaborativeRow["computedCells"]>);
+    byRow.set(cache.row_id, cells);
+    cells[cache.column_id] = {
+      version: 1,
+      value: JSON.parse(cache.value_json),
+      source: JSON.parse(cache.source_json),
+    };
+  }
+  for (const row of projected.rows) row.computedCells = byRow.get(row.id) ?? {};
   const hashSnapshot = async (snapshot: TableSnapshot) => {
     let hash = await sha256Hex(
       canonicalJson({
@@ -181,6 +178,16 @@ export async function compareTableProjection(
     return hash;
   };
   const [canonicalHash, projectionHash] = await Promise.all([hashSnapshot(canonical), hashSnapshot(projected)]);
+  return { canonicalHash, projectionHash, contentMatches: canonicalHash === projectionHash };
+}
+
+export async function compareTableProjection(
+  env: Env,
+  pageId: string,
+  canonical: TableSnapshot,
+  current: TableVerification,
+) {
+  const { canonicalHash, projectionHash, contentMatches } = await compareTableProjectionContent(env, pageId, canonical);
   const registry = await env.DB.prepare("SELECT generation,projected_revision FROM table_authority WHERE page_id=?")
     .bind(pageId)
     .first<{ generation: number; projected_revision: number }>();
@@ -192,7 +199,7 @@ export async function compareTableProjection(
     ...current,
     canonicalHash,
     projectionHash,
-    projectionMatches: consistent && canonicalHash === projectionHash,
+    projectionMatches: consistent && contentMatches,
     consistent,
   };
 }

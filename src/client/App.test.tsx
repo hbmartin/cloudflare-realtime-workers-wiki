@@ -177,6 +177,22 @@ function deferred<T>() {
   return { promise, reject, resolve };
 }
 
+function mockTreeEffects() {
+  const animate = vi.fn();
+  for (const [method, implementation] of [
+    ["animate", animate],
+    ["scrollIntoView", vi.fn()],
+  ] as const) {
+    const previous = Object.getOwnPropertyDescriptor(HTMLElement.prototype, method);
+    Object.defineProperty(HTMLElement.prototype, method, { configurable: true, value: implementation });
+    onTestFinished(() => {
+      if (previous) Object.defineProperty(HTMLElement.prototype, method, previous);
+      else Reflect.deleteProperty(HTMLElement.prototype, method);
+    });
+  }
+  return animate;
+}
+
 function reconnectWorkspace() {
   const reconnect = mocks.createWorkspaceEvents.mock.calls.at(-1)?.[2];
   if (!reconnect) throw new Error("Workspace reconnect handler was not registered.");
@@ -6965,6 +6981,91 @@ describe("App error handling", () => {
       await interruptedRender.promise;
     });
   });
+
+  it("cancels an unconsumed reveal when changing spaces so it cannot focus the page on return", async () => {
+    const animate = mockTreeEffects();
+    const frames = new Map<number, FrameRequestCallback>();
+    let nextFrame = 0;
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.set(++nextFrame, callback);
+      return nextFrame;
+    });
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => frames.delete(id));
+    const otherSpace = { ...shellGeneralSpace, id: "other-space", name: "Other space" };
+    const otherPage = { ...page, id: "other-page", spaceId: otherSpace.id, title: "Other page" };
+    mockShellApi({ pages: [page, otherPage] });
+    const shellApi = vi.mocked(api).getMockImplementation()!;
+    vi.mocked(api).mockImplementation(async (path, init) => {
+      if (path === "/api/spaces") return { spaces: [shellGeneralSpace, otherSpace] };
+      if (path === `/api/spaces/${otherSpace.id}/pins`) return { pages: [] };
+      return shellApi(path, init);
+    });
+    render(<App />);
+    const switcher = await screen.findByLabelText("Current space");
+    await waitFor(() => expect(switcher).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "Page actions" }));
+    fireEvent.click(screen.getByRole("button", { name: "Reveal in sidebar" }));
+    expect(frames.size).toBeGreaterThan(0);
+    fireEvent.change(switcher, { target: { value: otherSpace.id } });
+    await screen.findByRole("treeitem", { name: otherPage.title });
+    fireEvent.change(switcher, { target: { value: page.spaceId } });
+    await screen.findByRole("treeitem", { name: page.title });
+    act(() => {
+      const pending = [...frames];
+      frames.clear();
+      for (const [, callback] of pending) callback(performance.now());
+    });
+    expect(animate).not.toHaveBeenCalled();
+  });
+
+  it.each(["page", "space"])(
+    "ignores a hidden-page reveal breadcrumb result after navigating to another %s",
+    async (scope) => {
+      const animate = mockTreeEffects();
+      const otherSpace = { ...shellGeneralSpace, id: "other-space", name: "Other space" };
+      const otherPage = {
+        ...page,
+        id: "other-page",
+        spaceId: scope === "space" ? otherSpace.id : page.spaceId,
+        title: "Other page",
+      };
+      const hiddenPage = { ...page, id: "hidden-page", parentId: page.id, title: "Hidden detail" };
+      const breadcrumbs = deferred<{ breadcrumbs: Array<{ id: string }> }>();
+      mockShellApi({ pages: [page, otherPage] });
+      const shellApi = vi.mocked(api).getMockImplementation()!;
+      vi.mocked(api).mockImplementation(async (path, init) => {
+        if (path === "/api/spaces") return { spaces: [shellGeneralSpace, otherSpace] };
+        if (path === `/api/spaces/${otherSpace.id}/pins`) return { pages: [] };
+        if (path === `/api/pages/${hiddenPage.id}`) return { page: hiddenPage, sidebarHidden: true };
+        if (path === `/api/pages/${hiddenPage.id}/breadcrumbs`) return breadcrumbs.promise;
+        return shellApi(path, init);
+      });
+      render(<App />);
+      const switcher = await screen.findByLabelText("Current space");
+      await waitFor(() => expect(switcher).toBeEnabled());
+      act(() => {
+        window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: hiddenPage.id }));
+      });
+      await screen.findByText(hiddenPage.title, { selector: ".breadcrumbs button" });
+      fireEvent.click(screen.getByRole("button", { name: "Page actions" }));
+      fireEvent.click(screen.getByRole("button", { name: "Reveal in sidebar" }));
+      await waitFor(() => expect(api).toHaveBeenCalledWith(`/api/pages/${hiddenPage.id}/breadcrumbs`));
+      if (scope === "space") fireEvent.change(switcher, { target: { value: otherSpace.id } });
+      else
+        act(() => {
+          window.dispatchEvent(new CustomEvent(PAGE_NAVIGATE_EVENT, { detail: otherPage.id }));
+        });
+      await screen.findByText(otherPage.title, { selector: ".breadcrumbs button" });
+      await act(async () => {
+        breadcrumbs.resolve({ breadcrumbs: [{ id: page.id }, { id: hiddenPage.id }] });
+        await breadcrumbs.promise;
+      });
+      expect(switcher).toHaveValue(otherPage.spaceId);
+      expect(screen.getByText(otherPage.title, { selector: ".breadcrumbs button" })).toBeInTheDocument();
+      expect(document.querySelector(".workspace-sidebar")).not.toHaveClass("open");
+      expect(animate).not.toHaveBeenCalled();
+    },
+  );
 
   it("switches spaces and manages favorites, pins, and page tags", async () => {
     const generalSpace: Space = {

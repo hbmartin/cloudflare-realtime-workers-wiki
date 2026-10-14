@@ -83,6 +83,83 @@ describe("personal tree sorting and reveal", () => {
     view.rerender(<WorkspaceTree {...input} revealRequest={{ id: "child", sequence: 2 }} />);
     await waitFor(() => expect(screen.getByRole("treeitem", { name: "Child" })).toHaveFocus());
   });
+  it("reveals a root page even though its ancestor path is empty", async () => {
+    const onRevealHandled = vi.fn();
+    render(<WorkspaceTree {...props()} revealRequest={{ id: "two", sequence: 1 }} onRevealHandled={onRevealHandled} />);
+    await waitFor(() => expect(onRevealHandled).toHaveBeenCalledWith(1));
+    expect(screen.getByRole("treeitem", { name: "note 2" })).toHaveFocus();
+  });
+  it("consumes an absent target after loading without stealing focus if the page later returns", async () => {
+    const input = props();
+    const onRevealHandled = vi.fn();
+    const revealRequest = { id: "missing", sequence: 1 };
+    const view = render(
+      <WorkspaceTree {...input} revealRequest={revealRequest} onRevealHandled={onRevealHandled} treeReady />,
+    );
+    await waitFor(() => expect(onRevealHandled).toHaveBeenCalledWith(1));
+    const retainedFocus = screen.getByRole("treeitem", { name: "note 2" });
+    retainedFocus.focus();
+    view.rerender(
+      <WorkspaceTree
+        {...input}
+        nodes={buildTree([page("missing", "Returned", "c"), page("two", "note 2", "b")])}
+        revealRequest={revealRequest}
+        onRevealHandled={onRevealHandled}
+        treeReady
+      />,
+    );
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    expect(onRevealHandled).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("treeitem", { name: "note 2" })).toHaveFocus();
+    expect(HTMLElement.prototype.animate).not.toHaveBeenCalled();
+  });
+  it("retains an absent target during the initial load and reveals it when the tree arrives", async () => {
+    const input = props();
+    const onRevealHandled = vi.fn();
+    const revealRequest = { id: "child", sequence: 1 };
+    const view = render(
+      <WorkspaceTree
+        {...input}
+        nodes={[]}
+        revealRequest={revealRequest}
+        onRevealHandled={onRevealHandled}
+        treeReady={false}
+      />,
+    );
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    expect(onRevealHandled).not.toHaveBeenCalled();
+    view.rerender(
+      <WorkspaceTree {...input} revealRequest={revealRequest} onRevealHandled={onRevealHandled} treeReady />,
+    );
+    await waitFor(() => expect(onRevealHandled).toHaveBeenCalledWith(1));
+    expect(screen.getByRole("treeitem", { name: "Child" })).toHaveFocus();
+  });
+  it("consumes a still-absent target once the initial tree load finishes", async () => {
+    const input = props();
+    const onRevealHandled = vi.fn();
+    const revealRequest = { id: "child", sequence: 1 };
+    const view = render(
+      <WorkspaceTree
+        {...input}
+        nodes={[]}
+        revealRequest={revealRequest}
+        onRevealHandled={onRevealHandled}
+        treeReady={false}
+      />,
+    );
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    expect(onRevealHandled).not.toHaveBeenCalled();
+    view.rerender(
+      <WorkspaceTree {...input} nodes={[]} revealRequest={revealRequest} onRevealHandled={onRevealHandled} treeReady />,
+    );
+    await waitFor(() => expect(onRevealHandled).toHaveBeenCalledWith(1));
+    view.rerender(
+      <WorkspaceTree {...input} revealRequest={revealRequest} onRevealHandled={onRevealHandled} treeReady />,
+    );
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    expect(onRevealHandled).toHaveBeenCalledTimes(1);
+    expect(HTMLElement.prototype.animate).not.toHaveBeenCalled();
+  });
   it("consumes reveals once and expands a later externally selected branch", async () => {
     const input = {
       ...props(),

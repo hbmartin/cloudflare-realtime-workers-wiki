@@ -56,6 +56,7 @@ import {
   UPLOAD_SESSION_TTL_MS,
 } from "./attachments";
 import {
+  ACCEPTED_PAGE_DELETION_SQL,
   acceptPageDeletion,
   acceptedDeletionJob,
   pendingPageDeletion,
@@ -3227,6 +3228,7 @@ app.get("/api/pages/tree", async (c) => {
       JOIN spaces s ON s.id = p.space_id
       LEFT JOIN space_members sm ON sm.space_id = s.id AND sm.user_id = ?
      WHERE p.workspace_id = ? AND p.archived_at IS ${archived ? "NOT " : ""}NULL
+       ${archived ? `AND NOT ${ACCEPTED_PAGE_DELETION_SQL}` : ""}
        ${archived ? "" : "AND p.is_template = 0"} AND p.import_job_id IS NULL
        AND p.id NOT IN (
          WITH RECURSIVE hidden(id) AS (
@@ -4745,7 +4747,17 @@ app.post("/api/pages/:id/permanent-delete", async (c) => {
   const rootId = c.req.param("id");
   const existing = await acceptedDeletionJob(c.env, member.workspace.id, rootId);
   if (existing) {
-    c.executionCtx.waitUntil(processDeletionJob(c.env, existing.jobId));
+    c.executionCtx.waitUntil(
+      processDeletionJob(c.env, existing.jobId, { retryFailedRows: true }).catch((error) => {
+        logger.error(
+          "deletion.cleanup.failed",
+          "deletion",
+          "Immediate deletion cleanup failed.",
+          { jobId: existing.jobId },
+          error,
+        );
+      }),
+    );
     return c.json({ ok: true, pageIds: existing.pageIds, cleanupPending: true }, 202);
   }
   const page = await pageForMember(c.env, member, rootId, true);

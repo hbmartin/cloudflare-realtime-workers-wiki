@@ -1,6 +1,8 @@
 import { abortAllDurableObjects, applyD1Migrations, env, reset, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
+import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
+import { validateDocumentTree } from "../shared/document-validation";
 import type { Env } from "./env";
 
 type TestDocument = {
@@ -59,6 +61,22 @@ function installDocumentBlocks(document: Y.Doc, ...containers: Y.XmlElement[]) {
   fragment.insert(0, [group]);
 }
 
+function legacyCodeBlock(id = "legacy-code") {
+  const container = new Y.XmlElement("blockContainer"),
+    code = new Y.XmlElement("codeBlock");
+  container.setAttribute("id", id);
+  code.setAttribute("language", "javascript");
+  const text = new Y.XmlText();
+  text.insert(0, "  first");
+  text.format(0, 7, { bold: {}, "comment--0123abcd": { threadId: "thread", orphan: false } });
+  const tail = new Y.XmlText();
+  tail.insert(0, "\tsecond\n");
+  tail.format(0, 8, { link: { href: "https://example.test" } });
+  code.insert(0, [text, new Y.XmlElement("hardBreak"), tail]);
+  container.insert(0, [code]);
+  return { container, code, text };
+}
+
 const protectedOperationId = "mcp:v2:response-grant:protected-operation";
 const protectedInputHash = "a".repeat(64);
 
@@ -105,6 +123,167 @@ afterEach(async () => {
 });
 
 describe("document mutation response barriers", () => {
+  it("logs supported legacy code normalization during document startup", async () => {
+    const installed = await fixture(),
+      source = new Y.Doc();
+    installDocumentBlocks(source, legacyCodeBlock().container);
+    const bytes = Y.encodeStateAsUpdate(source);
+    source.destroy();
+    await env.BUCKET.put(`documents/${installed.pageId}/epochs/1/current.bin`, bytes);
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance, state) => {
+      const room = instance as unknown as TestDocument;
+      const restored = yXmlFragmentToProsemirrorJSON(room.document.getXmlFragment("document-store"));
+      validateDocumentTree(restored);
+      const code = restored.content![0]!.content![0]!.content![0]!;
+      expect(code.attrs).toEqual({ language: "javascript" });
+      expect(code.content!.map((node) => node.text).join("")).toBe("  first\n\tsecond\n");
+      expect(code.content![0]!.marks).toEqual([{ type: "comment", attrs: { threadId: "thread", orphan: false } }]);
+      // Both the loaded snapshot seed and subsequent normalization are recorded after observers attach.
+      expect(
+        state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) count FROM update_events").one().count,
+      ).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it("repairs legacy code before unrelated API edits and canonicalizes code inserted by the operation", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as TestDocument,
+        legacy = legacyCodeBlock();
+      installDocumentBlocks(room.document, legacy.container);
+      const anchor = Y.createRelativePositionFromTypeIndex(legacy.text, 3);
+      const response = await room.onRequest(
+        protectedMutation(installed.userId, {
+          operations: [
+            {
+              type: "append_children",
+              children: [
+                {
+                  type: "blockContainer",
+                  attrs: { id: "new-code" },
+                  content: [
+                    {
+                      type: "codeBlock",
+                      content: [
+                        { type: "text", text: "new", marks: [{ type: "italic" }] },
+                        { type: "hardBreak" },
+                        { type: "text", text: "code" },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      );
+      expect(response.status).toBe(200);
+      const result = await response.json<{ document: unknown }>();
+      validateDocumentTree(result.document);
+      expect(JSON.stringify(result.document)).not.toMatch(/"type":"(?:bold|italic|link|hardBreak)"/);
+      expect(legacy.code.get(0)).toBe(legacy.text);
+      expect(Y.createAbsolutePositionFromRelativePosition(anchor, room.document)).toMatchObject({
+        type: legacy.text,
+        index: 3,
+      });
+      expect(legacy.text.toDelta()[0]!.attributes).toEqual({
+        "comment--0123abcd": { threadId: "thread", orphan: false },
+      });
+      expect(JSON.stringify(result.document)).toContain("new");
+      expect(JSON.stringify(result.document)).toContain("code");
+    });
+  });
+
+  it("rejects unknown legacy code atoms without modifying the live document", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as TestDocument,
+        legacy = legacyCodeBlock();
+      legacy.code.insert(1, [new Y.XmlElement("footnoteReference")]);
+      installDocumentBlocks(room.document, legacy.container);
+      const before = Y.encodeStateAsUpdate(room.document);
+      const response = await room.onRequest(protectedMutation(installed.userId));
+      expect(response.status).toBe(422);
+      expect(Y.encodeStateAsUpdate(room.document)).toEqual(before);
+      expect(legacy.text.toDelta()[0]!.attributes).toHaveProperty("bold");
+    });
+  });
+
+  it("initializes staged legacy code using a normalized candidate while preserving import bytes", async () => {
+    const installed = await fixture(),
+      source = new Y.Doc(),
+      jobId = crypto.randomUUID();
+    installDocumentBlocks(source, legacyCodeBlock().container);
+    const bytes = Y.encodeStateAsUpdate(source),
+      inputKey = `jobs/${jobId}/input.bin`;
+    source.destroy();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO jobs(id,workspace_id,type,status,requested_by,created_at,updated_at) VALUES(?,'response-workspace','import','queued','response-owner',1,1)",
+      ).bind(jobId),
+      env.DB.prepare("UPDATE pages SET import_job_id=? WHERE id=?").bind(jobId, installed.pageId),
+    ]);
+    await env.BUCKET.put(inputKey, bytes);
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    const response = await stub.fetch(
+      new Request("https://document.internal/initialize", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+        body: JSON.stringify({ jobId, inputKey }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as TestDocument;
+      validateDocumentTree(yXmlFragmentToProsemirrorJSON(room.document.getXmlFragment("document-store")));
+    });
+    expect(new Uint8Array(await (await env.BUCKET.get(inputKey))!.arrayBuffer())).toEqual(bytes);
+  });
+
+  it("restores supported legacy code into a new epoch without rewriting the historical snapshot", async () => {
+    const installed = await fixture(),
+      source = new Y.Doc(),
+      versionId = crypto.randomUUID();
+    installDocumentBlocks(source, legacyCodeBlock().container);
+    const bytes = Y.encodeStateAsUpdate(source),
+      key = `documents/${installed.pageId}/versions/${versionId}.bin`;
+    source.destroy();
+    await env.BUCKET.put(key, bytes);
+    await env.DB.prepare(
+      "INSERT INTO page_versions(id,page_id,epoch,sequence,title,r2_key,byte_size,created_at) VALUES(?,?,1,1,'Legacy code',?,?,1)",
+    )
+      .bind(versionId, installed.pageId, key, bytes.byteLength)
+      .run();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    const response = await stub.fetch(
+      new Request("https://document.internal/restore-version", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-notes-internal": env.BETTER_AUTH_SECRET },
+        body: JSON.stringify({ versionId, userId: installed.userId }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ contentEpoch: 2 });
+    expect(new Uint8Array(await (await env.BUCKET.get(key))!.arrayBuffer())).toEqual(bytes);
+    const restored = new Y.Doc();
+    Y.applyUpdate(
+      restored,
+      new Uint8Array(await (await env.BUCKET.get(`documents/${installed.pageId}/epochs/2/current.bin`))!.arrayBuffer()),
+    );
+    const json = yXmlFragmentToProsemirrorJSON(restored.getXmlFragment("document-store"));
+    validateDocumentTree(json);
+    const code = json.content![0]!.content![0]!.content![0]!;
+    expect(code.content!.map((node) => node.text).join("")).toBe("  first\n\tsecond\n");
+    expect(code.content![0]!.marks).toEqual([{ type: "comment", attrs: { threadId: "thread", orphan: false } }]);
+    restored.destroy();
+  });
+
   it("mutates a document containing Yjs-normalized paragraph and code comment annotations", async () => {
     const installed = await fixture();
     const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);

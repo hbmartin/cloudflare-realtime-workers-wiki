@@ -2,8 +2,9 @@
 import { BlockNoteEditor, mapTableCell, contentNodeToTableContent, tableContentToNodes } from "@blocknote/core";
 import { TableHandlesExtension, TableHandlesView, insertOrUpdateBlockForSlashMenu } from "@blocknote/core/extensions";
 import { CommentsExtension } from "@blocknote/core/comments";
+import { withCollaboration } from "@blocknote/core/yjs";
 import { Fragment, Schema, Slice } from "prosemirror-model";
-import { EditorState, NodeSelection, TextSelection } from "prosemirror-state";
+import { EditorState, NodeSelection, TextSelection, type Transaction } from "prosemirror-state";
 import { describe, expect, it, vi } from "vitest";
 import { notesCommentSchema, notesSchema } from "./mentions";
 import { ServerThreadStore } from "./server-thread-store";
@@ -19,6 +20,7 @@ import { updateHeadingIndex } from "./heading-index";
 import * as Y from "yjs";
 import { prosemirrorToYXmlFragment, ySyncPluginKey, yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { validateDocumentTree } from "../shared/document-validation";
+import { normalizeYCodeBlocks } from "../shared/code-content";
 
 const schema = new Schema({
   nodes: {
@@ -32,6 +34,51 @@ const schema = new Schema({
 });
 const search = { query: "cat", caseSensitive: false, wholeWord: false };
 describe("document editor features", () => {
+  it.each([false, true])("loads imported code into the real collaborative editor schema (legacy: %s)", (legacy) => {
+    const doc = new Y.Doc();
+    const imported = htmlToDocument(
+      '<pre><code>\n  <strong>first</strong><br><a href="https://example.test">second</a>\n</code></pre>',
+    ).document;
+    Y.applyUpdate(doc, documentToYjsUpdate(imported));
+    const fragment = doc.getXmlFragment("document-store");
+    const code = ((fragment.get(0) as Y.XmlElement).get(0) as Y.XmlElement).get(0) as Y.XmlElement;
+    const text = code.get(0) as Y.XmlText;
+    if (legacy) {
+      text.format(0, text.length, { bold: {}, "comment--0123abcd": { threadId: "thread", orphan: false } });
+      code.insert(1, [new Y.XmlElement("hardBreak")]);
+    }
+    expect(normalizeYCodeBlocks(doc)).toBe(legacy);
+    expect(text.toDelta()[0]!.attributes ?? {}).toEqual(
+      legacy ? { "comment--0123abcd": { threadId: "thread", orphan: false } } : {},
+    );
+    validateDocumentTree(yXmlFragmentToProsemirrorJSON(fragment));
+    const editor = BlockNoteEditor.create(
+      withCollaboration({
+        schema: notesSchema,
+        extensions: [
+          CommentsExtension({
+            threadStore: new ServerThreadStore("page", "owner", () => {}),
+            schema: notesCommentSchema,
+            resolveUsers: async () => [],
+          }),
+        ],
+        collaboration: { fragment, user: { name: "Test", color: "#123456" } },
+      }),
+    );
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    try {
+      expect(() => editor.mount(host)).not.toThrow();
+      expect(editor.prosemirrorState.doc.textContent).toBe(legacy ? "\n  \nfirst\nsecond\n" : "\n  first\nsecond\n");
+      editor.prosemirrorState.doc.check();
+      validateDocumentTree(editor.prosemirrorState.doc.toJSON());
+      expect(JSON.stringify(editor.prosemirrorState.doc.toJSON()).includes('"threadId":"thread"')).toBe(legacy);
+    } finally {
+      editor.unmount();
+      host.remove();
+      doc.destroy();
+    }
+  });
   it("validates real editor comment annotations after Yjs normalizes their mark names, including code", () => {
     const doc = new Y.Doc();
     const editor = BlockNoteEditor.create({
@@ -78,14 +125,16 @@ describe("document editor features", () => {
   });
   it("mounts an empty collaborative document before its initial blocks receive IDs", () => {
     const doc = new Y.Doc();
-    const editor = BlockNoteEditor.create({
-      schema: notesSchema,
-      extensions: [tabsExtension, footnotesExtension],
-      collaboration: {
-        fragment: doc.getXmlFragment("document-store"),
-        user: { name: "Test", color: "#123456" },
-      },
-    });
+    const editor = BlockNoteEditor.create(
+      withCollaboration({
+        schema: notesSchema,
+        extensions: [tabsExtension, footnotesExtension],
+        collaboration: {
+          fragment: doc.getXmlFragment("document-store"),
+          user: { name: "Test", color: "#123456" },
+        },
+      }),
+    );
     const host = document.createElement("div");
     document.body.appendChild(host);
     try {
@@ -496,7 +545,35 @@ describe("document editor features", () => {
       // Native indent moves a gap containing tabs with a wrapper-only ReplaceAroundStep slice.
       editor.transact((tr) => tr.setSelection(NodeSelection.create(tr.doc, sourcePos)));
       expect(editor.canNestBlock()).toBe(true);
+      let indent: Transaction | undefined;
+      const dispatch = editor.prosemirrorView.dispatch.bind(editor.prosemirrorView);
+      const capture = vi.spyOn(editor.prosemirrorView, "dispatch").mockImplementation((tr) => {
+        indent = tr;
+        dispatch(tr);
+      });
       editor.nestBlock();
+      capture.mockRestore();
+      expect(editor.prosemirrorState.doc.eq(initial)).toBe(true);
+      if (!indent) throw new Error("Native indentation did not dispatch a transaction.");
+      const indentSteps = indent.steps;
+      expect(indentSteps.some((step) => "gapFrom" in step)).toBe(true);
+      editor.transact((tr) => {
+        // Move all original positions before replaying the native indent steps.
+        tr.insert(
+          1,
+          editor.pmSchema.nodeFromJSON({
+            type: "blockContainer",
+            attrs: { id: "prefix" },
+            content: [{ type: "paragraph", content: [{ type: "text", text: "Before" }] }],
+          }),
+        );
+        tr.doc.check();
+        for (const step of indentSteps) {
+          const mapped = step.map(tr.mapping);
+          if (!mapped) throw new Error("The indent step could not be mapped.");
+          tr.step(mapped);
+        }
+      });
       expect(editor.prosemirrorState.doc.eq(initial)).toBe(true);
 
       editor.transact((tr) => {
@@ -508,6 +585,10 @@ describe("document editor features", () => {
       expect(editor.prosemirrorState.doc.eq(initial)).toBe(false);
       editor.updateBlock("outer-body", { content: "Still editable" });
       expect(editor.getBlock("outer-body")!.content).toEqual([{ type: "text", text: "Still editable", styles: {} }]);
+      // Attribute changes use ReplaceAroundStep but do not move or insert tabs.
+      editor.updateBlock("outer-body", { props: { textColor: "red" } });
+      const body = editor.getBlock("outer-body")!;
+      expect(body.type === "paragraph" && body.props.textColor).toBe("red");
       editor.removeBlocks(["sibling"]);
       validateDocumentTree(editor.prosemirrorState.doc.toJSON());
       editor.insertBlocks([tabs("valid")], "outer", "after");

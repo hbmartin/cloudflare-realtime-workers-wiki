@@ -1070,6 +1070,17 @@ describe("import content", () => {
     const breakOnly = htmlToDocument("<p><br></p>");
     expect(breakOnly.document.content[0]!.content).toHaveLength(1);
   });
+  it("imports preformatted HTML as plain code without losing leading whitespace or line breaks", () => {
+    const parsed = htmlToDocument(
+      '<pre><code>\n  <strong>first</strong><br><a href="https://example.test">second</a>\n\t</code></pre><p><strong>outside</strong><br>end</p>',
+    );
+    const blocks = parsed.document.content[0]!.content!.map((container) => container.content![0]!);
+    expect(blocks[0]!.type).toBe("codeBlock");
+    expect(blocks[0]!.content!.map((node) => node.text).join("")).toBe("\n  first\nsecond\n\t");
+    expect(blocks[0]!.content!.every((node) => node.type === "text" && !node.marks)).toBe(true);
+    expect(blocks[1]!.content![0]!.marks).toEqual([{ type: "bold" }]);
+    expect(blocks[1]!.content![1]!.type).toBe("hardBreak");
+  });
 });
 
 it("keeps a closing emphasis delimiter before the next opening delimiter at a dense section split", () => {

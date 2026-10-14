@@ -15,10 +15,13 @@ import {
   outputConfig,
   portableDatabase,
   portableOverrides,
+  integrityDatabaseID,
+  queryD1,
   selectTarget,
   verifyBuild,
   withSecretsFile,
 } from "./deploy.mjs";
+import { metadataIntegrityCheck } from "./integrity.mjs";
 
 afterEach(() => vi.unstubAllEnvs());
 const existingDB = "11111111-1111-1111-1111-111111111111";
@@ -34,6 +37,84 @@ const dependencies = () => ({
   migrateDatabase: vi.fn().mockReturnValue(0),
   upload: vi.fn(),
   health: vi.fn(),
+});
+
+describe("deployment integrity REST transport", () => {
+  it("queries the finalized DB binding with the existing single-statement API shape", async () => {
+    const account = "a".repeat(32);
+    const config = {
+      d1_databases: [
+        { binding: "OTHER", database_id: newDB },
+        { binding: "DB", database_id: existingDB },
+      ],
+    };
+    const id = integrityDatabaseID(config, account, account);
+    const api = vi.fn().mockResolvedValue([{ success: true, results: [{ name: "d1_migrations" }] }]);
+    expect((await metadataIntegrityCheck((sql) => queryD1(api, id, sql))).ok).toBe(true);
+    expect(api).toHaveBeenCalledExactlyOnceWith(`/d1/database/${existingDB}/query`, {
+      method: "POST",
+      body: { sql: "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name" },
+    });
+  });
+
+  it.each([
+    {},
+    { d1_databases: [] },
+    { d1_databases: [{ binding: "OTHER", database_id: existingDB }] },
+    { d1_databases: [{ binding: "DB", database_id: placeholderID }] },
+    { d1_databases: [{ binding: "DB", database_id: "invalid" }] },
+    {
+      d1_databases: [
+        { binding: "DB", database_id: existingDB },
+        { binding: "DB", database_id: newDB },
+      ],
+    },
+  ])("rejects an invalid finalized DB configuration: %j", (config) => {
+    expect(() => integrityDatabaseID(config, "a".repeat(32), null)).toThrow("invalid database ID");
+  });
+
+  it.each(["manifest", "configuration"])("rejects a changed %s account", (source) => {
+    const config = { d1_databases: [{ binding: "DB", database_id: existingDB }] };
+    if (source === "configuration") config.account_id = "b".repeat(32);
+    expect(() => integrityDatabaseID(config, "a".repeat(32), source === "manifest" ? "b".repeat(32) : null)).toThrow(
+      "account changed",
+    );
+  });
+
+  it.each(
+    [
+      null,
+      {},
+      [],
+      [{ success: false, results: [] }],
+      [{ success: true, results: {} }],
+      [{ success: true, results: [null] }],
+      [{ success: true, results: ["invalid"] }],
+      [
+        { success: true, results: [] },
+        { success: true, results: [] },
+      ],
+    ].map((result) => ({ result })),
+  )("rejects malformed D1 REST results: $result", async ({ result }) => {
+    await expect(queryD1(vi.fn().mockResolvedValue(result), existingDB, "SELECT 1")).rejects.toThrow(
+      "invalid D1 query results",
+    );
+  });
+
+  it.each(["timeout", "permission denied", "invalid JSON"])(
+    "fails the deployment gate after %s without retrying",
+    async (failure) => {
+      const api = vi.fn().mockRejectedValue(new Error(failure));
+      const deps = {
+        ...dependencies(),
+        integrityCheck: () => metadataIntegrityCheck((sql) => queryD1(api, existingDB, sql)),
+      };
+      await expect(deployPrepared({ target: "production" }, deps)).rejects.toThrow(failure);
+      expect(api).toHaveBeenCalledOnce();
+      expect(deps.migrateDatabase).not.toHaveBeenCalled();
+      expect(deps.upload).not.toHaveBeenCalled();
+    },
+  );
 });
 
 function buildFixture() {

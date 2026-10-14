@@ -125,6 +125,12 @@ beforeEach(() => {
         }
         if (command.kind === "update_cells") Object.assign(data.rows[0]!.cells, command.payload.values);
         if (command.kind === "save_view") {
+          if (
+            (command.payload.visibleColumnIds as string[]).some(
+              (id) => !data.columns.some((property) => property.id === id),
+            )
+          )
+            throw new ApiClientError(400, "invalid_input", "Invalid visible properties.");
           const previous = data.views.find((view) => view.id === command.payload.id);
           if (previous && previous.revision !== command.payload.revision)
             throw new ApiClientError(409, "table_revision_conflict", "View changed.");
@@ -393,6 +399,21 @@ describe("collaborative table UI", () => {
     fireEvent.click(screen.getByRole("button", { name: "Save view" }));
     await waitFor(() => expect(writes[0]?.payload).toMatchObject({ name: "Remote view", revision: 2 }));
   });
+  it("copies an edited view after a collaborator removes a visible property without discarding the draft", async () => {
+    data.views[0] = { ...grid, visibleColumnIds: ["Title", "Amount"] };
+    show("grid");
+    fireEvent.click(await screen.findByRole("button", { name: "Views" }));
+    fireEvent.change(screen.getByLabelText("View name"), { target: { value: "My draft" } });
+    data.columns = data.columns.filter((property) => property.id !== "Amount");
+    data.views[0] = { ...data.views[0]!, visibleColumnIds: ["Title"], revision: 2 };
+    await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+    expect(screen.getByLabelText("View name")).toHaveValue("My draft");
+    fireEvent.click(screen.getByRole("button", { name: "Save as new view" }));
+    await waitFor(() => expect(screen.queryByLabelText("View name")).toBeNull());
+    expect(writes[0]?.payload).toMatchObject({ name: "My draft copy", visibleColumnIds: ["Title"] });
+    expect(writes[0]?.payload).not.toHaveProperty("id");
+    expect(writes[0]?.payload).not.toHaveProperty("revision");
+  });
   it("disables every view authoring control until the submitted settings finish saving", async () => {
     const user = userEvent.setup();
     show("board");
@@ -519,6 +540,60 @@ describe("collaborative table UI", () => {
     fireEvent.change(screen.getByLabelText("Formula for Twice"), { target: { value: "12" } });
     fireEvent.click(screen.getByRole("button", { name: "Update formula" }));
     await waitFor(() => expect(writes[2]?.payload).toMatchObject({ source: "12", revision: 3 }));
+  });
+  it("treats reverted names and formulas as pristine before remote settings arrive", async () => {
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Properties" }));
+    for (const [label, temporary, original] of [
+      ["Name for Title", "Temporary", "Title"],
+      ["Formula for Twice", "8", 'prop("Amount") * 2'],
+    ]) {
+      const input = screen.getByLabelText(label!);
+      fireEvent.change(input, { target: { value: temporary } });
+      fireEvent.change(input, { target: { value: original } });
+    }
+    data.columns = data.columns.map((property) =>
+      property.id === "Title"
+        ? { ...property, name: "Remote title", revision: 2 }
+        : property.id === "Twice"
+          ? { ...property, config: { ...property.config, source: "6" }, revision: 2 }
+          : property,
+    );
+    await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+    expect(screen.getByLabelText("Name for Remote title")).toHaveValue("Remote title");
+    expect(screen.getByLabelText("Formula for Twice")).toHaveValue("6");
+    expect(screen.queryByRole("button", { name: "Reload latest settings" })).toBeNull();
+    fireEvent.blur(screen.getByLabelText("Name for Remote title"));
+    expect(writes).toHaveLength(0);
+    fireEvent.change(screen.getByLabelText("Formula for Twice"), { target: { value: "10" } });
+    fireEvent.click(screen.getByRole("button", { name: "Update formula" }));
+    await waitFor(() => expect(writes[0]?.payload).toMatchObject({ source: "10", revision: 2 }));
+  });
+  it("clears a field matching current authority without discarding a dirty sibling's revision", async () => {
+    show();
+    fireEvent.click(await screen.findByRole("button", { name: "Properties" }));
+    fireEvent.change(screen.getByLabelText("Name for Twice"), { target: { value: "Remote name" } });
+    fireEvent.change(screen.getByLabelText("Formula for Twice"), { target: { value: "8" } });
+    data.columns = data.columns.map((property) =>
+      property.id === "Twice"
+        ? { ...property, name: "Remote name", config: { ...property.config, source: "6" }, revision: 2 }
+        : property,
+    );
+    await act(async () => window.dispatchEvent(new Event("notes:workspace-event")));
+    fireEvent.blur(screen.getByLabelText("Name for Remote name"));
+    expect(writes).toHaveLength(0);
+    expect(screen.getByLabelText("Formula for Remote name")).toHaveValue("8");
+    fireEvent.click(screen.getByRole("button", { name: "Update formula" }));
+    await waitFor(() => expect(writes[0]?.payload).toMatchObject({ source: "8", revision: 1 }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reload latest settings" })).toBeEnabled());
+    // Reverting to the original source still differs from the current authority and retains the conflict.
+    fireEvent.change(screen.getByLabelText("Formula for Remote name"), { target: { value: 'prop("Amount") * 2' } });
+    expect(screen.getByRole("button", { name: "Reload latest settings" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("Formula for Remote name"), { target: { value: "6" } });
+    expect(screen.queryByRole("button", { name: "Reload latest settings" })).toBeNull();
+    fireEvent.change(screen.getByLabelText("Formula for Remote name"), { target: { value: "12" } });
+    fireEvent.click(screen.getByRole("button", { name: "Update formula" }));
+    await waitFor(() => expect(writes[1]?.payload).toMatchObject({ source: "12", revision: 2 }));
   });
   it.each([
     ["Twice", "number", "gt", "4", 4],

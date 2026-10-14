@@ -127,3 +127,45 @@ test("two browser writers converge on ordered cells and reload canonical data af
     await peerContext.close();
   }
 });
+
+test("reverted property drafts follow server updates while different formula edits retain conflicts", async ({
+  page,
+}) => {
+  const f = await migratedTable(page);
+  const formulaId = `${f.table.id}-formula`;
+  await f.command("create_column", { id: formulaId, name: "Twice", type: "formula", source: "2" });
+  const changeProperty = async (columnId: string, payload: Record<string, unknown>) => {
+    const query = await (await page.request.get(`/api/tables/${f.table.id}/query`)).json();
+    const column = query.columns.find((item: { id: string }) => item.id === columnId);
+    await f.command("update_column", { columnId, revision: column.revision, ...payload });
+  };
+  await page.goto(`/?page=${f.table.id}`);
+  await page.getByRole("button", { name: "Properties", exact: true }).click();
+
+  const name = page.getByLabel("Name for Title", { exact: true });
+  await name.fill("Temporary name");
+  await name.fill("Title");
+  await name.press("Tab");
+  await changeProperty(f.title, { name: "Remote title" });
+  await expect(page.getByLabel("Name for Remote title", { exact: true })).toHaveValue("Remote title");
+  await expect(page.getByRole("button", { name: "Reload latest settings", exact: true })).toHaveCount(0);
+
+  const source = page.getByLabel("Formula for Twice", { exact: true });
+  await expect(source).toHaveValue("2");
+  await source.fill("3");
+  await source.fill("2");
+  await changeProperty(formulaId, { source: "4" });
+  await expect(source).toHaveValue("4");
+  await expect(page.getByRole("button", { name: "Reload latest settings", exact: true })).toHaveCount(0);
+
+  await source.fill("5");
+  await changeProperty(formulaId, { source: "6" });
+  await expect(page.getByRole("button", { name: "Reload latest settings", exact: true })).toBeVisible();
+  await expect(source).toHaveValue("5");
+  await page.getByRole("button", { name: "Update formula", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Reload latest settings", exact: true })).toBeVisible();
+  const query = await (await page.request.get(`/api/tables/${f.table.id}/query`)).json();
+  expect(query.columns.find((column: { id: string }) => column.id === formulaId).config.source).toBe("6");
+  await page.getByRole("button", { name: "Reload latest settings", exact: true }).click();
+  await expect(source).toHaveValue("6");
+});

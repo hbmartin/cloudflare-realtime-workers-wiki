@@ -2,6 +2,7 @@ import { hasUrlControls } from "./text.ts";
 import * as Y from "yjs";
 import { Lexer, Tokenizer, type Token } from "marked";
 import type { ColumnType, ProseMirrorJson } from "./types";
+import { normalizeCodeBlockContent } from "./code-content";
 
 export type ImportedTable = {
   columns: Array<{ name: string; type: ColumnType; options: string[] }>;
@@ -1364,13 +1365,13 @@ export function htmlToDocument(source: string) {
           : kind === "codeBlock"
             ? { language: "" }
             : { ...BLOCK_ATTRS };
-    blocks.push({ type: kind, attrs, content: compact });
+    blocks.push({ type: kind, attrs, content: kind === "codeBlock" ? normalizeCodeBlockContent(compact) : compact });
     resetBlock();
   };
   for (const token of tokens) {
     if (token[0] !== "<") {
       const text = kind === "codeBlock" ? decodeHtml(token) : decodeHtml(token).replace(/\s+/g, " ");
-      if (!text || (!text.trim() && !content.length)) continue;
+      if (!text || (kind !== "codeBlock" && !text.trim() && !content.length)) continue;
       const activeMarks: NonNullable<ProseMirrorJson["marks"]> = marks.map((type) => ({ type }));
       if (link) activeMarks.push({ type: "link", attrs: { href: link } });
       content.push(...inline(text, activeMarks));

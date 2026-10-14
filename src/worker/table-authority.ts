@@ -30,12 +30,51 @@ import {
 } from "../shared/table-computed";
 import type { ComputedValue } from "../shared/formula";
 import { compileFormula, retypeFormulaProperties, prepareFormulaEvaluation } from "../shared/formula";
-import { compareTableProjection, type TableSnapshot } from "./table-projection";
+import { compareTableProjectionContent, type TableSnapshot } from "./table-projection";
 import { broadcastWorkspaceEvent } from "./workspace-events";
 import { calendarDay, moveCalendarDate, validateCalendarZone } from "../shared/table-calendar";
 import { validateTaskTableCommand } from "../shared/task-table-policy";
 
 export type ProjectionStatement = { sql: string; binds: (string | number | null)[] };
+const PROJECTION_MAX_BYTES = 1_000_000;
+const PROJECTION_INSERT_SQL = {
+  table_columns:
+    "INSERT INTO table_columns(id,page_id,name,type,position,config_json,property_revision,property_generation,name_key) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,position=excluded.position,config_json=excluded.config_json,property_revision=excluded.property_revision,property_generation=excluded.property_generation,name_key=excluded.name_key",
+  table_select_options:
+    "INSERT INTO table_select_options(id,column_id,label,label_search_value,position,color) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET label=excluded.label,label_search_value=excluded.label_search_value,position=excluded.position,color=excluded.color",
+  table_rows:
+    "INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at,updated_by,row_revision) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET position=excluded.position,updated_at=excluded.updated_at,updated_by=excluded.updated_by,row_revision=excluded.row_revision",
+  table_row_pages:
+    "INSERT INTO table_row_pages(row_id,page_id,created_at) VALUES(?,?,?) ON CONFLICT(row_id) DO NOTHING",
+  table_cells:
+    "INSERT INTO table_cells(row_id,column_id,text_value,text_search_value,number_value,boolean_value,date_value,select_value,json_value,cell_revision,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(row_id,column_id) DO UPDATE SET text_value=excluded.text_value,text_search_value=excluded.text_search_value,number_value=excluded.number_value,boolean_value=excluded.boolean_value,date_value=excluded.date_value,select_value=excluded.select_value,json_value=excluded.json_value,cell_revision=excluded.cell_revision,updated_at=excluded.updated_at",
+  table_computed_cells:
+    "INSERT INTO table_computed_cells(row_id,column_id,value_json,source_json,revision) VALUES(?,?,?,?,?) ON CONFLICT(row_id,column_id) DO UPDATE SET value_json=excluded.value_json,source_json=excluded.source_json,revision=excluded.revision",
+  table_views:
+    "INSERT INTO table_views(page_id,id,owner_id,value_json) VALUES(?,?,?,?) ON CONFLICT(page_id,id) DO UPDATE SET owner_id=excluded.owner_id,value_json=excluded.value_json",
+  table_people:
+    "INSERT INTO table_people(page_id,user_id,name) VALUES(?,?,?) ON CONFLICT(page_id,user_id) DO UPDATE SET name=excluded.name",
+};
+
+const COMPUTED_DELETE_SQL =
+  "DELETE FROM table_computed_cells WHERE row_id IN (SELECT value FROM json_each(?)) AND row_id IN (SELECT id FROM table_rows WHERE page_id=?)";
+type Prerequisite = { table: string; columns: string[]; binds: ProjectionStatement["binds"] };
+type PendingEvent = {
+  revision: number;
+  operation_id: string;
+  value: string;
+  cancel_row_id: string | null;
+  next_step: number;
+};
+type CommandProjection = {
+  revision: number;
+  time: number;
+  projection: ProjectionStatement[];
+  prerequisites: Map<string, Prerequisite>;
+  createdRows: Set<string>;
+  createdColumns: Set<string>;
+  createdOptions: Set<string>;
+};
 export type TableActor = {
   pageId: string;
   workspaceId: string;
@@ -55,7 +94,19 @@ export type TableActor = {
 };
 type RepairIntent = {
   generation: number;
-  phase: "fence" | "drain" | "headers" | "rows" | "verify";
+  version?: 2;
+  phase: "fence" | "drain" | "bookkeeping" | "headers" | "rows" | "reconcile" | "verify" | "publish" | "blocked";
+  mode?: "pure";
+  pureFrom?: number;
+  bookkeeping?: { revision: number; position: number; statement: number };
+  reconcileCursor?: string;
+  blocked?: {
+    revision: number;
+    position: number;
+    reason: string;
+    resumePhase: Exclude<RepairIntent["phase"], "blocked">;
+  };
+  hashes?: { canonicalHash: string; projectionHash: string };
   revision?: number;
   headerStep?: number;
   rowCursor?: string;
@@ -394,7 +445,10 @@ export class TableAuthority extends DurableObject<Env> {
             nextCursor: rows.length === 100 ? rows.at(-1)!.id : null,
           });
         }
-        return Response.json(await this.resumeRepair());
+        const repaired = await this.resumeRepair(true);
+        if ("pending" in repaired)
+          return fail("Projection repair continues in the background.", 503, "table_projection_repairing");
+        return Response.json(repaired);
       }
       const actor = await this.authorize(request, path === "/commands");
       const meta = this.meta();
@@ -550,11 +604,11 @@ export class TableAuthority extends DurableObject<Env> {
         .map((person) => ({ ...person, active: false })),
     ];
   }
-  private columnProjection(column: CollaborativeColumn): ProjectionStatement[] {
+  private columnProjection(column: CollaborativeColumn, includeOptions = true): ProjectionStatement[] {
     const pageId = this.meta().pageId;
     return [
       {
-        sql: "INSERT INTO table_columns(id,page_id,name,type,position,config_json,property_revision,property_generation,name_key) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,position=excluded.position,config_json=excluded.config_json,property_revision=excluded.property_revision,property_generation=excluded.property_generation,name_key=excluded.name_key",
+        sql: PROJECTION_INSERT_SQL.table_columns,
         binds: [
           column.id,
           pageId,
@@ -567,8 +621,8 @@ export class TableAuthority extends DurableObject<Env> {
           normalizedColumnName(column.name),
         ],
       },
-      ...column.options.map((option) => ({
-        sql: "INSERT INTO table_select_options(id,column_id,label,label_search_value,position,color) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET label=excluded.label,label_search_value=excluded.label_search_value,position=excluded.position,color=excluded.color",
+      ...(includeOptions ? column.options : []).map((option) => ({
+        sql: PROJECTION_INSERT_SQL.table_select_options,
         binds: [
           option.id,
           column.id,
@@ -582,7 +636,7 @@ export class TableAuthority extends DurableObject<Env> {
   }
   private viewProjection(view: TableView): ProjectionStatement {
     return {
-      sql: "INSERT INTO table_views(page_id,id,owner_id,value_json) VALUES(?,?,?,?) ON CONFLICT(page_id,id) DO UPDATE SET owner_id=excluded.owner_id,value_json=excluded.value_json",
+      sql: PROJECTION_INSERT_SQL.table_views,
       binds: [this.meta().pageId, view.id, view.ownerId, JSON.stringify(view)],
     };
   }
@@ -595,7 +649,7 @@ export class TableAuthority extends DurableObject<Env> {
       ).map((cell) => {
         const computed = JSON.parse(cell.value) as ComputedValue;
         return {
-          sql: "INSERT INTO table_computed_cells(row_id,column_id,value_json,source_json,revision) VALUES(?,?,?,?,?) ON CONFLICT(row_id,column_id) DO UPDATE SET value_json=excluded.value_json,source_json=excluded.source_json,revision=excluded.revision",
+          sql: PROJECTION_INSERT_SQL.table_computed_cells,
           binds: [rowId, cell.column_id, JSON.stringify(computed.value), JSON.stringify(computed.source), revision],
         };
       }),
@@ -604,7 +658,7 @@ export class TableAuthority extends DurableObject<Env> {
   private rowProjection(row: StoredRow): ProjectionStatement[] {
     return [
       {
-        sql: "INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at,updated_by,row_revision) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET position=excluded.position,updated_at=excluded.updated_at,updated_by=excluded.updated_by,row_revision=excluded.row_revision",
+        sql: PROJECTION_INSERT_SQL.table_rows,
         binds: [
           row.id,
           this.meta().pageId,
@@ -619,7 +673,7 @@ export class TableAuthority extends DurableObject<Env> {
       ...(row.detail_page_id
         ? [
             {
-              sql: "INSERT INTO table_row_pages(row_id,page_id,created_at) VALUES(?,?,?) ON CONFLICT(row_id) DO NOTHING",
+              sql: PROJECTION_INSERT_SQL.table_row_pages,
               binds: [row.id, row.detail_page_id, row.created_at],
             },
           ]
@@ -635,7 +689,7 @@ export class TableAuthority extends DurableObject<Env> {
   ): ProjectionStatement {
     const column = this.column(columnId);
     return {
-      sql: "INSERT INTO table_cells(row_id,column_id,text_value,text_search_value,number_value,boolean_value,date_value,select_value,json_value,cell_revision,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(row_id,column_id) DO UPDATE SET text_value=excluded.text_value,text_search_value=excluded.text_search_value,number_value=excluded.number_value,boolean_value=excluded.boolean_value,date_value=excluded.date_value,select_value=excluded.select_value,json_value=excluded.json_value,cell_revision=excluded.cell_revision,updated_at=excluded.updated_at",
+      sql: PROJECTION_INSERT_SQL.table_cells,
       binds: [
         rowId,
         columnId,
@@ -655,12 +709,7 @@ export class TableAuthority extends DurableObject<Env> {
       ],
     };
   }
-  private command(
-    actor: TableActor,
-    command: TableCommand,
-    hash: string,
-    sub?: { revision: number; time: number; projection: ProjectionStatement[] },
-  ): TableCommandResult {
+  private command(actor: TableActor, command: TableCommand, hash: string, sub?: CommandProjection): TableCommandResult {
     const receipt = this.rows<{ hash: string; result: string }>(
       "SELECT hash,result FROM receipts WHERE actor_id=? AND operation_id=?",
       actor.userId,
@@ -678,6 +727,41 @@ export class TableAuthority extends DurableObject<Env> {
       time = sub?.time ?? Date.now(),
       p = command.payload,
       projection: ProjectionStatement[] = sub?.projection ?? [];
+    const prerequisites = sub?.prerequisites ?? new Map<string, Prerequisite>(),
+      createdRows = sub?.createdRows ?? new Set<string>(),
+      createdColumns = sub?.createdColumns ?? new Set<string>(),
+      createdOptions = sub?.createdOptions ?? new Set<string>();
+    const remember = (statement: ProjectionStatement) => {
+      const record = insertRecords(statement)[0];
+      if (!record) return;
+      const key = prerequisiteKey(record);
+      if (!prerequisites.has(key)) prerequisites.set(key, record);
+    };
+    const rememberColumn = (column: CollaborativeColumn, selected?: TableValue) => {
+      if (createdColumns.has(column.id)) return;
+      const selectedId =
+        ["select", "status"].includes(column.type) && typeof selected === "string" ? selected : undefined;
+      if (!prerequisites.has(`table_columns:${column.id}`)) remember(this.columnProjection(column, false)[0]!);
+      if (!selectedId || createdOptions.has(selectedId) || prerequisites.has(`table_select_options:${selectedId}`))
+        return;
+      const option = column.options.find((item) => item.id === selectedId);
+      if (option)
+        remember({
+          sql: PROJECTION_INSERT_SQL.table_select_options,
+          binds: [
+            option.id,
+            column.id,
+            option.label,
+            normalizeSearchValue(option.label),
+            option.position,
+            option.color ?? "gray",
+          ],
+        });
+    };
+    const rememberRow = (row: StoredRow) => {
+      if (!createdRows.has(row.id) && !prerequisites.has(`table_rows:${row.id}`))
+        for (const statement of this.rowProjection(row)) remember(statement);
+    };
     const schemaChanged =
       !sub &&
       (["create_column", "update_column", "delete_column", "commit_type"].includes(command.kind) ||
@@ -693,6 +777,8 @@ export class TableAuthority extends DurableObject<Env> {
           p.commands.some((item) => item?.kind === "add_option")));
     let result: Record<string, unknown> = {};
     const saveColumn = (column: CollaborativeColumn) => {
+      const original = this.rows<{ value: string }>("SELECT value FROM properties WHERE id=?", column.id)[0];
+      if (original) rememberColumn(JSON.parse(original.value) as CollaborativeColumn);
       this.ctx.storage.sql.exec("INSERT OR REPLACE INTO properties VALUES(?,?)", column.id, JSON.stringify(column));
       projection.push(...this.columnProjection(column));
     };
@@ -703,9 +789,11 @@ export class TableAuthority extends DurableObject<Env> {
       creating = false,
     ): void => {
       const row = this.row(rowId);
+      rememberRow(row);
       if (!values || typeof values !== "object" || Array.isArray(values)) return fail("Invalid cell values.");
       for (const [columnId, input] of Object.entries(values)) {
         const column = this.column(columnId);
+        rememberColumn(column, input as TableValue);
         if (column.conversion && !creating)
           return fail("This property has a pending type conversion.", 409, "property_conversion_pending");
         const previous =
@@ -757,6 +845,7 @@ export class TableAuthority extends DurableObject<Env> {
       };
       if (this.rows("SELECT id FROM properties WHERE id=?", column.id).length)
         return fail("Property ID already exists.", 409);
+      createdColumns.add(column.id);
       column.config = this.propertyConfig(column, p);
       saveColumn(column);
       result = { column };
@@ -820,6 +909,7 @@ export class TableAuthority extends DurableObject<Env> {
       if (this.columns().some((property) => property.options.some((existing) => existing.id === option.id)))
         return fail("Option ID has already been used.", 409, "table_id_collision");
       if (column.options.some((item) => item.label === option.label)) return fail("Option labels must be unique.");
+      createdOptions.add(option.id);
       saveColumn({ ...column, revision: column.revision + 1, options: [...column.options, option] });
       result = { option };
     } else if (command.kind === "delete_option") {
@@ -856,6 +946,7 @@ export class TableAuthority extends DurableObject<Env> {
       };
       if (p.detailPageId && actor.detailPageId !== p.detailPageId)
         return fail("Row detail pages must be created through the page service.");
+      createdRows.add(rowId);
       this.ctx.storage.sql.exec(
         "INSERT INTO rows VALUES(?,?,?,?,?,?,?)",
         row.id,
@@ -896,6 +987,7 @@ export class TableAuthority extends DurableObject<Env> {
       result = { rowId: p.rowId };
     } else if (command.kind === "delete_row") {
       const row = this.row(p.rowId);
+      rememberRow(row);
       if (row.detail_page_id && !actor.allowDeleteDetail)
         return fail("Archive the row detail page before deleting its row.", 409, "row_detail_archive_required");
       this.ctx.storage.sql.exec("DELETE FROM computed WHERE row_id=?", row.id);
@@ -1055,6 +1147,7 @@ export class TableAuthority extends DurableObject<Env> {
         "SELECT row_id,value,source_revision FROM converted_cells WHERE conversion_id=?",
         conversion.id,
       )) {
+        rememberRow(this.row(cell.row_id));
         const source =
           this.rows<{ revision: number }>(
             "SELECT revision FROM cells WHERE row_id=? AND column_id=?",
@@ -1121,7 +1214,7 @@ export class TableAuthority extends DurableObject<Env> {
             { ...actor, effects: [], effectsAfter: [] },
             { operationId: `${command.operationId}:${index}`, kind: item.kind, payload: item.payload },
             hash,
-            { revision, time, projection },
+            { revision, time, projection, prerequisites, createdRows, createdColumns, createdOptions },
           ).result,
       );
       result = { results };
@@ -1182,6 +1275,7 @@ export class TableAuthority extends DurableObject<Env> {
             : [];
     this.ctx.storage.sql.exec("DELETE FROM staged_computed");
     for (const row of affectedRows) {
+      rememberRow(row);
       const computed = computeRowFormulas({
         tableId: meta.pageId,
         tableRevision: revision,
@@ -1210,15 +1304,22 @@ export class TableAuthority extends DurableObject<Env> {
         ).length,
       );
     }
+    for (let start = 0; start < affectedRows.length; start += 100)
+      projection.push({
+        sql: COMPUTED_DELETE_SQL,
+        binds: [JSON.stringify(affectedRows.slice(start, start + 100).map((row) => row.id)), meta.pageId],
+      });
+    const propertyById = new Map(properties.map((property) => [property.id, property]));
     for (const row of affectedRows) {
-      projection.push({ sql: "DELETE FROM table_computed_cells WHERE row_id=?", binds: [row.id] });
       for (const cell of this.rows<{ column_id: string; value: string }>(
         "SELECT column_id,value FROM computed WHERE row_id=?",
         row.id,
       )) {
         const computed = JSON.parse(cell.value) as ComputedValue;
+        const property = propertyById.get(cell.column_id);
+        if (property) rememberColumn(property);
         projection.push({
-          sql: "INSERT INTO table_computed_cells(row_id,column_id,value_json,source_json,revision) VALUES(?,?,?,?,?) ON CONFLICT(row_id,column_id) DO UPDATE SET value_json=excluded.value_json,source_json=excluded.source_json,revision=excluded.revision",
+          sql: PROJECTION_INSERT_SQL.table_computed_cells,
           binds: [row.id, cell.column_id, JSON.stringify(computed.value), JSON.stringify(computed.source), revision],
         });
       }
@@ -1227,7 +1328,7 @@ export class TableAuthority extends DurableObject<Env> {
       projection.push(this.viewProjection(JSON.parse(view.value) as TableView));
     for (const person of this.rows<{ id: string; name: string }>("SELECT * FROM people"))
       projection.push({
-        sql: "INSERT INTO table_people(page_id,user_id,name) VALUES(?,?,?) ON CONFLICT(page_id,user_id) DO UPDATE SET name=excluded.name",
+        sql: PROJECTION_INSERT_SQL.table_people,
         binds: [meta.pageId, person.id, person.name],
       });
     projection.unshift(...(actor.effects ?? []));
@@ -1257,16 +1358,19 @@ export class TableAuthority extends DurableObject<Env> {
       hash,
       JSON.stringify(answer),
     );
+    const prerequisiteChunks = chunkPrerequisites([...prerequisites.values()]);
     this.ctx.storage.sql.exec(
       "INSERT INTO events(revision,operation_id,value,cancel_row_id) VALUES(?,?,?,?)",
       revision,
       command.operationId,
-      JSON.stringify({ projectionFormat: 2 }),
+      JSON.stringify({ projectionFormat: 2, prerequisiteFormat: 1, prerequisiteChunks: prerequisiteChunks.length }),
       actor.cancelRowOnPublicationFailure ?? null,
     );
     const steps = projectionBatches(compactProjection(projection));
     if (actor.cancelRowOnPublicationFailure && steps.length > 1)
       return fail("Task publication exceeds its atomic projection limit.");
+    for (const [index, value] of prerequisiteChunks.entries())
+      this.ctx.storage.sql.exec("INSERT INTO projection_steps VALUES(?,?,?)", revision, -index - 1, value);
     for (const [position, statements] of steps.entries())
       this.ctx.storage.sql.exec(
         "INSERT INTO projection_steps VALUES(?,?,?)",
@@ -1669,6 +1773,52 @@ export class TableAuthority extends DurableObject<Env> {
       this.env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(meta.pageId),
     ]);
   }
+  /** Guard recovery upserts and their foreign keys inside the same D1 transaction. */
+  private async applyOwnedProjection(statements: ProjectionStatement[], revision: number, advance = false) {
+    const pageId = this.meta().pageId,
+      references = new Map<string, Map<string, (string | number | null)[]>>();
+    const remember = (table: string, values: (string | number | null)[]) => {
+      if (!references.has(table)) references.set(table, new Map());
+      references.get(table)!.set(JSON.stringify(values), values);
+    };
+    const guarded = statements.map((statement) => {
+      const records = insertRecords(statement);
+      for (const record of records) {
+        if (["table_columns", "table_rows"].includes(record.table))
+          remember(record.table, [recordValue(record, "id")!]);
+        if (record.columns.includes("row_id")) remember("table_rows", [recordValue(record, "row_id")!]);
+        if (record.columns.includes("column_id")) remember("table_columns", [recordValue(record, "column_id")!]);
+        if (record.table === "table_select_options")
+          remember("table_select_options", [recordValue(record, "id")!, recordValue(record, "column_id")!]);
+        if (record.table === "table_cells" && recordValue(record, "select_value"))
+          remember("table_select_options", [recordValue(record, "select_value")!, recordValue(record, "column_id")!]);
+      }
+      const table = records[0]?.table;
+      if (table === "table_rows" || table === "table_columns")
+        return { ...statement, sql: `${statement.sql} WHERE ${table}.page_id=excluded.page_id` };
+      if (table === "table_select_options")
+        return { ...statement, sql: `${statement.sql} WHERE table_select_options.column_id=excluded.column_id` };
+      return statement;
+    });
+    for (const [table, values] of references) {
+      const condition =
+        table === "table_select_options"
+          ? "EXISTS(SELECT 1 FROM table_select_options o JOIN table_columns c ON c.id=o.column_id WHERE o.id=json_extract(value,'$[0]') AND o.column_id=json_extract(value,'$[1]') AND c.page_id=?)"
+          : `EXISTS(SELECT 1 FROM ${table} WHERE id=json_extract(value,'$[0]') AND page_id=?)`;
+      guarded.push({
+        sql: `INSERT OR REPLACE INTO table_publication_guards(page_id,ok) SELECT ?,CASE WHEN NOT EXISTS(SELECT 1 FROM json_each(?) WHERE NOT (${condition})) THEN 1 ELSE 0 END`,
+        binds: [pageId, JSON.stringify([...values.values()]), pageId],
+      });
+    }
+    guarded.push({ sql: "DELETE FROM table_publication_guards WHERE page_id=?", binds: [pageId] });
+    try {
+      await this.applyProjection(guarded, revision, advance);
+    } catch (error) {
+      if (String(error).includes("table_publication_conflict"))
+        fail("Projection ownership changed during recovery.", 503, "table_projection_blocked");
+      throw error;
+    }
+  }
   private normalizeEventProjection(event: { revision: number; value: string; next_step: number }) {
     if (JSON.parse(event.value)?.projectionFormat === 2) return;
     const remaining = this.rows<{ value: string }>(
@@ -1700,7 +1850,7 @@ export class TableAuthority extends DurableObject<Env> {
         );
       this.ctx.storage.sql.exec(
         "UPDATE events SET value=? WHERE revision=?",
-        JSON.stringify({ projectionFormat: 2 }),
+        JSON.stringify({ ...JSON.parse(event.value), projectionFormat: 2 }),
         event.revision,
       );
     });
@@ -1723,13 +1873,193 @@ export class TableAuthority extends DurableObject<Env> {
         0
     );
   }
-  private async project() {
+  private eventPrerequisites(event: PendingEvent): Prerequisite[] {
+    const marker = prerequisiteJson(event.value);
+    if (marker.prerequisiteFormat === undefined) return [];
+    if (
+      marker.prerequisiteFormat !== 1 ||
+      !Number.isSafeInteger(marker.prerequisiteChunks) ||
+      marker.prerequisiteChunks < 0
+    )
+      return fail("Invalid prerequisite marker.", 503, "table_projection_blocked");
+    const chunks = this.rows<{ position: number; value: string }>(
+      "SELECT position,value FROM projection_steps WHERE revision=? AND position<0 ORDER BY position DESC",
+      event.revision,
+    );
+    if (chunks.length !== marker.prerequisiteChunks)
+      return fail("Missing prerequisite chunk.", 503, "table_projection_blocked");
+    const records: Prerequisite[] = [];
+    let fragmented = "",
+      nextPart = 0,
+      expectedParts = 0,
+      entry = -1;
+    for (const [index, chunk] of chunks.entries()) {
+      if (chunk.position !== -index - 1 || new TextEncoder().encode(chunk.value).byteLength > PROJECTION_MAX_BYTES)
+        return fail("Invalid prerequisite chunk.", 503, "table_projection_blocked");
+      const packet = prerequisiteJson(chunk.value);
+      if (Array.isArray(packet.records)) {
+        if (nextPart) return fail("Incomplete prerequisite entry.", 503, "table_projection_blocked");
+        records.push(...packet.records);
+      } else {
+        if (
+          typeof packet.data !== "string" ||
+          packet.part !== nextPart ||
+          !Number.isSafeInteger(packet.parts) ||
+          packet.parts < 1 ||
+          packet.part >= packet.parts ||
+          (nextPart > 0 && packet.parts !== expectedParts) ||
+          packet.entry !== (nextPart ? entry : records.length)
+        )
+          return fail("Invalid prerequisite fragment.", 503, "table_projection_blocked");
+        entry = packet.entry;
+        expectedParts = packet.parts;
+        fragmented += packet.data;
+        nextPart++;
+        if (nextPart === packet.parts) {
+          records.push(prerequisiteJson(fragmented));
+          fragmented = "";
+          nextPart = 0;
+          expectedParts = 0;
+        }
+      }
+    }
+    if (nextPart) return fail("Incomplete prerequisite entry.", 503, "table_projection_blocked");
+    for (const record of records) {
+      if (!record || typeof record !== "object") fail("Invalid prerequisite record.", 503, "table_projection_blocked");
+      const template = PROJECTION_INSERT_SQL[record.table as keyof typeof PROJECTION_INSERT_SQL];
+      if (
+        !template ||
+        !["table_columns", "table_select_options", "table_rows", "table_row_pages"].includes(record.table) ||
+        !Array.isArray(record.columns) ||
+        !Array.isArray(record.binds) ||
+        insertRecords({ sql: template, binds: record.binds })[0]?.columns.join(",") !== record.columns.join(",")
+      )
+        return fail("Invalid prerequisite record.", 503, "table_projection_blocked");
+      if (!validProjectionRecord(record)) return fail("Invalid prerequisite bind.", 503, "table_projection_blocked");
+    }
+    return records;
+  }
+  private async recoverProjectionParents(event: PendingEvent, statements: ProjectionStatement[]): Promise<void> {
+    const meta = this.meta(),
+      sources = new Map(this.eventPrerequisites(event).map((record) => [prerequisiteKey(record), record]));
+    for (const step of this.rows<{ value: string }>(
+      "SELECT value FROM projection_steps WHERE revision=? AND position>=0 AND position<? ORDER BY position",
+      event.revision,
+      event.next_step,
+    ))
+      for (const statement of JSON.parse(step.value) as ProjectionStatement[])
+        for (const record of insertRecords(statement))
+          if (["table_columns", "table_select_options", "table_rows", "table_row_pages"].includes(record.table))
+            sources.set(prerequisiteKey(record), record);
+    const needed = new Set<string>(),
+      provided = new Set<string>(),
+      optionColumns = new Map<string, string>();
+    for (const statement of statements)
+      for (const record of insertRecords(statement)) {
+        for (const [table, field] of [
+          ["table_columns", "column_id"],
+          ["table_rows", "row_id"],
+          ["table_select_options", "select_value"],
+        ] as const) {
+          const value = recordValue(record, field);
+          if (typeof value === "string" && !provided.has(`${table}:${value}`)) needed.add(`${table}:${value}`);
+        }
+        if (record.table === "table_cells" && typeof recordValue(record, "select_value") === "string")
+          optionColumns.set(String(recordValue(record, "select_value")), String(recordValue(record, "column_id")));
+        provided.add(prerequisiteKey(record));
+      }
+    // A latest ordinary event can use unchanged current metadata. Older queues
+    // require their captured preimages; future schema is never installed early.
+    if (event.revision === meta.revision && !event.cancel_row_id) {
+      const changed = new Set(
+        this.rows<{ value: string }>(
+          "SELECT value FROM projection_steps WHERE revision=? AND position>=0",
+          event.revision,
+        )
+          .flatMap((step) => (JSON.parse(step.value) as ProjectionStatement[]).flatMap(insertRecords))
+          .filter((record) => record.table === "table_columns")
+          .map(prerequisiteKey),
+      );
+      for (const column of this.columns()) {
+        if (changed.has(`table_columns:${column.id}`)) continue;
+        for (const statement of this.columnProjection(column)) {
+          const record = insertRecords(statement)[0]!;
+          if (!sources.has(prerequisiteKey(record))) sources.set(prerequisiteKey(record), record);
+        }
+      }
+    }
+    // Selected options depend on their owning column, even if no cell references it.
+    for (const key of needed) {
+      const record = sources.get(key);
+      if (record?.table === "table_select_options") needed.add(`table_columns:${recordValue(record, "column_id")}`);
+    }
+    const restored: ProjectionStatement[] = [];
+    for (const table of ["table_columns", "table_select_options", "table_rows"]) {
+      for (const key of needed) {
+        if (!key.startsWith(`${table}:`)) continue;
+        const targetId = key.slice(table.length + 1),
+          record = sources.get(key);
+        const current = await this.env.DB.prepare(
+          table === "table_select_options"
+            ? "SELECT c.page_id,o.column_id FROM table_select_options o JOIN table_columns c ON c.id=o.column_id WHERE o.id=?"
+            : `SELECT page_id FROM ${table} WHERE id=?`,
+        )
+          .bind(targetId)
+          .first<{ page_id: string; column_id?: string }>();
+        if (current) {
+          if (
+            current.page_id !== meta.pageId ||
+            (table === "table_select_options" &&
+              current.column_id !==
+                (optionColumns.get(targetId) ?? (record ? recordValue(record, "column_id") : undefined)))
+          )
+            fail("Projection parent belongs to another table.", 503, "table_projection_blocked");
+          continue;
+        }
+        if (!record) fail(`Historical prerequisite ${key} is unavailable.`, 503, "table_projection_blocked");
+        if (
+          table === "table_select_options" &&
+          optionColumns.has(targetId) &&
+          recordValue(record, "column_id") !== optionColumns.get(targetId)
+        )
+          fail("Historical option belongs to another property.", 503, "table_projection_blocked");
+        if (table !== "table_select_options" && recordValue(record, "page_id") !== meta.pageId)
+          fail("Prerequisite belongs to another table.", 503, "table_projection_blocked");
+        const claim = await this.env.DB.prepare("SELECT page_id FROM table_id_claims WHERE kind=? AND id=?")
+          .bind(table === "table_rows" ? "row" : table === "table_columns" ? "column" : "option", targetId)
+          .first<{ page_id: string }>();
+        if (claim && claim.page_id !== meta.pageId)
+          fail("Prerequisite identity belongs to another table.", 503, "table_projection_blocked");
+        if (table === "table_rows") {
+          if (
+            this.rows(
+              "SELECT 1 FROM receipts WHERE json_extract(result,'$.result.rowId')=? AND json_extract(result,'$.result.publicationFailed')=1 LIMIT 1",
+              targetId,
+            ).length
+          )
+            fail("Publication denied this row.", 503, "table_projection_blocked");
+          for (const field of ["created_by", "updated_by"]) {
+            const userId = recordValue(record, field);
+            if (userId && !(await this.env.DB.prepare("SELECT id FROM user WHERE id=?").bind(userId).first()))
+              fail("Prerequisite user is unavailable.", 503, "table_projection_blocked");
+          }
+        }
+        restored.push({
+          sql: `INSERT INTO ${table}(${record.columns.join(",")}) VALUES(${record.binds.map(() => "?").join(",")}) ON CONFLICT DO NOTHING`,
+          binds: record.binds,
+        });
+      }
+    }
+    if (!restored.length) fail("Missing foreign-key evidence cannot be recovered.", 503, "table_projection_blocked");
+    await this.applyProjection(restored, event.revision, false);
+  }
+  private async project(recover = false) {
     if (this.projecting) return this.projecting;
     this.projecting = (async () => {
       while (true) {
         const meta = this.meta(),
-          event = this.rows<{ revision: number; value: string; cancel_row_id: string | null; next_step: number }>(
-            "SELECT revision,value,cancel_row_id,next_step FROM events WHERE revision>? ORDER BY revision LIMIT 1",
+          event = this.rows<PendingEvent>(
+            "SELECT revision,operation_id,value,cancel_row_id,next_step FROM events WHERE revision>? ORDER BY revision LIMIT 1",
             meta.projectedRevision,
           )[0];
         if (!event) break;
@@ -1743,17 +2073,27 @@ export class TableAuthority extends DurableObject<Env> {
           if (!steps.length) await this.applyProjection([], event.revision);
           for (const [index, step] of steps.entries()) {
             if (this.purged) return;
-            await this.applyProjection(
-              JSON.parse(step.value) as ProjectionStatement[],
-              event.revision,
-              index === steps.length - 1,
-            );
+            const statements = JSON.parse(step.value) as ProjectionStatement[];
+            try {
+              await this.applyProjection(statements, event.revision, index === steps.length - 1);
+            } catch (error) {
+              if (!recover || !missingProjectionParent(error)) throw error;
+              await this.recoverProjectionParents(event, statements);
+              try {
+                await this.applyOwnedProjection(statements, event.revision, index === steps.length - 1);
+              } catch (retryError) {
+                if (missingProjectionParent(retryError))
+                  fail("Projection still lacks a verified prerequisite.", 503, "table_projection_blocked");
+                throw retryError;
+              }
+            }
             if (this.purged) return;
             this.ctx.storage.sql.exec(
               "UPDATE events SET next_step=? WHERE revision=?",
               step.position + 1,
               event.revision,
             );
+            event.next_step = step.position + 1;
           }
         } catch (error) {
           if (!event.cancel_row_id || !String(error).includes("table_publication_conflict")) throw error;
@@ -1804,7 +2144,6 @@ export class TableAuthority extends DurableObject<Env> {
     return [
       ...(!seedBaseline
         ? [
-            { sql: "DELETE FROM table_rows WHERE page_id=?", binds: [meta.pageId] },
             { sql: "DELETE FROM table_columns WHERE page_id=?", binds: [meta.pageId] },
             { sql: "DELETE FROM table_views WHERE page_id=?", binds: [meta.pageId] },
             { sql: "DELETE FROM table_people WHERE page_id=?", binds: [meta.pageId] },
@@ -1815,7 +2154,7 @@ export class TableAuthority extends DurableObject<Env> {
         this.viewProjection(JSON.parse(view.value) as TableView),
       ),
       ...this.rows<{ id: string; name: string }>("SELECT * FROM people").map((person) => ({
-        sql: "INSERT INTO table_people(page_id,user_id,name) VALUES(?,?,?) ON CONFLICT(page_id,user_id) DO UPDATE SET name=excluded.name",
+        sql: PROJECTION_INSERT_SQL.table_people,
         binds: [meta.pageId, person.id, person.name],
       })),
     ];
@@ -1909,16 +2248,111 @@ export class TableAuthority extends DurableObject<Env> {
       this.repairing = false;
     }
   }
-  private async resumeRepair() {
+  private remainingPure() {
+    const meta = this.meta();
+    const events = this.rows<PendingEvent>(
+      "SELECT * FROM events WHERE revision>? ORDER BY revision",
+      meta.projectedRevision,
+    );
+    if (!events.length) return null;
+    for (const event of events) {
+      if (event.cancel_row_id) return null;
+      this.normalizeEventProjection(event);
+      for (const step of this.rows<{ value: string }>(
+        "SELECT value FROM projection_steps WHERE revision=? AND position>=? ORDER BY position",
+        event.revision,
+        event.next_step,
+      )) {
+        for (const statement of JSON.parse(step.value) as ProjectionStatement[]) {
+          if (!pureProjection(statement, meta.pageId) && !bookkeepingProjection(statement)) return null;
+          if (
+            bookkeepingProjection(statement) &&
+            statement.binds[statement.sql.startsWith("UPDATE") ? 2 : 0] !== meta.pageId
+          )
+            return null;
+          for (const record of insertRecords(statement))
+            if (
+              ["table_columns", "table_rows", "table_views", "table_people"].includes(record.table) &&
+              recordValue(record, "page_id") !== meta.pageId
+            )
+              return null;
+        }
+      }
+    }
+    return events[0]!.revision;
+  }
+  private async repairRowStatements(row: StoredRow) {
+    const meta = this.meta();
+    const existing = await this.env.DB.prepare("SELECT page_id FROM table_rows WHERE id=?")
+      .bind(row.id)
+      .first<{ page_id: string }>();
+    const claim = await this.env.DB.prepare("SELECT page_id FROM table_id_claims WHERE kind='row' AND id=?")
+      .bind(row.id)
+      .first<{ page_id: string }>();
+    if ((existing && existing.page_id !== meta.pageId) || (claim && claim.page_id !== meta.pageId))
+      return fail("Repair row belongs to another table.", 503, "table_projection_blocked");
+    const linked = await this.env.DB.prepare(
+      "SELECT link.page_id,p.workspace_id FROM table_row_pages link JOIN pages p ON p.id=link.page_id WHERE row_id=?",
+    )
+      .bind(row.id)
+      .first<{ page_id: string; workspace_id: string }>();
+    if (linked && linked.workspace_id !== meta.workspaceId)
+      return fail("Repair detail belongs to another workspace.", 503, "table_projection_blocked");
+    if (row.detail_page_id) {
+      const detail = await this.env.DB.prepare(
+        "SELECT p.workspace_id,link.row_id FROM pages p LEFT JOIN table_row_pages link ON link.page_id=p.id WHERE p.id=?",
+      )
+        .bind(row.detail_page_id)
+        .first<{ workspace_id: string; row_id: string | null }>();
+      if (!detail || detail.workspace_id !== meta.workspaceId || (detail.row_id && detail.row_id !== row.id))
+        return fail("Repair detail ownership is unavailable.", 503, "table_projection_blocked");
+    }
+    const statements = this.repairRow(row);
+    statements[0] = {
+      ...statements[0]!,
+      sql: `${PROJECTION_INSERT_SQL.table_rows.replace("DO UPDATE SET ", "DO UPDATE SET created_by=excluded.created_by,created_at=excluded.created_at,")} WHERE table_rows.page_id=excluded.page_id`,
+    };
+    statements.splice(1, 0, {
+      sql: "INSERT OR REPLACE INTO table_publication_guards(page_id,ok) SELECT ?,CASE WHEN EXISTS(SELECT 1 FROM table_rows WHERE id=? AND page_id=?) THEN 1 ELSE 0 END",
+      binds: [meta.pageId, row.id, meta.pageId],
+    });
+    if (linked && linked.page_id !== row.detail_page_id)
+      statements.splice(2, 0, {
+        sql: "DELETE FROM table_row_pages WHERE row_id=? AND page_id=?",
+        binds: [row.id, linked.page_id],
+      });
+    if (row.detail_page_id || linked)
+      statements.push({
+        sql: "INSERT OR REPLACE INTO table_publication_guards(page_id,ok) SELECT ?,CASE WHEN (? IS NULL OR EXISTS(SELECT 1 FROM pages p WHERE p.id=? AND p.workspace_id=?)) AND (? IS NULL OR EXISTS(SELECT 1 FROM pages p WHERE p.id=? AND p.workspace_id=?)) AND (? IS NULL OR EXISTS(SELECT 1 FROM table_row_pages WHERE row_id=? AND page_id=?)) THEN 1 ELSE 0 END",
+        binds: [
+          meta.pageId,
+          row.detail_page_id,
+          row.detail_page_id,
+          meta.workspaceId,
+          linked?.page_id ?? null,
+          linked?.page_id ?? null,
+          meta.workspaceId,
+          row.detail_page_id,
+          row.id,
+          row.detail_page_id,
+        ],
+      });
+    statements.push({ sql: "DELETE FROM table_publication_guards WHERE page_id=?", binds: [meta.pageId] });
+    return statements;
+  }
+  private async resumeRepair(ownerRetry = false) {
     if (this.repairing) return fail("Repair is already running.", 409);
     this.repairing = true;
     try {
       const initial = this.meta();
       if (!initial.seeded)
         return fail("Pending table publications must complete before repair.", 503, "table_projection_pending");
-      if (!initial.repairIntent)
-        this.putMeta({ ...initial, repairIntent: { generation: initial.generation, phase: "fence" } });
-      // The intent and alarm precede the remote fence, including a lost initial response.
+      if (initial.repairIntent?.phase === "blocked") {
+        if (!ownerRetry) return { pending: true as const };
+        const { blocked, ...retry } = initial.repairIntent;
+        this.putMeta({ ...initial, repairIntent: { ...retry, phase: blocked?.resumePhase ?? "drain" } });
+      } else if (!initial.repairIntent)
+        this.putMeta({ ...initial, repairIntent: { generation: initial.generation, version: 2, phase: "fence" } });
       await this.ctx.storage.setAlarm(Date.now() + 1000);
       let intent = this.meta().repairIntent!;
       const registry = await this.env.DB.prepare("SELECT generation,state FROM table_authority WHERE page_id=?")
@@ -1928,30 +2362,97 @@ export class TableAuthority extends DurableObject<Env> {
         return fail("Repair generation changed.", 409, "table_generation_conflict");
       if (!["do", "repairing"].includes(registry.state))
         return fail("Table is not ready for repair.", 503, "table_seed_pending");
-      await this.env.DB.prepare(
+      const fenced = await this.env.DB.prepare(
         "UPDATE table_authority SET state='repairing' WHERE page_id=? AND generation=? AND state IN ('do','repairing')",
       )
         .bind(initial.pageId, intent.generation)
         .run();
+      if (!fenced.meta.changes) return fail("Repair generation changed.", 409, "table_generation_conflict");
       const setIntent = (next: RepairIntent) => {
         intent = next;
         this.putMeta({ ...this.meta(), repairIntent: next });
       };
+      if (intent.version !== 2)
+        setIntent({
+          generation: intent.generation,
+          version: 2,
+          phase: ["fence", "drain"].includes(intent.phase) ? "drain" : "headers",
+          ...(intent.revision === undefined ? {} : { revision: intent.revision }),
+          headerStep: 0,
+        });
       if (intent.phase === "fence") setIntent({ ...intent, phase: "drain" });
       if (intent.phase === "drain") {
-        await this.project();
-        this.normalizeRepairState();
-        await this.project();
-        if (this.meta().projectedRevision !== this.meta().revision)
-          return fail("Pending table publications must complete before repair.", 503, "table_projection_pending");
-        setIntent({ ...intent, phase: "headers", revision: this.meta().revision, headerStep: 0 });
+        try {
+          await this.project(true);
+        } catch (error) {
+          if ((error as { code?: string }).code !== "table_projection_blocked") throw error;
+          if (this.remainingPure() === null) throw error;
+          this.normalizeRepairState();
+          const pureFrom = this.remainingPure()!;
+          setIntent({ ...intent, mode: "pure", pureFrom, phase: "bookkeeping", revision: this.meta().revision });
+        }
+        if (intent.phase === "drain") {
+          this.normalizeRepairState();
+          await this.project(true);
+          if (this.meta().projectedRevision !== this.meta().revision)
+            return fail("Pending table publications must complete before repair.", 503, "table_projection_pending");
+          setIntent({ ...intent, phase: "headers", revision: this.meta().revision, headerStep: 0 });
+        }
       }
       if (intent.revision !== this.meta().revision)
         return fail("Repair snapshot changed.", 409, "table_revision_conflict");
+      if (intent.phase === "bookkeeping") {
+        for (const event of this.rows<PendingEvent>(
+          "SELECT * FROM events WHERE revision>=? ORDER BY revision",
+          intent.pureFrom!,
+        )) {
+          for (const step of this.rows<{ position: number; value: string }>(
+            "SELECT position,value FROM projection_steps WHERE revision=? AND position>=? ORDER BY position",
+            event.revision,
+            event.next_step,
+          )) {
+            for (const [index, statement] of (JSON.parse(step.value) as ProjectionStatement[]).entries()) {
+              const cursor = intent.bookkeeping;
+              if (
+                cursor &&
+                (event.revision < cursor.revision ||
+                  (event.revision === cursor.revision &&
+                    (step.position < cursor.position ||
+                      (step.position === cursor.position && index <= cursor.statement))))
+              )
+                continue;
+              if (bookkeepingProjection(statement)) await this.applyProjection([statement], intent.revision!, false);
+              setIntent({
+                ...intent,
+                bookkeeping: { revision: event.revision, position: step.position, statement: index },
+              });
+            }
+          }
+        }
+        setIntent({ ...intent, phase: "headers", headerStep: 0 });
+      }
       if (intent.phase === "headers") {
-        const batches = projectionBatches(compactProjection(this.repairHeaders(false)));
+        const headers = this.repairHeaders(false);
+        for (const statement of headers) {
+          const record = insertRecords(statement)[0];
+          if (!record || !["table_columns", "table_select_options"].includes(record.table)) continue;
+          const existing = await this.env.DB.prepare(
+            record.table === "table_columns"
+              ? "SELECT page_id FROM table_columns WHERE id=?"
+              : "SELECT c.page_id,o.column_id FROM table_select_options o JOIN table_columns c ON c.id=o.column_id WHERE o.id=?",
+          )
+            .bind(recordValue(record, "id")!)
+            .first<{ page_id: string; column_id?: string }>();
+          if (
+            existing &&
+            (existing.page_id !== initial.pageId ||
+              (record.table === "table_select_options" && existing.column_id !== recordValue(record, "column_id")))
+          )
+            return fail("Repair property belongs to another table.", 503, "table_projection_blocked");
+        }
+        const batches = projectionBatches(compactProjection(headers));
         for (let position = intent.headerStep ?? 0; position < batches.length; position++) {
-          await this.applyProjection(batches[position]!, intent.revision!, false);
+          await this.applyOwnedProjection(batches[position]!, intent.revision!, false);
           setIntent({ ...intent, headerStep: position + 1 });
         }
         setIntent({ ...intent, phase: "rows" });
@@ -1962,37 +2463,114 @@ export class TableAuthority extends DurableObject<Env> {
           intent.rowCursor ?? "",
         );
         for (const row of rows) {
-          await this.applyProjection(this.repairRow(row), intent.revision!, false);
+          await this.applyOwnedProjection(await this.repairRowStatements(row), intent.revision!, false);
           setIntent({ ...intent, rowCursor: row.id });
         }
         if (rows.length === 100 && this.rows("SELECT id FROM rows WHERE id>? LIMIT 1", intent.rowCursor!).length) {
           await this.ctx.storage.setAlarm(Date.now() + 1000);
-          return fail("Projection repair continues in the background.", 503, "table_projection_repairing");
+          return { pending: true as const };
         }
-        await this.applyProjection([], intent.revision!);
+        setIntent({ ...intent, phase: "reconcile" });
+      }
+      if (intent.phase === "reconcile") {
+        const projected = await this.env.DB.prepare(
+          "SELECT id FROM table_rows WHERE page_id=? AND id>? ORDER BY id LIMIT 1000",
+        )
+          .bind(initial.pageId, intent.reconcileCursor ?? "")
+          .all<{ id: string }>();
+        const stale = projected.results.filter((row) => !this.rows("SELECT id FROM rows WHERE id=?", row.id).length);
+        if (stale.length) {
+          const ids = JSON.stringify(stale.map((row) => row.id));
+          await this.applyOwnedProjection(
+            [
+              {
+                sql: "INSERT OR REPLACE INTO table_publication_guards(page_id,ok) SELECT ?,CASE WHEN NOT EXISTS(SELECT 1 FROM table_row_pages link JOIN pages detail ON detail.id=link.page_id WHERE link.row_id IN (SELECT value FROM json_each(?)) AND detail.workspace_id<>?) THEN 1 ELSE 0 END",
+                binds: [initial.pageId, ids, initial.workspaceId],
+              },
+              {
+                sql: "DELETE FROM table_rows WHERE page_id=? AND id IN (SELECT value FROM json_each(?))",
+                binds: [initial.pageId, ids],
+              },
+            ],
+            intent.revision!,
+            false,
+          );
+        }
+        if (projected.results.length) setIntent({ ...intent, reconcileCursor: projected.results.at(-1)!.id });
+        if (projected.results.length === 1000) {
+          await this.ctx.storage.setAlarm(Date.now() + 1000);
+          return { pending: true as const };
+        }
         setIntent({ ...intent, phase: "verify" });
       }
-      const result = await compareTableProjection(this.env, initial.pageId, this.snapshot(), await this.verification());
-      if (!result.projectionMatches) {
-        setIntent({ generation: intent.generation, phase: "headers", revision: intent.revision, headerStep: 0 });
-        return fail(
-          "Projection verification failed. The write fence remains active.",
-          503,
-          "table_projection_mismatch",
-        );
+      if (intent.phase === "verify") {
+        const content = await compareTableProjectionContent(this.env, initial.pageId, this.snapshot());
+        if (!content.contentMatches) {
+          const { rowCursor: _row, reconcileCursor: _reconcile, ...restart } = intent;
+          setIntent({ ...restart, phase: "headers", headerStep: 0 });
+          return fail(
+            "Projection verification failed. The write fence remains active.",
+            503,
+            "table_projection_mismatch",
+          );
+        }
+        setIntent({
+          ...intent,
+          phase: "publish",
+          hashes: { canonicalHash: content.canonicalHash, projectionHash: content.projectionHash },
+        });
       }
-      const released = await this.env.DB.prepare(
-        "UPDATE table_authority SET state='do' WHERE page_id=? AND generation=? AND state='repairing' AND projected_revision=?",
-      )
-        .bind(initial.pageId, intent.generation, intent.revision!)
-        .run();
-      if (!released.meta.changes) return fail("Repair generation changed.", 409, "table_generation_conflict");
-      const next = this.meta();
-      delete next.repairIntent;
-      this.putMeta(next);
-      return result;
+      const published = await this.env.DB.batch([
+        this.env.DB.prepare("INSERT OR REPLACE INTO table_projection_context VALUES(?,?)").bind(
+          initial.pageId,
+          intent.generation,
+        ),
+        this.env.DB.prepare(
+          "UPDATE table_state SET revision=? WHERE page_id=? AND EXISTS(SELECT 1 FROM table_authority WHERE page_id=? AND generation=? AND state='repairing' AND projected_revision<=?)",
+        ).bind(intent.revision!, initial.pageId, initial.pageId, intent.generation, intent.revision!),
+        this.env.DB.prepare(
+          "UPDATE table_authority SET projected_revision=?,state='do' WHERE page_id=? AND generation=? AND state='repairing' AND projected_revision<=?",
+        ).bind(intent.revision!, initial.pageId, intent.generation, intent.revision!),
+        this.env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(initial.pageId),
+      ]);
+      if (!published[2]!.meta.changes || !published[1]!.meta.changes)
+        return fail("Repair generation changed.", 409, "table_generation_conflict");
+      this.ctx.storage.transactionSync(() => {
+        const current = this.meta();
+        if (current.revision !== intent.revision || current.generation !== intent.generation)
+          fail("Repair snapshot changed.", 409, "table_revision_conflict");
+        delete current.repairIntent;
+        this.putMeta({ ...current, projectedRevision: intent.revision! });
+        this.ctx.storage.sql.exec("DELETE FROM projection_steps WHERE revision<=?", intent.revision!);
+      });
+      return { ...(await this.verification()), ...intent.hashes!, consistent: true, projectionMatches: true };
     } catch (error) {
-      if (!this.purged) await this.ctx.storage.setAlarm(Date.now() + 10_000);
+      if (!this.purged) {
+        if ((error as { code?: string }).code === "table_projection_blocked") {
+          const current = this.meta(),
+            pending = this.rows<PendingEvent>(
+              "SELECT * FROM events WHERE revision>? ORDER BY revision LIMIT 1",
+              current.projectedRevision,
+            )[0];
+          this.putMeta({
+            ...current,
+            repairIntent: {
+              ...current.repairIntent!,
+              phase: "blocked",
+              blocked: {
+                revision: pending?.revision ?? current.revision,
+                position: pending?.next_step ?? 0,
+                reason: (error as Error).message.slice(0, 500),
+                resumePhase:
+                  current.repairIntent!.phase === "blocked"
+                    ? (current.repairIntent!.blocked?.resumePhase ?? "drain")
+                    : current.repairIntent!.phase,
+              },
+            },
+          });
+          await this.ctx.storage.deleteAlarm();
+        } else await this.ctx.storage.setAlarm(Date.now() + 10_000);
+      }
       throw error;
     } finally {
       this.repairing = false;
@@ -2017,6 +2595,13 @@ export class TableAuthority extends DurableObject<Env> {
     id(body.jobId);
     if (target.tableId !== meta.pageId || target.generation !== meta.generation || !meta.seeded)
       return fail("Deletion target generation changed.", 409, "table_generation_conflict");
+    const userId = `deletion-job:${body.jobId}`;
+    const command: TableCommand = {
+      kind: "delete_row",
+      operationId: `permanent-delete:${body.jobId}:${target.rowId}`,
+      payload: { rowId: target.rowId },
+    };
+    const hash = await sha256Hex(canonicalJson(command));
     const authorize = async () => {
       const accepted = await this.env.DB.prepare(`SELECT job.workspace_id,authority.generation,authority.state
       FROM deletion_jobs job JOIN deletion_targets target ON target.job_id=job.id
@@ -2052,27 +2637,31 @@ export class TableAuthority extends DurableObject<Env> {
     if (row && row.detail_page_id !== target.detailPageId)
       return fail("Deletion target ownership changed.", 403, "table_forbidden");
     if (!row) {
-      const claim = await this.env.DB.prepare("SELECT page_id FROM table_id_claims WHERE kind='row' AND id=?")
-        .bind(target.rowId)
-        .first<{ page_id: string }>();
-      if (claim?.page_id !== meta.pageId) return fail("Deletion target ownership changed.", 403, "table_forbidden");
+      const receipt = this.rows<{ hash: string }>(
+        "SELECT hash FROM receipts WHERE actor_id=? AND operation_id=?",
+        userId,
+        command.operationId,
+      )[0];
+      if (receipt) {
+        if (receipt.hash !== hash)
+          return fail("That operation ID describes a different command.", 409, "idempotency_key_reused");
+      } else {
+        const claim = await this.env.DB.prepare("SELECT page_id FROM table_id_claims WHERE kind='row' AND id=?")
+          .bind(target.rowId)
+          .first<{ page_id: string }>();
+        if (claim?.page_id !== meta.pageId) return fail("Deletion target ownership changed.", 403, "table_forbidden");
+      }
     }
     await this.ctx.storage.setAlarm(Date.now() + 1000);
     await this.project();
     if (this.rows<StoredRow>("SELECT * FROM rows WHERE id=?", target.rowId).length) {
-      const command: TableCommand = {
-        kind: "delete_row",
-        operationId: `permanent-delete:${body.jobId}:${target.rowId}`,
-        payload: { rowId: target.rowId },
-      };
-      const hash = await sha256Hex(canonicalJson(command));
       await authorize();
       this.ctx.storage.transactionSync(() => {
         if (this.rows("SELECT id FROM rows WHERE id=?", target.rowId).length)
           this.command(
             {
               ...this.meta(),
-              userId: `deletion-job:${body.jobId}`,
+              userId,
               deletionJob: body.jobId,
               allowDeleteDetail: true,
               taskMutation: true,
@@ -2099,13 +2688,23 @@ export class TableAuthority extends DurableObject<Env> {
         const registry = await this.env.DB.prepare("SELECT generation,state FROM table_authority WHERE page_id=?")
           .bind(meta.pageId)
           .first<{ generation: number; state: string }>();
-        if (registry?.state === "repairing" && registry.generation === meta.generation)
-          this.putMeta({ ...meta, repairIntent: { generation: meta.generation, phase: "fence" } });
+        if (this.purged) return;
+        this.ctx.storage.transactionSync(() => {
+          const current = this.meta();
+          if (
+            !current.repairIntent &&
+            current.seeded &&
+            registry?.state === "repairing" &&
+            registry.generation === current.generation
+          )
+            this.putMeta({ ...current, repairIntent: { generation: current.generation, version: 2, phase: "fence" } });
+        });
       }
       if (this.meta().repairIntent) await this.resumeRepair();
       else await this.project();
     } catch {
-      if (!this.purged) await this.ctx.storage.setAlarm(Date.now() + 10_000);
+      if (!this.purged && this.meta().repairIntent?.phase !== "blocked")
+        await this.ctx.storage.setAlarm(Date.now() + 10_000);
     }
   }
   // fallow-ignore-next-line unused-class-member -- Called by Cloudflare Durable Object runtime.
@@ -2168,6 +2767,179 @@ function compactProjection(statements: ProjectionStatement[]): ProjectionStateme
   return result;
 }
 
+function prerequisiteJson(value: string) {
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object") fail("Invalid prerequisite JSON.", 503, "table_projection_blocked");
+    return parsed;
+  } catch {
+    return fail("Invalid prerequisite JSON.", 503, "table_projection_blocked");
+  }
+}
+const PROJECTION_NUMERIC_FIELDS = new Set([
+  "position",
+  "created_at",
+  "updated_at",
+  "property_revision",
+  "property_generation",
+  "row_revision",
+  "cell_revision",
+  "revision",
+  "number_value",
+  "boolean_value",
+]);
+const PROJECTION_NULLABLE_FIELDS = new Set([
+  "created_by",
+  "updated_by",
+  "owner_id",
+  "color",
+  "text_value",
+  "text_search_value",
+  "number_value",
+  "boolean_value",
+  "date_value",
+  "select_value",
+]);
+function validProjectionRecord(record: Prerequisite) {
+  return record.columns.every((field, index) => {
+    const value = record.binds[index];
+    if (value === null) return PROJECTION_NULLABLE_FIELDS.has(field);
+    if (PROJECTION_NUMERIC_FIELDS.has(field)) return typeof value === "number" && Number.isFinite(value);
+    if (typeof value !== "string") return false;
+    if (
+      [
+        "id",
+        "page_id",
+        "row_id",
+        "column_id",
+        "user_id",
+        "owner_id",
+        "created_by",
+        "updated_by",
+        "select_value",
+      ].includes(field)
+    )
+      return /^[\w:-]{1,300}$/.test(value);
+    return true;
+  });
+}
+function insertRecords(statement: ProjectionStatement): Prerequisite[] {
+  const match =
+    /^INSERT INTO (table_columns|table_select_options|table_rows|table_row_pages|table_cells|table_computed_cells|table_views|table_people)\(([^)]+)\) (VALUES\([^)]+\)|SELECT .* FROM json_each\(\?\) WHERE 1)/.exec(
+      statement.sql,
+    );
+  if (!match) return [];
+  const columns = match[2]!.split(",");
+  const template = PROJECTION_INSERT_SQL[match[1] as keyof typeof PROJECTION_INSERT_SQL];
+  const compacted = template.replace(
+    /VALUES\([^)]+\)/,
+    `SELECT ${columns.map((_, index) => `json_extract(value,'$[${index}]')`).join(",")} FROM json_each(?) WHERE 1 `,
+  );
+  if (statement.sql !== template && statement.sql !== compacted) return [];
+  const values = match[3]!.startsWith("VALUES") ? [statement.binds] : prerequisiteJson(String(statement.binds[0]));
+  if (!Array.isArray(values) || values.some((row) => !Array.isArray(row) || row.length !== columns.length))
+    return fail("Invalid persisted projection artifact.", 503, "table_projection_blocked");
+  const records = values.map((binds) => ({ table: match[1]!, columns, binds }));
+  if (records.some((record) => !validProjectionRecord(record)))
+    return fail("Invalid persisted projection bind.", 503, "table_projection_blocked");
+  return records;
+}
+function prerequisiteKey(record: Prerequisite) {
+  return `${record.table}:${record.binds[record.columns.indexOf(record.table === "table_row_pages" ? "row_id" : "id")]}`;
+}
+function recordValue(record: Prerequisite, name: string) {
+  return record.binds[record.columns.indexOf(name)];
+}
+function chunkPrerequisites(records: Prerequisite[]): string[] {
+  const chunks: string[] = [];
+  let group: Prerequisite[] = [],
+    bytes = 16;
+  const flush = () => {
+    if (group.length) chunks.push(JSON.stringify({ records: group }));
+    group = [];
+    bytes = 16;
+  };
+  // Ordinary records share a chunk; only oversized entries are fragmented.
+  const length = Math.floor((PROJECTION_MAX_BYTES - 256) / 6);
+  for (const [entry, record] of records.entries()) {
+    const serialized = JSON.stringify(record),
+      size = new TextEncoder().encode(serialized).byteLength;
+    if (size + 16 <= PROJECTION_MAX_BYTES) {
+      if (bytes + size + 1 > PROJECTION_MAX_BYTES) flush();
+      group.push(record);
+      bytes += size + 1;
+      continue;
+    }
+    flush();
+    const parts = Math.ceil(serialized.length / length);
+    for (let part = 0; part < parts; part++) {
+      const value = JSON.stringify({ entry, part, parts, data: serialized.slice(part * length, (part + 1) * length) });
+      if (new TextEncoder().encode(value).byteLength > PROJECTION_MAX_BYTES)
+        return fail("Prerequisite exceeds the projection payload limit.", 422, "table_projection_limit");
+      chunks.push(value);
+    }
+  }
+  flush();
+  return chunks;
+}
+function pureProjection(statement: ProjectionStatement, pageId: string) {
+  if (insertRecords(statement).length) return true;
+  const patterns: Record<string, { count: number; page?: number; json?: number }> = {
+    "DELETE FROM table_columns WHERE id=? AND page_id=?": { count: 2, page: 1 },
+    "DELETE FROM table_select_options WHERE id=? AND column_id=?": { count: 2 },
+    "DELETE FROM table_rows WHERE id=? AND page_id=?": { count: 2, page: 1 },
+    "DELETE FROM table_views WHERE page_id=? AND id=?": { count: 2, page: 0 },
+    "DELETE FROM table_computed_cells WHERE row_id=?": { count: 1 },
+    "DELETE FROM table_computed_cells WHERE row_id IN (SELECT value FROM json_each(?))": { count: 1, json: 0 },
+    [COMPUTED_DELETE_SQL]: { count: 2, page: 1, json: 0 },
+  };
+  const pattern = patterns[statement.sql];
+  if (
+    !pattern ||
+    statement.binds.length !== pattern.count ||
+    (pattern.page !== undefined && statement.binds[pattern.page] !== pageId)
+  )
+    return false;
+  return statement.binds.every((value, index) => {
+    if (typeof value !== "string") return false;
+    if (index !== pattern.json) return /^[\w:-]{1,300}$/.test(value);
+    try {
+      const values = JSON.parse(value);
+      return (
+        Array.isArray(values) && values.every((entry) => typeof entry === "string" && /^[\w:-]{1,300}$/.test(entry))
+      );
+    } catch {
+      return false;
+    }
+  });
+}
+function bookkeepingProjection(statement: ProjectionStatement) {
+  if (
+    statement.sql ===
+    "INSERT INTO page_contributors(page_id,user_id,first_edit_at,last_edit_at) VALUES(?,?,?,?) ON CONFLICT(page_id,user_id) DO UPDATE SET last_edit_at=max(last_edit_at,excluded.last_edit_at)"
+  )
+    return (
+      statement.binds.length === 4 &&
+      typeof statement.binds[0] === "string" &&
+      typeof statement.binds[1] === "string" &&
+      typeof statement.binds[2] === "number" &&
+      Number.isFinite(statement.binds[2]) &&
+      typeof statement.binds[3] === "number" &&
+      Number.isFinite(statement.binds[3])
+    );
+  return (
+    statement.sql === "UPDATE pages SET updated_by=?,updated_at=? WHERE id=?" &&
+    statement.binds.length === 3 &&
+    (statement.binds[0] === null || typeof statement.binds[0] === "string") &&
+    typeof statement.binds[1] === "number" &&
+    Number.isFinite(statement.binds[1]) &&
+    typeof statement.binds[2] === "string"
+  );
+}
+function missingProjectionParent(error: unknown) {
+  return String(error).includes("FOREIGN KEY constraint failed");
+}
+
 /** Old compaction grouped unlike INSERTs across chunk boundaries. Only reorder
  * recognized INSERT segments; effects and all other statements remain barriers. */
 function normalizeLegacyProjection(statements: ProjectionStatement[]): ProjectionStatement[] {
@@ -2207,7 +2979,7 @@ function projectionBatches(statements: ProjectionStatement[]): ProjectionStateme
   let bytes = 0;
   for (const statement of statements) {
     const size = JSON.stringify(statement).length;
-    if (batch.length && (batch.length >= 200 || bytes + size > 1000000)) {
+    if (batch.length && (batch.length >= 200 || bytes + size > PROJECTION_MAX_BYTES)) {
       result.push(batch);
       batch = [];
       bytes = 0;

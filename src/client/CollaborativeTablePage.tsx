@@ -819,6 +819,16 @@ function ViewEditor({
     setDraft((current) => ({ ...(current ?? viewDraft(view, columns)), ...change }));
   };
   const { name, kind, columnId, personal, filters, join, sorts, visible, calculations } = draft;
+  const payload = {
+    name,
+    kind,
+    columnId: kind === "grid" ? null : columnId,
+    personal,
+    filters: { kind: "group", operator: join, filters },
+    sorts,
+    visibleColumnIds: visible.filter((id) => columns.some((column) => column.id === id)),
+    calculations,
+  };
   const [filterColumn, setFilterColumn] = useState(""),
     [filterValue, setFilterValue] = useState(""),
     [filterIds, setFilterIds] = useState<string[]>([]),
@@ -860,15 +870,8 @@ function ViewEditor({
       onSubmit={(event) => {
         event.preventDefault();
         void save({
+          ...payload,
           ...(view ? { id: view.id, revision: draft.revision } : {}),
-          name,
-          kind,
-          columnId: kind === "grid" ? null : columnId,
-          personal,
-          filters: { kind: "group", operator: join, filters },
-          sorts,
-          visibleColumnIds: visible.filter((id) => columns.some((column) => column.id === id)),
-          calculations,
         });
       }}
     >
@@ -1161,14 +1164,8 @@ function ViewEditor({
             disabled={busy}
             onClick={() =>
               void save({
+                ...payload,
                 name: `${name} copy`,
-                kind,
-                columnId: kind === "grid" ? null : columnId,
-                personal,
-                filters: { kind: "group", operator: join, filters },
-                sorts,
-                visibleColumnIds: visible,
-                calculations,
               })
             }
           >
@@ -1272,6 +1269,8 @@ function Property({
     [editedSource, setSourceDraft] = useState<ReturnType<typeof propertyDraft> | null>(null),
     [option, setOption] = useState(""),
     [clearInvalid, setClearInvalid] = useState(false);
+  if (editedName?.value === column.name) setNameDraft(null);
+  if (editedSource?.value === currentSource) setSourceDraft(null);
   const nameDraft = editedName ?? propertyDraft(column.name, column.revision),
     sourceDraft = editedSource ?? propertyDraft(currentSource, column.revision);
   const conflict =
