@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { unstable_readConfig } from "wrangler";
 import {
+  cloudflare,
   deployPrepared,
   configurationHash,
   initializedDatabase,
@@ -37,6 +38,202 @@ const dependencies = () => ({
   migrateDatabase: vi.fn().mockReturnValue(0),
   upload: vi.fn(),
   health: vi.fn(),
+});
+
+const denied = (status, code = 10000) =>
+  Response.json({ success: false, errors: [{ code, message: "Authentication denied" }] }, { status });
+const successful = () => Response.json({ success: true, result: [{ success: true, results: [{ checked: 1 }] }] });
+
+describe("Cloudflare OAuth renewal", () => {
+  const account = "a".repeat(32);
+  const expired = { type: "oauth", token: "expired-oauth" };
+  const rotated = { type: "oauth", token: "rotated-oauth" };
+
+  it.each([401, 403])(
+    "renews an expired OAuth credential after HTTP %i and retries the identical query",
+    async (status) => {
+      const readCredentials = vi.fn().mockResolvedValueOnce(expired).mockResolvedValueOnce(rotated);
+      const body = { sql: "SELECT 1" };
+      const request = vi
+        .fn()
+        .mockImplementationOnce(() => {
+          body.sql = "SELECT 2";
+          return denied(status);
+        })
+        .mockImplementationOnce(successful);
+      const { api } = await cloudflare(account, { readCredentials, request });
+      expect(await api(`/d1/database/${existingDB}/query`, { method: "POST", body, jurisdiction: "eu" })).toEqual([
+        { success: true, results: [{ checked: 1 }] },
+      ]);
+      expect(readCredentials).toHaveBeenCalledTimes(2);
+      expect(request).toHaveBeenCalledTimes(2);
+      for (const [url, options] of request.mock.calls) {
+        expect(url).toBe(`https://api.cloudflare.com/client/v4/accounts/${account}/d1/database/${existingDB}/query`);
+        expect(options).toMatchObject({
+          method: "POST",
+          body: '{"sql":"SELECT 1"}',
+          headers: { "cf-r2-jurisdiction": "eu" },
+        });
+      }
+      expect(request.mock.calls.map(([, options]) => options.headers.Authorization)).toEqual([
+        "Bearer expired-oauth",
+        "Bearer rotated-oauth",
+      ]);
+    },
+  );
+
+  it("recognizes Cloudflare's alternate authentication code", async () => {
+    const readCredentials = vi.fn().mockResolvedValueOnce(expired).mockResolvedValueOnce(rotated);
+    const request = vi.fn().mockResolvedValueOnce(denied(403, 9106)).mockImplementationOnce(successful);
+    const { api } = await cloudflare(account, { readCredentials, request });
+    await expect(api("/workers/scripts/example/secrets")).resolves.toBeDefined();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not resend the request when Wrangler returns the same token", async () => {
+    const readCredentials = vi.fn().mockResolvedValue(expired);
+    const request = vi.fn().mockResolvedValueOnce(denied(401));
+    const { api } = await cloudflare(account, { readCredentials, request });
+    await expect(api("/workers/scripts/example/secrets")).rejects.toThrow("failed (401)");
+    expect(readCredentials).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it("retries only once when the rotated credential is also rejected", async () => {
+    const readCredentials = vi.fn().mockResolvedValueOnce(expired).mockResolvedValueOnce(rotated);
+    const request = vi.fn().mockImplementation(() => denied(401));
+    const { api } = await cloudflare(account, { readCredentials, request });
+    await expect(api("/workers/scripts/example/secrets")).rejects.toThrow("failed (401)");
+    expect(readCredentials).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { type: "api_token", token: "static-token" },
+    { type: "api_key", key: "static-key", email: "owner@example.test" },
+  ])("does not renew $type credentials", async (credentials) => {
+    const readCredentials = vi.fn().mockResolvedValue(credentials);
+    const request = vi.fn().mockResolvedValueOnce(denied(401));
+    const { api } = await cloudflare(account, { readCredentials, request });
+    await expect(api("/workers/scripts/example/secrets")).rejects.toThrow("failed (401)");
+    expect(readCredentials).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [403, 10021],
+    [500, 10000],
+    [200, 10000],
+  ])("does not renew after status %i with code %i", async (status, code) => {
+    const readCredentials = vi.fn().mockResolvedValue(expired);
+    const request = vi.fn().mockResolvedValueOnce(denied(status, code));
+    const { api } = await cloudflare(account, { readCredentials, request });
+    await expect(api("/workers/scripts/example/secrets")).rejects.toThrow(`failed (${status})`);
+    expect(readCredentials).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it.each(["invalid JSON", "invalid envelope", "network failure"])("does not renew after %s", async (failure) => {
+    const readCredentials = vi.fn().mockResolvedValue(expired);
+    const request = vi.fn();
+    if (failure === "network failure") request.mockRejectedValueOnce(new Error("Request timed out"));
+    else
+      request.mockResolvedValueOnce(
+        failure === "invalid JSON" ? new Response("not-json", { status: 401 }) : Response.json(null, { status: 401 }),
+      );
+    const { api } = await cloudflare(account, { readCredentials, request });
+    await expect(api("/workers/scripts/example/secrets")).rejects.toThrow(
+      failure === "network failure"
+        ? "Request timed out"
+        : failure === "invalid JSON"
+          ? "invalid JSON"
+          : "failed (401)",
+    );
+    expect(readCredentials).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it.each(["invalid", {}, [null], [{ code: "10000", message: "Denied" }]])(
+    "does not renew an authentication response with malformed errors: %j",
+    async (errors) => {
+      const readCredentials = vi.fn().mockResolvedValue(expired);
+      const request = vi.fn().mockResolvedValueOnce(Response.json({ success: false, errors }, { status: 401 }));
+      const { api } = await cloudflare(account, { readCredentials, request });
+      await expect(api("/workers/scripts/example/secrets")).rejects.toThrow("failed (401)");
+      expect(readCredentials).toHaveBeenCalledOnce();
+      expect(request).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("shares a renewal across concurrent authentication failures", async () => {
+    let finishRenewal;
+    let renewalStarted;
+    const started = new Promise((resolvePromise) => {
+      renewalStarted = resolvePromise;
+    });
+    const renewal = new Promise((resolvePromise) => {
+      finishRenewal = resolvePromise;
+    });
+    const readCredentials = vi
+      .fn()
+      .mockResolvedValueOnce(expired)
+      .mockImplementation(() => {
+        renewalStarted();
+        return renewal;
+      });
+    const request = vi.fn((_url, options) =>
+      options.headers.Authorization === "Bearer expired-oauth" ? denied(401) : successful(),
+    );
+    const { api } = await cloudflare(account, { readCredentials, request });
+    const first = api("/workers/scripts/example/secrets");
+    const second = api(`/d1/database/${existingDB}/query`, { method: "POST", body: { sql: "SELECT 1" } });
+    await started;
+    finishRenewal(rotated);
+    await Promise.all([first, second]);
+    expect(readCredentials).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(4);
+  });
+
+  it("uses already rotated credentials when an older denial arrives late", async () => {
+    let finishDenial;
+    const delayed = new Promise((resolvePromise) => {
+      finishDenial = resolvePromise;
+    });
+    const readCredentials = vi.fn().mockResolvedValueOnce(expired).mockResolvedValueOnce(rotated);
+    const request = vi.fn((_url, options) => {
+      if (options.headers.Authorization !== "Bearer expired-oauth") return successful();
+      return request.mock.calls.length === 1 ? delayed : denied(401);
+    });
+    const { api } = await cloudflare(account, { readCredentials, request });
+    const late = api("/workers/scripts/example/secrets");
+    await api(`/d1/database/${existingDB}/query`, { method: "POST", body: { sql: "SELECT 1" } });
+    finishDenial(denied(401));
+    await late;
+    expect(readCredentials).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(4);
+  });
+
+  it("allows a post-migration integrity scan to renew before Worker upload", async () => {
+    const readCredentials = vi.fn().mockResolvedValueOnce(expired).mockResolvedValueOnce(rotated);
+    let migrated = false;
+    const request = vi.fn((_url, options) => {
+      if (migrated && options.headers.Authorization === "Bearer expired-oauth") return denied(401);
+      return Response.json({ success: true, result: [{ success: true, results: [] }] });
+    });
+    const { api } = await cloudflare(account, { readCredentials, request });
+    const deps = {
+      ...dependencies(),
+      migrateDatabase: vi.fn(() => {
+        migrated = true;
+        return 0;
+      }),
+      integrityCheck: () => metadataIntegrityCheck((sql) => queryD1(api, existingDB, sql)),
+    };
+    await deployPrepared({ target: "production" }, deps);
+    expect(readCredentials).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(deps.upload).toHaveBeenCalledOnce();
+  });
 });
 
 describe("deployment integrity REST transport", () => {

@@ -4046,7 +4046,7 @@ function Workspace({ member, onSignOut }: { member: ClientMemberContext; onSignO
               nodes={tree}
               selectedId={resolvedSelectedId}
               treeReady={pagesLoaded}
-              revealRequest={revealRequest?.spaceId === currentSpaceId ? revealRequest : undefined}
+              revealRequest={revealRequest}
               onRevealHandled={handleRevealHandled}
               editable={canEditActiveSpace}
               canCreate={canCreatePage}

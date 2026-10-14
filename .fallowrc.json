@@ -8,6 +8,7 @@
     "vitest.worker.config.ts",
     "playwright.config.ts",
     "tests/e2e/fixtures/editor-render-benchmark.mjs",
+    "tests/e2e/fixtures/editor-code-reconciliation.mjs",
     "scripts/*.mjs",
     "scripts/**/*.test.mjs",
     "src/plugin-ui/main.tsx"

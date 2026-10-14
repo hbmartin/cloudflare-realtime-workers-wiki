@@ -1300,7 +1300,6 @@ export class Document extends YServer {
       Y.applyUpdate(clone, Y.encodeStateAsUpdate(this.document));
       try {
         normalizeYDocumentTables(clone);
-        normalizeYCodeBlocks(clone);
         clone.transact(() => {
           for (const operation of body.operations as ApiBlockMutation[]) applyApiMutation(clone, operation);
           if (operationId && requestHash) clone.getMap<string>("api-operation-receipts").set(operationId, requestHash);

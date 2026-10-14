@@ -202,6 +202,45 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
   requirePageEditor(page);
   if (page.kind !== "table") throw new HttpError(422, "table_required", "Choose a table.");
   let registry = await tableRegistry(env, pageId);
+  const seedBatch = async (statements: D1PreparedStatement[]) => {
+    const expected = registry;
+    try {
+      return await env.DB.batch([
+        env.DB.prepare(`INSERT OR REPLACE INTO table_publication_guards(page_id,ok)
+          SELECT ?,CASE WHEN EXISTS(SELECT 1 FROM pages WHERE id=? AND kind='table' AND workspace_id=? AND archived_at IS NULL AND import_job_id IS NULL)
+            AND NOT EXISTS(SELECT 1 FROM deletion_job_pages locked JOIN deletion_jobs job ON job.id=locked.job_id
+              WHERE locked.page_id=? AND job.workspace_id=? AND job.phase IN ('rows','cleanup'))
+            AND ${expected ? "EXISTS(SELECT 1 FROM table_authority WHERE page_id=? AND generation=? AND state=?)" : "NOT EXISTS(SELECT 1 FROM table_authority WHERE page_id=?)"}
+            THEN 1 ELSE 0 END`).bind(
+          pageId,
+          pageId,
+          member.workspace.id,
+          pageId,
+          member.workspace.id,
+          pageId,
+          ...(expected ? [expected.generation, expected.state] : []),
+        ),
+        ...statements,
+        env.DB.prepare("DELETE FROM table_publication_guards WHERE page_id=?").bind(pageId),
+      ]);
+    } catch (error) {
+      if (String(error).includes("table_publication_conflict")) {
+        const deleting =
+          await env.DB.prepare(`SELECT 1 FROM deletion_job_pages locked JOIN deletion_jobs job ON job.id=locked.job_id
+          WHERE locked.page_id=? AND job.workspace_id=? AND job.phase IN ('rows','cleanup')`)
+            .bind(pageId, member.workspace.id)
+            .first();
+        if (deleting)
+          throw new HttpError(409, "deletion_pending", "Permanent deletion has already been accepted for this table.");
+        throw new HttpError(
+          409,
+          "table_generation_conflict",
+          "Table authority changed during seeding. Reload before retrying.",
+        );
+      }
+      throw error;
+    }
+  };
   if (registry && ["do", "repairing"].includes(registry.state)) return registry;
   if (registry?.state !== "seeding") {
     const deleting = await env.DB.prepare(`SELECT 1 FROM table_rows row JOIN table_row_pages link ON link.row_id=row.id
@@ -227,27 +266,38 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
     .first<{ revision: number }>();
   if (!state) throw new HttpError(409, "table_state_missing", "Table state is missing.");
   if (registry?.state !== "seeding") {
+    const generation = registry?.generation ?? 1;
     try {
-      await env.DB.prepare(
-        `INSERT INTO table_authority(page_id,state,generation,seed_revision) VALUES(?,'seeding',1,?) ON CONFLICT(page_id) DO UPDATE SET state='seeding',seed_revision=excluded.seed_revision WHERE table_authority.state='d1'`,
-      )
-        .bind(pageId, state.revision)
-        .run();
+      await seedBatch([
+        env.DB.prepare(
+          `INSERT INTO table_authority(page_id,state,generation,seed_revision) VALUES(?,'seeding',1,?) ON CONFLICT(page_id) DO UPDATE SET state='seeding',seed_revision=excluded.seed_revision WHERE table_authority.state='d1'`,
+        ).bind(pageId, state.revision),
+      ]);
     } catch (error) {
       if (String(error).includes("deletion_pending"))
         throw new HttpError(409, "deletion_pending", "A task in this table is being permanently deleted.");
       throw error;
     }
+    registry = await tableRegistry(env, pageId);
+    if (!registry || registry.generation !== generation)
+      throw new HttpError(
+        409,
+        "table_generation_conflict",
+        "Table authority changed during seeding. Reload before retrying.",
+      );
+    if (["do", "repairing"].includes(registry.state)) return registry;
   }
-  registry = (await tableRegistry(env, pageId))!;
   const frozen = await env.DB.prepare("SELECT revision FROM table_state WHERE page_id=?")
     .bind(pageId)
     .first<{ revision: number }>();
   if (registry.state === "seeding" && registry.seed_revision !== frozen!.revision) {
-    await env.DB.prepare("UPDATE table_authority SET seed_revision=? WHERE page_id=? AND state='seeding'")
-      .bind(frozen!.revision, pageId)
-      .run();
-    registry = (await tableRegistry(env, pageId))!;
+    await seedBatch([
+      env.DB.prepare("UPDATE table_authority SET seed_revision=? WHERE page_id=? AND state='seeding'").bind(
+        frozen!.revision,
+        pageId,
+      ),
+    ]);
+    registry = { ...registry, seed_revision: frozen!.revision };
   }
   const columns = await projectionColumns(env, pageId);
   const views = (
@@ -260,7 +310,7 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
       .bind(pageId)
       .all<{ id: string; name: string }>()
   ).results;
-  await env.DB.batch([
+  await seedBatch([
     env.DB.prepare("INSERT OR REPLACE INTO table_projection_context VALUES(?,?)").bind(pageId, registry.generation),
     env.DB.prepare("UPDATE table_rows SET row_revision=? WHERE page_id=? AND row_revision<?").bind(
       registry.seed_revision,
@@ -286,12 +336,12 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
     }
   }
   if (renames.length)
-    await env.DB.batch([
+    await seedBatch([
       env.DB.prepare("INSERT OR REPLACE INTO table_projection_context VALUES(?,?)").bind(pageId, registry.generation),
       ...renames.map((item) => env.DB.prepare(item.sql).bind(...item.binds)),
       env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(pageId),
     ]);
-  await tableInternal(env, pageId, "/seed", {
+  const seeded = await tableInternal<{ seeded: boolean }>(env, pageId, "/seed", {
     meta: {
       pageId,
       workspaceId: member.workspace.id,
@@ -311,13 +361,14 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
   do {
     const rows = await projectionRows(env, pageId, cursor);
     for (const row of rows) hash = await sha256Hex(`${hash}:${canonicalJson(row)}`);
-    if (rows.length) await tableInternal(env, pageId, "/seed-rows", { generation: registry.generation, rows });
+    if (rows.length && !seeded.seeded)
+      await tableInternal(env, pageId, "/seed-rows", { generation: registry.generation, rows });
     cursor = rows.length === 100 ? rows.at(-1)!.id : null;
   } while (cursor);
   const verified = await tableInternal<{ hash: string; revision: number }>(env, pageId, "/seed-finish", {});
   if (verified.hash !== hash || verified.revision !== registry.seed_revision)
     throw new HttpError(409, "table_seed_mismatch", "The table seed does not match D1. Legacy writes remain fenced.");
-  await env.DB.batch([
+  await seedBatch([
     env.DB.prepare(
       "UPDATE table_authority SET state='do',seed_hash=?,projected_hash=?,projected_revision=?,cutover_at=? WHERE page_id=? AND generation=? AND state='seeding'",
     ).bind(hash, hash, verified.revision, Date.now(), pageId, registry.generation),

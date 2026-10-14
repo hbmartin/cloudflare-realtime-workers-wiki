@@ -43,14 +43,39 @@ function wranglerJSON(args) {
   }
 }
 
-async function cloudflare(configuredAccount) {
-  const credentials = wranglerJSON(["auth", "token", "--json"]);
-  const headers =
-    credentials.type === "api_key"
-      ? { "X-Auth-Key": credentials.key, "X-Auth-Email": credentials.email }
-      : { Authorization: `Bearer ${credentials.token}` };
-  if (!credentials.token && !(credentials.key && credentials.email))
+function validatedCloudflareCredentials(value) {
+  if (
+    !value ||
+    (value.type === "api_key"
+      ? typeof value.key !== "string" || !value.key || typeof value.email !== "string" || !value.email
+      : !["oauth", "api_token"].includes(value.type) || typeof value.token !== "string" || !value.token)
+  )
     throw new Error("Cloudflare authentication is missing.");
+  return { ...value };
+}
+
+export async function cloudflare(
+  configuredAccount,
+  { readCredentials = () => wranglerJSON(["auth", "token", "--json"]), request = fetch } = {},
+) {
+  let credentials = validatedCloudflareCredentials(await readCredentials());
+  let renewal;
+  const renewOAuth = async (failedCredentials) => {
+    if (credentials !== failedCredentials) return credentials;
+    const pending = (renewal ??= Promise.resolve()
+      .then(readCredentials)
+      .then((value) => {
+        const next = validatedCloudflareCredentials(value);
+        if (next.type !== "oauth") throw new Error("Cloudflare authentication method changed. Retry deployment.");
+        credentials = next;
+        return next;
+      }));
+    try {
+      return await pending;
+    } finally {
+      if (renewal === pending) renewal = undefined;
+    }
+  };
   let account = process.env.CLOUDFLARE_ACCOUNT_ID ?? configuredAccount;
   if (!account) {
     const identity = wranglerJSON(["whoami", "--json"]);
@@ -60,27 +85,50 @@ async function cloudflare(configuredAccount) {
   }
   if (!/^[a-f0-9]{32}$/.test(account)) throw new Error("Invalid CLOUDFLARE_ACCOUNT_ID.");
   const api = async (path, { method = "GET", body, allowMissing = false, paginated = false, jurisdiction } = {}) => {
-    const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}${path}`, {
-      method,
-      headers: {
-        ...headers,
-        "Content-Type": "application/json",
-        ...(jurisdiction ? { "cf-r2-jurisdiction": jurisdiction } : {}),
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-      signal: AbortSignal.timeout(60_000),
-    });
-    // API responses may contain credentials; report status codes, never bodies.
-    if (allowMissing && response.status === 404) return null;
-    let value;
-    try {
-      value = await response.json();
-    } catch {
-      throw new Error(`Cloudflare ${method} request returned invalid JSON.`);
+    const payload = body ? JSON.stringify(body) : undefined;
+    let canRenew = true;
+    for (;;) {
+      const sentCredentials = credentials;
+      const response = await request(`https://api.cloudflare.com/client/v4/accounts/${account}${path}`, {
+        method,
+        headers: {
+          ...(sentCredentials.type === "api_key"
+            ? { "X-Auth-Key": sentCredentials.key, "X-Auth-Email": sentCredentials.email }
+            : { Authorization: `Bearer ${sentCredentials.token}` }),
+          "Content-Type": "application/json",
+          ...(jurisdiction ? { "cf-r2-jurisdiction": jurisdiction } : {}),
+        },
+        ...(payload ? { body: payload } : {}),
+        signal: AbortSignal.timeout(60_000),
+      });
+      // API responses may contain credentials; report status codes, never bodies.
+      if (allowMissing && response.status === 404) return null;
+      let value;
+      try {
+        value = await response.json();
+      } catch {
+        throw new Error(`Cloudflare ${method} request returned invalid JSON.`);
+      }
+      const authenticationDenied =
+        value?.success === false &&
+        (value.errors === undefined ||
+          (Array.isArray(value.errors) &&
+            value.errors.every(
+              (error) => error && typeof error.code === "number" && typeof error.message === "string",
+            ))) &&
+        (response.status === 401 ||
+          (response.status === 403 &&
+            Array.isArray(value.errors) &&
+            value.errors.some((error) => [9106, 10000].includes(error?.code))));
+      if (canRenew && sentCredentials.type === "oauth" && authenticationDenied) {
+        canRenew = false;
+        const next = await renewOAuth(sentCredentials);
+        if (next.token !== sentCredentials.token) continue;
+      }
+      if (!response.ok || value?.success !== true)
+        throw new Error(`Cloudflare ${method} request failed (${response.status}). Check account permissions.`);
+      return paginated ? { result: value.result, result_info: value.result_info } : value.result;
     }
-    if (!response.ok || value?.success !== true)
-      throw new Error(`Cloudflare ${method} request failed (${response.status}). Check account permissions.`);
-    return paginated ? { result: value.result, result_info: value.result_info } : value.result;
   };
   return { account, api };
 }
