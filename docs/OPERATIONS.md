@@ -92,6 +92,8 @@ for the drain rates that tell "stuck" from "backed off".
 
 Permanent deletion returns `202` and commits a job. The job purges each document epoch's Durable Object,
 then deletes exact attachment keys and complete `documents/{pageId}/` prefixes.
+If table evidence cannot be captured, acceptance returns `503 / deletion_evidence_unavailable`;
+retry shortly. Ownership changes return `409 / deletion_pending`. Neither response accepts the deletion.
 
 ```sh
 pnpm wrangler d1 execute DB --env production --remote --command \
@@ -105,8 +107,14 @@ pnpm wrangler d1 execute DB --env production --remote --command \
      FROM deletion_targets WHERE completed_at IS NULL ORDER BY job_id;"
 ```
 
-`kind` is one of `document_do`, `r2_object`, or `r2_prefix`. `last_error` is truncated to 500
+`kind` is one of `document_do`, `table_do`, `table_row`, `r2_object`, or `r2_prefix`. `last_error` is truncated to 500
 characters. A healthy installation has zero rows in both queries.
+
+Table deletion captures linked row identities through a paged internal manifest; cells and formulas
+are not exported. `deletion_evidence_lookup` indexes the retained JSON evidence and is removed with
+its job. A dependent row deletion can recover an exact generation proof from the table's purge
+tombstone after the whole-table job is gone. If that proof is unavailable, the accepted job keeps its
+locks and parks with a diagnostic. An authorized repeat of permanent deletion rechecks the same job.
 
 ### Abandoned uploads
 
@@ -202,7 +210,8 @@ the verification retry budget. Pending and blocked responses expose generation, 
 phase, and a bounded blocked reason without scanning the whole table. Completed repair
 returns verification; a POST that completes existing work retains HTTP 200 `{ verification }`.
 
-Repair keeps table writes fenced until content parity succeeds. A second verification
+Repair keeps table writes fenced until content parity succeeds. The first verification mismatch
+returns pending and schedules one rebuild; polling does not consume another attempt. A second verification
 mismatch parks repair. Resolve the reported ownership or content issue before explicitly
 retrying POST. Accepted permanent deletion has its own stop intent and does not start repair.
 

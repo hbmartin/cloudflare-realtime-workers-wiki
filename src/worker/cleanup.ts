@@ -1,9 +1,10 @@
 import type { Env } from "./env";
 import { locationHint } from "./http";
-import { correlationHeaders, safeTelemetryErrorMessage } from "./observability";
-import { HttpError } from "./http";
+import { correlationHeaders, logger, safeTelemetryErrorMessage } from "./observability";
+import { HttpError, safeHttpError } from "./http";
 import type { PageRow } from "./page-access";
 import { acceptedPageDeletionSql } from "./deletion-policy";
+import { decodeTableResponse, tableReadPages } from "./table-transport";
 
 type DeletionTargetKind = "document_do" | "table_do" | "table_row" | "r2_object" | "r2_prefix";
 
@@ -62,7 +63,12 @@ type RowDeletionTarget = {
 };
 
 type ExternalRowEvidence = { detailPageId: string; rowId?: string; kind: "row" | "provenance" };
-const EVIDENCE_MAX_BYTES = 64_000;
+const EVIDENCE_MAX_BYTES = 1_000_000;
+const EVIDENCE_MAX_RECORDS = 1_000;
+const EVIDENCE_FAILURE = {
+  code: "deletion_evidence_unavailable",
+  message: "Table deletion evidence is temporarily unavailable. Please retry shortly.",
+};
 
 async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUntil: number) {
   const locked = await env.DB.prepare("SELECT page_id FROM deletion_job_pages WHERE job_id=?")
@@ -101,69 +107,101 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
     for (const row of provenance.results)
       if (!evidence.has(row.detailPageId)) evidence.set(row.detailPageId, { ...row, kind: "provenance" });
     if (table.generation !== null) {
-      let after: string | null = null,
-        revision: number | undefined;
-      do {
-        const params = new URLSearchParams({
-          deletionJob: job.id,
-          ...(after ? { after } : {}),
-          ...(revision === undefined ? {} : { revision: String(revision) }),
-        });
-        const response = await env.TABLE.getByName(table.pageId).fetch(
-          new Request(`https://table.internal/export?${params}`, {
-            headers: { "x-table-internal": env.BETTER_AUTH_SECRET },
-            signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
-          }),
-        );
-        if (!response.ok) {
-          const error = await response.json<{ error?: { code?: string } }>();
-          if (response.status === 503 && error.error?.code === "table_not_seeded") break;
-          throw new Error(`Deletion evidence snapshot failed with ${response.status}`);
-        }
-        const snapshot = await response.json<{
-          pageId: string;
-          workspaceId: string;
-          generation: number;
-          revision: number;
-          rows: Array<{ id: string; detailPageId: string | null }>;
-          nextCursor: string | null;
-        }>();
-        if (
-          snapshot.pageId !== table.pageId ||
-          snapshot.workspaceId !== table.workspaceId ||
-          snapshot.generation !== table.generation ||
-          !Number.isSafeInteger(snapshot.revision) ||
-          !Array.isArray(snapshot.rows) ||
-          snapshot.rows.length > 100 ||
-          (snapshot.nextCursor !== null && (typeof snapshot.nextCursor !== "string" || snapshot.nextCursor === after))
-        )
-          throw new Error("Deletion evidence snapshot ownership changed");
-        revision = snapshot.revision;
-        for (const row of snapshot.rows)
-          if (row.detailPageId && !ownedPages.has(row.detailPageId))
+      const canonicalLinks = new Map<string, string>();
+      try {
+        for await (const snapshot of tableReadPages(async (params) => {
+          params.set("deletionJob", job.id);
+          params.set("generation", String(table.generation));
+          params.set("stopTarget", stop.target);
+          const response = await env.TABLE.getByName(table.pageId).fetch(
+            new Request(`https://table.internal/deletion-evidence?${params}`, {
+              headers: { "x-table-internal": env.BETTER_AUTH_SECRET },
+              signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
+            }),
+          );
+          const manifest = await decodeTableResponse<{
+            pageId: string;
+            workspaceId: string;
+            generation: number;
+            revision: number;
+            rows: Array<{ id: string; detailPageId: string }>;
+            nextCursor: string | null;
+          }>(response, EVIDENCE_FAILURE);
+          if (
+            manifest.pageId !== table.pageId ||
+            manifest.workspaceId !== table.workspaceId ||
+            manifest.generation !== table.generation ||
+            !Array.isArray(manifest.rows) ||
+            manifest.rows.length > EVIDENCE_MAX_RECORDS ||
+            manifest.rows.some((row) => typeof row.id !== "string" || typeof row.detailPageId !== "string")
+          )
+            throw new HttpError(409, "deletion_pending", "The page subtree changed. Reload before retrying.");
+          return manifest;
+        })) {
+          for (const row of snapshot.rows) {
+            if (ownedPages.has(row.detailPageId)) continue;
+            const priorRow = canonicalLinks.get(row.detailPageId);
+            if (priorRow !== undefined && priorRow !== row.id)
+              throw new HttpError(503, EVIDENCE_FAILURE.code, EVIDENCE_FAILURE.message);
+            canonicalLinks.set(row.detailPageId, row.id);
             evidence.set(row.detailPageId, { kind: "row", rowId: row.id, detailPageId: row.detailPageId });
-        after = snapshot.nextCursor;
-      } while (after);
+          }
+        }
+      } catch (error) {
+        const failure = safeHttpError(error);
+        if (
+          failure?.code === "table_response_unavailable" ||
+          (failure?.code === "table_not_seeded" && failure.status !== 503)
+        )
+          throw new HttpError(503, EVIDENCE_FAILURE.code, EVIDENCE_FAILURE.message);
+        if (!(failure?.status === 503 && failure.code === "table_not_seeded")) throw error;
+      }
     }
+    // Interrupted accepted capture keeps its exact historical protection.
+    const prior = await env.DB.prepare(`SELECT detail_page_id,row_id,source_kind,workspace_id,generation
+      FROM deletion_evidence_lookup WHERE job_id=? AND table_id=?`)
+      .bind(job.id, table.pageId)
+      .all<{
+        detail_page_id: string;
+        row_id: string | null;
+        source_kind: "row" | "provenance";
+        workspace_id: string;
+        generation: number | null;
+      }>();
+    for (const record of prior.results) {
+      const current = evidence.get(record.detail_page_id);
+      if (
+        record.workspace_id !== table.workspaceId ||
+        record.generation !== table.generation ||
+        (current && (current.kind !== record.source_kind || (current.rowId ?? null) !== record.row_id))
+      )
+        throw new HttpError(503, EVIDENCE_FAILURE.code, EVIDENCE_FAILURE.message);
+      if (current) evidence.delete(record.detail_page_id);
+    }
+    const stored = await env.DB.prepare(`SELECT count(*) count FROM deletion_targets WHERE job_id=? AND kind='table_do'
+      AND json_valid(target) AND json_extract(target,'$.stage')='evidence' AND json_extract(target,'$.pageId')=?`)
+      .bind(job.id, table.pageId)
+      .first<{ count: number }>();
+    const firstIndex = stored!.count;
     // Keep all chunks bounded, including the final empty snapshot checkpoint.
     const chunks: ExternalRowEvidence[][] = [[]];
+    let chunkBytes = 2;
+    const encoder = new TextEncoder();
     for (const row of evidence.values()) {
+      const bytes = encoder.encode(JSON.stringify(row)).byteLength + 1;
+      if (bytes > EVIDENCE_MAX_BYTES - 1_000) throw new HttpError(503, EVIDENCE_FAILURE.code, EVIDENCE_FAILURE.message);
       let chunk = chunks.at(-1)!;
-      if (
-        chunk.length === 100 ||
-        new TextEncoder().encode(JSON.stringify([...chunk, row])).byteLength > EVIDENCE_MAX_BYTES / 2
-      ) {
+      if (chunk.length === EVIDENCE_MAX_RECORDS || chunkBytes + bytes > EVIDENCE_MAX_BYTES - 1_000) {
         chunks.push([]);
         chunk = chunks.at(-1)!;
+        chunkBytes = 2;
       }
       chunk.push(row);
+      chunkBytes += bytes;
     }
-    await env.DB.prepare(`DELETE FROM deletion_targets WHERE job_id=? AND kind='table_do' AND json_valid(target)
-      AND json_extract(target,'$.stage')='evidence' AND json_extract(target,'$.pageId')=?
-      AND EXISTS(SELECT 1 FROM deletion_jobs WHERE id=? AND phase='rows' AND next_attempt_at=?)`)
-      .bind(job.id, table.pageId, job.id, leaseUntil)
-      .run();
-    for (const [index, records] of chunks.entries()) {
+    const statements: D1PreparedStatement[] = [];
+    for (const [offset, records] of chunks.entries()) {
+      const index = firstIndex + offset;
       const value = JSON.stringify({
         version: 1,
         stage: "evidence",
@@ -172,11 +210,12 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
         generation: table.generation,
         index,
         records,
-        sealed: index === chunks.length - 1,
+        sealed: offset === chunks.length - 1,
       });
       if (new TextEncoder().encode(value).byteLength > EVIDENCE_MAX_BYTES)
         throw new Error("Deletion evidence exceeds its checkpoint limit");
-      const inserted = await env.DB.prepare(`INSERT INTO deletion_targets(job_id,kind,target,completed_at)
+      statements.push(
+        env.DB.prepare(`INSERT INTO deletion_targets(job_id,kind,target,completed_at)
         SELECT ?, 'table_do', ?, ? WHERE EXISTS(SELECT 1 FROM deletion_jobs whole JOIN deletion_job_pages locked ON locked.job_id=whole.id
           JOIN pages page ON page.id=locked.page_id AND page.workspace_id=whole.workspace_id AND page.kind='table'
           LEFT JOIN table_authority authority ON authority.page_id=page.id
@@ -184,8 +223,7 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
             AND page.archived_at IS locked.archived_at AND page.archive_operation_id IS locked.archive_operation_id
             AND EXISTS(SELECT 1 FROM deletion_targets WHERE job_id=whole.id AND kind='table_do' AND target=?))
           AND (SELECT count(*) FROM deletion_targets WHERE job_id=? AND kind='table_do' AND json_valid(target)
-            AND json_extract(target,'$.stage')='evidence' AND json_extract(target,'$.pageId')=?)=?`)
-        .bind(
+            AND json_extract(target,'$.stage')='evidence' AND json_extract(target,'$.pageId')=?)=?`).bind(
           job.id,
           value,
           Date.now(),
@@ -198,22 +236,28 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
           job.id,
           table.pageId,
           index,
-        )
-        .run();
-      if (!inserted.meta.changes) throw new Error("Deletion evidence snapshot ownership changed");
+        ),
+      );
+    }
+    for (let offset = 0; offset < statements.length; offset += 50) {
+      const inserted = await env.DB.batch(statements.slice(offset, offset + 50));
+      if (inserted.some((result) => !result.meta.changes))
+        throw new HttpError(409, "deletion_pending", "The page subtree changed. Reload before retrying.");
     }
   }
 }
 
 function authorityHistorySql(pageId: string, ownJob: string) {
-  return `EXISTS(SELECT 1 FROM deletion_targets history WHERE history.job_id<>${ownJob} AND (
-    (history.kind='table_do' AND (history.target=${pageId} OR (json_valid(history.target)
-      AND json_extract(history.target,'$.pageId')=${pageId} AND NOT COALESCE((json_extract(history.target,'$.version')=2
-        AND json_extract(history.target,'$.mode')='d1' AND json_type(history.target,'$.generation')='null'
-        AND json_type(history.target,'$.pageId')='text' AND json_type(history.target,'$.workspaceId')='text'
-        AND json_extract(history.target,'$.stage') IN('stop','purge')),0))))
-    OR (history.kind='table_row' AND json_valid(history.target) AND json_extract(history.target,'$.tableId')=${pageId}
-      AND json_type(history.target,'$.generation')='integer')))`;
+  return `(EXISTS(SELECT 1 FROM deletion_targets history WHERE history.kind='table_do' AND substr(history.target,1,1)<>'{'
+    AND history.target=${pageId} AND history.job_id<>${ownJob})
+    OR EXISTS(SELECT 1 FROM deletion_targets history WHERE history.kind='table_do' AND json_valid(history.target)
+      AND json_extract(history.target,'$.pageId')=${pageId} AND history.job_id<>${ownJob}
+      AND NOT COALESCE((json_extract(history.target,'$.version')=2 AND json_extract(history.target,'$.mode')='d1'
+        AND json_type(history.target,'$.generation')='null' AND json_type(history.target,'$.pageId')='text'
+        AND json_type(history.target,'$.workspaceId')='text' AND json_extract(history.target,'$.stage') IN('stop','purge')),0))
+    OR EXISTS(SELECT 1 FROM deletion_targets history WHERE history.kind='table_row' AND json_valid(history.target)
+      AND json_extract(history.target,'$.tableId')=${pageId} AND json_type(history.target,'$.generation')='integer'
+      AND history.job_id<>${ownJob}))`;
 }
 
 function d1CheckpointSql() {
@@ -230,7 +274,7 @@ function d1CheckpointSql() {
         OR (checkpoint.phase='cleanup' AND json_extract(deletion_targets.target,'$.stage')='purge' AND page.id IS NULL)))`;
 }
 
-const ROW_HANDOFF_FROM_SQL = `FROM deletion_targets target JOIN deletion_jobs dependent ON dependent.id=target.job_id
+const ROW_HANDOFF_BASE_SQL = `FROM deletion_targets target JOIN deletion_jobs dependent ON dependent.id=target.job_id
   JOIN deletion_job_pages detailLock ON detailLock.job_id=dependent.id AND detailLock.page_id=json_extract(target.target,'$.detailPageId')
   JOIN pages detail ON detail.id=detailLock.page_id AND detail.workspace_id=dependent.workspace_id
   JOIN pages source ON source.id=json_extract(target.target,'$.tableId') AND source.workspace_id=dependent.workspace_id AND source.kind='table'
@@ -242,7 +286,7 @@ const ROW_HANDOFF_FROM_SQL = `FROM deletion_targets target JOIN deletion_jobs de
     AND json_extract(stop.target,'$.pageId')=source.id AND json_extract(stop.target,'$.workspaceId')=whole.workspace_id
     AND json_extract(stop.target,'$.generation')=authority.generation AND (dependent.phase='rows' OR stop.completed_at IS NULL)
   WHERE target.kind='table_row' AND target.completed_at IS NULL AND json_valid(target.target)
-    AND json_type(target.target,'$.generation')='integer' AND json_type(target.target,'$.handoff') IS NULL
+    AND json_type(target.target,'$.generation')='integer'
     AND detail.archived_at IS detailLock.archived_at AND detail.archive_operation_id IS detailLock.archive_operation_id
     AND source.archived_at IS tableLock.archived_at AND source.archive_operation_id IS tableLock.archive_operation_id
     AND dependent.id<>whole.id
@@ -251,6 +295,26 @@ const ROW_HANDOFF_FROM_SQL = `FROM deletion_targets target JOIN deletion_jobs de
       OR (link.page_id=detail.id AND link.row_id<>json_extract(target.target,'$.rowId')))
     AND (dependent.phase='rows' OR (dependent.phase='staging' AND EXISTS(SELECT 1 FROM table_rows row
       JOIN table_row_pages link ON link.row_id=row.id WHERE row.id=json_extract(target.target,'$.rowId') AND row.page_id=source.id AND link.page_id=detail.id)))`;
+
+const ROW_HANDOFF_FROM_SQL = `${ROW_HANDOFF_BASE_SQL} AND json_type(target.target,'$.handoff') IS NULL`;
+
+function encodedRowHandoff(target: string, handoff: RowDeletionTarget["handoff"]) {
+  return JSON.stringify({ ...JSON.parse(target), handoff });
+}
+
+async function compareAndSwapRowTarget(
+  env: Env,
+  jobId: string,
+  previous: string,
+  next: string,
+  guard: string,
+  bindings: Array<string | number | null>,
+) {
+  return env.DB.prepare(`UPDATE deletion_targets SET target=?
+    WHERE job_id=? AND kind='table_row' AND target=? AND completed_at IS NULL AND ${guard}`)
+    .bind(next, jobId, previous, ...bindings)
+    .run();
+}
 
 async function captureRowHandoffs(
   env: Env,
@@ -281,32 +345,24 @@ async function captureRowHandoffs(
       }>();
   for (const candidate of candidates.results) {
     const row = JSON.parse(candidate.target) as RowDeletionTarget;
-    const next = JSON.stringify({
-      ...row,
-      handoff: {
-        version: 1,
-        jobId: candidate.wholeJobId,
-        pageId: row.tableId,
-        workspaceId: candidate.workspaceId,
-        generation: row.generation,
-        archivedAt: candidate.archivedAt,
-        archiveOperationId: candidate.archiveOperationId,
-        status: "pending",
-      },
+    const next = encodedRowHandoff(candidate.target, {
+      version: 1,
+      jobId: candidate.wholeJobId,
+      pageId: row.tableId,
+      workspaceId: candidate.workspaceId,
+      generation: row.generation,
+      archivedAt: candidate.archivedAt,
+      archiveOperationId: candidate.archiveOperationId,
+      status: "pending",
     });
-    const captured =
-      await env.DB.prepare(`UPDATE deletion_targets SET target=? WHERE job_id=? AND kind='table_row' AND target=? AND completed_at IS NULL
-      AND EXISTS(SELECT 1 ${ROW_HANDOFF_FROM_SQL} ${filter} AND dependent.id=? AND whole.id=? AND target.target=?)`)
-        .bind(
-          next,
-          candidate.jobId,
-          candidate.target,
-          ...bindings,
-          candidate.jobId,
-          candidate.wholeJobId,
-          candidate.target,
-        )
-        .run();
+    const captured = await compareAndSwapRowTarget(
+      env,
+      candidate.jobId,
+      candidate.target,
+      next,
+      `EXISTS(SELECT 1 ${ROW_HANDOFF_FROM_SQL} ${filter} AND dependent.id=? AND whole.id=? AND target.target=?)`,
+      [...bindings, candidate.jobId, candidate.wholeJobId, candidate.target],
+    );
     if (!captured.meta.changes) return "Deletion row handoff ownership changed";
   }
   return undefined;
@@ -348,33 +404,24 @@ async function captureLegacyCleanupHandoffs(env: Env, job: DeletionJobRow, lease
     }>();
   for (const candidate of candidates.results) {
     const row = JSON.parse(candidate.target) as RowDeletionTarget;
-    const next = JSON.stringify({
-      ...row,
-      handoff: {
-        version: 1,
-        jobId: job.id,
-        pageId: row.tableId,
-        workspaceId: job.workspace_id,
-        generation: row.generation,
-        archivedAt: candidate.archivedAt,
-        archiveOperationId: candidate.archiveOperationId,
-        status: "pending",
-      },
+    const next = encodedRowHandoff(candidate.target, {
+      version: 1,
+      jobId: job.id,
+      pageId: row.tableId,
+      workspaceId: job.workspace_id,
+      generation: row.generation,
+      archivedAt: candidate.archivedAt,
+      archiveOperationId: candidate.archiveOperationId,
+      status: "pending",
     });
-    const captured =
-      await env.DB.prepare(`UPDATE deletion_targets SET target=? WHERE job_id=? AND kind='table_row' AND target=? AND completed_at IS NULL
-      AND EXISTS(SELECT 1 ${LEGACY_CLEANUP_HANDOFF_SQL} ${filter} AND dependent.id=? AND target.target=? AND purge.target=?)`)
-        .bind(
-          next,
-          candidate.jobId,
-          candidate.target,
-          job.id,
-          leaseUntil,
-          candidate.jobId,
-          candidate.target,
-          candidate.purgeTarget,
-        )
-        .run();
+    const captured = await compareAndSwapRowTarget(
+      env,
+      candidate.jobId,
+      candidate.target,
+      next,
+      `EXISTS(SELECT 1 ${LEGACY_CLEANUP_HANDOFF_SQL} ${filter} AND dependent.id=? AND target.target=? AND purge.target=?)`,
+      [job.id, leaseUntil, candidate.jobId, candidate.target, candidate.purgeTarget],
+    );
     if (!captured.meta.changes) return "Deletion row handoff ownership changed";
   }
   return undefined;
@@ -398,10 +445,13 @@ async function publishRowHandoffProofs(
     .all<{ job_id: string; target: string }>();
   for (const candidate of candidates.results) {
     const row = JSON.parse(candidate.target) as RowDeletionTarget;
-    const next = JSON.stringify({ ...row, handoff: { ...row.handoff!, status: "purged" } });
-    const persisted =
-      await env.DB.prepare(`UPDATE deletion_targets SET target=? WHERE job_id=? AND kind='table_row' AND target=? AND completed_at IS NULL
-      AND EXISTS(SELECT 1 FROM deletion_jobs whole WHERE whole.id=? AND whole.phase='cleanup' AND whole.next_attempt_at=?
+    const next = encodedRowHandoff(candidate.target, { ...row.handoff!, status: "purged" });
+    const persisted = await compareAndSwapRowTarget(
+      env,
+      candidate.job_id,
+      candidate.target,
+      next,
+      `EXISTS(SELECT 1 FROM deletion_jobs whole WHERE whole.id=? AND whole.phase='cleanup' AND whole.next_attempt_at=?
         AND whole.workspace_id=? AND EXISTS(SELECT 1 FROM deletion_targets purge WHERE purge.job_id=whole.id AND purge.kind='table_do' AND purge.target=?))
       AND EXISTS(SELECT 1 FROM deletion_jobs dependent JOIN deletion_job_pages locked ON locked.job_id=dependent.id
         JOIN pages detail ON detail.id=locked.page_id AND detail.workspace_id=dependent.workspace_id
@@ -410,22 +460,19 @@ async function publishRowHandoffProofs(
           AND detail.archived_at IS locked.archived_at AND detail.archive_operation_id IS locked.archive_operation_id)
       AND NOT EXISTS(SELECT 1 FROM table_rows row WHERE row.id=json_extract(deletion_targets.target,'$.rowId') AND row.page_id<>json_extract(deletion_targets.target,'$.tableId'))
       AND NOT EXISTS(SELECT 1 FROM table_row_pages link WHERE (link.row_id=json_extract(deletion_targets.target,'$.rowId') AND link.page_id<>json_extract(deletion_targets.target,'$.detailPageId'))
-        OR (link.page_id=json_extract(deletion_targets.target,'$.detailPageId') AND link.row_id<>json_extract(deletion_targets.target,'$.rowId')))`)
-        .bind(
-          next,
-          candidate.job_id,
-          candidate.target,
-          jobId,
-          leaseUntil,
-          table.workspaceId,
-          targetText,
-          candidate.job_id,
-          table.workspaceId,
-          row.detailPageId,
-          row.handoff!.archivedAt,
-          row.handoff!.archiveOperationId,
-        )
-        .run();
+        OR (link.page_id=json_extract(deletion_targets.target,'$.detailPageId') AND link.row_id<>json_extract(deletion_targets.target,'$.rowId')))`,
+      [
+        jobId,
+        leaseUntil,
+        table.workspaceId,
+        targetText,
+        candidate.job_id,
+        table.workspaceId,
+        row.detailPageId,
+        row.handoff!.archivedAt,
+        row.handoff!.archiveOperationId,
+      ],
+    );
     if (!persisted.meta.changes) {
       const remaining =
         await env.DB.prepare(`SELECT 1 FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL
@@ -494,29 +541,26 @@ const WHOLE_DELETION_ANCESTRY_SQL = `EXISTS(${DELETION_ANCESTRY_SQL} SELECT 1 FR
       AND json_extract(rowTarget.target,'$.handoff.pageId')=source.id))`;
 
 const EVIDENCE_DELETION_PENDING_SQL = `EXISTS(${DELETION_ANCESTRY_SQL} SELECT 1 FROM ancestors
-  JOIN deletion_targets evidence ON evidence.kind='table_do' AND json_valid(evidence.target)
-    AND json_extract(evidence.target,'$.stage')='evidence'
+  JOIN deletion_evidence_lookup evidence ON evidence.workspace_id=ancestors.workspace_id AND evidence.detail_page_id=ancestors.id
   JOIN deletion_jobs whole ON whole.id=evidence.job_id AND whole.workspace_id=ancestors.workspace_id AND whole.phase IN ('rows','cleanup')
-  JOIN json_each(evidence.target,'$.records') record ON json_extract(record.value,'$.detailPageId')=ancestors.id
   WHERE whole.id<>ancestors.job_id
     AND NOT EXISTS(SELECT 1 FROM deletion_targets purge WHERE purge.job_id=whole.id AND purge.kind='table_do' AND purge.completed_at IS NOT NULL
       AND json_valid(purge.target) AND json_extract(purge.target,'$.stage')='purge'
-      AND json_extract(purge.target,'$.pageId')=json_extract(evidence.target,'$.pageId')
-      AND json_extract(purge.target,'$.generation') IS json_extract(evidence.target,'$.generation'))
+      AND json_extract(purge.target,'$.pageId')=evidence.table_id
+      AND json_extract(purge.target,'$.generation') IS evidence.generation)
     AND NOT EXISTS(SELECT 1 FROM deletion_targets rowTarget WHERE rowTarget.job_id=ancestors.job_id AND rowTarget.kind='table_row'
-      AND json_extract(rowTarget.target,'$.handoff.jobId')=whole.id AND json_extract(rowTarget.target,'$.handoff.pageId')=json_extract(evidence.target,'$.pageId')
-      AND json_extract(rowTarget.target,'$.handoff.generation')=json_extract(evidence.target,'$.generation')
+      AND json_extract(rowTarget.target,'$.handoff.jobId')=whole.id AND json_extract(rowTarget.target,'$.handoff.pageId')=evidence.table_id
+      AND json_extract(rowTarget.target,'$.handoff.generation')=evidence.generation
       AND json_extract(rowTarget.target,'$.handoff.status') IN ('pending','purged'))) `;
 
 const INVALID_ROW_HANDOFF_SQL = `EXISTS(SELECT 1 FROM deletion_targets candidate WHERE candidate.job_id=? AND candidate.kind='table_row'
-  AND json_type(candidate.target,'$.handoff') IS NOT NULL AND NOT EXISTS(SELECT 1 ${ROW_HANDOFF_FROM_SQL.replace(
-    "json_type(target.target,'$.handoff') IS NULL",
-    `json_extract(target.target,'$.handoff.version')=1 AND json_extract(target.target,'$.handoff.jobId')=whole.id
-      AND json_extract(target.target,'$.handoff.pageId')=source.id AND json_extract(target.target,'$.handoff.workspaceId')=dependent.workspace_id
-      AND json_extract(target.target,'$.handoff.generation')=authority.generation AND json_extract(target.target,'$.handoff.status')='pending'
-      AND json_extract(target.target,'$.handoff.archivedAt')=detailLock.archived_at
-      AND json_extract(target.target,'$.handoff.archiveOperationId') IS detailLock.archive_operation_id`,
-  )} AND target.job_id=candidate.job_id AND target.target=candidate.target))`;
+  AND json_type(candidate.target,'$.handoff') IS NOT NULL AND NOT EXISTS(SELECT 1 ${ROW_HANDOFF_BASE_SQL}
+    AND json_extract(target.target,'$.handoff.version')=1 AND json_extract(target.target,'$.handoff.jobId')=whole.id
+    AND json_extract(target.target,'$.handoff.pageId')=source.id AND json_extract(target.target,'$.handoff.workspaceId')=dependent.workspace_id
+    AND json_extract(target.target,'$.handoff.generation')=authority.generation AND json_extract(target.target,'$.handoff.status')='pending'
+    AND json_extract(target.target,'$.handoff.archivedAt')=detailLock.archived_at
+    AND json_extract(target.target,'$.handoff.archiveOperationId') IS detailLock.archive_operation_id
+    AND target.job_id=candidate.job_id AND target.target=candidate.target))`;
 
 export const TASK_DELETION_PENDING_SQL = `EXISTS(SELECT 1 FROM deletion_job_pages lock
  JOIN deletion_jobs job ON job.id=lock.job_id JOIN table_row_pages link ON link.page_id=lock.page_id
@@ -645,9 +689,12 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
         Number.MAX_SAFE_INTEGER,
       );
     } catch (error) {
-      if ((error as Error).message.includes("snapshot ownership changed"))
-        throw new HttpError(409, "deletion_pending", "The page subtree changed. Reload before retrying.");
-      throw error;
+      if (safeHttpError(error)) throw error;
+      throw new HttpError(
+        503,
+        "deletion_evidence_unavailable",
+        "Table deletion evidence is temporarily unavailable. Please retry shortly.",
+      );
     }
     if (await captureRowHandoffs(env, { dependentJobId: jobId }))
       throw new HttpError(409, "deletion_pending", "The containing table deletion changed. Retry after it completes.");
@@ -713,7 +760,17 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
     }
     return { jobId, pageIds };
   } catch (error) {
-    await env.DB.prepare("DELETE FROM deletion_jobs WHERE id=? AND phase='staging'").bind(jobId).run();
+    try {
+      await env.DB.prepare("DELETE FROM deletion_jobs WHERE id=? AND phase='staging'").bind(jobId).run();
+    } catch (cleanupError) {
+      logger.warn(
+        "deletion.staging.cleanup_failed",
+        "cleanup",
+        "Unaccepted deletion staging could not be removed.",
+        { jobId },
+        cleanupError,
+      );
+    }
     throw error;
   }
 }
@@ -832,8 +889,108 @@ async function processTarget(
         signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
       }),
     );
-    if (!response.ok) throw new Error(`Canonical row deletion failed with ${response.status}`);
-    const result = await response.json<{ ok?: unknown; projectionPending?: unknown }>();
+    let result: { ok?: unknown; projectionPending?: unknown };
+    try {
+      result = await decodeTableResponse(response);
+    } catch (error) {
+      const failure = safeHttpError(error);
+      if (failure?.status === 503 && failure.code === "table_not_seeded") {
+        const absent = await env.DB.prepare(`SELECT 1 WHERE NOT EXISTS(SELECT 1 FROM pages WHERE id=?)
+          AND NOT EXISTS(SELECT 1 FROM table_authority WHERE page_id=?)`)
+          .bind(tuple.tableId, tuple.tableId)
+          .first();
+        if (!absent) throw error;
+      } else if (failure?.status !== 410 || failure.code !== "table_purged") throw error;
+      const dependent = await env.DB.prepare(
+        "SELECT workspace_id FROM deletion_jobs WHERE id=? AND phase='rows' AND next_attempt_at=?",
+      )
+        .bind(jobId, leaseUntil)
+        .first<{ workspace_id: string }>();
+      if (!dependent) throw new HttpError(409, "deletion_pending", "Deletion ownership changed. Please retry.");
+      const proofResponse = await env.TABLE.getByName(tuple.tableId).fetch(
+        new Request("https://table.internal/row-deletion-proof", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-table-internal": env.BETTER_AUTH_SECRET },
+          body: JSON.stringify({
+            jobId,
+            pageId: tuple.tableId,
+            workspaceId: dependent.workspace_id,
+            generation: tuple.generation,
+            rowId: tuple.rowId,
+            detailPageId: tuple.detailPageId,
+            target: target.target,
+            leaseUntil,
+          }),
+          signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
+        }),
+      );
+      const proof = await decodeTableResponse<{
+        purged: unknown;
+        pageId: string;
+        workspaceId: string;
+        generation: number;
+        purgeJobId: string;
+        archivedAt: number;
+        archiveOperationId: string | null;
+      }>(proofResponse);
+      if (
+        proof.purged !== true ||
+        proof.pageId !== tuple.tableId ||
+        proof.workspaceId !== dependent.workspace_id ||
+        proof.generation !== tuple.generation ||
+        typeof proof.purgeJobId !== "string" ||
+        !Number.isSafeInteger(proof.archivedAt) ||
+        (proof.archiveOperationId !== null && typeof proof.archiveOperationId !== "string")
+      )
+        throw new HttpError(
+          503,
+          "table_deletion_proof_unavailable",
+          "Deletion proof is unavailable. An owner can retry this deletion.",
+        );
+      const next = encodedRowHandoff(target.target, {
+        version: 1,
+        jobId: proof.purgeJobId,
+        pageId: tuple.tableId,
+        workspaceId: proof.workspaceId,
+        generation: proof.generation,
+        archivedAt: proof.archivedAt,
+        archiveOperationId: proof.archiveOperationId,
+        status: "purged",
+      });
+      const captured = await compareAndSwapRowTarget(
+        env,
+        jobId!,
+        target.target,
+        next,
+        `EXISTS(SELECT 1 FROM deletion_jobs dependent JOIN deletion_job_pages locked ON locked.job_id=dependent.id
+          JOIN pages detail ON detail.id=locked.page_id AND detail.workspace_id=dependent.workspace_id
+          WHERE dependent.id=? AND dependent.phase='rows' AND dependent.next_attempt_at=? AND dependent.workspace_id=?
+            AND locked.page_id=? AND locked.archived_at=? AND locked.archive_operation_id IS ?
+            AND detail.archived_at IS locked.archived_at AND detail.archive_operation_id IS locked.archive_operation_id)
+          AND NOT EXISTS(SELECT 1 FROM pages WHERE id=?) AND NOT EXISTS(SELECT 1 FROM table_authority WHERE page_id=?)
+          AND NOT EXISTS(SELECT 1 FROM table_rows WHERE id=?) AND NOT EXISTS(SELECT 1 FROM table_row_pages WHERE row_id=? OR page_id=?)
+          AND NOT EXISTS(SELECT 1 FROM table_id_claims WHERE kind='row' AND id=? AND page_id<>?)`,
+        [
+          jobId!,
+          leaseUntil!,
+          proof.workspaceId,
+          tuple.detailPageId,
+          proof.archivedAt,
+          proof.archiveOperationId,
+          tuple.tableId,
+          tuple.tableId,
+          tuple.rowId,
+          tuple.rowId,
+          tuple.detailPageId,
+          tuple.rowId,
+          tuple.tableId,
+        ],
+      );
+      if (!captured.meta.changes)
+        throw new HttpError(409, "deletion_pending", "Deletion proof ownership changed. Please retry.");
+      target.target = next;
+      return;
+    }
     if (result.ok !== true || result.projectionPending !== false)
       throw new Error("Canonical row deletion projection is pending");
     return;
@@ -1041,147 +1198,177 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
     .first<DeletionJobRow>();
   if (!job) return;
 
-  let phaseFailure = job.phase === "rows" ? await upgradeDeletionTableTargets(env, job, leaseUntil) : undefined;
-  if (job.phase === "cleanup") phaseFailure = await captureLegacyCleanupHandoffs(env, job, leaseUntil);
-  if (job.phase === "rows" && !phaseFailure) {
-    try {
-      await captureExternalRowEvidence(env, job, leaseUntil);
-      phaseFailure = await captureRowHandoffs(env, { wholeJobId: job.id, leaseUntil });
-    } catch (error) {
-      phaseFailure = safeTelemetryErrorMessage(error, "Deletion handoff capture failed");
+  let phaseFailure: string | undefined;
+  let parked = false;
+  try {
+    phaseFailure = job.phase === "rows" ? await upgradeDeletionTableTargets(env, job, leaseUntil) : undefined;
+    if (job.phase === "cleanup") phaseFailure = await captureLegacyCleanupHandoffs(env, job, leaseUntil);
+    if (job.phase === "rows" && !phaseFailure) {
+      try {
+        await captureExternalRowEvidence(env, job, leaseUntil);
+        phaseFailure = await captureRowHandoffs(env, { wholeJobId: job.id, leaseUntil });
+      } catch (error) {
+        phaseFailure = safeTelemetryErrorMessage(error, "Deletion handoff capture failed");
+      }
     }
-  }
 
-  let targets = await env.DB.prepare(
-    `SELECT kind, target FROM deletion_targets
+    let targets = await env.DB.prepare(
+      `SELECT kind, target FROM deletion_targets
       WHERE job_id = ? AND completed_at IS NULL
         AND (kind<>'table_do' OR NOT json_valid(target) OR json_extract(target,'$.stage') IN ('stop','purge'))
         AND (?<>'rows' OR (kind='table_do' AND json_valid(target) AND json_extract(target,'$.stage')='stop'))
       ORDER BY CASE kind WHEN 'document_do' THEN 0 WHEN 'r2_object' THEN 1 ELSE 2 END, target`,
-  )
-    .bind(job.id, job.phase ?? "cleanup")
-    .all<DeletionTargetRow>();
+    )
+      .bind(job.id, job.phase ?? "cleanup")
+      .all<DeletionTargetRow>();
 
-  let hint: DurableObjectLocationHint | undefined;
-  if (targets.results.some((target) => target.kind === "document_do")) {
-    const workspace = await env.DB.prepare(`SELECT location_hint FROM workspaces WHERE id = ?`)
-      .bind(job.workspace_id)
-      .first<{ location_hint: string | null }>();
-    hint = locationHint(workspace?.location_hint ?? undefined);
-  }
+    let hint: DurableObjectLocationHint | undefined;
+    if (targets.results.some((target) => target.kind === "document_do")) {
+      const workspace = await env.DB.prepare(`SELECT location_hint FROM workspaces WHERE id = ?`)
+        .bind(job.workspace_id)
+        .first<{ location_hint: string | null }>();
+      hint = locationHint(workspace?.location_hint ?? undefined);
+    }
 
-  for (;;) {
-    if (phaseFailure) break;
-    for (const target of targets.results) {
-      try {
-        await processTarget(env, target, hint, job.id, leaseUntil);
-        const d1 = target.kind === "table_do" && tableDeletionTarget(target.target)?.version === 2;
-        const completed = await env.DB.prepare(
-          `UPDATE deletion_targets
+    for (;;) {
+      if (phaseFailure) break;
+      for (const target of targets.results) {
+        try {
+          await processTarget(env, target, hint, job.id, leaseUntil);
+          const d1 = target.kind === "table_do" && tableDeletionTarget(target.target)?.version === 2;
+          const completed = await env.DB.prepare(
+            `UPDATE deletion_targets
             SET completed_at = ?, attempts = attempts + 1, last_error = NULL
           WHERE job_id = ? AND kind = ? AND target = ?
             AND EXISTS (
               SELECT 1 FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?
             ) ${d1 ? `AND ${d1CheckpointSql()}` : ""}`,
-        )
-          .bind(Date.now(), job.id, target.kind, target.target, job.id, leaseUntil)
-          .run();
-        if (d1 && !completed.meta.changes) throw new Error("D1 table deletion ownership changed");
-      } catch (error) {
-        const message = safeTelemetryErrorMessage(error, "Unknown cleanup failure");
-        await env.DB.prepare(
-          `UPDATE deletion_targets
+          )
+            .bind(Date.now(), job.id, target.kind, target.target, job.id, leaseUntil)
+            .run();
+          if (d1 && !completed.meta.changes) throw new Error("D1 table deletion ownership changed");
+        } catch (error) {
+          const message = safeTelemetryErrorMessage(error, "Unknown cleanup failure");
+          parked ||= safeHttpError(error)?.code === "table_deletion_proof_unavailable";
+          phaseFailure ??= message;
+          await env.DB.prepare(
+            `UPDATE deletion_targets
             SET attempts = attempts + 1, last_error = ?
           WHERE job_id = ? AND kind = ? AND target = ?
             AND EXISTS (
               SELECT 1 FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?
             )`,
-        )
-          .bind(message, job.id, target.kind, target.target, job.id, leaseUntil)
-          .run();
+          )
+            .bind(message, job.id, target.kind, target.target, job.id, leaseUntil)
+            .run();
+        }
       }
-    }
-    if (job.phase !== "rows" || phaseFailure) break;
-    if (targets.results.some((target) => target.kind === "table_do")) {
-      const unstopped = await env.DB.prepare(`SELECT 1 FROM deletion_targets WHERE job_id=? AND kind='table_do'
+      if (job.phase !== "rows" || phaseFailure) break;
+      if (targets.results.some((target) => target.kind === "table_do")) {
+        const unstopped = await env.DB.prepare(`SELECT 1 FROM deletion_targets WHERE job_id=? AND kind='table_do'
         AND json_valid(target) AND json_extract(target,'$.stage')='stop' AND completed_at IS NULL LIMIT 1`)
-        .bind(job.id)
-        .first();
-      if (unstopped) break;
-    }
-    // Owned tables cannot restore links while external row targets are reconciled.
-    if (targets.results.every((target) => target.kind !== "table_row")) {
-      phaseFailure = await reconcileDeletionRowTargets(env, job, leaseUntil);
-      if (phaseFailure) break;
-      targets = await env.DB.prepare(
-        "SELECT kind,target FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL ORDER BY target",
+          .bind(job.id)
+          .first();
+        if (unstopped) break;
+      }
+      // Owned tables cannot restore links while external row targets are reconciled.
+      if (targets.results.every((target) => target.kind !== "table_row")) {
+        phaseFailure = await reconcileDeletionRowTargets(env, job, leaseUntil);
+        if (phaseFailure) break;
+        targets = await env.DB.prepare(
+          "SELECT kind,target FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL ORDER BY target",
+        )
+          .bind(job.id)
+          .all<DeletionTargetRow>();
+        if (targets.results.length) continue;
+      }
+      const remainingRows = await env.DB.prepare(
+        "SELECT count(*) count FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL",
       )
         .bind(job.id)
-        .all<DeletionTargetRow>();
-      if (targets.results.length) continue;
+        .first<{ count: number }>();
+      if (remainingRows?.count) break;
+      try {
+        if (!(await removeDeletionMetadata(env, job, leaseUntil)))
+          throw new Error("Deletion metadata ownership changed or cleanup lease expired");
+        job.phase = "cleanup";
+        targets = await env.DB.prepare(
+          "SELECT kind,target FROM deletion_targets WHERE job_id=? AND completed_at IS NULL AND (kind<>'table_do' OR NOT json_valid(target) OR json_extract(target,'$.stage') IN ('stop','purge')) ORDER BY kind,target",
+        )
+          .bind(job.id)
+          .all<DeletionTargetRow>();
+        if (targets.results.some((target) => target.kind === "document_do")) {
+          const workspace = await env.DB.prepare("SELECT location_hint FROM workspaces WHERE id=?")
+            .bind(job.workspace_id)
+            .first<{ location_hint: string | null }>();
+          hint = locationHint(workspace?.location_hint ?? undefined);
+        }
+      } catch (error) {
+        phaseFailure = safeTelemetryErrorMessage(error, "Deletion metadata cleanup failed");
+        break;
+      }
     }
-    const remainingRows = await env.DB.prepare(
-      "SELECT count(*) count FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL",
+
+    const pending = await env.DB.prepare(
+      `SELECT COUNT(*) count FROM deletion_targets WHERE job_id = ? AND completed_at IS NULL`,
     )
       .bind(job.id)
       .first<{ count: number }>();
-    if (remainingRows?.count) break;
-    try {
-      if (!(await removeDeletionMetadata(env, job, leaseUntil)))
-        throw new Error("Deletion metadata ownership changed or cleanup lease expired");
-      job.phase = "cleanup";
-      targets = await env.DB.prepare(
-        "SELECT kind,target FROM deletion_targets WHERE job_id=? AND completed_at IS NULL AND (kind<>'table_do' OR NOT json_valid(target) OR json_extract(target,'$.stage') IN ('stop','purge')) ORDER BY kind,target",
-      )
-        .bind(job.id)
-        .all<DeletionTargetRow>();
-      if (targets.results.some((target) => target.kind === "document_do")) {
-        const workspace = await env.DB.prepare("SELECT location_hint FROM workspaces WHERE id=?")
-          .bind(job.workspace_id)
-          .first<{ location_hint: string | null }>();
-        hint = locationHint(workspace?.location_hint ?? undefined);
-      }
-    } catch (error) {
-      phaseFailure = safeTelemetryErrorMessage(error, "Deletion metadata cleanup failed");
-      break;
+    if (!pending?.count && job.phase !== "rows") {
+      await env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?`)
+        .bind(job.id, leaseUntil)
+        .run();
+      return;
     }
+  } catch (error) {
+    phaseFailure = safeTelemetryErrorMessage(error, "Deletion processing failed");
+    parked ||= safeHttpError(error)?.code === "table_deletion_proof_unavailable";
   }
 
-  const pending = await env.DB.prepare(
-    `SELECT COUNT(*) count FROM deletion_targets WHERE job_id = ? AND completed_at IS NULL`,
-  )
-    .bind(job.id)
-    .first<{ count: number }>();
-  if (!pending?.count && job.phase !== "rows") {
-    await env.DB.prepare(`DELETE FROM deletion_jobs WHERE id = ? AND next_attempt_at = ?`)
-      .bind(job.id, leaseUntil)
-      .run();
-    return;
-  }
+  await recordDeletionFailure(env, job.id, leaseUntil, phaseFailure, parked);
+}
 
-  const attempts = job.attempts + 1;
-  const delay =
-    job.phase === "rows" ? 60_000 : Math.min(24 * 60 * 60_000, 60 * 60_000 * 2 ** Math.min(attempts - 1, 4));
-  const failed = await env.DB.prepare(
-    `SELECT last_error FROM deletion_targets
+async function recordDeletionFailure(
+  env: Env,
+  jobId: string,
+  leaseUntil: number,
+  phaseFailure?: string,
+  parked = false,
+) {
+  try {
+    // Metadata finalization can commit even when its response is lost.
+    const job = await env.DB.prepare("SELECT phase,attempts FROM deletion_jobs WHERE id=? AND next_attempt_at=?")
+      .bind(jobId, leaseUntil)
+      .first<{ phase: DeletionJobRow["phase"]; attempts: number }>();
+    if (!job) return;
+    const attempts = job.attempts + 1;
+    const delay =
+      job.phase === "rows" ? 60_000 : Math.min(24 * 60 * 60_000, 60 * 60_000 * 2 ** Math.min(attempts - 1, 4));
+    const failed = await env.DB.prepare(
+      `SELECT last_error FROM deletion_targets
       WHERE job_id = ? AND completed_at IS NULL AND last_error IS NOT NULL LIMIT 1`,
-  )
-    .bind(job.id)
-    .first<{ last_error: string }>();
-  await env.DB.prepare(
-    `UPDATE deletion_jobs
+    )
+      .bind(jobId)
+      .first<{ last_error: string }>();
+    await env.DB.prepare(
+      `UPDATE deletion_jobs
         SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
       WHERE id = ? AND next_attempt_at = ?`,
-  )
-    .bind(
-      attempts,
-      Date.now() + delay,
-      phaseFailure ?? failed?.last_error ?? "Cleanup incomplete",
-      Date.now(),
-      job.id,
-      leaseUntil,
     )
-    .run();
+      .bind(
+        attempts,
+        parked ? Number.MAX_SAFE_INTEGER : Date.now() + delay,
+        phaseFailure ?? failed?.last_error ?? "Cleanup incomplete",
+        Date.now(),
+        jobId,
+        leaseUntil,
+      )
+      .run();
+  } catch (error) {
+    logger.warn("cleanup.failure_checkpoint", "cleanup", "Deletion failure checkpoint unavailable", {
+      error: safeTelemetryErrorMessage(error, "Cleanup retry checkpoint failed"),
+    });
+  }
 }
 
 export async function processDueDeletionJobs(env: Env, limit = 10) {
@@ -1193,5 +1380,13 @@ export async function processDueDeletionJobs(env: Env, limit = 10) {
   )
     .bind(Date.now(), limit)
     .all<{ id: string }>();
-  for (const job of jobs.results) await processDeletionJob(env, job.id);
+  for (const job of jobs.results) {
+    try {
+      await processDeletionJob(env, job.id);
+    } catch (error) {
+      logger.warn("cleanup.job_unavailable", "cleanup", "Deletion job processing unavailable", {
+        error: safeTelemetryErrorMessage(error, "Cleanup processing failed"),
+      });
+    }
+  }
 }

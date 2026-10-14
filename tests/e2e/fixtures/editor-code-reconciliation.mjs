@@ -11,6 +11,88 @@ import { documentToYjsUpdate } from "../../../src/shared/import-content";
 const annotationKey = "comment--0123abcd";
 const codeElement = (doc) => doc.getXmlFragment("document-store").get(0).get(0).get(0);
 
+/** Count code inspections through the browser's mounted binding. */
+export function inspectChangedCodeScopes() {
+  const doc = new Y.Doc(),
+    group = new Y.XmlElement("blockGroup"),
+    paragraph = new Y.XmlElement("blockContainer"),
+    plain = new Y.XmlElement("paragraph"),
+    plainText = new Y.XmlText();
+  paragraph.setAttribute("id", "plain");
+  plain.insert(0, [plainText]);
+  paragraph.insert(0, [plain]);
+  group.insert(0, [paragraph]);
+  const texts = Array.from({ length: 100 }, (_, index) => {
+    const container = new Y.XmlElement("blockContainer"),
+      code = new Y.XmlElement("codeBlock"),
+      text = new Y.XmlText();
+    container.setAttribute("id", `code-${index}`);
+    code.setAttribute("language", "javascript");
+    text.insert(0, "safe code");
+    code.insert(0, [text]);
+    container.insert(0, [code]);
+    group.insert(index + 1, [container]);
+    return text;
+  });
+  doc.getXmlFragment("document-store").insert(0, [group]);
+  const editor = BlockNoteEditor.create(
+    withCollaboration({
+      schema: notesSchema,
+      collaboration: {
+        fragment: doc.getXmlFragment("document-store"),
+        user: { name: "Scope fixture", color: "#123456" },
+      },
+    }),
+  );
+  const host = document.createElement("section");
+  document.body.appendChild(host);
+  editor.mount(host);
+  const counts = Array(texts.length).fill(0),
+    deltaReaders = texts.map((text) => Reflect.get(text, "toDelta"));
+  texts.forEach((text, index) => {
+    text.toDelta = (...args) => {
+      counts[index]++;
+      return deltaReaders[index].apply(text, args);
+    };
+  });
+  const inspect = () => [Math.min(...counts), Math.max(...counts)],
+    reset = () => counts.fill(0);
+  const listenerCount = Reflect.get(doc, "_observers").get("beforeObserverCalls")?.size ?? 0;
+  try {
+    plainText.insert(0, "paragraph only");
+    doc.getMap("presence").set("cursor", 1);
+    const unrelated = inspect();
+    reset();
+    texts[0].insert(1, "!");
+    const affected = counts[0],
+      untouched = Math.max(...counts.slice(1));
+    reset();
+    const added = new Y.XmlElement("blockContainer");
+    added.setAttribute("id", "structural");
+    added.insert(0, [new Y.XmlElement("paragraph")]);
+    group.insert(1, [added]);
+    const structural = inspect();
+    reset();
+    const binding = ySyncPluginKey.getState(editor.prosemirrorState).binding;
+    Reflect.get(binding, "_forceRerender").call(binding);
+    const forced = inspect();
+    editor.unmount();
+    return {
+      unrelated,
+      affected,
+      untouched,
+      structural,
+      forced,
+      listenerRemoved: (Reflect.get(doc, "_observers").get("beforeObserverCalls")?.size ?? 0) < listenerCount,
+    };
+  } finally {
+    texts.forEach((text, index) => (text.toDelta = deltaReaders[index]));
+    editor.unmount();
+    host.remove();
+    doc.destroy();
+  }
+}
+
 /** Exercise rejection with the browser's actual editor binding, preserving the received bytes. */
 export function rejectUnsupportedCode() {
   const results = [];
