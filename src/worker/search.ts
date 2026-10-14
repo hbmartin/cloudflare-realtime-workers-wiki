@@ -10,7 +10,7 @@ import { PAGE_KINDS } from "../shared/page-kind";
 import { ID_PATTERN } from "../shared/validation";
 import type { MemberContext } from "./env";
 import { HttpError } from "./http";
-import { ACCEPTED_PAGE_DELETION_SQL } from "./cleanup";
+import { ACCEPTED_PAGE_DELETION_SQL } from "./deletion-policy";
 import { pageJson, type PageJsonRow } from "./page-row";
 import { normalizedTitle, titleSimilarity, titleTrigramMatch } from "../shared/title-search";
 

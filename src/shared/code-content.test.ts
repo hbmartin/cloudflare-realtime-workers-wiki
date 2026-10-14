@@ -34,6 +34,58 @@ function legacyDocument(content: ProseMirrorJson[]) {
 }
 
 describe("legacy code content normalization", () => {
+  it.each(["cjs", "esm"])(
+    "preflights unsupported code before the %s reader or writer changes shared content",
+    (format) => {
+      const imports =
+        format === "cjs"
+          ? 'const Y = require("yjs"), { Schema } = require("prosemirror-model"), p = require("y-prosemirror");'
+          : 'import * as Y from "yjs"; import { Schema } from "prosemirror-model"; import * as p from "y-prosemirror";';
+      const output = execFileSync(
+        process.execPath,
+        [
+          ...(format === "esm" ? ["--input-type=module"] : []),
+          "-e",
+          `${imports}
+      const schema = new Schema({ nodes: { doc: { content: "paragraph codeBlock" }, paragraph: { content: "text*", attrs: { id: { default: "original" } } }, codeBlock: { content: "text*", attrs: { language: { default: "js" } } }, text: {} } });
+      const doc = new Y.Doc(), fragment = doc.getXmlFragment("document-store"), paragraph = new Y.XmlElement("paragraph"), code = new Y.XmlElement("codeBlock");
+      const head = new Y.XmlText(), tail = new Y.XmlText(); head.insert(0, "left"); tail.insert(0, "right");
+      paragraph.insert(0, [new Y.XmlText()]); code.insert(0, [head, tail]); code.setAttribute("language", "js"); fragment.insert(0, [paragraph, code]);
+      const { meta } = p.initProseMirrorDoc(fragment, schema);
+      // An earlier paragraph would be merged by the upstream reader. An earlier
+      // attribute/text would be changed by the writer without root preflight.
+      const owned = new Y.XmlText(); owned.insert(0, "owned"); paragraph.insert(1, [owned]);
+      tail.insertEmbed(2, { unsupported: "image" });
+      const before = Buffer.from(Y.encodeStateAsUpdate(doc)), mappings = [...meta.mapping.entries()];
+      const desired = schema.node("doc", null, [schema.node("paragraph", { id: "changed" }, [schema.text("changed")]), schema.node("codeBlock", { language: "python" }, [schema.text("replacement")])]);
+      const attempts = [
+        () => p.assertSupportedCodeContent(fragment),
+        () => p.initProseMirrorDoc(fragment, schema),
+        () => p.yXmlFragmentToProseMirrorRootNode(fragment, schema),
+        () => p.updateYFragment(doc, fragment, desired, meta),
+      ];
+      const errors = attempts.map(attempt => { try { attempt(); throw Error("Expected rejection"); } catch (error) { if (!(error instanceof p.UnsupportedCodeContentError)) throw error; return error.code; } });
+      if (!Buffer.from(Y.encodeStateAsUpdate(doc)).equals(before)) throw Error("Shared bytes changed");
+      if (paragraph.length !== 2 || code.get(1) !== tail || paragraph.getAttribute("id") !== undefined || code.getAttribute("language") !== "js") throw Error("Shared identities or attributes changed");
+      if (mappings.length !== meta.mapping.size || mappings.some(([key, value]) => meta.mapping.get(key) !== value)) throw Error("Mapping changed before preflight");
+      const observers = () => [...doc._observers.values()].reduce((sum, listeners) => sum + listeners.size, 0), count = observers();
+      const plugin = p.ySyncPlugin(fragment, { mapping: meta.mapping });
+      try { plugin.spec.view({ state: { schema } }); throw Error("Expected initial rejection"); } catch (error) { if (!(error instanceof p.UnsupportedCodeContentError)) throw error; }
+      if (observers() !== count || fragment._dEH.l.length) throw Error("Failed mount leaked observers");
+      if (!Buffer.from(Y.encodeStateAsUpdate(doc)).equals(before)) throw Error("Failed mount changed bytes");
+      console.log(JSON.stringify({ errors, identitiesRetained: true, observersCleaned: true }));
+      doc.destroy();`,
+        ],
+        { encoding: "utf8" },
+      );
+      expect(JSON.parse(output)).toEqual({
+        errors: Array(4).fill("unsupported_code_content"),
+        identitiesRetained: true,
+        observersCleaned: true,
+      });
+    },
+  );
+
   it("uses the persisted CJS patch to preserve same-thread aliases within one text and across texts", () => {
     const output = execFileSync(
       process.execPath,

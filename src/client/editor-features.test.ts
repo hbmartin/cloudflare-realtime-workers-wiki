@@ -24,6 +24,11 @@ import {
   yUndoPluginKey,
   yXmlFragmentToProsemirrorJSON,
   relativePositionToAbsolutePosition,
+  assertSupportedCodeContent,
+  observeUnsupportedCodeContent,
+  UnsupportedCodeContentError,
+  initProseMirrorDoc,
+  updateYFragment,
 } from "y-prosemirror";
 import { validateDocumentTree } from "../shared/document-validation";
 import { normalizeYCodeBlocks } from "../shared/code-content";
@@ -121,6 +126,90 @@ function codeMarkKeys(doc: Y.Doc) {
 }
 
 describe("segmented code collaboration", () => {
+  it("rejects initial embedded code without deleting shared text", () => {
+    const doc = segmentedCodeDocument(221),
+      code = codeElement(doc);
+    const text = code.get(2) as Y.XmlText;
+    text.insertEmbed(2, { unsupported: "image" });
+    const before = Y.encodeStateAsUpdate(doc),
+      delta = text.toDelta();
+    try {
+      expect(() => mountSegmentedEditor(doc)).toThrow(UnsupportedCodeContentError);
+      expect(Y.encodeStateAsUpdate(doc)).toEqual(before);
+      expect(text.toDelta()).toEqual(delta);
+      expect(code.get(2)).toBe(text);
+    } finally {
+      doc.destroy();
+    }
+  });
+
+  it("latches an unsupported received update without rewriting it, then supports a repaired remount", () => {
+    const doc = segmentedCodeDocument(222),
+      mounted = mountSegmentedEditor(doc);
+    const remote = new Y.Doc(),
+      expected = new Y.Doc();
+    Y.applyUpdate(remote, Y.encodeStateAsUpdate(doc));
+    Y.applyUpdate(expected, Y.encodeStateAsUpdate(doc));
+    const text = codeElement(doc).get(2) as Y.XmlText;
+    const anchor = Y.createRelativePositionFromTypeIndex(text, 1);
+    const errors: UnsupportedCodeContentError[] = [];
+    const unsubscribe = observeUnsupportedCodeContent(doc, (error) => errors.push(error));
+    try {
+      (codeElement(remote).get(2) as Y.XmlText).insertEmbed(2, { unsupported: "image" });
+      const update = Y.encodeStateAsUpdate(remote);
+      Y.applyUpdate(expected, update);
+      Y.applyUpdate(doc, update);
+      const rejectedBytes = Y.encodeStateAsUpdate(doc);
+      expect(rejectedBytes).toEqual(Y.encodeStateAsUpdate(expected));
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toBeInstanceOf(UnsupportedCodeContentError);
+      expect(codeText(mounted.editor)).toBe("left\nright");
+      expect(codeElement(doc).get(2)).toBe(text);
+      expect(Y.createAbsolutePositionFromRelativePosition(anchor, doc)?.type).toBe(text);
+      editCode(mounted.editor, "blocked", 0);
+      expect(Y.encodeStateAsUpdate(doc)).toEqual(rejectedBytes);
+      // Removing invalid content is an explicit API recovery operation, not a
+      // binding rewrite. The old binding stays blocked until it is remounted.
+      (codeElement(remote).get(2) as Y.XmlText).delete(2, 1);
+      Y.applyUpdate(doc, Y.encodeStateAsUpdate(remote));
+      expect(errors).toHaveLength(1);
+      expect(() => assertSupportedCodeContent(doc.getXmlFragment("document-store"))).not.toThrow();
+      mounted.editor.unmount();
+      const replacement = mountSegmentedEditor(doc);
+      try {
+        expect(codeText(replacement.editor)).toBe("left\nright");
+        editCode(replacement.editor, "!", 10);
+        expect(codeText(replacement.editor)).toBe("left\nright!");
+      } finally {
+        replacement.dispose();
+      }
+    } finally {
+      unsubscribe();
+      mounted.dispose();
+      remote.destroy();
+      expected.destroy();
+    }
+  });
+
+  it("rejects inconsistent code text length before writer mappings or attributes change", () => {
+    const doc = segmentedCodeDocument(223),
+      fragment = doc.getXmlFragment("document-store");
+    const mounted = mountSegmentedEditor(doc);
+    const { doc: pm, meta } = initProseMirrorDoc(fragment, mounted.editor.prosemirrorState.schema);
+    const before = Y.encodeStateAsUpdate(doc),
+      entries = [...meta.mapping.entries()];
+    const text = codeElement(doc).get(2) as Y.XmlText;
+    const delta = vi.spyOn(text, "toDelta").mockReturnValue([{ insert: "short!" }]);
+    try {
+      expect(() => updateYFragment(doc, fragment, pm, meta)).toThrow(UnsupportedCodeContentError);
+      expect(Y.encodeStateAsUpdate(doc)).toEqual(before);
+      expect([...meta.mapping.entries()]).toEqual(entries);
+    } finally {
+      delta.mockRestore();
+      mounted.dispose();
+    }
+  });
+
   it.each([false, true])(
     "preserves range-local aliases of one comment through Unicode edits, crossings and undo (single text %s)",
     (single) => {

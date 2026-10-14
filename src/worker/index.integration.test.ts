@@ -42,6 +42,7 @@ import { processDeletionJob } from "./cleanup";
 import { migrateLegacyColumns } from "./document";
 import { requireMember } from "./auth";
 import { enableTableAuthority, queryTable } from "./table-service";
+import type { TableRepairStatus } from "./table-authority";
 import type { Env } from "./env";
 import { HttpError } from "./http";
 import worker, { backfillTableSearchValues, executeScheduledTasks, runSlackMaintenance } from "./index";
@@ -9396,4 +9397,179 @@ it("downgrades an owner's embedded diagram connection to a read-only grant", asy
     attacker.destroy();
   });
   socket.close();
+});
+
+describe("collaborative table repair responses", () => {
+  async function fixture() {
+    const installed = await bootstrap();
+    const page = await createPage(installed.cookie, "table");
+    await seedRows(installed, page.id, 1);
+    const member = await requireMember(authenticatedRequest(installed.cookie, "/api/me"), env);
+    await enableTableAuthority(env, member, page.id);
+    const stub = env.TABLE.getByName(page.id);
+    // Advance alarms explicitly; automatic wall-clock execution cannot race polling assertions.
+    await runInDurableObject(stub, (_instance, state) => {
+      const setAlarm = state.storage.setAlarm.bind(state.storage);
+      state.storage.setAlarm = (_scheduledTime, options) => setAlarm(Date.now() + 3_600_000, options);
+    });
+    return { ...installed, pageId: page.id, stub };
+  }
+
+  it("accepts a one-row repair, polls without exporting rows, and returns completed verification", async () => {
+    const f = await fixture();
+    const path = `/api/tables/${f.pageId}/repair`;
+    const accepted = await SELF.fetch(authenticatedRequest(f.cookie, path, { method: "POST" }));
+    expect(accepted.status).toBe(202);
+    expect(accepted.headers.get("Location")).toBe(`/api/tables/${f.pageId}/authority/verification`);
+    expect(accepted.headers.get("Retry-After")).toBe("1");
+    expect(await accepted.json()).toMatchObject({ verification: null, repair: { state: "pending", generation: 1 } });
+    const requests: string[] = [];
+    const bindings = {
+      ...env,
+      TABLE: {
+        getByName: (name: string) => ({
+          fetch: (request: Request) => {
+            requests.push(new URL(request.url).pathname);
+            return env.TABLE.getByName(name).fetch(request);
+          },
+        }),
+      },
+    } as unknown as Env;
+    const statusPath = accepted.headers.get("Location")!;
+    const pending = await worker.fetch(authenticatedRequest(f.cookie, statusPath), bindings, createExecutionContext());
+    expect(pending.status).toBe(200);
+    expect(await pending.json()).toMatchObject({ verification: null, repair: { state: "pending" } });
+    expect(requests).toEqual(["/repair-status"]);
+    let completed: { repair: TableRepairStatus; verification: { projectionMatches: boolean } | null } | undefined;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await runDurableObjectAlarm(f.stub);
+      const response = await SELF.fetch(authenticatedRequest(f.cookie, statusPath));
+      const result = await response.json<{
+        repair: TableRepairStatus;
+        verification: { projectionMatches: boolean } | null;
+      }>();
+      expect(response.status).toBe(200);
+      if (result.repair.state === "complete") {
+        completed = result;
+        break;
+      }
+      expect(result.verification).toBeNull();
+    }
+    expect(completed?.repair.state).toBe("complete");
+    expect(completed?.verification).toMatchObject({ projectionMatches: true });
+  });
+
+  it("polls blocked repair without resetting its budget and returns the original completed POST shape", async () => {
+    const f = await fixture();
+    await runInDurableObject(f.stub, (_instance, state) => {
+      const meta = JSON.parse(
+        state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+      );
+      meta.repairIntent = {
+        version: 2,
+        generation: meta.generation,
+        revision: meta.revision,
+        phase: "blocked",
+        mismatches: 2,
+        blocked: {
+          revision: meta.revision,
+          position: 0,
+          reason: "Ownership evidence is unavailable.",
+          resumePhase: "headers",
+        },
+      };
+      state.storage.sql.exec("UPDATE meta SET value=? WHERE id=1", JSON.stringify(meta));
+    });
+    const statusPath = `/api/tables/${f.pageId}/authority/verification`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await SELF.fetch(authenticatedRequest(f.cookie, statusPath));
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        verification: null,
+        repair: { state: "blocked", phase: "blocked", reason: "Ownership evidence is unavailable." },
+      });
+    }
+    await runInDurableObject(f.stub, (_instance, state) => {
+      const meta = JSON.parse(
+        state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+      );
+      expect(meta.repairIntent.mismatches).toBe(2);
+      meta.repairIntent.phase = "verify";
+      state.storage.sql.exec("UPDATE meta SET value=? WHERE id=1", JSON.stringify(meta));
+    });
+    const completed = await SELF.fetch(
+      authenticatedRequest(f.cookie, `/api/tables/${f.pageId}/repair`, { method: "POST" }),
+    );
+    expect(completed.status).toBe(200);
+    expect(completed.headers.get("Location")).toBeNull();
+    const body = await completed.json();
+    expect(body).toMatchObject({ verification: { consistent: true, projectionMatches: true } });
+    expect(body).not.toHaveProperty("repair");
+  });
+
+  it("reports a durable fence without starting work and rejects a changed generation", async () => {
+    const f = await fixture();
+    await env.DB.prepare("UPDATE table_authority SET state='repairing' WHERE page_id=?").bind(f.pageId).run();
+    const before = await runInDurableObject(f.stub, async (_instance, state) => ({
+      meta: state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+      alarm: await state.storage.getAlarm(),
+    }));
+    const statusPath = `/api/tables/${f.pageId}/authority/verification`;
+    const pending = await SELF.fetch(authenticatedRequest(f.cookie, statusPath));
+    expect(pending.status).toBe(200);
+    expect(await pending.json()).toMatchObject({ verification: null, repair: { state: "pending", phase: "fence" } });
+    expect(
+      await runInDurableObject(f.stub, async (_instance, state) => ({
+        meta: state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+        alarm: await state.storage.getAlarm(),
+      })),
+    ).toEqual(before);
+    await env.DB.prepare("UPDATE table_authority SET generation=2 WHERE page_id=?").bind(f.pageId).run();
+    const conflict = await SELF.fetch(authenticatedRequest(f.cookie, statusPath));
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toMatchObject({ error: { code: "table_generation_conflict" } });
+  });
+
+  it("requires an owner and reports genuine infrastructure failures as errors", async () => {
+    const f = await fixture();
+    const otherOwner = crypto.randomUUID();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO user(id,name,email,createdAt,updatedAt) VALUES(?,'Owner',?,1,1)").bind(
+        otherOwner,
+        `${otherOwner}@example.test`,
+      ),
+      env.DB.prepare("INSERT INTO workspace_members(workspace_id,user_id,role,created_at) VALUES(?,?,'owner',1)").bind(
+        f.workspaceId,
+        otherOwner,
+      ),
+    ]);
+    await env.DB.prepare("UPDATE workspace_members SET role='editor' WHERE workspace_id=? AND user_id=?")
+      .bind(f.workspaceId, f.userId)
+      .run();
+    for (const [suffix, method] of [
+      ["repair", "POST"],
+      ["authority/verification", "GET"],
+    ] as const) {
+      const response = await SELF.fetch(
+        authenticatedRequest(f.cookie, `/api/tables/${f.pageId}/${suffix}`, { method }),
+      );
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ error: { code: "owner_required" } });
+    }
+    await env.DB.prepare("UPDATE workspace_members SET role='owner' WHERE workspace_id=? AND user_id=?")
+      .bind(f.workspaceId, f.userId)
+      .run();
+    await env.DB.prepare(
+      "CREATE TRIGGER pr256_repair_unavailable BEFORE UPDATE ON table_authority WHEN NEW.state='repairing' BEGIN SELECT RAISE(ABORT,'pr256_d1_unavailable'); END",
+    ).run();
+    try {
+      const response = await SELF.fetch(
+        authenticatedRequest(f.cookie, `/api/tables/${f.pageId}/repair`, { method: "POST" }),
+      );
+      expect(response.status).toBe(500);
+      expect(await response.json()).toHaveProperty("error");
+    } finally {
+      await env.DB.prepare("DROP TRIGGER pr256_repair_unavailable").run();
+    }
+  });
 });

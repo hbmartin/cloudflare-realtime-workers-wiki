@@ -175,7 +175,7 @@ async function restoredPanel() {
   fireEvent.click(screen.getByRole("button", { name: "Generate" }));
   await screen.findByText("Empty follow-up failed");
   const preview = () => view.container.querySelector('.writing-panel > [aria-label="Writing result"]');
-  expect(preview()).toHaveTextContent("Improved writing");
+  await waitFor(() => expect(preview()).toHaveTextContent("Improved writing"));
   return { ...view, saved, original, preview };
 }
 async function completedPanel() {

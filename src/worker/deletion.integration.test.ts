@@ -17,6 +17,7 @@ import {
   requireTaskRestorable,
 } from "./cleanup";
 import { enableTableAuthority, queryTable, tableInternal } from "./table-service";
+import { acceptedPageDeletionSql } from "./deletion-policy";
 import { mutateTask, taskListStatements } from "./tasks";
 
 beforeEach(async () => {
@@ -127,7 +128,530 @@ function beforeBatch(matches: (sql: string) => boolean, compete: () => Promise<v
   });
 }
 
+async function handoffFixture() {
+  const f = await fixture();
+  await env.DB.prepare("UPDATE pages SET parent_id=NULL WHERE id=?").bind(f.detailId).run();
+  const dependent = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.detailId);
+  await archiveTable(f);
+  const whole = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.listId);
+  return { ...f, dependent, whole };
+}
+
+async function rowTarget(jobId: string) {
+  const stored = await env.DB.prepare(
+    "SELECT target,completed_at FROM deletion_targets WHERE job_id=? AND kind='table_row'",
+  )
+    .bind(jobId)
+    .first<{ target: string; completed_at: number | null }>();
+  return {
+    ...stored!,
+    value: JSON.parse(stored!.target) as {
+      tableId: string;
+      rowId: string;
+      detailPageId: string;
+      generation: number;
+      handoff?: { status: string; jobId: string };
+    },
+  };
+}
+
+describe("deletion handoff policy", () => {
+  it.each(["rows", "cleanup"])(
+    "recovers a legacy already-stopped %s job without discarding its accepted dependent target",
+    async (phase) => {
+      const f = await handoffFixture();
+      const stop = await env.DB.prepare(
+        "SELECT target FROM deletion_targets WHERE job_id=? AND kind='table_do' AND json_extract(target,'$.stage')='stop'",
+      )
+        .bind(f.whole.jobId)
+        .first<{ target: string }>();
+      const body = { ...JSON.parse(stop!.target), jobId: f.whole.jobId };
+      await tableInternal(env, f.listId, "/stop-repair-for-deletion", body);
+      await env.DB.batch([
+        env.DB.prepare(
+          "UPDATE deletion_targets SET completed_at=1 WHERE job_id=? AND kind='table_do' AND json_extract(target,'$.stage')='stop'",
+        ).bind(f.whole.jobId),
+        env.DB.prepare(
+          "DELETE FROM deletion_targets WHERE job_id=? AND kind='table_do' AND json_extract(target,'$.stage')='evidence'",
+        ).bind(f.whole.jobId),
+      ]);
+      if (phase === "cleanup")
+        await env.DB.batch([
+          env.DB.prepare("UPDATE deletion_jobs SET phase='cleanup' WHERE id=?").bind(f.whole.jobId),
+          env.DB.prepare("INSERT INTO table_projection_context VALUES(?,1)").bind(f.listId),
+          env.DB.prepare("DELETE FROM pages WHERE id=?").bind(f.listId),
+          env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(f.listId),
+        ]);
+      await processDeletionJob(env, f.whole.jobId);
+      expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("purged");
+      await processDeletionJob(env, f.dependent.jobId);
+      expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).toBeNull();
+    },
+  );
+
+  it("does not capture a legacy cleanup handoff after the dependent archive ownership changes", async () => {
+    const f = await handoffFixture();
+    const stop = await env.DB.prepare(
+      "SELECT target FROM deletion_targets WHERE job_id=? AND kind='table_do' AND json_extract(target,'$.stage')='stop'",
+    )
+      .bind(f.whole.jobId)
+      .first<{ target: string }>();
+    await tableInternal(env, f.listId, "/stop-repair-for-deletion", {
+      ...JSON.parse(stop!.target),
+      jobId: f.whole.jobId,
+    });
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE deletion_targets SET completed_at=1 WHERE job_id=? AND kind='table_do' AND json_extract(target,'$.stage')='stop'",
+      ).bind(f.whole.jobId),
+      env.DB.prepare("UPDATE deletion_jobs SET phase='cleanup' WHERE id=?").bind(f.whole.jobId),
+      env.DB.prepare("INSERT INTO table_projection_context VALUES(?,1)").bind(f.listId),
+      env.DB.prepare("DELETE FROM pages WHERE id=?").bind(f.listId),
+      env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(f.listId),
+      env.DB.prepare("UPDATE pages SET archive_operation_id='new-owner' WHERE id=?").bind(f.detailId),
+    ]);
+    await processDeletionJob(env, f.whole.jobId);
+    await processDeletionJob(env, f.dependent.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value.handoff).toBeUndefined();
+    expect((await rowTarget(f.dependent.jobId)).completed_at).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).not.toBeNull();
+  });
+
+  it.each(["generation", "workspaceId", "jobId"])("refuses a purge acknowledgment with the wrong %s", async (field) => {
+    const f = await handoffFixture();
+    const bindings = {
+      ...env,
+      TABLE: {
+        getByName: (name: string) => ({
+          fetch: async (request: Request) => {
+            const response = await env.TABLE.getByName(name).fetch(request);
+            if (new URL(request.url).pathname !== "/purge") return response;
+            return Response.json({
+              ...(await response.json<Record<string, unknown>>()),
+              [field]: field === "generation" ? 2 : "foreign",
+            });
+          },
+        }),
+      },
+    } as unknown as Env;
+    await processDeletionJob(bindings, f.whole.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("pending");
+    await retry(f.whole.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("purged");
+  });
+
+  it("replays purge when an exact proof write loses to a competing target change", async () => {
+    const f = await handoffFixture();
+    const db = afterD1(
+      env.DB,
+      (sql) => sql.includes("SELECT target.job_id,target.target"),
+      async () => {
+        await env.DB.prepare(
+          "UPDATE deletion_targets SET target=json_set(target,'$.proofRetryTag','latest') WHERE job_id=? AND kind='table_row'",
+        )
+          .bind(f.dependent.jobId)
+          .run();
+      },
+    );
+    await processDeletionJob({ ...env, DB: db } as Env, f.whole.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("pending");
+    expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(f.whole.jobId).first()).not.toBeNull();
+    await retry(f.whole.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value).toMatchObject({
+      proofRetryTag: "latest",
+      handoff: { status: "purged" },
+    });
+  });
+
+  it("preserves a newer original row generation rather than treating a 410 as deletion proof", async () => {
+    const f = await handoffFixture();
+    await env.DB.prepare(
+      "UPDATE deletion_targets SET target=json_set(target,'$.generation',2) WHERE job_id=? AND kind='table_row'",
+    )
+      .bind(f.dependent.jobId)
+      .run();
+    await processDeletionJob(env, f.whole.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value.handoff).toBeUndefined();
+    await processDeletionJob(env, f.dependent.jobId);
+    expect((await rowTarget(f.dependent.jobId)).completed_at).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).not.toBeNull();
+    expect(
+      await env.DB.prepare("SELECT last_error FROM deletion_jobs WHERE id=?").bind(f.dependent.jobId).first(),
+    ).toEqual({ last_error: "Canonical row deletion failed with 410" });
+  });
+
+  it("keeps purge proof pending when the dependent archive owner changes", async () => {
+    const f = await handoffFixture();
+    const archive = await env.DB.prepare("SELECT archive_operation_id FROM pages WHERE id=?")
+      .bind(f.detailId)
+      .first<{ archive_operation_id: string | null }>();
+    const bindings = {
+      ...env,
+      TABLE: {
+        getByName: (name: string) => ({
+          fetch: async (request: Request) => {
+            const response = await env.TABLE.getByName(name).fetch(request);
+            if (new URL(request.url).pathname === "/stop-repair-for-deletion")
+              await env.DB.prepare("UPDATE pages SET archive_operation_id='new-owner' WHERE id=?")
+                .bind(f.detailId)
+                .run();
+            return response;
+          },
+        }),
+      },
+    } as unknown as Env;
+    await processDeletionJob(bindings, f.whole.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("pending");
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).not.toBeNull();
+    await env.DB.prepare("UPDATE pages SET archive_operation_id=? WHERE id=?")
+      .bind(archive!.archive_operation_id, f.detailId)
+      .run();
+    await retry(f.whole.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("purged");
+  });
+
+  it.each(["registered", "plain", "null capture", "row generation", "uncertain d1"])(
+    "retains the authority path for %s history",
+    async (history) => {
+      const f = await fixture(false);
+      await archiveTable(f);
+      if (history === "registered")
+        await env.DB.prepare("INSERT INTO table_authority(page_id,state,generation) VALUES(?,'d1',1)")
+          .bind(f.listId)
+          .run();
+      else {
+        const oldJob = `old-${f.listId}`;
+        await env.DB.batch([
+          env.DB.prepare(
+            "INSERT INTO deletion_jobs(id,workspace_id,root_page_id,phase,next_attempt_at,created_at,updated_at) VALUES(?,?,?,'staging',0,1,1)",
+          ).bind(oldJob, f.member.workspace.id, `other-${f.listId}`),
+          env.DB.prepare("INSERT INTO deletion_targets(job_id,kind,target) VALUES(?,?,?)").bind(
+            oldJob,
+            history === "row generation" ? "table_row" : "table_do",
+            history === "plain"
+              ? f.listId
+              : history === "row generation"
+                ? JSON.stringify({ tableId: f.listId, rowId: f.rowId, detailPageId: f.detailId, generation: 1 })
+                : JSON.stringify({
+                    version: 1,
+                    pageId: f.listId,
+                    workspaceId: f.member.workspace.id,
+                    generation: null,
+                    stage: "purge",
+                    ...(history === "uncertain d1" ? { mode: "d1" } : {}),
+                  }),
+          ),
+        ]);
+      }
+      const whole = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.listId);
+      const targets = await env.DB.prepare(
+        "SELECT target FROM deletion_targets WHERE job_id=? AND kind='table_do' AND json_extract(target,'$.stage')='stop'",
+      )
+        .bind(whole.jobId)
+        .all<{ target: string }>();
+      expect(targets.results.map(({ target }) => JSON.parse(target))).toEqual([
+        expect.objectContaining({ version: 1 }),
+      ]);
+      const paths: string[] = [];
+      const bindings = {
+        ...env,
+        TABLE: {
+          getByName: (name: string) => ({
+            fetch: (request: Request) => {
+              paths.push(new URL(request.url).pathname);
+              return env.TABLE.getByName(name).fetch(request);
+            },
+          }),
+        },
+      } as unknown as Env;
+      await processDeletionJob(bindings, whole.jobId);
+      expect(paths).toEqual(["/stop-repair-for-deletion", "/purge"]);
+    },
+  );
+
+  it("bounds canonical-only external evidence and excludes details owned by the whole job", async () => {
+    const f = await fixture();
+    const detailIds = Array.from({ length: 205 }, (_, index) => `external-${index}-${f.listId}`);
+    for (let offset = 0; offset < detailIds.length; offset += 80)
+      await env.DB.batch(
+        detailIds.slice(offset, offset + 80).map((pageId) =>
+          env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,archived_at)
+      SELECT ?,workspace_id,space_id,'document','a0','External',created_by,1,1,1 FROM pages WHERE id=?`).bind(
+            pageId,
+            f.listId,
+          ),
+        ),
+      );
+    await runInDurableObject(env.TABLE.getByName(f.listId), (_instance, state) => {
+      for (const [index, detailId] of detailIds.entries())
+        state.storage.sql.exec("INSERT INTO rows VALUES(?,?,1,NULL,1,NULL,?)", `row-${detailId}`, index + 1, detailId);
+    });
+    await archiveTable(f);
+    const whole = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.listId);
+    const snapshots = await env.DB.prepare(
+      "SELECT target,completed_at FROM deletion_targets WHERE job_id=? AND kind='table_do' AND json_extract(target,'$.stage')='evidence'",
+    )
+      .bind(whole.jobId)
+      .all<{ target: string; completed_at: number }>();
+    const records = snapshots.results.map(
+      ({ target }) => JSON.parse(target).records as Array<{ detailPageId: string }>,
+    );
+    expect(records.flat()).toHaveLength(205);
+    expect(records.flat().map((record) => record.detailPageId)).not.toContain(f.detailId);
+    expect(records.every((chunk) => chunk.length <= 100)).toBe(true);
+    expect(
+      snapshots.results.every(
+        (snapshot) => new TextEncoder().encode(snapshot.target).byteLength <= 64_000 && snapshot.completed_at !== null,
+      ),
+    ).toBe(true);
+    await expect(acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, detailIds[0]!)).rejects.toMatchObject(
+      { code: "deletion_pending" },
+    );
+    await processDeletionJob(env, whole.jobId);
+    expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(whole.jobId).first()).toBeNull();
+  });
+  it.each(["rows", "cleanup", "staging"])(
+    "correlates accepted %s policy across caller aliases and workspaces",
+    async (phase) => {
+      const f = await fixture(false),
+        other = await fixture(false);
+      const jobId = `policy-${f.listId}`;
+      await env.DB.batch([
+        env.DB.prepare(
+          "INSERT INTO deletion_jobs(id,workspace_id,root_page_id,phase,next_attempt_at,created_at,updated_at) VALUES(?,?,?,?,0,1,1)",
+        ).bind(jobId, f.member.workspace.id, f.listId, phase),
+        env.DB.prepare("INSERT INTO deletion_job_pages(job_id,page_id,archived_at) VALUES(?,?,1)").bind(
+          jobId,
+          f.listId,
+        ),
+      ]);
+      const predicate = acceptedPageDeletionSql("accepted_deletion_page.id", "accepted_deletion_job.workspace_id");
+      const query = (workspaceId: string) =>
+        env.DB.prepare(`SELECT ${predicate} pending FROM pages accepted_deletion_page
+      CROSS JOIN (SELECT ? workspace_id) accepted_deletion_job WHERE accepted_deletion_page.id=?`)
+          .bind(workspaceId, f.listId)
+          .first();
+      expect(await query(f.member.workspace.id)).toEqual({ pending: phase === "staging" ? 0 : 1 });
+      expect(await query(other.member.workspace.id)).toEqual({ pending: 0 });
+      expect(
+        await env.DB.prepare(`SELECT ${acceptedPageDeletionSql("?", "?")} pending`)
+          .bind(f.listId, f.member.workspace.id)
+          .first(),
+      ).toEqual({ pending: phase === "staging" ? 0 : 1 });
+    },
+  );
+
+  it("proves the original dependent checkpoint before the whole job is pruned", async () => {
+    const f = await handoffFixture();
+    await processDeletionJob(env, f.whole.jobId);
+    const target = await rowTarget(f.dependent.jobId);
+    expect(target.value.handoff).toMatchObject({ jobId: f.whole.jobId, status: "purged" });
+    expect(target.completed_at).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(f.whole.jobId).first()).toBeNull();
+    const getByName = vi.fn(() => {
+      throw new Error("A purge proof must not allocate the source actor");
+    });
+    await processDeletionJob({ ...env, TABLE: { getByName } } as unknown as Env, f.dependent.jobId);
+    expect(getByName).not.toHaveBeenCalled();
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(f.dependent.jobId).first()).toBeNull();
+  });
+
+  it.each(["failed purge", "lost acknowledgment"])(
+    "waits for a matching successful purge after %s and eviction",
+    async (mode) => {
+      const f = await handoffFixture();
+      let fail = true;
+      const bindings = {
+        ...env,
+        TABLE: {
+          getByName: (name: string) => ({
+            fetch: async (request: Request) => {
+              if (new URL(request.url).pathname === "/purge" && fail) {
+                fail = false;
+                if (mode === "lost acknowledgment") {
+                  const lost = await env.TABLE.getByName(name).fetch(request);
+                  await lost.arrayBuffer();
+                }
+                throw new Error("purge response unavailable");
+              }
+              return env.TABLE.getByName(name).fetch(request);
+            },
+          }),
+        },
+      } as unknown as Env;
+      await processDeletionJob(bindings, f.whole.jobId);
+      expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("pending");
+      const now = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+      const getByName = vi.fn(() => {
+        throw new Error("Pending handoff must not retry a stopped actor");
+      });
+      await processDeletionJob({ ...env, TABLE: { getByName } } as unknown as Env, f.dependent.jobId);
+      expect(getByName).not.toHaveBeenCalled();
+      expect(
+        await env.DB.prepare("SELECT next_attempt_at,last_error FROM deletion_jobs WHERE id=?")
+          .bind(f.dependent.jobId)
+          .first(),
+      ).toEqual({ next_attempt_at: now + 60_000, last_error: "Whole-table deletion is pending" });
+      await evictDurableObject(env.TABLE.getByName(f.listId));
+      await retry(f.whole.jobId);
+      expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("purged");
+      clock.mockReturnValue(now + 60_000);
+      await processDeletionJob(env, f.dependent.jobId);
+      expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).toBeNull();
+    },
+  );
+
+  it.each(["current", "legacy"])("publishes proof without taking over the dependent %s lease", async (mode) => {
+    const f = await handoffFixture(),
+      now = Date.now();
+    const lease = now + 15 * 60_000;
+    await env.DB.prepare("UPDATE deletion_jobs SET next_attempt_at=?,updated_at=?,last_error=? WHERE id=?")
+      .bind(lease, now, mode === "legacy" ? "previous failure" : null, f.dependent.jobId)
+      .run();
+    await processDeletionJob(env, f.whole.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value.handoff?.status).toBe("purged");
+    expect(
+      await env.DB.prepare("SELECT next_attempt_at,updated_at,last_error FROM deletion_jobs WHERE id=?")
+        .bind(f.dependent.jobId)
+        .first(),
+    ).toEqual({ next_attempt_at: lease, updated_at: now, last_error: mode === "legacy" ? "previous failure" : null });
+    await processDeletionJob(env, f.dependent.jobId, { retryFailedRows: true });
+    expect((await rowTarget(f.dependent.jobId)).completed_at).toBeNull();
+  });
+
+  it("retries exact-value handoff capture before stopping when a competing target write wins", async () => {
+    const f = await handoffFixture();
+    const db = afterD1(
+      env.DB,
+      (sql) => sql.includes("SELECT dependent.id jobId,target.target"),
+      async () => {
+        await env.DB.prepare(
+          "UPDATE deletion_targets SET target=json_set(target,'$.retryTag','latest') WHERE job_id=? AND kind='table_row'",
+        )
+          .bind(f.dependent.jobId)
+          .run();
+      },
+    );
+    await processDeletionJob({ ...env, DB: db } as Env, f.whole.jobId);
+    expect(
+      await env.DB.prepare("SELECT phase,last_error FROM deletion_jobs WHERE id=?").bind(f.whole.jobId).first(),
+    ).toEqual({ phase: "rows", last_error: "Deletion row handoff ownership changed" });
+    await processDeletionJob(env, f.whole.jobId, { retryFailedRows: true });
+    expect((await rowTarget(f.dependent.jobId)).value).toMatchObject({
+      retryTag: "latest",
+      handoff: { status: "purged" },
+    });
+  });
+
+  it("hands off the original accepted tuple after a canonical row acknowledgment was lost", async () => {
+    const f = await handoffFixture();
+    const original = await rowTarget(f.dependent.jobId);
+    // The row checkpoint was accepted while the source still existed; losing its
+    // projection/completion response cannot turn missing links into new authority.
+    await env.DB.batch([
+      env.DB.prepare("INSERT OR REPLACE INTO table_projection_context VALUES(?,1)").bind(f.listId),
+      env.DB.prepare("DELETE FROM table_rows WHERE id=?").bind(f.rowId),
+      env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(f.listId),
+    ]);
+    await processDeletionJob(env, f.whole.jobId);
+    expect((await rowTarget(f.dependent.jobId)).value).toMatchObject({
+      ...JSON.parse(original.target),
+      handoff: { status: "purged" },
+    });
+  });
+
+  it("keeps new requests blocked after metadata cascade until purge proof exists", async () => {
+    const f = await fixture();
+    await env.DB.prepare("UPDATE pages SET parent_id=NULL WHERE id=?").bind(f.detailId).run();
+    await archiveTable(f);
+    const whole = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.listId);
+    const bindings = {
+      ...env,
+      TABLE: {
+        getByName: (name: string) => ({
+          fetch: (request: Request) =>
+            new URL(request.url).pathname === "/purge"
+              ? Promise.resolve(new Response(null, { status: 503 }))
+              : env.TABLE.getByName(name).fetch(request),
+        }),
+      },
+    } as unknown as Env;
+    await processDeletionJob(bindings, whole.jobId);
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).toBeNull();
+    await expect(acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.detailId)).rejects.toMatchObject({
+      code: "deletion_pending",
+    });
+    await retry(whole.jobId);
+    const dependent = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.detailId);
+    await processDeletionJob(env, dependent.jobId);
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).toBeNull();
+  });
+
+  it("lets a new exact external row job join before the table stop checkpoint", async () => {
+    const f = await fixture();
+    await env.DB.prepare("UPDATE pages SET parent_id=NULL WHERE id=?").bind(f.detailId).run();
+    await archiveTable(f);
+    const whole = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.listId);
+    const dependent = await acceptPageDeletion(env, f.member.workspace.id, f.member.user.id, f.detailId);
+    expect((await rowTarget(dependent.jobId)).value.handoff).toMatchObject({ jobId: whole.jobId, status: "pending" });
+    await processDeletionJob(env, whole.jobId);
+    await processDeletionJob(env, dependent.jobId);
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).toBeNull();
+  });
+
+  it("deletes a proven D1-only table without allocating an authority actor", async () => {
+    const f = await fixture(false);
+    await archiveTable(f);
+    const getByName = vi.fn(() => {
+      throw new Error("D1-only deletion must not allocate a DO");
+    });
+    const bindings = { ...env, TABLE: { getByName } } as unknown as Env;
+    const whole = await acceptPageDeletion(bindings, f.member.workspace.id, f.member.user.id, f.listId);
+    await processDeletionJob(bindings, whole.jobId);
+    expect(getByName).not.toHaveBeenCalled();
+    expect(
+      await env.DB.prepare("SELECT page_id FROM table_authority WHERE page_id=?").bind(f.listId).first(),
+    ).toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).toBeNull();
+  });
+});
+
 describe("whole-table deletion recovery", () => {
+  it.each([
+    { state: "archived", timing: "initial", status: 404, code: "page_not_found" },
+    { state: "importing", timing: "initial", status: 404, code: "page_not_found" },
+    { state: "archived", timing: "race", status: 409, code: "page_archived" },
+    { state: "importing", timing: "race", status: 409, code: "import_pending" },
+  ])("preserves $timing $state seed visibility", async ({ state, timing, status, code }) => {
+    const f = await fixture(false),
+      importJob = `import-${f.listId}`;
+    if (state === "importing")
+      await env.DB.prepare(
+        "INSERT INTO jobs(id,workspace_id,type,status,requested_by,created_at,updated_at) VALUES(?,?,'import','running',?,1,1)",
+      )
+        .bind(importJob, f.member.workspace.id, f.member.user.id)
+        .run();
+    const change = async () => {
+      await env.DB.prepare(
+        state === "archived"
+          ? "UPDATE pages SET archived_at=1 WHERE id=?"
+          : "UPDATE pages SET import_job_id=? WHERE id=?",
+      )
+        .bind(...(state === "archived" ? [f.listId] : [importJob, f.listId]))
+        .run();
+    };
+    if (timing === "initial") await change();
+    const db = timing === "race" ? beforeBatch((sql) => sql.startsWith("INSERT INTO table_authority"), change) : env.DB;
+    await expect(enableTableAuthority({ ...env, DB: db } as Env, f.member, f.listId)).rejects.toMatchObject({
+      status,
+      code,
+    });
+    expect(
+      await env.DB.prepare("SELECT page_id FROM table_authority WHERE page_id=?").bind(f.listId).first(),
+    ).toBeNull();
+  });
   it.each(["absent", "d1"])("rejects stale seed acquisition from an %s registry snapshot", async (mode) => {
     const f = await fixture(false);
     if (mode === "d1")
@@ -167,8 +691,8 @@ describe("whole-table deletion recovery", () => {
       },
     );
     await expect(enableTableAuthority({ ...env, DB: db } as Env, f.member, f.listId)).rejects.toMatchObject({
-      code: "table_generation_conflict",
-      status: 409,
+      code: "page_not_found",
+      status: 404,
     });
     expect(await env.DB.prepare("SELECT state FROM table_authority WHERE page_id=?").bind(f.listId).first()).toBeNull();
   });
@@ -302,7 +826,7 @@ describe("whole-table deletion recovery", () => {
     expect(paths).toEqual(["/seed", "/seed-finish"]);
     expect((await queryTable(env, f.member, f.listId)).rows).toHaveLength(1);
   });
-  it("quiesces nested owned tables before purging either actor", async () => {
+  it("purges the registered actor and checkpoints its nested legacy table in D1", async () => {
     const f = await fixture();
     const nested = `nested-${f.listId}`;
     await env.DB.prepare(`INSERT INTO pages(id,workspace_id,space_id,parent_id,kind,position,title,created_by,created_at,updated_at,archived_at)
@@ -324,7 +848,7 @@ describe("whole-table deletion recovery", () => {
       },
     } as unknown as Env;
     await processDeletionJob(bindings, accepted.jobId);
-    expect(stages).toEqual(["/stop-repair-for-deletion", "/stop-repair-for-deletion", "/purge", "/purge"]);
+    expect(stages).toEqual(["/stop-repair-for-deletion", "/purge"]);
     expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(accepted.jobId).first()).toBeNull();
   });
 
@@ -397,14 +921,16 @@ describe("whole-table deletion recovery", () => {
     expect(targets.results.map(({ target }) => JSON.parse(target))).toEqual(
       expect.arrayContaining([
         {
-          version: 1,
+          version: mode === "legacy" ? 2 : 1,
+          ...(mode === "legacy" ? { mode: "d1" } : {}),
           pageId: f.listId,
           workspaceId: f.member.workspace.id,
           generation: mode === "legacy" ? null : 1,
           stage: "stop",
         },
         {
-          version: 1,
+          version: mode === "legacy" ? 2 : 1,
+          ...(mode === "legacy" ? { mode: "d1" } : {}),
           pageId: f.listId,
           workspaceId: f.member.workspace.id,
           generation: mode === "legacy" ? null : 1,
@@ -425,9 +951,13 @@ describe("whole-table deletion recovery", () => {
       },
     } as unknown as Env;
     await processDeletionJob(bindings, accepted.jobId);
-    expect(paths).toEqual(["/stop-repair-for-deletion", "/purge"]);
+    expect(paths).toEqual(mode === "legacy" ? [] : ["/stop-repair-for-deletion", "/purge"]);
     expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).toBeNull();
     expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(accepted.jobId).first()).toBeNull();
+    expect(
+      await env.DB.prepare("SELECT page_id FROM table_authority WHERE page_id=?").bind(f.listId).first(),
+    ).toBeNull();
+    if (mode === "legacy") return;
     await evictDurableObject(env.TABLE.getByName(f.listId));
     await expect(tableInternal(env, f.listId, "/repair", {})).rejects.toMatchObject({ status: 410 });
   });

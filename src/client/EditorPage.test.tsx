@@ -8,6 +8,8 @@ import { ApiClientError } from "./api";
 import { createCollaboration, OfflineStorageTimeoutError } from "./collaboration";
 import { EditorPage } from "./EditorPage";
 import type { WritingLaunchRequest } from "./writing-target";
+import * as Y from "yjs";
+import { UnsupportedCodeContentError } from "y-prosemirror";
 
 const mocks = vi.hoisted(() => {
   const handlers = new Map<string, (value: unknown) => void>();
@@ -35,6 +37,9 @@ const mocks = vi.hoisted(() => {
     slashItems: null as null | ((query: string) => Promise<Array<{ title: string; onItemClick: () => void }>>),
     unsynced: false,
     writingPanel: vi.fn(),
+    editorCreated: vi.fn(),
+    documents: [] as Array<import("yjs").Doc>,
+    realDocument: false,
   };
 });
 
@@ -43,7 +48,7 @@ vi.mock("./api", async (importOriginal) => ({
   api: mocks.api,
 }));
 
-vi.mock("./collaboration", () => ({
+vi.mock("./collaboration", async () => ({
   OFFLINE_COPY_MISSING_MESSAGE: "This offline document copy is no longer on this device.",
   OfflineStorageTimeoutError: class MockOfflineStorageTimeoutError extends Error {
     constructor() {
@@ -51,12 +56,18 @@ vi.mock("./collaboration", () => ({
     }
   },
   createCollaboration: vi.fn(() => ({
-    doc: {
-      getMap: vi.fn(() => new Map()),
-      getXmlFragment: vi.fn(() => ({})),
-      on: vi.fn(),
-      off: vi.fn(),
-    },
+    doc: (() => {
+      const doc = new Y.Doc();
+      mocks.documents.push(doc);
+      return mocks.realDocument
+        ? doc
+        : {
+            getMap: vi.fn(() => new Map()),
+            getXmlFragment: vi.fn((name: string) => doc.getXmlFragment(name)),
+            on: vi.fn(),
+            off: vi.fn(),
+          };
+    })(),
     provider: mocks.provider,
     indexeddb: { _storeUpdate: mocks.storeUpdate, db: null, _dbsize: 0 },
     ready: mocks.ready,
@@ -108,11 +119,14 @@ vi.mock("@blocknote/react", () => ({
   FormattingToolbarController: () => null,
   FormattingToolbar: () => null,
   getFormattingToolbarItems: () => [],
-  useCreateBlockNote: () => ({
-    document: [{ id: "paragraph", type: "paragraph", content: "Snapshot document" }],
-    insertInlineContent: vi.fn(),
-    prosemirrorState: { doc: {}, selection: { from: 0, to: 0 } },
-  }),
+  useCreateBlockNote: () => {
+    mocks.editorCreated();
+    return {
+      document: [{ id: "paragraph", type: "paragraph", content: "Snapshot document" }],
+      insertInlineContent: vi.fn(),
+      prosemirrorState: { doc: {}, selection: { from: 0, to: 0 } },
+    };
+  },
 }));
 
 vi.mock("./writing-target", async (original) => ({
@@ -194,6 +208,8 @@ describe("EditorPage close reconciliation", () => {
     mocks.slashItems = null;
     mocks.unsynced = false;
     mocks.writingPanel.mockClear();
+    mocks.editorCreated.mockClear();
+    mocks.realDocument = false;
     Object.defineProperty(globalThis, "localStorage", { configurable: true, value: storage });
     localStorage.clear();
   });
@@ -219,9 +235,58 @@ describe("EditorPage close reconciliation", () => {
   });
 
   afterEach(() => {
+    for (const doc of mocks.documents.splice(0)) doc.destroy();
     vi.useRealTimers();
     vi.restoreAllMocks();
     window.history.replaceState(null, "", "/");
+  });
+
+  it.each([false, true])("uses existing recovery controls for unsupported code (received=%s)", async (received) => {
+    mocks.realDocument = true;
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let ready!: () => void;
+    mocks.ready = new Promise<void>((resolve) => (ready = resolve));
+    mocks.api.mockResolvedValue({ page });
+    render(
+      <EditorPage
+        page={page}
+        member={member}
+        onPageChanged={vi.fn()}
+        onPageUnavailable={vi.fn()}
+        onAccessDenied={vi.fn()}
+        onSelectPage={vi.fn()}
+        backlinksRevision={0}
+      />,
+    );
+    const doc = mocks.documents.at(-1)!,
+      code = new Y.XmlElement("codeBlock"),
+      text = new Y.XmlText();
+    doc.transact(() => {
+      text.insert(0, "preserved");
+      code.insert(0, [text]);
+      doc.getXmlFragment("document-store").insert(0, [code]);
+    }, mocks.provider);
+    if (received) await act(async () => ready());
+    doc.transact(() => text.insertEmbed(4, { unsupported: "image" }), mocks.provider);
+    const bytes = Y.encodeStateAsUpdate(doc);
+    await act(async () => {
+      if (received) {
+        (doc as unknown as { emit: (event: string, args: unknown[]) => void }).emit("unsupported-code-content", [
+          new UnsupportedCodeContentError(),
+        ]);
+      } else ready();
+    });
+    expect(screen.getByText("This content could not be displayed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open version history" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download recovery copy" })).toBeInTheDocument();
+    expect(Y.encodeStateAsUpdate(doc)).toEqual(bytes);
+    const creations = mocks.editorCreated.mock.calls.length;
+    expect(creations > 0).toBe(received);
+    expect(doc["_observers"].get("unsupported-code-content")?.size ?? 0).toBe(0);
+    doc.transact(() => text.delete(4, 1), mocks.provider);
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Try again" })));
+    expect(screen.queryByText("This content could not be displayed")).toBeNull();
+    expect(mocks.editorCreated.mock.calls.length).toBeGreaterThan(creations);
   });
 
   it.each([

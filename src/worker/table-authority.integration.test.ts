@@ -13,6 +13,7 @@ import {
   enableTableAuthority,
   queryTable,
   repairTableProjection as requestRepairTableProjection,
+  tableRepairStatus,
   tableCommand,
   tableInternal,
   verifyTableProjection,
@@ -78,38 +79,23 @@ async function write(
 
 async function repairTableProjection(
   ...args: Parameters<typeof requestRepairTableProjection>
-): ReturnType<typeof requestRepairTableProjection> {
-  try {
-    return await requestRepairTableProjection(...args);
-  } catch (error) {
-    if ((error as { code?: string }).code !== "table_projection_repairing") throw error;
-  }
+): ReturnType<typeof verifyTableProjection> {
+  const initial = await requestRepairTableProjection(...args);
+  if (!("repair" in initial)) return initial;
   for (let attempt = 0; attempt < 100; attempt++) {
-    try {
-      const result = await runInDurableObject(args[0].TABLE.getByName(args[2]), (instance) =>
-        (
-          instance as unknown as {
-            resumeRepair(): Promise<Awaited<ReturnType<typeof requestRepairTableProjection>> | { pending: true }>;
-          }
-        ).resumeRepair(),
-      );
-      if (!("pending" in result)) return result;
-    } catch (error) {
-      throw Object.assign(error as Error, { status: (error as { status?: number }).status ?? 500 });
-    }
+    await runDurableObjectAlarm(args[0].TABLE.getByName(args[2]));
+    const status = await tableRepairStatus(args[0], args[2]);
+    if (status.state === "complete") return verifyTableProjection(args[0], args[2]);
+    if (status.state === "blocked")
+      throw Object.assign(new Error(status.reason), { status: 503, code: "table_projection_blocked" });
   }
   throw new Error("Repair did not finish within its bounded continuations.");
 }
 async function finishAlarmRepair(pageId: string) {
   for (let attempt = 0; attempt < 100; attempt++) {
     await runDurableObjectAlarm(env.TABLE.getByName(pageId));
-    const intent = await runInDurableObject(
-      env.TABLE.getByName(pageId),
-      (_instance, state) =>
-        JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value)
-          .repairIntent,
-    );
-    if (!intent || intent.phase === "blocked") return;
+    const status = await tableRepairStatus(env, pageId);
+    if (status.state === "complete" || status.state === "blocked") return;
   }
   throw new Error("Alarm repair did not finish.");
 }
@@ -465,7 +451,8 @@ describe("per-table authority", () => {
       "CREATE TRIGGER hold_link_repair BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
     ).run();
     try {
-      await expect(repairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
+      await requestRepairTableProjection(env, member, pageId);
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
       expect(
         await env.DB.prepare("SELECT page_id FROM table_row_pages WHERE row_id=?").bind(task.rowId).first(),
       ).toEqual({ page_id: task.detailPageId });
@@ -489,8 +476,9 @@ describe("per-table authority", () => {
     const now = Date.now() + 24 * 60 * 60 * 1000;
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     try {
-      await expect(requestRepairTableProjection(env, next.member, next.pageId)).rejects.toMatchObject({
-        code: "table_projection_repairing",
+      await expect(requestRepairTableProjection(env, next.member, next.pageId)).resolves.toMatchObject({
+        repair: { state: "pending" },
+        verification: null,
       });
       expect(await runDurableObjectAlarm(env.TABLE.getByName(next.pageId))).toBe(true);
       await runInDurableObject(env.TABLE.getByName(next.pageId), async (_instance, state) => {
@@ -685,6 +673,104 @@ describe("per-table authority", () => {
     await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
     expect((await queryTable(env, member, pageId)).rows.map((row) => row.id)).toEqual(["interleaved-row"]);
+  });
+  it("keeps bounded link reconciliation atomic under byte pressure and checkpoints only complete row work", async () => {
+    const { pageId, member } = await fixture();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('large-a',?,'A','text',0),('large-b',?,'B','text',1)",
+      ).bind(pageId, pageId),
+      env.DB.prepare(
+        "WITH RECURSIVE n(value) AS (SELECT 0 UNION ALL SELECT value+1 FROM n WHERE value<79) INSERT INTO pages(id,workspace_id,space_id,parent_id,kind,position,title,created_by,updated_by,created_at,updated_at) SELECT list.id||'-'||variant.name||'-'||printf('%03d',n.value),list.workspace_id,list.space_id,list.id,'document',printf('a%03d',n.value),variant.name,?,?,1,1 FROM n CROSS JOIN (SELECT 'desired' name UNION ALL SELECT 'old') variant JOIN pages list ON list.id=?",
+      ).bind(member.user.id, member.user.id, pageId),
+      env.DB.prepare(
+        "WITH RECURSIVE n(value) AS (SELECT 0 UNION ALL SELECT value+1 FROM n WHERE value<79) INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) SELECT printf('repair-row%03d',value),?,value,?,1,1 FROM n",
+      ).bind(pageId, member.user.id),
+      env.DB.prepare(
+        "INSERT INTO table_row_pages(row_id,page_id,created_at) SELECT id,?||'-desired-'||substr(id,-3),1 FROM table_rows WHERE page_id=?",
+      ).bind(pageId, pageId),
+      env.DB.prepare(
+        "INSERT INTO table_cells(row_id,column_id,text_value,json_value,updated_at) SELECT row.id,col.id,printf('%08000d',0),json_quote(printf('%08000d',0)),1 FROM table_rows row JOIN table_columns col ON col.page_id=row.page_id WHERE row.page_id=?",
+      ).bind(pageId),
+    ]);
+    await enableTableAuthority(env, member, pageId);
+    await changeProjection(pageId, [
+      {
+        sql: "UPDATE table_row_pages SET page_id=?||'-old-'||substr(row_id,-3) WHERE row_id IN (SELECT id FROM table_rows WHERE page_id=?)",
+        binds: [pageId, pageId],
+      },
+    ]);
+    await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+      const internal = instance as unknown as {
+        rowProjection(...args: unknown[]): ProjectionStatement[];
+        rowRevision(id: string): number;
+        repairRowsStatements(rows: unknown[]): Promise<ProjectionStatement[][]>;
+      };
+      const projection = internal.rowProjection,
+        revision = internal.rowRevision;
+      let projections = 0,
+        revisions = 0;
+      internal.rowProjection = (...args) => {
+        projections++;
+        return projection.apply(internal, args);
+      };
+      internal.rowRevision = (rowId) => {
+        revisions++;
+        return revision.call(internal, rowId);
+      };
+      try {
+        const batches = await internal.repairRowsStatements(
+          state.storage.sql.exec("SELECT * FROM rows ORDER BY id").toArray(),
+        );
+        const links = batches.filter((batch) =>
+          batch.some((statement) => /^(?:DELETE FROM|INSERT INTO) table_row_pages/.test(statement.sql)),
+        );
+        expect(links).toHaveLength(1);
+        expect(links[0]!.at(0)!.sql).toContain("INSERT OR REPLACE INTO table_publication_guards");
+        expect(links[0]!.at(-1)!.sql).toContain("INSERT OR REPLACE INTO table_publication_guards");
+        expect(batches.length).toBeGreaterThan(3);
+        expect(projections).toBe(80);
+        expect(revisions).toBe(80);
+      } finally {
+        internal.rowProjection = projection;
+        internal.rowRevision = revision;
+      }
+    });
+    await env.DB.prepare(
+      "CREATE TRIGGER fail_link_transaction BEFORE INSERT ON table_row_pages BEGIN SELECT RAISE(ABORT,'temporary_link_failure'); END",
+    ).run();
+    try {
+      await requestRepairTableProjection(env, member, pageId);
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
+      expect(
+        await env.DB.prepare("SELECT count(*) count FROM table_row_pages WHERE instr(page_id,?)=1")
+          .bind(`${pageId}-old-`)
+          .first(),
+      ).toEqual({ count: 80 });
+      await env.DB.prepare("DROP TRIGGER fail_link_transaction").run();
+      await env.DB.prepare(
+        "CREATE TRIGGER fail_late_cells BEFORE INSERT ON table_cells WHEN NEW.row_id='repair-row079' BEGIN SELECT RAISE(ABORT,'temporary_late_cell_failure'); END",
+      ).run();
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
+      expect(
+        await env.DB.prepare("SELECT count(*) count FROM table_row_pages WHERE instr(page_id,?)=1")
+          .bind(`${pageId}-desired-`)
+          .first(),
+      ).toEqual({ count: 80 });
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        const intent = JSON.parse(
+          state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+        ).repairIntent;
+        expect(intent).toMatchObject({ phase: "rows" });
+        expect(intent.rowCursor).toBeUndefined();
+      });
+      await env.DB.prepare("DROP TRIGGER fail_late_cells").run();
+      await finishAlarmRepair(pageId);
+      expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS fail_link_transaction").run();
+      await env.DB.prepare("DROP TRIGGER IF EXISTS fail_late_cells").run();
+    }
   });
   it.each(["row", "option", "detail"])(
     "retains foreign %s ownership when it changes between repair reads and writes",
@@ -1045,6 +1131,117 @@ describe("per-table authority", () => {
       }
     },
   );
+  it("finishes link prerequisites across continuations and revalidates lost prefixes before status activity", async () => {
+    const { pageId, member } = await fixture(true);
+    await env.DB.prepare("UPDATE round2_runtime SET activity_enabled=0 WHERE id=1").run();
+    await env.DB.batch([
+      env.DB.prepare(
+        "WITH RECURSIVE n(value) AS (SELECT 0 UNION ALL SELECT value+1 FROM n WHERE value<99) INSERT INTO pages(id,workspace_id,space_id,parent_id,kind,position,title,created_by,updated_by,created_at,updated_at) SELECT list.id||'-recovery-'||printf('%03d',n.value),list.workspace_id,list.space_id,list.id,'document',printf('a%03d',n.value),'Task',?,?,1,1 FROM n JOIN pages list ON list.id=?",
+      ).bind(member.user.id, member.user.id, pageId),
+      env.DB.prepare(
+        "WITH RECURSIVE n(value) AS (SELECT 0 UNION ALL SELECT value+1 FROM n WHERE value<99) INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) SELECT printf('recovery-row%03d',value),?,value,?,1,1 FROM n",
+      ).bind(pageId, member.user.id),
+      env.DB.prepare(
+        "INSERT INTO table_row_pages(row_id,page_id,created_at) SELECT id,?||'-recovery-'||substr(id,-3),1 FROM table_rows WHERE page_id=?",
+      ).bind(pageId, pageId),
+      env.DB.prepare(
+        "INSERT INTO table_cells(row_id,column_id,select_value,json_value,updated_at) SELECT id,?||'-status',?||'-todo',json_quote(?||'-todo'),1 FROM table_rows WHERE page_id=?",
+      ).bind(pageId, pageId, pageId, pageId),
+    ]);
+    await enableTableAuthority(env, member, pageId);
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_many_statuses BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    const stub = env.TABLE.getByName(pageId);
+    try {
+      const pending = await tableCommand(
+        env,
+        member,
+        pageId,
+        {
+          kind: "bulk",
+          operationId: "many-statuses",
+          payload: {
+            commands: Array.from({ length: 100 }, (_v, i) => ({
+              kind: "update_cells",
+              payload: {
+                rowId: `recovery-row${i.toString().padStart(3, "0")}`,
+                values: { [`${pageId}-status`]: `${pageId}-doing` },
+              },
+            })),
+          },
+        },
+        { taskMutation: true },
+      );
+      const checkpoint = (await queryTable(env, member, pageId)).rows[0]!.editedAt;
+      await changeProjection(pageId, [{ sql: "DELETE FROM table_rows WHERE page_id=?", binds: [pageId] }]);
+      await env.DB.prepare("DROP TRIGGER hold_many_statuses").run();
+      await env.DB.prepare("UPDATE round2_runtime SET activity_enabled=1 WHERE id=1").run();
+      expect(
+        await runInDurableObject(stub, (instance) =>
+          (instance as unknown as { project(recover: boolean): Promise<boolean> }).project(true),
+        ),
+      ).toBe(false);
+      await changeProjection(pageId, [
+        { sql: "DELETE FROM table_row_pages WHERE row_id='recovery-row000'", binds: [] },
+      ]);
+      await expect(
+        runInDurableObject(stub, (instance) =>
+          (instance as unknown as { project(recover: boolean): Promise<boolean> }).project(true),
+        ),
+      ).rejects.toMatchObject({ code: "table_projection_blocked" });
+      await runInDurableObject(stub, (_instance, state) => {
+        const event = state.storage.sql
+          .exec<{ value: string; next_step: number }>(
+            "SELECT value,next_step FROM events WHERE revision=?",
+            pending.revision,
+          )
+          .one();
+        expect(JSON.parse(event.value).recovery).toBeUndefined();
+        expect(JSON.parse(event.value).recoveryRequired).toEqual({
+          generation: 1,
+          revision: pending.revision,
+          position: 0,
+        });
+        expect(event.next_step).toBe(0);
+      });
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) count FROM workspace_activity WHERE workspace_id=? AND event_type='task_status_changed'",
+        )
+          .bind(member.workspace.id)
+          .first(),
+      ).toEqual({ count: 0 });
+      expect(
+        await runInDurableObject(stub, (instance) =>
+          (instance as unknown as { project(recover: boolean): Promise<boolean> }).project(true),
+        ),
+      ).toBe(false);
+      expect(
+        await runInDurableObject(stub, (instance) =>
+          (instance as unknown as { project(recover: boolean): Promise<boolean> }).project(true),
+        ),
+      ).toBe(true);
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) count FROM workspace_activity WHERE workspace_id=? AND event_type='task_status_changed' AND created_at=?",
+        )
+          .bind(member.workspace.id, checkpoint)
+          .first(),
+      ).toEqual({ count: 100 });
+      expect(
+        await env.DB.prepare(
+          "SELECT count(*) count FROM table_row_pages WHERE row_id IN (SELECT id FROM table_rows WHERE page_id=?)",
+        )
+          .bind(pageId)
+          .first(),
+      ).toEqual({ count: 100 });
+      expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_many_statuses").run();
+      await env.DB.prepare("UPDATE round2_runtime SET activity_enabled=0 WHERE id=1").run();
+    }
+  });
   it("rejects a foreign row claim even when the recovered task's parent row exists", async () => {
     const { pageId, member } = await fixture(true);
     const foreign = await fixture();
@@ -1212,6 +1409,7 @@ describe("per-table authority", () => {
         type: "formula",
         source: 'prop("Number") * 2',
       });
+      await addEffect(pageId, pending.revision);
       await changeProjection(pageId, [{ sql: "DELETE FROM table_rows WHERE page_id=?", binds: [pageId] }]);
       await env.DB.prepare("DROP TRIGGER hold_bounded_parents").run();
       const requests = await runInDurableObject(env.TABLE.getByName(pageId), async (instance) => {
@@ -1252,6 +1450,7 @@ describe("per-table authority", () => {
           .one();
         expect(event.next_step).toBe(0);
         expect(JSON.parse(event.value).recovery).toMatchObject({
+          generation: 1,
           revision: pending.revision,
           position: 0,
           table: "table_rows",
@@ -1261,10 +1460,163 @@ describe("per-table authority", () => {
             .projectedRevision,
         ).toBe(pending.revision - 1);
       });
+      await changeProjection(pageId, [
+        { sql: "DELETE FROM table_rows WHERE id='bounded-000' AND page_id=?", binds: [pageId] },
+      ]);
+      await requestRepairTableProjection(env, member, pageId);
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
+        code: "table_projection_blocked",
+      });
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        const event = state.storage.sql
+          .exec<{ value: string; next_step: number }>(
+            "SELECT value,next_step FROM events WHERE revision=?",
+            pending.revision,
+          )
+          .one();
+        expect(JSON.parse(event.value).recovery).toBeUndefined();
+        expect(event.next_step).toBe(0);
+      });
+      await expect(requestRepairTableProjection(env, member, pageId)).resolves.toMatchObject({
+        repair: { state: "pending" },
+        verification: null,
+      });
       await finishAlarmRepair(pageId);
       expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
     } finally {
       await env.DB.prepare("DROP TRIGGER IF EXISTS hold_bounded_parents").run();
+    }
+  });
+  it.each(["generation", "revision", "position"] as const)(
+    "blocks a recovery cursor with a mismatched %s and clears it on owner retry",
+    async (field) => {
+      const { pageId, member } = await fixture();
+      await enableTableAuthority(env, member, pageId);
+      await write(pageId, member, "create_column", { id: "cursor-title", name: "Title", type: "text" });
+      await write(pageId, member, "create_row", { id: "cursor-row", values: { "cursor-title": "Before" } });
+      await env.DB.prepare(
+        "CREATE TRIGGER hold_cursor_validation BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+      ).run();
+      try {
+        const pending = await write(pageId, member, "update_cells", {
+          rowId: "cursor-row",
+          values: { "cursor-title": "After" },
+        });
+        await addEffect(pageId, pending.revision);
+        await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+          const event = state.storage.sql
+            .exec<{ value: string }>("SELECT value FROM events WHERE revision=?", pending.revision)
+            .one();
+          const recovery = {
+            generation: 1,
+            revision: pending.revision,
+            position: 0,
+            table: "table_rows",
+            key: "table_rows:cursor-row",
+          };
+          recovery[field]++;
+          state.storage.sql.exec(
+            "UPDATE events SET value=? WHERE revision=?",
+            JSON.stringify({ ...JSON.parse(event.value), recovery }),
+            pending.revision,
+          );
+        });
+        await changeProjection(pageId, [
+          { sql: "DELETE FROM table_columns WHERE id='cursor-title' AND page_id=?", binds: [pageId] },
+        ]);
+        await env.DB.prepare("DROP TRIGGER hold_cursor_validation").run();
+        await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
+          code: "table_projection_blocked",
+        });
+        expect(await tableRepairStatus(env, pageId)).toMatchObject({ state: "blocked", phase: "blocked" });
+        expect(await env.DB.prepare("SELECT title FROM pages WHERE id=?").bind(pageId).first()).toEqual({
+          title: "Tasks",
+        });
+        expect((await repairTableProjection(env, member, pageId)).projectionMatches).toBe(true);
+        expect(await env.DB.prepare("SELECT title FROM pages WHERE id=?").bind(pageId).first()).toEqual({
+          title: "Tasks effect",
+        });
+      } finally {
+        await env.DB.prepare("DROP TRIGGER IF EXISTS hold_cursor_validation").run();
+      }
+    },
+  );
+  it("does not cancel a row for an unrelated error mentioning the publication constraint", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "error-title", name: "Title", type: "text" });
+    await env.DB.prepare(
+      "CREATE TRIGGER unrelated_publication_error BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary table_publication_conflict from another subsystem'); END",
+    ).run();
+    try {
+      const result = await tableCommand(
+        env,
+        member,
+        pageId,
+        {
+          kind: "create_row",
+          operationId: "unrelated-error",
+          payload: { id: "unrelated-row", values: { "error-title": "Keep" } },
+        },
+        { cancelRowOnPublicationFailure: "unrelated-row" },
+      );
+      expect(result.projectionPending).toBe(true);
+      expect(result.result.publicationFailed).toBeUndefined();
+      expect((await queryTable(env, member, pageId)).rowCount).toBe(1);
+      await env.DB.prepare("DROP TRIGGER unrelated_publication_error").run();
+      await runDurableObjectAlarm(env.TABLE.getByName(pageId));
+      expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS unrelated_publication_error").run();
+    }
+  });
+  it("blocks a multi-step cancellable artifact before legacy normalization can merge it", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "atomic-title", name: "Title", type: "text" });
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_atomic_artifact BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    try {
+      const pending = await tableCommand(
+        env,
+        member,
+        pageId,
+        {
+          kind: "create_row",
+          operationId: "multi-step-cancel",
+          payload: { id: "atomic-row", values: { "atomic-title": "Keep" } },
+        },
+        { cancelRowOnPublicationFailure: "atomic-row" },
+      );
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        const step = state.storage.sql
+          .exec<{ value: string }>(
+            "SELECT value FROM projection_steps WHERE revision=? AND position=0",
+            pending.revision,
+          )
+          .one();
+        const statements = JSON.parse(step.value) as ProjectionStatement[];
+        state.storage.sql.exec(
+          "UPDATE projection_steps SET value=? WHERE revision=? AND position=0",
+          JSON.stringify(statements.slice(0, 1)),
+          pending.revision,
+        );
+        state.storage.sql.exec(
+          "INSERT INTO projection_steps VALUES(?,1,?)",
+          pending.revision,
+          JSON.stringify(statements.slice(1)),
+        );
+        state.storage.sql.exec("UPDATE events SET value='[]' WHERE revision=?", pending.revision);
+      });
+      await env.DB.prepare("DROP TRIGGER hold_atomic_artifact").run();
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
+        code: "table_projection_blocked",
+      });
+      expect((await queryTable(env, member, pageId)).rowCount).toBe(1);
+      expect(await tableRegistryForTest(pageId)).toMatchObject({ projected_revision: pending.revision - 1 });
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_atomic_artifact").run();
     }
   });
   it("bounds header validation and publication to100 entities per repair turn", async () => {
@@ -1434,8 +1786,9 @@ describe("per-table authority", () => {
     ).run();
     const stub = env.TABLE.getByName(pageId);
     try {
-      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
-        code: "table_projection_repairing",
+      await expect(requestRepairTableProjection(env, member, pageId)).resolves.toMatchObject({
+        repair: { state: "pending" },
+        verification: null,
       });
       expect(await runDurableObjectAlarm(stub)).toBe(true);
       expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -1447,8 +1800,9 @@ describe("per-table authority", () => {
         expect(intent.hashes.canonicalHash).not.toBe(intent.hashes.projectionHash);
       });
       // An explicit owner retry resets the budget even before repair is parked.
-      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
-        code: "table_projection_repairing",
+      await expect(requestRepairTableProjection(env, member, pageId)).resolves.toMatchObject({
+        repair: { state: "pending" },
+        verification: null,
       });
       expect(await runDurableObjectAlarm(stub)).toBe(true);
       expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -1596,7 +1950,9 @@ describe("per-table authority", () => {
         `CREATE TRIGGER interrupted_repair ${trigger} BEGIN SELECT RAISE(ABORT,'temporary_repair_failure'); END`,
       ).run();
       try {
-        await expect(repairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
+        if (phase === "rows" || phase === "verify") await requestRepairTableProjection(env, member, pageId);
+        if (phase === "verify") await runDurableObjectAlarm(env.TABLE.getByName(pageId));
+        await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
         await expect(write(pageId, member, "save_view", { name: "Blocked" })).rejects.toMatchObject({
           code: "table_projection_repairing",
         });
@@ -1631,7 +1987,9 @@ describe("per-table authority", () => {
     ).run();
     const stub = env.TABLE.getByName(pageId);
     try {
-      await expect(repairTableProjection(env, member, pageId)).rejects.toMatchObject({
+      await requestRepairTableProjection(env, member, pageId);
+      await runDurableObjectAlarm(stub);
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
         code: "table_projection_mismatch",
       });
       expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "repairing", generation: 1 });
@@ -1664,7 +2022,9 @@ describe("per-table authority", () => {
     ).run();
     const stub = env.TABLE.getByName(pageId);
     try {
-      await expect(repairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
+      await requestRepairTableProjection(env, member, pageId);
+      await runDurableObjectAlarm(stub);
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({ status: 500 });
       await env.DB.prepare("DROP TRIGGER hold_repair_verification").run();
       await env.DB.prepare("UPDATE table_authority SET generation=2 WHERE page_id=?").bind(pageId).run();
       await evictDurableObject(stub);
@@ -1699,8 +2059,9 @@ describe("per-table authority", () => {
         payload: { id: `row-${String(index).padStart(3, "0")}`, values: { title: String(index) } },
       })),
     });
-    await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
-      code: "table_projection_repairing",
+    await expect(requestRepairTableProjection(env, member, pageId)).resolves.toMatchObject({
+      repair: { state: "pending" },
+      verification: null,
     });
     expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "repairing" });
     expect(await env.DB.prepare("SELECT count(*) count FROM table_rows WHERE page_id=?").bind(pageId).first()).toEqual({

@@ -2,7 +2,7 @@ import { BlockNoteEditor } from "@blocknote/core";
 import { CommentsExtension } from "@blocknote/core/comments";
 import { withCollaboration } from "@blocknote/core/yjs";
 import * as Y from "yjs";
-import { ySyncPluginKey } from "y-prosemirror";
+import { observeUnsupportedCodeContent, UnsupportedCodeContentError, ySyncPluginKey } from "y-prosemirror";
 import { notesCommentSchema, notesSchema } from "../../../src/client/mentions";
 import { ServerThreadStore } from "../../../src/client/server-thread-store";
 import { normalizeYCodeBlocks } from "../../../src/shared/code-content";
@@ -10,6 +10,106 @@ import { documentToYjsUpdate } from "../../../src/shared/import-content";
 
 const annotationKey = "comment--0123abcd";
 const codeElement = (doc) => doc.getXmlFragment("document-store").get(0).get(0).get(0);
+
+/** Exercise rejection with the browser's actual editor binding, preserving the received bytes. */
+export function rejectUnsupportedCode() {
+  const results = [];
+  for (const received of [false, true]) {
+    const doc = new Y.Doc(),
+      remote = new Y.Doc(),
+      expected = new Y.Doc();
+    const group = new Y.XmlElement("blockGroup"),
+      container = new Y.XmlElement("blockContainer"),
+      code = new Y.XmlElement("codeBlock"),
+      text = new Y.XmlText();
+    container.setAttribute("id", "code");
+    code.setAttribute("language", "javascript");
+    text.insert(0, "safe code");
+    code.insert(0, [text]);
+    container.insert(0, [code]);
+    group.insert(0, [container]);
+    doc.getXmlFragment("document-store").insert(0, [group]);
+    const anchor = Y.createRelativePositionFromTypeIndex(text, 2);
+    const host = document.createElement("section");
+    document.body.appendChild(host);
+    const errors = [];
+    const unsubscribe = observeUnsupportedCodeContent(doc, (error) => errors.push(error));
+    let editor;
+    const mount = () => {
+      const instance = BlockNoteEditor.create(
+        withCollaboration({
+          schema: notesSchema,
+          collaboration: {
+            fragment: doc.getXmlFragment("document-store"),
+            user: { name: "Code fixture", color: "#123456" },
+          },
+        }),
+      );
+      instance.mount(host);
+      return instance;
+    };
+    const unchanged = (before) => {
+      const after = Y.encodeStateAsUpdate(doc);
+      return before.length === after.length && before.every((value, index) => value === after[index]);
+    };
+    try {
+      if (!received) {
+        text.insertEmbed(4, { unsupported: "image" });
+        const before = Y.encodeStateAsUpdate(doc);
+        let controlledError = false;
+        try {
+          editor = mount();
+        } catch (error) {
+          controlledError = error instanceof UnsupportedCodeContentError;
+        }
+        results.push({
+          received,
+          controlledError,
+          bytesRetained: unchanged(before),
+          identityRetained: code.get(0) === text,
+        });
+      } else {
+        editor = mount();
+        Y.applyUpdate(remote, Y.encodeStateAsUpdate(doc));
+        Y.applyUpdate(expected, Y.encodeStateAsUpdate(doc));
+        const remoteText = codeElement(remote).get(0);
+        remoteText.insertEmbed(4, { unsupported: "image" });
+        const update = Y.encodeStateAsUpdate(remote);
+        Y.applyUpdate(expected, update);
+        Y.applyUpdate(doc, update);
+        const before = Y.encodeStateAsUpdate(doc);
+        const bytesRetained = unchanged(Y.encodeStateAsUpdate(expected));
+        editor.prosemirrorView.dispatch(editor.prosemirrorState.tr.insertText("blocked", 3));
+        const writesBlocked = unchanged(before);
+        const controlledError = errors.length === 1 && errors[0] instanceof UnsupportedCodeContentError;
+        const identityRetained = code.get(0) === text;
+        const anchorRetained = Y.createAbsolutePositionFromRelativePosition(anchor, doc)?.type === text;
+        remoteText.delete(4, 1);
+        Y.applyUpdate(doc, Y.encodeStateAsUpdate(remote));
+        editor.unmount();
+        editor = mount();
+        const repaired = editor.prosemirrorState.doc.textContent === "safe code";
+        results.push({
+          received,
+          controlledError,
+          bytesRetained,
+          writesBlocked,
+          identityRetained,
+          anchorRetained,
+          repaired,
+        });
+      }
+    } finally {
+      unsubscribe();
+      editor?.unmount();
+      host.remove();
+      doc.destroy();
+      remote.destroy();
+      expected.destroy();
+    }
+  }
+  return results;
+}
 
 /** Exercise the shipped browser binding on migrated code without a connected provider. */
 export async function reconcileCodeReplicas() {

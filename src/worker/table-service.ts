@@ -9,7 +9,13 @@ import {
   type TableQueryResult,
   type TableView,
 } from "../shared/table-protocol";
-import { tableActorSignature, type TableActor, type ProjectionStatement } from "./table-authority";
+import {
+  tableActorSignature,
+  type TableActor,
+  type ProjectionStatement,
+  type TableRepairStatus,
+} from "./table-authority";
+import { acceptedPageDeletionSql } from "./deletion-policy";
 import {
   projectionColumns,
   projectionRows,
@@ -208,8 +214,7 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
       return await env.DB.batch([
         env.DB.prepare(`INSERT OR REPLACE INTO table_publication_guards(page_id,ok)
           SELECT ?,CASE WHEN EXISTS(SELECT 1 FROM pages WHERE id=? AND kind='table' AND workspace_id=? AND archived_at IS NULL AND import_job_id IS NULL)
-            AND NOT EXISTS(SELECT 1 FROM deletion_job_pages locked JOIN deletion_jobs job ON job.id=locked.job_id
-              WHERE locked.page_id=? AND job.workspace_id=? AND job.phase IN ('rows','cleanup'))
+            AND NOT ${acceptedPageDeletionSql("?", "?")}
             AND ${expected ? "EXISTS(SELECT 1 FROM table_authority WHERE page_id=? AND generation=? AND state=?)" : "NOT EXISTS(SELECT 1 FROM table_authority WHERE page_id=?)"}
             THEN 1 ELSE 0 END`).bind(
           pageId,
@@ -225,13 +230,21 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
       ]);
     } catch (error) {
       if (String(error).includes("table_publication_conflict")) {
-        const deleting =
-          await env.DB.prepare(`SELECT 1 FROM deletion_job_pages locked JOIN deletion_jobs job ON job.id=locked.job_id
-          WHERE locked.page_id=? AND job.workspace_id=? AND job.phase IN ('rows','cleanup')`)
-            .bind(pageId, member.workspace.id)
-            .first();
+        const deleting = await env.DB.prepare(`SELECT 1 WHERE ${acceptedPageDeletionSql("?", "?")}`)
+          .bind(pageId, member.workspace.id)
+          .first();
         if (deleting)
           throw new HttpError(409, "deletion_pending", "Permanent deletion has already been accepted for this table.");
+        const source = await env.DB.prepare("SELECT workspace_id,kind,archived_at,import_job_id FROM pages WHERE id=?")
+          .bind(pageId)
+          .first<{ workspace_id: string; kind: string; archived_at: number | null; import_job_id: string | null }>();
+        if (!source || source.workspace_id !== member.workspace.id)
+          throw new HttpError(404, "page_not_found", "Page not found.");
+        if (source.archived_at !== null)
+          throw new HttpError(409, "page_archived", "Restore the table before enabling collaboration.");
+        if (source.import_job_id !== null)
+          throw new HttpError(409, "import_pending", "The table is still importing. Retry after import finishes.");
+        if (source.kind !== "table") throw new HttpError(422, "table_required", "Choose a table.");
         throw new HttpError(
           409,
           "table_generation_conflict",
@@ -376,10 +389,27 @@ export async function enableTableAuthority(env: Env, member: MemberContext, page
   ]);
   return (await tableRegistry(env, pageId))!;
 }
+type TableRepairResult =
+  | Awaited<ReturnType<typeof compareTableProjection>>
+  | { repair: TableRepairStatus; verification: null };
+
 export async function repairTableProjection(env: Env, member: MemberContext, pageId: string) {
   await pageForMember(env, member, pageId);
   if (member.role !== "owner") throw new HttpError(403, "owner_required", "Only an owner can repair a projection.");
-  return tableInternal<Awaited<ReturnType<typeof compareTableProjection>>>(env, pageId, "/repair", {});
+  return tableInternal<TableRepairResult>(env, pageId, "/repair", {});
+}
+
+/** Poll durable progress without initiating repair or exporting canonical rows. */
+export async function tableRepairStatus(env: Env, pageId: string) {
+  const [registry, status] = await Promise.all([
+    tableRegistry(env, pageId),
+    tableInternal<TableRepairStatus>(env, pageId, "/repair-status"),
+  ]);
+  if (!registry || registry.generation !== status.generation)
+    throw new HttpError(409, "table_generation_conflict", "Repair generation changed.");
+  if (registry.state === "repairing" && status.state === "complete")
+    return { ...status, state: "pending" as const, phase: "fence" as const };
+  return status;
 }
 
 /** Compare the actual disposable projection, including typed values and computed source stamps. */
