@@ -215,6 +215,70 @@ describe("document mutation response barriers", () => {
     });
   });
 
+  it.each(["delete_block", "replace_block"] as const)("allows %s to remove unsupported legacy code", async (type) => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as TestDocument,
+        legacy = legacyCodeBlock();
+      legacy.code.insert(1, [new Y.XmlElement("footnoteReference")]);
+      installDocumentBlocks(room.document, legacy.container);
+      const response = await room.onRequest(
+        protectedMutation(installed.userId, {
+          operations: [
+            {
+              type,
+              internalId: "legacy-code",
+              ...(type === "replace_block"
+                ? {
+                    container: {
+                      type: "blockContainer",
+                      attrs: { id: "legacy-code" },
+                      content: [{ type: "paragraph", content: [{ type: "text", text: "Recovered" }] }],
+                    },
+                  }
+                : {}),
+            },
+          ],
+        }),
+      );
+      expect(response.status).toBe(200);
+      const result = await response.json<{ document: unknown }>();
+      validateDocumentTree(result.document);
+      expect(JSON.stringify(result.document)).not.toContain("footnoteReference");
+      expect(JSON.stringify(result.document).includes("Recovered")).toBe(type === "replace_block");
+    });
+  });
+
+  it("rejects removal if another unsupported code block survives, then accepts removing both", async () => {
+    const installed = await fixture();
+    const stub = env.DOCUMENT.getByName(`${installed.pageId}~1`);
+    await stub.fetch(internalWarmupRequest());
+    await runInDurableObject(stub, async (instance) => {
+      const room = instance as unknown as TestDocument;
+      const blocks = [legacyCodeBlock("first-bad"), legacyCodeBlock("second-bad")];
+      for (const block of blocks) block.code.insert(1, [new Y.XmlElement("footnoteReference")]);
+      installDocumentBlocks(room.document, ...blocks.map((block) => block.container));
+      const before = Y.encodeStateAsUpdate(room.document);
+      const rejected = await room.onRequest(
+        protectedMutation(installed.userId, { operations: [{ type: "delete_block", internalId: "first-bad" }] }),
+      );
+      expect(rejected.status).toBe(422);
+      expect(Y.encodeStateAsUpdate(room.document)).toEqual(before);
+      const accepted = await room.onRequest(
+        protectedMutation(installed.userId, {
+          operations: blocks.map((_, index) => ({
+            type: "delete_block",
+            internalId: index ? "second-bad" : "first-bad",
+          })),
+        }),
+      );
+      expect(accepted.status).toBe(200);
+      validateDocumentTree((await accepted.json<{ document: unknown }>()).document);
+    });
+  });
+
   it("initializes staged legacy code using a normalized candidate while preserving import bytes", async () => {
     const installed = await fixture(),
       source = new Y.Doc(),

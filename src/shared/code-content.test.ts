@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { execFileSync } from "node:child_process";
 import * as Y from "yjs";
 import { yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
 import { normalizeCodeBlockContent, normalizeYCodeBlocks } from "./code-content";
@@ -33,6 +34,68 @@ function legacyDocument(content: ProseMirrorJson[]) {
 }
 
 describe("legacy code content normalization", () => {
+  it("uses the persisted CJS patch to preserve same-thread aliases within one text and across texts", () => {
+    const output = execFileSync(
+      process.execPath,
+      [
+        "-e",
+        `
+      const Y = require("yjs"), { Schema } = require("prosemirror-model"), p = require("y-prosemirror");
+      const schema = new Schema({ nodes: { doc: { content: "codeBlock+" }, codeBlock: { content: "text*" }, text: {} }, marks: { comment: { attrs: { threadId: { default: "" }, orphan: { default: false } }, excludes: "" } } });
+      const results = [];
+      for (const single of [false, true]) {
+        const doc = new Y.Doc(), code = new Y.XmlElement("codeBlock"), attrs = { threadId: "same-thread", orphan: false };
+        const runs = [{ insert: "left", attributes: { comment: attrs } }, { insert: "right", attributes: { "comment--0123abcd": attrs } }];
+        const texts = single ? [new Y.XmlText()] : [new Y.XmlText(), new Y.XmlText()];
+        if (single) texts[0].applyDelta(runs); else runs.forEach((run, index) => texts[index].applyDelta([run]));
+        code.insert(0, texts); doc.getXmlFragment("document-store").insert(0, [code]);
+        const { doc: pm, meta } = p.initProseMirrorDoc(doc.getXmlFragment("document-store"), schema);
+        p.updateYFragment(doc, doc.getXmlFragment("document-store"), schema.node("doc", null, [schema.node("codeBlock", null, [schema.text("leXftright", pm.firstChild.firstChild.marks)])]), meta);
+        results.push({ text: texts.map(text => text.toDelta().map(delta => delta.insert).join("")).join(""), keys: texts.flatMap(text => text.toDelta().flatMap(delta => Array.from({ length: delta.insert.length }, () => Object.keys(delta.attributes || {}).sort()))), identity: code.toArray().every((text, index) => text === texts[index]) });
+      }
+      console.log(JSON.stringify(results));
+    `,
+      ],
+      { encoding: "utf8" },
+    );
+    for (const result of JSON.parse(output)) {
+      expect(result.text).toBe("leXftright");
+      expect(result.keys).toEqual([
+        ...Array.from({ length: 5 }, () => ["comment"]),
+        ...Array.from({ length: 5 }, () => ["comment--0123abcd"]),
+      ]);
+      expect(result.identity).toBe(true);
+    }
+  });
+  it("uses the persisted CJS reader/writer patch when reconciling concurrent segmented code", () => {
+    const output = execFileSync(
+      process.execPath,
+      [
+        "-e",
+        `
+      const Y = require("yjs"), { Schema } = require("prosemirror-model"), p = require("y-prosemirror");
+      const schema = new Schema({ nodes: { doc: { content: "codeBlock+" }, codeBlock: { content: "text*" }, text: {} } });
+      const seed = new Y.Doc(), code = new Y.XmlElement("codeBlock");
+      const texts = ["left", "\\n", "right"].map(value => { const text = new Y.XmlText(); text.insert(0, value); return text; });
+      code.insert(0, texts); seed.getXmlFragment("document-store").insert(0, [code]);
+      p.initProseMirrorDoc(seed.getXmlFragment("document-store"), schema);
+      if (code.length !== 3) throw Error("Reader moved text identity");
+      const bytes = Y.encodeStateAsUpdate(seed), docs = [new Y.Doc(), new Y.Doc()];
+      for (const [index, doc] of docs.entries()) {
+        Y.applyUpdate(doc, bytes);
+        const fragment = doc.getXmlFragment("document-store"), { doc: pm, meta } = p.initProseMirrorDoc(fragment, schema);
+        p.updateYFragment(doc, fragment, schema.node("doc", null, [schema.node("codeBlock", null, [schema.text(pm.textContent + (index ? " B" : " A"))])]), meta);
+      }
+      Y.applyUpdate(docs[0], Y.encodeStateAsUpdate(docs[1]));
+      console.log(JSON.stringify({ text: p.yXmlFragmentToProseMirrorRootNode(docs[0].getXmlFragment("document-store"), schema).textContent, types: docs[0].getXmlFragment("document-store").get(0).length }));
+    `,
+      ],
+      { encoding: "utf8" },
+    );
+    const result = JSON.parse(output);
+    expect(result.text).toMatch(/^left\nright (A B|B A)$/);
+    expect(result.types).toBe(3);
+  });
   it("preserves whitespace and both comment forms while stripping only known formatting and converting breaks", () => {
     const content = [
       {

@@ -19,22 +19,68 @@ interface DeletionTargetRow {
   target: string;
 }
 
+type TableDeletionTarget = {
+  version: 1;
+  pageId: string;
+  workspaceId: string;
+  generation: number | null;
+  stage: "stop" | "purge";
+};
+
+function tableDeletionTarget(target: string): TableDeletionTarget | null {
+  if (!target.startsWith("{")) return null;
+  const value = JSON.parse(target) as TableDeletionTarget;
+  if (
+    value.version !== 1 ||
+    typeof value.pageId !== "string" ||
+    typeof value.workspaceId !== "string" ||
+    (value.generation !== null && (!Number.isSafeInteger(value.generation) || value.generation < 1)) ||
+    !["stop", "purge"].includes(value.stage)
+  )
+    throw new Error("Invalid table deletion target");
+  return value;
+}
+
+// Every owned table keeps distinct stop and purge checkpoints in the existing target table.
+function missingTableStopsSql(completed: boolean) {
+  return `EXISTS(SELECT 1 FROM deletion_job_pages locked JOIN deletion_jobs job ON job.id=locked.job_id
+    JOIN pages page ON page.id=locked.page_id AND page.kind='table'
+    LEFT JOIN table_authority authority ON authority.page_id=page.id
+    WHERE job.id=? AND NOT EXISTS(SELECT 1 FROM deletion_targets target WHERE target.job_id=job.id
+      AND target.kind='table_do' AND json_valid(target.target)
+      AND json_extract(target.target,'$.version')=1 AND json_extract(target.target,'$.stage')='stop'
+      AND json_extract(target.target,'$.pageId')=page.id AND json_extract(target.target,'$.workspaceId')=job.workspace_id
+      AND json_extract(target.target,'$.generation') IS authority.generation
+      ${completed ? "AND target.completed_at IS NOT NULL" : ""}
+      AND EXISTS(SELECT 1 FROM deletion_targets purge WHERE purge.job_id=job.id AND purge.kind='table_do'
+        AND json_valid(purge.target) AND json_extract(purge.target,'$.version')=1
+        AND json_extract(purge.target,'$.stage')='purge' AND json_extract(purge.target,'$.pageId')=page.id
+        AND json_extract(purge.target,'$.workspaceId')=job.workspace_id
+        AND json_extract(purge.target,'$.generation') IS authority.generation)))`;
+}
+
 const CLEANUP_LEASE_MS = 15 * 60_000;
 const DOCUMENT_PURGE_TIMEOUT_MS = 30_000;
 
-const REPAIRING_DELETION_ANCESTRY_SQL = `EXISTS(WITH RECURSIVE ancestors(id,workspace_id) AS (
-  SELECT page.id,page.workspace_id FROM deletion_job_pages locked JOIN deletion_jobs job ON job.id=locked.job_id
+const REPAIRING_DELETION_ANCESTRY_SQL = `EXISTS(WITH RECURSIVE ancestors(id,workspace_id,job_id) AS (
+  SELECT page.id,page.workspace_id,job.id FROM deletion_job_pages locked JOIN deletion_jobs job ON job.id=locked.job_id
     JOIN pages page ON page.id=locked.page_id AND page.workspace_id=job.workspace_id WHERE job.id=?
   UNION
-  SELECT parent.id,parent.workspace_id FROM ancestors child JOIN pages page ON page.id=child.id
+  SELECT parent.id,parent.workspace_id,child.job_id FROM ancestors child JOIN pages page ON page.id=child.id
     JOIN pages parent ON parent.id=page.parent_id AND parent.workspace_id=child.workspace_id
   UNION
-  SELECT parent.id,parent.workspace_id FROM ancestors child JOIN page_import_sources source
+  SELECT parent.id,parent.workspace_id,child.job_id FROM ancestors child JOIN page_import_sources source
     ON source.page_id=child.id AND source.source_role='table_row_detail'
     JOIN page_import_sources provenance ON source.job_id IS NOT NULL AND provenance.job_id=source.job_id
       AND source.parent_source_path IS NOT NULL AND provenance.source_path=source.parent_source_path
     JOIN pages parent ON parent.id=provenance.page_id AND parent.workspace_id=child.workspace_id
-) SELECT 1 FROM ancestors JOIN table_authority authority ON authority.page_id=ancestors.id WHERE authority.state='repairing')`;
+) SELECT 1 FROM ancestors JOIN table_authority authority ON authority.page_id=ancestors.id WHERE authority.state='repairing'
+  AND NOT EXISTS(SELECT 1 FROM deletion_job_pages locked JOIN deletion_targets target ON target.job_id=locked.job_id
+    WHERE locked.job_id=ancestors.job_id AND locked.page_id=ancestors.id AND target.kind='table_do'
+      AND json_valid(target.target) AND json_extract(target.target,'$.version')=1
+      AND json_extract(target.target,'$.stage')='stop' AND json_extract(target.target,'$.pageId')=ancestors.id
+      AND json_extract(target.target,'$.workspaceId')=ancestors.workspace_id
+      AND json_extract(target.target,'$.generation')=authority.generation))`;
 
 export const ACCEPTED_PAGE_DELETION_SQL = `EXISTS(SELECT 1 FROM deletion_job_pages lock
  JOIN deletion_jobs job ON job.id=lock.job_id WHERE lock.page_id=p.id
@@ -95,8 +141,24 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
       .bind(serializedIds, serializedIds)
       .all<{ r2_key: string }>();
   const targets = new Map<string, DeletionTargetRow>();
+  const authorities = await env.DB.prepare(
+    "SELECT page_id,generation FROM table_authority WHERE page_id IN(SELECT value FROM json_each(?))",
+  )
+    .bind(serializedIds)
+    .all<{ page_id: string; generation: number }>();
+  const generations = new Map(authorities.results.map((authority) => [authority.page_id, authority.generation]));
   for (const page of pages.results) {
-    if (page.kind === "table") targets.set(`table:${page.id}`, { kind: "table_do", target: page.id });
+    if (page.kind === "table")
+      for (const stage of ["stop", "purge"] as const) {
+        const target: TableDeletionTarget = {
+          version: 1,
+          pageId: page.id,
+          workspaceId,
+          generation: generations.get(page.id) ?? null,
+          stage,
+        };
+        targets.set(`table:${page.id}:${stage}`, { kind: "table_do", target: JSON.stringify(target) });
+      }
     else if (page.kind === "document" || page.kind === "diagram") {
       targets.set(`prefix:${page.id}`, {
         kind: "r2_prefix",
@@ -156,7 +218,7 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
         AND NOT EXISTS(SELECT 1 FROM deletion_targets target WHERE target.job_id=? AND target.kind='table_row'
           AND json_extract(target.target,'$.rowId')=row.id AND json_extract(target.target,'$.detailPageId')=link.page_id
           AND json_extract(target.target,'$.tableId')=row.page_id AND json_extract(target.target,'$.generation')=authority.generation))
-      AND NOT ${REPAIRING_DELETION_ANCESTRY_SQL}
+      AND NOT ${missingTableStopsSql(false)} AND NOT ${REPAIRING_DELETION_ANCESTRY_SQL}
       RETURNING id`)
       .bind(
         timestamp,
@@ -174,12 +236,20 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
         jobId,
         jobId,
         jobId,
+        jobId,
       )
       .first<{ id: string }>();
     if (!accepted) {
       const raced = await acceptedDeletionJob(env, workspaceId, rootId);
+      const repairing = await env.DB.prepare(`SELECT 1 WHERE ${REPAIRING_DELETION_ANCESTRY_SQL}`).bind(jobId).first();
       await env.DB.prepare("DELETE FROM deletion_jobs WHERE id=? AND phase='staging'").bind(jobId).run();
       if (raced) return raced;
+      if (repairing)
+        throw new HttpError(
+          409,
+          "table_repairing",
+          "A containing table is being repaired. Finish its repair before deleting this page.",
+        );
       throw new HttpError(
         409,
         "deletion_pending",
@@ -206,7 +276,7 @@ async function removeDeletionMetadata(env: Env, job: DeletionJobRow, leaseUntil:
       AND NOT EXISTS(SELECT 1 FROM table_row_pages link JOIN table_rows row ON row.id=link.row_id
         JOIN table_authority a ON a.page_id=row.page_id AND a.state<>'d1'
         WHERE link.page_id IN (${ids}) AND row.page_id NOT IN (${ids}))
-      AND NOT ${REPAIRING_DELETION_ANCESTRY_SQL} RETURNING id`).bind(
+      AND NOT ${missingTableStopsSql(true)} AND NOT ${REPAIRING_DELETION_ANCESTRY_SQL} RETURNING id`).bind(
       Date.now(),
       job.id,
       leaseUntil,
@@ -215,6 +285,7 @@ async function removeDeletionMetadata(env: Env, job: DeletionJobRow, leaseUntil:
       job.root_page_id,
       job.id,
       job.workspace_id,
+      job.id,
       job.id,
       job.id,
       job.id,
@@ -275,14 +346,40 @@ async function processTarget(env: Env, target: DeletionTargetRow, hint?: Durable
     return;
   }
   if (target.kind === "table_do") {
-    const response = await env.TABLE.getByName(target.target).fetch(
-      new Request("https://table.internal/purge", {
+    const tuple = tableDeletionTarget(target.target);
+    const pageId = tuple?.pageId ?? target.target;
+    if (!tuple) {
+      // Older cleanup jobs may have no page lock. Reserve the absent identity
+      // in the same D1 statement that proves this job still owns its purge.
+      const reserved =
+        await env.DB.prepare(`INSERT OR IGNORE INTO deletion_job_pages(job_id,page_id,archive_operation_id,archived_at)
+        SELECT job.id,?,NULL,0 FROM deletion_jobs job WHERE job.id=? AND job.phase='cleanup'
+        AND EXISTS(SELECT 1 FROM deletion_targets WHERE job_id=job.id AND kind='table_do' AND target=? AND completed_at IS NULL)
+        AND NOT EXISTS(SELECT 1 FROM pages WHERE id=?) AND NOT EXISTS(SELECT 1 FROM table_authority WHERE page_id=?);
+      `)
+          .bind(pageId, jobId, target.target, pageId, pageId)
+          .run();
+      const owned =
+        await env.DB.prepare(`SELECT 1 FROM deletion_job_pages locked JOIN deletion_jobs job ON job.id=locked.job_id
+        WHERE job.id=? AND job.phase='cleanup' AND locked.page_id=?
+        AND NOT EXISTS(SELECT 1 FROM pages WHERE id=?) AND NOT EXISTS(SELECT 1 FROM table_authority WHERE page_id=?)`)
+          .bind(jobId, pageId, pageId, pageId)
+          .first();
+      if (!reserved.meta.changes && !owned) throw new Error("Legacy table purge identity is unavailable");
+    }
+    const stop = tuple?.stage === "stop";
+    const response = await env.TABLE.getByName(pageId).fetch(
+      new Request(`https://table.internal/${stop ? "stop-repair-for-deletion" : "purge"}`, {
         method: "POST",
-        headers: { "x-table-internal": env.BETTER_AUTH_SECRET },
+        headers: { "content-type": "application/json", "x-table-internal": env.BETTER_AUTH_SECRET },
+        body: JSON.stringify(tuple ? { ...tuple, jobId } : { jobId, pageId }),
         signal: AbortSignal.timeout(DOCUMENT_PURGE_TIMEOUT_MS),
       }),
     );
-    if (!response.ok) throw new Error(`Table purge failed with ${response.status}`);
+    if (!response.ok) throw new Error(`Table ${stop ? "stop" : "purge"} failed with ${response.status}`);
+    const result = await response.json<{ ok?: unknown; stopped?: unknown; generation?: unknown }>();
+    if (result.ok !== true || (stop && (result.stopped !== true || result.generation !== tuple!.generation)))
+      throw new Error("Table deletion acknowledgment is invalid");
     return;
   }
   if (target.kind === "r2_object") {
@@ -302,6 +399,53 @@ async function processTarget(env: Env, target: DeletionTargetRow, hint?: Durable
     }),
   );
   if (!response.ok) throw new Error(`Document purge failed with ${response.status}`);
+}
+
+async function upgradeDeletionTableTargets(env: Env, job: DeletionJobRow, leaseUntil: number) {
+  const legacy = await env.DB.prepare(`SELECT target.target,page.workspace_id,authority.generation
+    FROM deletion_targets target JOIN deletion_jobs job ON job.id=target.job_id
+    JOIN deletion_job_pages locked ON locked.job_id=job.id AND locked.page_id=target.target
+    JOIN pages page ON page.id=locked.page_id AND page.workspace_id=job.workspace_id AND page.kind='table'
+    LEFT JOIN table_authority authority ON authority.page_id=page.id
+    WHERE job.id=? AND job.phase='rows' AND job.next_attempt_at=? AND target.kind='table_do'
+      AND substr(target.target,1,1)<>'{' AND target.completed_at IS NULL
+      AND page.archived_at IS locked.archived_at AND page.archive_operation_id IS locked.archive_operation_id`)
+    .bind(job.id, leaseUntil)
+    .all<{ target: string; workspace_id: string; generation: number | null }>();
+  for (const old of legacy.results) {
+    const tuple = { version: 1, pageId: old.target, workspaceId: old.workspace_id, generation: old.generation };
+    const guard = `EXISTS(SELECT 1 FROM deletion_jobs job JOIN deletion_job_pages locked ON locked.job_id=job.id
+      JOIN pages page ON page.id=locked.page_id AND page.workspace_id=job.workspace_id AND page.kind='table'
+      LEFT JOIN table_authority authority ON authority.page_id=page.id
+      WHERE job.id=? AND job.phase='rows' AND job.next_attempt_at=? AND page.id=?
+        AND page.archived_at IS locked.archived_at AND page.archive_operation_id IS locked.archive_operation_id
+        AND authority.generation IS ? AND EXISTS(SELECT 1 FROM deletion_targets WHERE job_id=job.id AND kind='table_do' AND target=?))`;
+    const result = await env.DB.batch([
+      ...(["stop", "purge"] as const).map((stage) =>
+        env.DB.prepare(`INSERT OR IGNORE INTO deletion_targets(job_id,kind,target)
+        SELECT ?,'table_do',? WHERE ${guard}`).bind(
+          job.id,
+          JSON.stringify({ ...tuple, stage }),
+          job.id,
+          leaseUntil,
+          old.target,
+          old.generation,
+          old.target,
+        ),
+      ),
+      env.DB.prepare(`DELETE FROM deletion_targets WHERE job_id=? AND kind='table_do' AND target=? AND ${guard}`).bind(
+        job.id,
+        old.target,
+        job.id,
+        leaseUntil,
+        old.target,
+        old.generation,
+        old.target,
+      ),
+    ]);
+    if (!result[2]?.meta.changes) return "Deletion table target ownership changed";
+  }
+  return undefined;
 }
 
 async function reconcileDeletionRowTargets(env: Env, job: DeletionJobRow, leaseUntil: number) {
@@ -384,12 +528,12 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
     .first<DeletionJobRow>();
   if (!job) return;
 
-  let phaseFailure = job.phase === "rows" ? await reconcileDeletionRowTargets(env, job, leaseUntil) : undefined;
+  let phaseFailure = job.phase === "rows" ? await upgradeDeletionTableTargets(env, job, leaseUntil) : undefined;
 
   let targets = await env.DB.prepare(
     `SELECT kind, target FROM deletion_targets
       WHERE job_id = ? AND completed_at IS NULL
-        AND (?<>'rows' OR kind='table_row')
+        AND (?<>'rows' OR (kind='table_do' AND json_valid(target) AND json_extract(target,'$.stage')='stop'))
       ORDER BY CASE kind WHEN 'document_do' THEN 0 WHEN 'r2_object' THEN 1 ELSE 2 END, target`,
   )
     .bind(job.id, job.phase ?? "cleanup")
@@ -432,6 +576,24 @@ export async function processDeletionJob(env: Env, jobId: string, { retryFailedR
       }
     }
     if (job.phase !== "rows" || phaseFailure) break;
+    if (targets.results.some((target) => target.kind === "table_do")) {
+      const unstopped = await env.DB.prepare(`SELECT 1 FROM deletion_targets WHERE job_id=? AND kind='table_do'
+        AND json_valid(target) AND json_extract(target,'$.stage')='stop' AND completed_at IS NULL LIMIT 1`)
+        .bind(job.id)
+        .first();
+      if (unstopped) break;
+    }
+    // Owned tables cannot restore links while external row targets are reconciled.
+    if (targets.results.every((target) => target.kind !== "table_row")) {
+      phaseFailure = await reconcileDeletionRowTargets(env, job, leaseUntil);
+      if (phaseFailure) break;
+      targets = await env.DB.prepare(
+        "SELECT kind,target FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL ORDER BY target",
+      )
+        .bind(job.id)
+        .all<DeletionTargetRow>();
+      if (targets.results.length) continue;
+    }
     const remainingRows = await env.DB.prepare(
       "SELECT count(*) count FROM deletion_targets WHERE job_id=? AND kind='table_row' AND completed_at IS NULL",
     )
@@ -501,7 +663,7 @@ export async function processDueDeletionJobs(env: Env, limit = 10) {
     .bind(Date.now() - 24 * 60 * 60_000)
     .run();
   const jobs = await env.DB.prepare(
-    `SELECT id FROM deletion_jobs WHERE next_attempt_at <= ? AND phase<>'staging' ORDER BY created_at LIMIT ?`,
+    `SELECT id FROM deletion_jobs WHERE next_attempt_at <= ? AND phase<>'staging' ORDER BY next_attempt_at,created_at,id LIMIT ?`,
   )
     .bind(Date.now(), limit)
     .all<{ id: string }>();

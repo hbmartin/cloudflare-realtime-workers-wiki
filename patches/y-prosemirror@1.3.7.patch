@@ -1,0 +1,307 @@
+diff --git a/dist/y-prosemirror.cjs b/dist/y-prosemirror.cjs
+index de4d1e6609bba2ffbc2a57048023cdf5bad44b18..cf08336f7dba3f0f428e8a3c4247583d7e904463 100644
+--- a/dist/y-prosemirror.cjs
++++ b/dist/y-prosemirror.cjs
+@@ -826,7 +826,7 @@ const createNodeFromYElement = (
+       // This is a fix for #160 -- duplication of characters when two Y.Text exist next to each
+       // other.
+       const nextytext = /** @type {Y.ContentType} */ (type._item.right?.content)?.type;
+-      if (nextytext instanceof Y__namespace.Text && !nextytext._item.deleted && nextytext._item.id.client === nextytext.doc.clientID) {
++      if (el.nodeName !== 'codeBlock' && nextytext instanceof Y__namespace.Text && !nextytext._item.deleted && nextytext._item.id.client === nextytext.doc.clientID) {
+         type.applyDelta([
+           { retain: type.length },
+           ...nextytext.toDelta()
+@@ -1146,23 +1146,27 @@ const ytextTrans = (ytext) => {
+  * @param {Array<any>} ptexts
+  * @param {BindingMetadata} meta
+  */
+-const updateYText = (ytext, ptexts, meta) => {
+-  meta.mapping.set(ytext, ptexts);
+-  const { nAttrs, str } = ytextTrans(ytext);
++const updateYText = (ytext, ptexts, meta, codeMarks = null) => {
++  meta.mapping.set(ytext, ptexts)
++  const { nAttrs, str } = ytextTrans(ytext)
+   const content = ptexts.map((p) => ({
+     insert: /** @type {any} */ (p).text,
+     attributes: Object.assign({}, nAttrs, marksToAttributes(p.marks, meta))
+-  }));
++  }))
+   const { insert, remove, index } = diff.simpleDiff(
+     str,
+     content.map((c) => c.insert).join('')
+-  );
+-  ytext.delete(index, remove);
+-  ytext.insert(index, insert);
++  )
++  ytext.delete(index, remove)
++  ytext.insert(index, insert)
++  if (codeMarks !== null) {
++    updateCodeMarkRanges(ytext, ptexts, codeMarks, nAttrs, index, index + insert.length, meta)
++    return
++  }
+   ytext.applyDelta(
+     content.map((c) => ({ retain: c.insert.length, attributes: c.attributes }))
+-  );
+-};
++  )
++}
+ 
+ const hashedMarkNameRegex = /(.*)(--[a-zA-Z0-9+/=]{8})$/;
+ /**
+@@ -1203,6 +1207,96 @@ const marksToAttributes = (marks, meta) => {
+   return pattrs
+ };
+ 
++// Keep raw annotation keys/attributes when the schema-normalized mark is unchanged.
++const codeMarkAttributes = (marks, current, existing, inserted, meta) => {
++  const attributes = {}
++  marks.forEach(mark => {
++    const matchesMark = ([name, attrs]) =>
++      yattr2markname(name) === mark.type.name && equalAttrs(mark.type.create(attrs).attrs, mark.attrs)
++    const matches = Object.entries(current).filter(matchesMark)
++    if (matches.length && !inserted) {
++      matches.forEach(([name, attrs]) => { attributes[name] = attrs })
++    } else {
++      // Inserted/newly annotated text chooses one deterministic alias, never
++      // all aliases used by equivalent marks elsewhere in the code block.
++      const candidates = matches.length ? matches : existing.filter(matchesMark)
++      const chosen = candidates.sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)[0]
++      if (chosen) attributes[chosen[0]] = chosen[1]
++      else Object.assign(attributes, marksToAttributes([mark], meta))
++    }
++  })
++  return attributes
++}
++
++// Read after the character diff: untouched characters still have their exact
++// original keys, even when one XmlText contains several aliases of a mark.
++const updateCodeMarkRanges = (text, ptexts, existing, cleared, insertedFrom, insertedTo, meta) => {
++  const retains = []
++  let pindex = 0
++  let poffset = 0
++  let offset = 0
++  text.toDelta().forEach(delta => {
++    let remaining = delta.insert.length
++    while (remaining > 0) {
++      const node = ptexts[pindex]
++      let length = Math.min(remaining, node.text.length - poffset)
++      if (offset < insertedFrom) length = Math.min(length, insertedFrom - offset)
++      else if (offset < insertedTo) length = Math.min(length, insertedTo - offset)
++      const attributes = codeMarkAttributes(node.marks, delta.attributes || {}, existing, offset >= insertedFrom && offset < insertedTo, meta)
++      retains.push({ retain: length, attributes: Object.assign({}, cleared, attributes) })
++      remaining -= length
++      offset += length
++      poffset += length
++      if (poffset === node.text.length) {
++        pindex++
++        poffset = 0
++      }
++    }
++  })
++  text.applyDelta(retains)
++}
++
++// A code block may retain multiple XmlTexts from imports/legacy break repair.
++// Reconcile one logical diff in place: moving a shared tail into the first text
++// on two replicas duplicates that tail and invalidates anchors/offline edits.
++const updateCodeTextSequence = (texts, ptexts, meta) => {
++  const lengths = texts.map(text => text.length)
++  const existingMarks = texts.flatMap(text => text.toDelta().flatMap(delta => Object.entries(delta.attributes || {})))
++  const { insert, remove, index } = diff.simpleDiff(
++    texts.map(text => ytextTrans(text).str).join(''),
++    ptexts.map(text => text.text).join('')
++  )
++  let start = 0
++  let insertionText = -1
++  const nextLengths = lengths.map((length, i) => {
++    const end = start + length
++    if (insertionText === -1 && index <= end) insertionText = i
++    const deleted = Math.max(0, Math.min(end, index + remove) - Math.max(start, index))
++    start = end
++    return length - deleted
++  })
++  nextLengths[insertionText] += insert.length
++  let pindex = 0
++  let poffset = 0
++  texts.forEach((text, i) => {
++    const chunk = []
++    let remaining = nextLengths[i]
++    while (remaining > 0) {
++      const node = ptexts[pindex]
++      const length = Math.min(remaining, node.text.length - poffset)
++      chunk.push(node.cut(poffset, poffset + length))
++      remaining -= length
++      poffset += length
++      if (poffset === node.text.length) {
++        pindex++
++        poffset = 0
++      }
++    }
++    if (!equalYTextPText(text, chunk)) updateYText(text, chunk, meta, existingMarks)
++    else meta.mapping.set(text, chunk)
++  })
++}
++
+ /**
+  * Update a yDom node by syncing the current content of the prosemirror node.
+  *
+@@ -1249,6 +1343,14 @@ const updateYFragment = (y, yDomFragment, pNode, meta) => {
+   const pChildCnt = pChildren.length;
+   const yChildren = yDomFragment.toArray();
+   const yChildCnt = yChildren.length;
++  if (
++    yDomFragment instanceof Y__namespace.XmlElement && yDomFragment.nodeName === 'codeBlock' &&
++    yChildCnt > 0 && yChildren.every(child => child instanceof Y__namespace.XmlText) &&
++    (pChildCnt === 0 || (pChildCnt === 1 && pChildren[0] instanceof Array))
++  ) {
++    y.transact(() => updateCodeTextSequence(yChildren, pChildren[0] || [], meta), ySyncPluginKey)
++    return
++  }
+   const minCnt = math__namespace.min(pChildCnt, yChildCnt);
+   let left = 0;
+   let right = 0;
+diff --git a/src/plugins/sync-plugin.js b/src/plugins/sync-plugin.js
+index dccfb76918c8c70fe5a5b12372cdabcc9d8c58dd..92cd656a8526d6dfee9b75d407fa96768eb1bcff 100644
+--- a/src/plugins/sync-plugin.js
++++ b/src/plugins/sync-plugin.js
+@@ -752,7 +752,7 @@ export const createNodeFromYElement = (
+       // This is a fix for #160 -- duplication of characters when two Y.Text exist next to each
+       // other.
+       const nextytext = /** @type {Y.ContentType} */ (type._item.right?.content)?.type
+-      if (nextytext instanceof Y.Text && !nextytext._item.deleted && nextytext._item.id.client === nextytext.doc.clientID) {
++      if (el.nodeName !== 'codeBlock' && nextytext instanceof Y.Text && !nextytext._item.deleted && nextytext._item.id.client === nextytext.doc.clientID) {
+         type.applyDelta([
+           { retain: type.length },
+           ...nextytext.toDelta()
+@@ -1072,7 +1072,7 @@ const ytextTrans = (ytext) => {
+  * @param {Array<any>} ptexts
+  * @param {BindingMetadata} meta
+  */
+-const updateYText = (ytext, ptexts, meta) => {
++const updateYText = (ytext, ptexts, meta, codeMarks = null) => {
+   meta.mapping.set(ytext, ptexts)
+   const { nAttrs, str } = ytextTrans(ytext)
+   const content = ptexts.map((p) => ({
+@@ -1085,6 +1085,10 @@ const updateYText = (ytext, ptexts, meta) => {
+   )
+   ytext.delete(index, remove)
+   ytext.insert(index, insert)
++  if (codeMarks !== null) {
++    updateCodeMarkRanges(ytext, ptexts, codeMarks, nAttrs, index, index + insert.length, meta)
++    return
++  }
+   ytext.applyDelta(
+     content.map((c) => ({ retain: c.insert.length, attributes: c.attributes }))
+   )
+@@ -1129,6 +1133,96 @@ const marksToAttributes = (marks, meta) => {
+   return pattrs
+ }
+ 
++// Keep raw annotation keys/attributes when the schema-normalized mark is unchanged.
++const codeMarkAttributes = (marks, current, existing, inserted, meta) => {
++  const attributes = {}
++  marks.forEach(mark => {
++    const matchesMark = ([name, attrs]) =>
++      yattr2markname(name) === mark.type.name && equalAttrs(mark.type.create(attrs).attrs, mark.attrs)
++    const matches = Object.entries(current).filter(matchesMark)
++    if (matches.length && !inserted) {
++      matches.forEach(([name, attrs]) => { attributes[name] = attrs })
++    } else {
++      // Inserted/newly annotated text chooses one deterministic alias, never
++      // all aliases used by equivalent marks elsewhere in the code block.
++      const candidates = matches.length ? matches : existing.filter(matchesMark)
++      const chosen = candidates.sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)[0]
++      if (chosen) attributes[chosen[0]] = chosen[1]
++      else Object.assign(attributes, marksToAttributes([mark], meta))
++    }
++  })
++  return attributes
++}
++
++// Read after the character diff: untouched characters still have their exact
++// original keys, even when one XmlText contains several aliases of a mark.
++const updateCodeMarkRanges = (text, ptexts, existing, cleared, insertedFrom, insertedTo, meta) => {
++  const retains = []
++  let pindex = 0
++  let poffset = 0
++  let offset = 0
++  text.toDelta().forEach(delta => {
++    let remaining = delta.insert.length
++    while (remaining > 0) {
++      const node = ptexts[pindex]
++      let length = Math.min(remaining, node.text.length - poffset)
++      if (offset < insertedFrom) length = Math.min(length, insertedFrom - offset)
++      else if (offset < insertedTo) length = Math.min(length, insertedTo - offset)
++      const attributes = codeMarkAttributes(node.marks, delta.attributes || {}, existing, offset >= insertedFrom && offset < insertedTo, meta)
++      retains.push({ retain: length, attributes: Object.assign({}, cleared, attributes) })
++      remaining -= length
++      offset += length
++      poffset += length
++      if (poffset === node.text.length) {
++        pindex++
++        poffset = 0
++      }
++    }
++  })
++  text.applyDelta(retains)
++}
++
++// A code block may retain multiple XmlTexts from imports/legacy break repair.
++// Reconcile one logical diff in place: moving a shared tail into the first text
++// on two replicas duplicates that tail and invalidates anchors/offline edits.
++const updateCodeTextSequence = (texts, ptexts, meta) => {
++  const lengths = texts.map(text => text.length)
++  const existingMarks = texts.flatMap(text => text.toDelta().flatMap(delta => Object.entries(delta.attributes || {})))
++  const { insert, remove, index } = simpleDiff(
++    texts.map(text => ytextTrans(text).str).join(''),
++    ptexts.map(text => text.text).join('')
++  )
++  let start = 0
++  let insertionText = -1
++  const nextLengths = lengths.map((length, i) => {
++    const end = start + length
++    if (insertionText === -1 && index <= end) insertionText = i
++    const deleted = Math.max(0, Math.min(end, index + remove) - Math.max(start, index))
++    start = end
++    return length - deleted
++  })
++  nextLengths[insertionText] += insert.length
++  let pindex = 0
++  let poffset = 0
++  texts.forEach((text, i) => {
++    const chunk = []
++    let remaining = nextLengths[i]
++    while (remaining > 0) {
++      const node = ptexts[pindex]
++      const length = Math.min(remaining, node.text.length - poffset)
++      chunk.push(node.cut(poffset, poffset + length))
++      remaining -= length
++      poffset += length
++      if (poffset === node.text.length) {
++        pindex++
++        poffset = 0
++      }
++    }
++    if (!equalYTextPText(text, chunk)) updateYText(text, chunk, meta, existingMarks)
++    else meta.mapping.set(text, chunk)
++  })
++}
++
+ /**
+  * Update a yDom node by syncing the current content of the prosemirror node.
+  *
+@@ -1175,6 +1269,14 @@ export const updateYFragment = (y, yDomFragment, pNode, meta) => {
+   const pChildCnt = pChildren.length
+   const yChildren = yDomFragment.toArray()
+   const yChildCnt = yChildren.length
++  if (
++    yDomFragment instanceof Y.XmlElement && yDomFragment.nodeName === 'codeBlock' &&
++    yChildCnt > 0 && yChildren.every(child => child instanceof Y.XmlText) &&
++    (pChildCnt === 0 || (pChildCnt === 1 && pChildren[0] instanceof Array))
++  ) {
++    y.transact(() => updateCodeTextSequence(yChildren, pChildren[0] || [], meta), ySyncPluginKey)
++    return
++  }
+   const minCnt = math.min(pChildCnt, yChildCnt)
+   let left = 0
+   let right = 0

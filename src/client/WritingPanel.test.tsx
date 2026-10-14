@@ -1818,7 +1818,7 @@ describe("writing UI", () => {
     const view = panel();
     await waitFor(() => expect(lookups).toBe(1));
     expect(screen.getByRole("button", { name: "Generate" })).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Retry model access" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Retry model access" }));
     expect(screen.queryByRole("button", { name: "Retry model access" })).toBeNull();
     expect(screen.getByText("Checking model access…")).toBeVisible();
     view.rerender(<WritingPanel {...view.props} visible={false} />);

@@ -18,7 +18,13 @@ import { moveTabPanel, duplicateTabPanel } from "./tab-operations";
 import { paginateBlocks } from "./presentation-layout";
 import { updateHeadingIndex } from "./heading-index";
 import * as Y from "yjs";
-import { prosemirrorToYXmlFragment, ySyncPluginKey, yXmlFragmentToProsemirrorJSON } from "y-prosemirror";
+import {
+  prosemirrorToYXmlFragment,
+  ySyncPluginKey,
+  yUndoPluginKey,
+  yXmlFragmentToProsemirrorJSON,
+  relativePositionToAbsolutePosition,
+} from "y-prosemirror";
 import { validateDocumentTree } from "../shared/document-validation";
 import { normalizeYCodeBlocks } from "../shared/code-content";
 
@@ -33,6 +39,355 @@ const schema = new Schema({
   marks: { bold: {}, italic: {} },
 });
 const search = { query: "cat", caseSensitive: false, wholeWord: false };
+
+function segmentedCodeDocument(clientID: number) {
+  const doc = new Y.Doc();
+  doc.clientID = clientID;
+  const group = new Y.XmlElement("blockGroup"),
+    container = new Y.XmlElement("blockContainer"),
+    code = new Y.XmlElement("codeBlock");
+  container.setAttribute("id", "code");
+  code.setAttribute("language", "javascript");
+  const left = new Y.XmlText(),
+    right = new Y.XmlText();
+  left.insert(0, "left", { "comment--0123abcd": { threadId: "left-thread", orphan: true } });
+  right.insert(0, "right", { comment: { threadId: "right-thread", orphan: true } });
+  code.insert(0, [left, new Y.XmlElement("hardBreak"), right]);
+  container.insert(0, [code]);
+  const trailing = new Y.XmlElement("blockContainer");
+  trailing.setAttribute("id", "trailing");
+  trailing.insert(0, [new Y.XmlElement("paragraph")]);
+  group.insert(0, [container, trailing]);
+  doc.getXmlFragment("document-store").insert(0, [group]);
+  normalizeYCodeBlocks(doc);
+  return doc;
+}
+function codeElement(doc: Y.Doc) {
+  return ((doc.getXmlFragment("document-store").get(0) as Y.XmlElement).get(0) as Y.XmlElement).get(0) as Y.XmlElement;
+}
+function mountSegmentedEditor(doc: Y.Doc) {
+  const editor = BlockNoteEditor.create(
+    withCollaboration({
+      schema: notesSchema,
+      extensions: [
+        CommentsExtension({
+          threadStore: new ServerThreadStore("page", "owner", () => {}),
+          schema: notesCommentSchema,
+          resolveUsers: async () => [],
+        }),
+      ],
+      collaboration: { fragment: doc.getXmlFragment("document-store"), user: { name: "Test", color: "#123456" } },
+    }),
+  );
+  const host = document.createElement("div");
+  document.body.appendChild(host);
+  editor.mount(host);
+  return {
+    editor,
+    dispose: () => {
+      editor.unmount();
+      host.remove();
+      doc.destroy();
+    },
+  };
+}
+function editCode(editor: ReturnType<typeof mountSegmentedEditor>["editor"], text: string, from: number, to = from) {
+  editor.transact((tr) => {
+    let start = -1;
+    tr.doc.descendants((node, pos) => {
+      if (node.type.name === "codeBlock") start = pos + 1;
+    });
+    if (start < 0) throw new Error("Code block missing");
+    tr.insertText(text, start + from, start + to);
+  });
+}
+function codeText(editor: ReturnType<typeof mountSegmentedEditor>["editor"]) {
+  let text = "";
+  editor.prosemirrorState.doc.descendants((node) => {
+    if (node.type.name === "codeBlock") text = node.textContent;
+  });
+  return text;
+}
+function codeMarkKeys(doc: Y.Doc) {
+  return codeElement(doc)
+    .toArray()
+    .flatMap((node) =>
+      (node as Y.XmlText)
+        .toDelta()
+        .flatMap((delta: { insert: string; attributes?: Record<string, unknown> }) =>
+          Array.from({ length: delta.insert.length }, () => Object.keys(delta.attributes ?? {}).sort()),
+        ),
+    );
+}
+
+describe("segmented code collaboration", () => {
+  it.each([false, true])(
+    "preserves range-local aliases of one comment through Unicode edits, crossings and undo (single text %s)",
+    (single) => {
+      const doc = segmentedCodeDocument(111),
+        code = codeElement(doc);
+      const attrs = { threadId: "same-thread", orphan: true };
+      const runs = [
+        { insert: "L😀eft", attributes: { comment: attrs } },
+        { insert: "\n" },
+        { insert: "right", attributes: { "comment--0123abcd": attrs } },
+      ];
+      const texts = single ? [new Y.XmlText()] : runs.map(() => new Y.XmlText());
+      if (single) texts[0]!.applyDelta(runs);
+      else for (const [index, run] of runs.entries()) texts[index]!.applyDelta([run]);
+      code.delete(0, code.length);
+      code.insert(0, texts);
+      const anchor = Y.createRelativePositionFromTypeIndex(texts.at(-1)!, single ? 11 : 4);
+      const mounted = mountSegmentedEditor(doc),
+        manager = yUndoPluginKey.getState(mounted.editor.prosemirrorState)!.undoManager;
+      const originalKeys = codeMarkKeys(doc);
+      try {
+        manager.clear();
+        editCode(mounted.editor, "X", 1);
+        expect(codeText(mounted.editor)).toBe("LX😀eft\nright");
+        expect(codeMarkKeys(doc)).toEqual([
+          ...Array.from({ length: 7 }, () => ["comment"]),
+          [],
+          ...Array.from({ length: 5 }, () => ["comment--0123abcd"]),
+        ]);
+        expect(codeElement(doc).toArray()).toEqual(texts);
+        expect(Y.createAbsolutePositionFromRelativePosition(anchor, doc)).toMatchObject({
+          type: texts.at(-1),
+          index: single ? 12 : 4,
+        });
+        manager.stopCapturing();
+        editCode(mounted.editor, "Z", 2, 10);
+        expect(codeText(mounted.editor)).toBe("LXZght");
+        const keys = codeMarkKeys(doc);
+        expect(keys.slice(0, 2)).toEqual([["comment"], ["comment"]]);
+        expect(keys[2]).toHaveLength(1);
+        expect(["comment", "comment--0123abcd"]).toContain(keys[2]![0]);
+        expect(keys.slice(3)).toEqual(Array.from({ length: 3 }, () => ["comment--0123abcd"]));
+        expect(codeElement(doc).toArray()).toEqual(texts);
+        expect(Y.createAbsolutePositionFromRelativePosition(anchor, doc)).toMatchObject({
+          type: texts.at(-1),
+          index: single ? 5 : 2,
+        });
+        expect(mounted.editor.undo()).toBe(true);
+        expect(codeText(mounted.editor)).toBe("LX😀eft\nright");
+        expect(mounted.editor.undo()).toBe(true);
+        expect(codeText(mounted.editor)).toBe("L😀eft\nright");
+        expect(codeMarkKeys(doc)).toEqual(originalKeys);
+        expect(codeElement(doc).toArray()).toEqual(texts);
+        expect(Y.createAbsolutePositionFromRelativePosition(anchor, doc)).toMatchObject({
+          type: texts.at(-1),
+          index: single ? 11 : 4,
+        });
+        validateDocumentTree(mounted.editor.prosemirrorState.doc.toJSON());
+      } finally {
+        mounted.dispose();
+      }
+    },
+  );
+  it("preserves matching raw comments in single-text code and creates text in a truly empty code block", () => {
+    for (const empty of [false, true]) {
+      const doc = segmentedCodeDocument(111),
+        code = codeElement(doc);
+      code.delete(0, code.length);
+      const text = new Y.XmlText();
+      if (!empty) {
+        text.insert(0, "first", { "comment--0123abcd": { threadId: "left-thread", orphan: true } });
+        text.insert(5, "second", { comment: { threadId: "right-thread", orphan: true } });
+        code.insert(0, [text]);
+      }
+      const mounted = mountSegmentedEditor(doc);
+      try {
+        editCode(mounted.editor, "X", empty ? 0 : 2);
+        expect(codeText(mounted.editor)).toBe(empty ? "X" : "fiXrstsecond");
+        expect(code.length).toBe(1);
+        const actual = code.get(0) as Y.XmlText;
+        expect(actual === text).toBe(!empty);
+        expect(
+          actual
+            .toDelta()
+            .flatMap((delta: { attributes?: Record<string, unknown> }) => Object.keys(delta.attributes ?? {})),
+        ).toEqual(empty ? [] : ["comment--0123abcd", "comment"]);
+      } finally {
+        mounted.dispose();
+      }
+    }
+  });
+  it.each([
+    [111, 999, false],
+    [999, 111, false],
+    [111, 999, true],
+    [999, 111, true],
+  ] as const)(
+    "converges without moving text objects or duplicating tails (IDs %s/%s, reverse %s)",
+    (firstID, secondID, reverse) => {
+      const firstDoc = segmentedCodeDocument(firstID),
+        secondDoc = new Y.Doc();
+      secondDoc.clientID = secondID;
+      Y.applyUpdate(secondDoc, Y.encodeStateAsUpdate(firstDoc));
+      const firstTypes = codeElement(firstDoc).toArray(),
+        secondTypes = codeElement(secondDoc).toArray();
+      const position = Y.createRelativePositionFromTypeIndex(firstTypes[2] as Y.XmlText, 2);
+      const first = mountSegmentedEditor(firstDoc),
+        second = mountSegmentedEditor(secondDoc);
+      try {
+        expect(codeElement(firstDoc).toArray()).toEqual(firstTypes);
+        expect(codeElement(secondDoc).toArray()).toEqual(secondTypes);
+        editCode(first.editor, " A", 10);
+        editCode(second.editor, " B", 10);
+        const a = Y.encodeStateAsUpdate(firstDoc),
+          b = Y.encodeStateAsUpdate(secondDoc);
+        for (const [doc, update] of reverse
+          ? ([
+              [secondDoc, a],
+              [firstDoc, b],
+            ] as const)
+          : ([
+              [firstDoc, b],
+              [secondDoc, a],
+            ] as const))
+          Y.applyUpdate(doc, update);
+        expect(codeText(first.editor)).toMatch(/^left\nright (A B|B A)$/);
+        expect(codeText(second.editor)).toBe(codeText(first.editor));
+        expect(codeElement(firstDoc).toArray()).toEqual(firstTypes);
+        expect(codeElement(secondDoc).toArray()).toEqual(secondTypes);
+        expect(Y.createAbsolutePositionFromRelativePosition(position, firstDoc)).toMatchObject({
+          type: firstTypes[2],
+          index: 2,
+        });
+        expect(Y.createAbsolutePositionFromRelativePosition(position, secondDoc)).toMatchObject({
+          type: secondTypes[2],
+          index: 2,
+        });
+        expect((firstTypes[0] as Y.XmlText).toDelta()[0]!.attributes).toEqual({
+          "comment--0123abcd": { threadId: "left-thread", orphan: true },
+        });
+        expect((firstTypes[2] as Y.XmlText).toDelta()[0]!.attributes).toEqual({
+          comment: { threadId: "right-thread", orphan: true },
+        });
+        const binding = ySyncPluginKey.getState(first.editor.prosemirrorState)!.binding;
+        expect(relativePositionToAbsolutePosition(firstDoc, binding.type, position, binding.mapping)).toBe(10);
+        validateDocumentTree(first.editor.prosemirrorState.doc.toJSON());
+      } finally {
+        first.dispose();
+        second.dispose();
+      }
+    },
+  );
+  it("keeps empty segments and their positions during crossing deletions, typing and undo", () => {
+    const doc = segmentedCodeDocument(111),
+      types = codeElement(doc).toArray();
+    const tailPosition = Y.createRelativePositionFromTypeIndex(types[2] as Y.XmlText, 4);
+    const mounted = mountSegmentedEditor(doc);
+    const manager = yUndoPluginKey.getState(mounted.editor.prosemirrorState)!.undoManager;
+    try {
+      manager.clear();
+      editCode(mounted.editor, "X", 2, 7);
+      expect(codeText(mounted.editor)).toBe("leXght");
+      expect(codeElement(doc).toArray()).toEqual(types);
+      expect((types[1] as Y.XmlText).length).toBe(0);
+      expect(Y.createAbsolutePositionFromRelativePosition(tailPosition, doc)).toMatchObject({
+        type: types[2],
+        index: 2,
+      });
+      expect(mounted.editor.undo()).toBe(true);
+      expect(codeText(mounted.editor)).toBe("left\nright");
+      expect(codeElement(doc).toArray()).toEqual(types);
+      manager.stopCapturing();
+      editCode(mounted.editor, "", 0, 10);
+      expect(codeText(mounted.editor)).toBe("");
+      expect(codeElement(doc).toArray()).toEqual(types);
+      expect(types.map((type) => (type as Y.XmlText).length)).toEqual([0, 0, 0]);
+      manager.stopCapturing();
+      editCode(mounted.editor, "new", 0);
+      expect(codeText(mounted.editor)).toBe("new");
+      expect(codeElement(doc).toArray()).toEqual(types);
+      expect(mounted.editor.undo()).toBe(true);
+      expect(codeText(mounted.editor)).toBe("");
+      expect(mounted.editor.undo()).toBe(true);
+      expect(codeText(mounted.editor)).toBe("left\nright");
+      expect(Y.createAbsolutePositionFromRelativePosition(tailPosition, doc)).toMatchObject({
+        type: types[2],
+        index: 4,
+      });
+    } finally {
+      mounted.dispose();
+    }
+  });
+  it.each([false, true])(
+    "retains a remote edit in a segment emptied by a crossing deletion (reverse %s)",
+    (reverse) => {
+      const firstDoc = segmentedCodeDocument(111),
+        secondDoc = new Y.Doc();
+      secondDoc.clientID = 999;
+      Y.applyUpdate(secondDoc, Y.encodeStateAsUpdate(firstDoc));
+      const firstTypes = codeElement(firstDoc).toArray(),
+        secondTypes = codeElement(secondDoc).toArray();
+      const first = mountSegmentedEditor(firstDoc),
+        second = mountSegmentedEditor(secondDoc);
+      try {
+        editCode(first.editor, "X", 2, 7);
+        editCode(second.editor, "M", 5);
+        const a = Y.encodeStateAsUpdate(firstDoc),
+          b = Y.encodeStateAsUpdate(secondDoc);
+        for (const [doc, update] of reverse
+          ? ([
+              [secondDoc, a],
+              [firstDoc, b],
+            ] as const)
+          : ([
+              [firstDoc, b],
+              [secondDoc, a],
+            ] as const))
+          Y.applyUpdate(doc, update);
+        expect(codeText(first.editor)).toBe("leXMght");
+        expect(codeText(second.editor)).toBe(codeText(first.editor));
+        expect(codeElement(firstDoc).toArray()).toEqual(firstTypes);
+        expect(codeElement(secondDoc).toArray()).toEqual(secondTypes);
+        expect((firstTypes[1] as Y.XmlText).toString()).toBe("M");
+      } finally {
+        first.dispose();
+        second.dispose();
+      }
+    },
+  );
+  it("merges pending offline edits targeting original code text objects and retains stored comment selections", () => {
+    const liveDoc = segmentedCodeDocument(111),
+      offlineDoc = new Y.Doc();
+    offlineDoc.clientID = 999;
+    Y.applyUpdate(offlineDoc, Y.encodeStateAsUpdate(liveDoc));
+    const liveTypes = codeElement(liveDoc).toArray(),
+      offlineTypes = codeElement(offlineDoc).toArray();
+    const selection = {
+      head: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(liveTypes[0] as Y.XmlText, 1)),
+      anchor: Y.relativePositionToJSON(Y.createRelativePositionFromTypeIndex(liveTypes[2] as Y.XmlText, 3)),
+    };
+    const live = mountSegmentedEditor(liveDoc),
+      offline = mountSegmentedEditor(offlineDoc);
+    try {
+      editCode(live.editor, "!", 0);
+      editCode(offline.editor, "?", 10);
+      const pending = Y.encodeStateAsUpdate(offlineDoc, Y.encodeStateVector(liveDoc));
+      Y.applyUpdate(liveDoc, pending);
+      Y.applyUpdate(offlineDoc, Y.encodeStateAsUpdate(liveDoc, Y.encodeStateVector(offlineDoc)));
+      expect(codeText(live.editor)).toBe("!left\nright?");
+      expect(codeText(offline.editor)).toBe(codeText(live.editor));
+      expect(codeElement(liveDoc).toArray()).toEqual(liveTypes);
+      expect(codeElement(offlineDoc).toArray()).toEqual(offlineTypes);
+      expect(
+        Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(selection.head), liveDoc),
+      ).toMatchObject({ type: liveTypes[0], index: 2 });
+      expect(
+        Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(selection.anchor), liveDoc),
+      ).toMatchObject({ type: liveTypes[2], index: 3 });
+      expect((liveTypes[2] as Y.XmlText).toDelta()[0]!.attributes).toEqual({
+        comment: { threadId: "right-thread", orphan: true },
+      });
+    } finally {
+      live.dispose();
+      offline.dispose();
+    }
+  });
+});
 describe("document editor features", () => {
   it.each([false, true])("loads imported code into the real collaborative editor schema (legacy: %s)", (legacy) => {
     const doc = new Y.Doc();

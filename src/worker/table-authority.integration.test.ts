@@ -12,12 +12,13 @@ import {
   collaborativeTable,
   enableTableAuthority,
   queryTable,
-  repairTableProjection,
+  repairTableProjection as requestRepairTableProjection,
   tableCommand,
   tableInternal,
   verifyTableProjection,
 } from "./table-service";
 import { mutateTask, taskListStatements, listTasks } from "./tasks";
+import { acceptPageDeletion, processDeletionJob } from "./cleanup";
 import type { ProjectionStatement, TableActor } from "./table-authority";
 
 beforeEach(async () => {
@@ -75,6 +76,43 @@ async function write(
   return tableCommand(env, member, pageId, { operationId, kind, payload });
 }
 
+async function repairTableProjection(
+  ...args: Parameters<typeof requestRepairTableProjection>
+): ReturnType<typeof requestRepairTableProjection> {
+  try {
+    return await requestRepairTableProjection(...args);
+  } catch (error) {
+    if ((error as { code?: string }).code !== "table_projection_repairing") throw error;
+  }
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      const result = await runInDurableObject(args[0].TABLE.getByName(args[2]), (instance) =>
+        (
+          instance as unknown as {
+            resumeRepair(): Promise<Awaited<ReturnType<typeof requestRepairTableProjection>> | { pending: true }>;
+          }
+        ).resumeRepair(),
+      );
+      if (!("pending" in result)) return result;
+    } catch (error) {
+      throw Object.assign(error as Error, { status: (error as { status?: number }).status ?? 500 });
+    }
+  }
+  throw new Error("Repair did not finish within its bounded continuations.");
+}
+async function finishAlarmRepair(pageId: string) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    await runDurableObjectAlarm(env.TABLE.getByName(pageId));
+    const intent = await runInDurableObject(
+      env.TABLE.getByName(pageId),
+      (_instance, state) =>
+        JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value)
+          .repairIntent,
+    );
+    if (!intent || intent.phase === "blocked") return;
+  }
+  throw new Error("Alarm repair did not finish.");
+}
 async function writeRows(
   pageId: string,
   member: MemberContext,
@@ -271,6 +309,8 @@ describe("per-table authority", () => {
           }),
         };
         try {
+          expect(await internal.resumeRepair()).toEqual({ pending: true });
+          expect(await internal.resumeRepair()).toEqual({ pending: true });
           await expect(internal.resumeRepair()).rejects.toThrow("lost_successful_publication_response");
           const meta = JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta").one().value);
           expect(meta).toMatchObject({
@@ -289,6 +329,7 @@ describe("per-table authority", () => {
       expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "do", projected_revision: later.revision });
       await evictDurableObject(stub);
       expect(await runDurableObjectAlarm(stub)).toBe(true);
+      await finishAlarmRepair(pageId);
       expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
       await runInDurableObject(stub, (_instance, state) => {
         expect(state.storage.sql.exec("SELECT count(*) count FROM projection_steps").one()).toEqual({ count: 0 });
@@ -432,6 +473,7 @@ describe("per-table authority", () => {
       await env.DB.prepare("DROP TRIGGER IF EXISTS hold_link_repair").run();
     }
     expect(await runDurableObjectAlarm(env.TABLE.getByName(pageId))).toBe(true);
+    await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
 
     const next = await fixture();
@@ -447,7 +489,7 @@ describe("per-table authority", () => {
     const now = Date.now() + 24 * 60 * 60 * 1000;
     const clock = vi.spyOn(Date, "now").mockReturnValue(now);
     try {
-      await expect(repairTableProjection(env, next.member, next.pageId)).rejects.toMatchObject({
+      await expect(requestRepairTableProjection(env, next.member, next.pageId)).rejects.toMatchObject({
         code: "table_projection_repairing",
       });
       expect(await runDurableObjectAlarm(env.TABLE.getByName(next.pageId))).toBe(true);
@@ -455,6 +497,7 @@ describe("per-table authority", () => {
         expect(await state.storage.getAlarm()).toBe(now + 1000);
       });
       expect(await runDurableObjectAlarm(env.TABLE.getByName(next.pageId))).toBe(true);
+      await finishAlarmRepair(next.pageId);
       expect((await verifyTableProjection(env, next.pageId)).projectionMatches).toBe(true);
     } finally {
       clock.mockRestore();
@@ -508,6 +551,7 @@ describe("per-table authority", () => {
       await env.DB.prepare("DROP TRIGGER IF EXISTS hold_computed_batch").run();
     }
     expect(await runDurableObjectAlarm(env.TABLE.getByName(pageId))).toBe(true);
+    await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
   });
   it("does not resurrect a cancelled publication from a dependent event's preimage", async () => {
@@ -633,11 +677,12 @@ describe("per-table authority", () => {
         await internal.alarm();
         const meta = JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta").one().value);
         expect(meta).toMatchObject({ revision: 2, projectedRevision: 2 });
-        expect(meta.repairIntent).toBeUndefined();
+        expect(meta.repairIntent).toMatchObject({ phase: "rows" });
       } finally {
         internal.env = original;
       }
     });
+    await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
     expect((await queryTable(env, member, pageId)).rows.map((row) => row.id)).toEqual(["interleaved-row"]);
   });
@@ -672,7 +717,7 @@ describe("per-table authority", () => {
         .bind(foreign.pageId)
         .run();
       const stub = env.TABLE.getByName(pageId);
-      await runInDurableObject(stub, async (instance) => {
+      await runInDurableObject(stub, async (instance, state) => {
         const internal = instance as unknown as { env: Env; resumeRepair(): Promise<unknown> };
         const original = internal.env;
         let moved = false;
@@ -682,67 +727,29 @@ describe("per-table authority", () => {
             get(target, property) {
               if (property === "batch")
                 return async (statements: D1PreparedStatement[]) => {
-                  if (!moved) {
-                    // Header deletion removes own options, so inject that collision immediately before its batch.
-                    if (kind === "option") {
-                      moved = true;
+                  const phase = JSON.parse(
+                    state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+                  ).repairIntent?.phase;
+                  if (!moved && (kind === "option" || phase === "rows")) {
+                    moved = true;
+                    if (kind === "option")
                       await changeProjection(pageId, [
                         {
                           sql: "UPDATE table_select_options SET column_id='foreign-column',label='Foreign label' WHERE id='owned-option'",
                           binds: [],
                         },
                       ]);
-                    }
+                    else if (kind === "row")
+                      await changeProjection(pageId, [
+                        { sql: "DELETE FROM table_id_claims WHERE kind='row' AND id=?", binds: [rowId] },
+                        { sql: "UPDATE table_rows SET page_id=? WHERE id=?", binds: [foreign.pageId, rowId] },
+                      ]);
+                    else
+                      await original.DB.prepare("UPDATE pages SET workspace_id=? WHERE id=?")
+                        .bind(foreign.member.workspace.id, detailPageId)
+                        .run();
                   }
                   return target.batch(statements);
-                };
-              if (property === "prepare" && kind !== "option")
-                return (sql: string) => {
-                  const prepared = target.prepare(sql);
-                  const watched =
-                    kind === "row"
-                      ? "SELECT page_id FROM table_id_claims WHERE kind='row' AND id=?"
-                      : "SELECT p.workspace_id,link.row_id FROM pages p LEFT JOIN table_row_pages link ON link.page_id=p.id WHERE p.id=?";
-                  if (sql !== watched) return prepared;
-                  return new Proxy(prepared, {
-                    get(statement, method) {
-                      if (method === "bind")
-                        return (...binds: unknown[]) => {
-                          const bound = statement.bind(...binds);
-                          return new Proxy(bound, {
-                            get(result, action) {
-                              if (action === "first")
-                                return async () => {
-                                  const value = await result.first();
-                                  if (!moved) {
-                                    moved = true;
-                                    if (kind === "row")
-                                      await changeProjection(pageId, [
-                                        {
-                                          sql: "DELETE FROM table_id_claims WHERE kind='row' AND id=?",
-                                          binds: [rowId],
-                                        },
-                                        {
-                                          sql: "UPDATE table_rows SET page_id=? WHERE id=?",
-                                          binds: [foreign.pageId, rowId],
-                                        },
-                                      ]);
-                                    else
-                                      await original.DB.prepare("UPDATE pages SET workspace_id=? WHERE id=?")
-                                        .bind(foreign.member.workspace.id, detailPageId)
-                                        .run();
-                                  }
-                                  return value;
-                                };
-                              const value = Reflect.get(result, action);
-                              return typeof value === "function" ? value.bind(result) : value;
-                            },
-                          });
-                        };
-                      const value = Reflect.get(statement, method);
-                      return typeof value === "function" ? value.bind(statement) : value;
-                    },
-                  });
                 };
               const value = Reflect.get(target, property);
               return typeof value === "function" ? value.bind(target) : value;
@@ -750,7 +757,9 @@ describe("per-table authority", () => {
           }),
         };
         try {
-          await expect(internal.resumeRepair()).rejects.toBeDefined();
+          const first = kind === "option" ? null : await internal.resumeRepair();
+          expect(first).toEqual(kind === "option" ? null : { pending: true });
+          await expect(internal.resumeRepair()).rejects.toMatchObject({ code: "table_projection_blocked" });
         } finally {
           internal.env = original;
         }
@@ -944,6 +953,527 @@ describe("per-table authority", () => {
       await env.DB.prepare("DROP TABLE IF EXISTS repair_bookkeeping_calls").run();
     }
   });
+  it.each([false, true])(
+    "restores task links before the original status activity checkpoint (missing row=%s)",
+    async (missingRow) => {
+      const { pageId, member } = await fixture(true);
+      await enableTableAuthority(env, member, pageId);
+      const task = await mutateTask(env, member, pageId, null, {
+        operationId: "activity-original",
+        expectedRevision: 1,
+        title: "Task",
+      });
+      const checkpoint = Date.now() + 86400000;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(checkpoint);
+      await env.DB.batch([
+        env.DB.prepare(
+          "INSERT INTO slack_installations(id,workspace_id,team_id,team_name,bot_user_id,bot_token_ciphertext,scopes,installed_by,created_at,updated_at) VALUES('status-installation',?,'STATUS','Status','STATUS-BOT','unused','chat:write',?,1,1)",
+        ).bind(member.workspace.id, member.user.id),
+        env.DB.prepare(
+          "INSERT INTO slack_channel_subscriptions(id,installation_id,space_id,channel_id,event_types_json,cadence,created_by,created_at,updated_at,round2_initialized) SELECT 'status-mapping','status-installation',space_id,'STATUS-CHANNEL','[\"task_status_changed\"]','immediate',?,1,1,1 FROM pages WHERE id=?",
+        ).bind(member.user.id, pageId),
+      ]);
+      await env.DB.prepare("UPDATE round2_runtime SET activity_enabled=1 WHERE id=1").run();
+      await env.DB.prepare(
+        "CREATE TRIGGER hold_status_recovery BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+      ).run();
+      try {
+        await expect(
+          mutateTask(env, member, pageId, task.rowId, {
+            operationId: "activity-pending",
+            expectedRevision: 2,
+            status: "doing",
+          }),
+        ).rejects.toMatchObject({ code: "task_projection_pending" });
+        await changeProjection(
+          pageId,
+          missingRow
+            ? [{ sql: "DELETE FROM table_rows WHERE id=? AND page_id=?", binds: [task.rowId, pageId] }]
+            : [
+                { sql: "DELETE FROM table_row_pages WHERE row_id=?", binds: [task.rowId] },
+                { sql: "DELETE FROM table_select_options WHERE id=?", binds: [`${pageId}-doing`] },
+              ],
+        );
+        await env.DB.prepare("DROP TRIGGER hold_status_recovery").run();
+        clock.mockReturnValue(checkpoint + 1000);
+        await runInDurableObject(env.TABLE.getByName(pageId), (instance) =>
+          (instance as unknown as { project(recover: boolean): Promise<boolean> }).project(true),
+        );
+        expect(
+          (
+            await env.DB.prepare(
+              "SELECT event_type FROM workspace_activity WHERE page_id=? AND event_type='task_status_changed'",
+            )
+              .bind(task.detailPageId)
+              .all()
+          ).results,
+        ).toEqual([{ event_type: "task_status_changed" }]);
+        const deliveries = await env.DB.prepare(
+          "SELECT a.id,a.created_at,e.id AS delivery,o.id AS queued FROM workspace_activity a JOIN slack_channel_events e ON e.id='activity:'||a.id||':status-mapping' JOIN outbox o ON o.id='outbox:'||e.id WHERE a.page_id=? AND a.event_type='task_status_changed' ORDER BY a.created_at",
+        )
+          .bind(task.detailPageId)
+          .all<{ id: string; created_at: number; delivery: string; queued: string }>();
+        expect(deliveries.results).toHaveLength(1);
+        expect(deliveries.results[0]!.created_at).toBe(checkpoint);
+        expect(
+          await env.DB.prepare("SELECT page_id FROM table_row_pages WHERE row_id=?").bind(task.rowId).first(),
+        ).toEqual({ page_id: task.detailPageId });
+        await mutateTask(env, member, pageId, task.rowId, {
+          operationId: "activity-later",
+          expectedRevision: 3,
+          title: "Task",
+          status: "done",
+        });
+        expect(
+          await env.DB.prepare("SELECT id,created_at FROM workspace_activity WHERE id=?")
+            .bind(deliveries.results[0]!.id)
+            .first(),
+        ).toEqual({ id: deliveries.results[0]!.id, created_at: checkpoint });
+        expect(
+          await env.DB.prepare(
+            "SELECT count(*) count FROM workspace_activity a JOIN slack_channel_events e ON e.id='activity:'||a.id||':status-mapping' JOIN outbox o ON o.id='outbox:'||e.id WHERE a.page_id=? AND a.event_type='task_status_changed'",
+          )
+            .bind(task.detailPageId)
+            .first(),
+        ).toEqual({ count: 2 });
+        if (missingRow) await repairTableProjection(env, member, pageId);
+        expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+      } finally {
+        clock.mockRestore();
+        await env.DB.prepare("DROP TRIGGER IF EXISTS hold_status_recovery").run();
+        await env.DB.prepare("UPDATE round2_runtime SET activity_enabled=0 WHERE id=1").run();
+      }
+    },
+  );
+  it("rejects a foreign row claim even when the recovered task's parent row exists", async () => {
+    const { pageId, member } = await fixture(true);
+    const foreign = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    const task = await mutateTask(env, member, pageId, null, {
+      operationId: "claim-task",
+      expectedRevision: 1,
+      title: "Task",
+    });
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_claim_recovery BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    try {
+      await expect(
+        mutateTask(env, member, pageId, task.rowId, {
+          operationId: "claim-status",
+          expectedRevision: 2,
+          status: "doing",
+        }),
+      ).rejects.toMatchObject({ code: "task_projection_pending" });
+      await changeProjection(pageId, [
+        { sql: "DELETE FROM table_row_pages WHERE row_id=?", binds: [task.rowId] },
+        { sql: "DELETE FROM table_select_options WHERE id=?", binds: [`${pageId}-doing`] },
+        { sql: "UPDATE table_id_claims SET page_id=? WHERE kind='row' AND id=?", binds: [foreign.pageId, task.rowId] },
+      ]);
+      await env.DB.prepare("DROP TRIGGER hold_claim_recovery").run();
+      await expect(repairTableProjection(env, member, pageId)).rejects.toMatchObject({
+        code: "table_projection_blocked",
+      });
+      expect(await env.DB.prepare("SELECT page_id FROM table_rows WHERE id=?").bind(task.rowId).first()).toEqual({
+        page_id: pageId,
+      });
+      expect(
+        await env.DB.prepare("SELECT page_id FROM table_id_claims WHERE kind='row' AND id=?").bind(task.rowId).first(),
+      ).toEqual({ page_id: foreign.pageId });
+      expect(
+        await env.DB.prepare("SELECT page_id FROM table_row_pages WHERE row_id=?").bind(task.rowId).first(),
+      ).toBeNull();
+      expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "repairing", projected_revision: 2 });
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_claim_recovery").run();
+    }
+  });
+  it("cancels an atomic publication when its original guard fails after foreign-key recovery", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "choice", name: "Choice", type: "select" });
+    await write(pageId, member, "add_option", { columnId: "choice", id: "done", label: "Done" });
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_cancellable_fk BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    try {
+      const pending = await tableCommand(
+        env,
+        member,
+        pageId,
+        {
+          kind: "create_row",
+          operationId: "cancellable-fk",
+          payload: { id: "unpublished-row", values: { choice: "done" } },
+        },
+        {
+          effectsAfter: [
+            { sql: "INSERT OR REPLACE INTO table_publication_guards(page_id,ok) VALUES(?,0)", binds: [pageId] },
+          ],
+          cancelRowOnPublicationFailure: "unpublished-row",
+        },
+      );
+      expect(pending.projectionPending).toBe(true);
+      await changeProjection(pageId, [{ sql: "DELETE FROM table_select_options WHERE id='done'", binds: [] }]);
+      await env.DB.prepare("DROP TRIGGER hold_cancellable_fk").run();
+      expect((await repairTableProjection(env, member, pageId)).projectionMatches).toBe(true);
+      expect((await queryTable(env, member, pageId)).rowCount).toBe(0);
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        const receipt = JSON.parse(
+          state.storage.sql
+            .exec<{ result: string }>("SELECT result FROM receipts WHERE operation_id='cancellable-fk'")
+            .one().result,
+        );
+        expect(receipt.result.publicationFailed).toBe(true);
+      });
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_cancellable_fk").run();
+    }
+  });
+  it("promotes a joined ordinary drain to recovery after the original foreign-key failure", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "title", name: "Title", type: "text" });
+    await write(pageId, member, "create_row", { id: "row-a", values: { title: "Before" } });
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_joined_drain BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    try {
+      await write(pageId, member, "update_cells", { rowId: "row-a", values: { title: "After" } });
+      await changeProjection(pageId, [
+        { sql: "DELETE FROM table_columns WHERE id='title' AND page_id=?", binds: [pageId] },
+      ]);
+      await env.DB.prepare("DROP TRIGGER hold_joined_drain").run();
+      await runInDurableObject(env.TABLE.getByName(pageId), async (instance) => {
+        const internal = instance as unknown as { env: Env; project(recover?: boolean): Promise<boolean> };
+        const original = internal.env;
+        let entered!: () => void, release!: () => void;
+        const started = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const resumed = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let delayed = false;
+        internal.env = {
+          ...original,
+          DB: new Proxy(original.DB, {
+            get(target, property) {
+              if (property === "batch")
+                return async (statements: D1PreparedStatement[]) => {
+                  if (!delayed) {
+                    delayed = true;
+                    entered();
+                    await resumed;
+                  }
+                  return target.batch(statements);
+                };
+              const value = Reflect.get(target, property);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          }),
+        };
+        try {
+          const ordinary = internal.project();
+          await started;
+          const recovery = internal.project(true);
+          release();
+          const outcomes = await Promise.allSettled([ordinary, recovery]);
+          expect(outcomes[0]).toMatchObject({ status: "rejected" });
+          expect(outcomes[1]).toEqual({ status: "fulfilled", value: true });
+        } finally {
+          internal.env = original;
+        }
+      });
+      expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_joined_drain").run();
+    }
+  });
+  it("continues missing-parent recovery in durable batches before advancing the event", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "number", name: "Number", type: "number" });
+    await writeRows(
+      pageId,
+      member,
+      Array.from({ length: 205 }, (_v, index) => ({
+        kind: "create_row",
+        payload: { id: `bounded-${index.toString().padStart(3, "0")}`, values: { number: index } },
+      })),
+    );
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_bounded_parents BEFORE INSERT ON table_computed_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    try {
+      const pending = await write(pageId, member, "create_column", {
+        id: "formula",
+        name: "Formula",
+        type: "formula",
+        source: 'prop("Number") * 2',
+      });
+      await changeProjection(pageId, [{ sql: "DELETE FROM table_rows WHERE page_id=?", binds: [pageId] }]);
+      await env.DB.prepare("DROP TRIGGER hold_bounded_parents").run();
+      const requests = await runInDurableObject(env.TABLE.getByName(pageId), async (instance) => {
+        const internal = instance as unknown as { env: Env; resumeRepair(): Promise<unknown> };
+        const original = internal.env;
+        let prepared = 0;
+        internal.env = {
+          ...original,
+          DB: new Proxy(original.DB, {
+            get(target, property) {
+              if (property === "prepare")
+                return (sql: string) => {
+                  prepared++;
+                  return target.prepare(sql);
+                };
+              const value = Reflect.get(target, property);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          }),
+        };
+        try {
+          expect(await internal.resumeRepair()).toEqual({ pending: true });
+          return prepared;
+        } finally {
+          internal.env = original;
+        }
+      });
+      expect(requests).toBeLessThan(50);
+      expect(
+        await env.DB.prepare("SELECT count(*) count FROM table_rows WHERE page_id=?").bind(pageId).first(),
+      ).toEqual({ count: 100 });
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        const event = state.storage.sql
+          .exec<{ value: string; next_step: number }>(
+            "SELECT value,next_step FROM events WHERE revision=?",
+            pending.revision,
+          )
+          .one();
+        expect(event.next_step).toBe(0);
+        expect(JSON.parse(event.value).recovery).toMatchObject({
+          revision: pending.revision,
+          position: 0,
+          table: "table_rows",
+        });
+        expect(
+          JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value)
+            .projectedRevision,
+        ).toBe(pending.revision - 1);
+      });
+      await finishAlarmRepair(pageId);
+      expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_bounded_parents").run();
+    }
+  });
+  it("bounds header validation and publication to100 entities per repair turn", async () => {
+    const { pageId, member } = await fixture();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO table_columns(id,page_id,name,type,position,config_json) VALUES('many-options',?,'Options','select',0,'{}')",
+      ).bind(pageId),
+      env.DB.prepare(
+        "WITH RECURSIVE n(value) AS (SELECT 0 UNION ALL SELECT value+1 FROM n WHERE value<249) INSERT INTO table_select_options(id,column_id,label,color,position) SELECT printf('header-option-%03d',value),'many-options',printf('Option %d',value),'gray',value FROM n",
+      ),
+    ]);
+    await enableTableAuthority(env, member, pageId);
+    const requests = await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+      const internal = instance as unknown as { env: Env; resumeRepair(): Promise<unknown> };
+      const original = internal.env;
+      let prepared = 0;
+      internal.env = {
+        ...original,
+        DB: new Proxy(original.DB, {
+          get(target, property) {
+            if (property === "prepare")
+              return (sql: string) => {
+                prepared++;
+                return target.prepare(sql);
+              };
+            const value = Reflect.get(target, property);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        }),
+      };
+      try {
+        expect(await internal.resumeRepair()).toEqual({ pending: true });
+        const meta = JSON.parse(
+          state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+        );
+        expect(meta).toMatchObject({
+          projectedRevision: 1,
+          repairIntent: { phase: "headers", headerFormat: 1, headerStep: 1 },
+        });
+        return prepared;
+      } finally {
+        internal.env = original;
+      }
+    });
+    expect(requests).toBeLessThan(30);
+    expect(
+      await env.DB.prepare("SELECT count(*) count FROM table_select_options WHERE column_id='many-options'").first(),
+    ).toEqual({ count: 96 });
+    await finishAlarmRepair(pageId);
+    expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+  });
+  it("checkpoints discarded pure SQL only at bounded traversal boundaries", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "old", name: "Old", type: "text" });
+    await write(pageId, member, "create_row", { id: "row-a", values: { old: "Before" } });
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_pure_quantum BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    try {
+      const pending = await write(pageId, member, "update_cells", { rowId: "row-a", values: { old: "After" } });
+      await write(pageId, member, "delete_column", { columnId: "old" });
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        const step = state.storage.sql
+          .exec<{ value: string }>(
+            "SELECT value FROM projection_steps WHERE revision=? AND position=0",
+            pending.revision,
+          )
+          .one();
+        const statements = JSON.parse(step.value) as ProjectionStatement[];
+        const cell = statements.find((statement) => statement.sql.startsWith("INSERT INTO table_cells("))!;
+        const effects = statements.filter(
+          (statement) =>
+            statement.sql.startsWith("INSERT INTO page_contributors") ||
+            statement.sql.startsWith("UPDATE pages SET updated_by="),
+        );
+        state.storage.sql.exec("DELETE FROM projection_steps WHERE revision=?", pending.revision);
+        state.storage.sql.exec(
+          "INSERT INTO projection_steps VALUES(?,0,?)",
+          pending.revision,
+          JSON.stringify([...Array.from({ length: 110 }, () => cell), ...effects]),
+        );
+        state.storage.sql.exec(
+          "UPDATE events SET value=? WHERE revision=?",
+          JSON.stringify({ projectionFormat: 2 }),
+          pending.revision,
+        );
+      });
+      await changeProjection(pageId, [
+        { sql: "DELETE FROM table_columns WHERE id='old' AND page_id=?", binds: [pageId] },
+      ]);
+      await env.DB.prepare("DROP TRIGGER hold_pure_quantum").run();
+      const writes = await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+        const internal = instance as unknown as { putMeta(meta: unknown): void; resumeRepair(): Promise<unknown> };
+        const original = internal.putMeta;
+        let count = 0;
+        internal.putMeta = (meta) => {
+          count++;
+          original.call(internal, meta);
+        };
+        try {
+          expect(await internal.resumeRepair()).toEqual({ pending: true });
+          const meta = JSON.parse(
+            state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+          );
+          expect(meta).toMatchObject({
+            projectedRevision: pending.revision - 1,
+            repairIntent: {
+              mode: "pure",
+              phase: "bookkeeping",
+              bookkeeping: { revision: pending.revision, position: 0, statement: 99 },
+            },
+          });
+          return count;
+        } finally {
+          internal.putMeta = original;
+        }
+      });
+      expect(writes).toBeLessThan(8);
+      await finishAlarmRepair(pageId);
+      expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_pure_quantum").run();
+    }
+  });
+  it("captures only touched-row preimages for a bulk without formulas", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "title", name: "Title", type: "text" });
+    await writeRows(
+      pageId,
+      member,
+      Array.from({ length: 150 }, (_v, index) => ({
+        kind: "create_row",
+        payload: { id: `untouched-${index}`, values: { title: "Before" } },
+      })),
+    );
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_sparse_bulk BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    try {
+      const pending = await write(pageId, member, "bulk", {
+        commands: [{ kind: "update_cells", payload: { rowId: "untouched-0", values: { title: "After" } } }],
+      });
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        const records = state.storage.sql
+          .exec<{ value: string }>(
+            "SELECT value FROM projection_steps WHERE revision=? AND position<0",
+            pending.revision,
+          )
+          .toArray()
+          .flatMap((chunk) => JSON.parse(chunk.value).records);
+        expect(records.filter((record: { table: string }) => record.table === "table_rows")).toHaveLength(1);
+      });
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_sparse_bulk").run();
+    }
+  });
+  it("parks repair after one automatic rebuild and permits an explicit owner reset", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "title", name: "Title", type: "text" });
+    await write(pageId, member, "create_row", { id: "row-a", values: { title: "Canonical" } });
+    await env.DB.prepare(
+      "CREATE TRIGGER permanent_parity_mismatch AFTER INSERT ON table_cells BEGIN UPDATE table_cells SET text_value='Corrupt',json_value=json_quote('Corrupt') WHERE row_id=NEW.row_id AND column_id=NEW.column_id; END",
+    ).run();
+    const stub = env.TABLE.getByName(pageId);
+    try {
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
+        code: "table_projection_repairing",
+      });
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      await runInDurableObject(stub, (_instance, state) => {
+        const intent = JSON.parse(
+          state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+        ).repairIntent;
+        expect(intent).toMatchObject({ phase: "headers", mismatches: 1 });
+        expect(intent.hashes.canonicalHash).not.toBe(intent.hashes.projectionHash);
+      });
+      // An explicit owner retry resets the budget even before repair is parked.
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
+        code: "table_projection_repairing",
+      });
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      expect(await runDurableObjectAlarm(stub)).toBe(true);
+      await runInDurableObject(stub, (_instance, state) => {
+        expect(
+          JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value)
+            .repairIntent,
+        ).toMatchObject({ phase: "headers", mismatches: 1 });
+      });
+      await finishAlarmRepair(pageId);
+      await evictDurableObject(stub);
+      await runInDurableObject(stub, async (_instance, state) => {
+        const intent = JSON.parse(
+          state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value,
+        ).repairIntent;
+        expect(intent).toMatchObject({ phase: "blocked", mismatches: 2, blocked: { resumePhase: "headers" } });
+        expect(await state.storage.getAlarm()).toBeNull();
+      });
+      expect(await runDurableObjectAlarm(stub)).toBe(false);
+      await env.DB.prepare("DROP TRIGGER permanent_parity_mismatch").run();
+      expect((await repairTableProjection(env, member, pageId)).projectionMatches).toBe(true);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS permanent_parity_mismatch").run();
+    }
+  });
   it("appends options after surviving positions and repairs legacy ties in canonical order", async () => {
     const { pageId, member } = await fixture();
     await enableTableAuthority(env, member, pageId);
@@ -1082,6 +1612,7 @@ describe("per-table authority", () => {
         const stub = env.TABLE.getByName(pageId);
         await evictDurableObject(stub);
         expect(await runDurableObjectAlarm(stub)).toBe(true);
+        await finishAlarmRepair(pageId);
         expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
         expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "do", projected_revision: 4 });
       } finally {
@@ -1116,6 +1647,7 @@ describe("per-table authority", () => {
       await env.DB.prepare("DROP TRIGGER corrupt_repair_projection").run();
       await evictDurableObject(stub);
       expect(await runDurableObjectAlarm(stub)).toBe(true);
+      await finishAlarmRepair(pageId);
       expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
       expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "do", generation: 1 });
     } finally {
@@ -1151,6 +1683,7 @@ describe("per-table authority", () => {
       });
       await env.DB.prepare("UPDATE table_authority SET generation=1 WHERE page_id=?").bind(pageId).run();
       expect(await runDurableObjectAlarm(stub)).toBe(true);
+      await finishAlarmRepair(pageId);
       expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
     } finally {
       await env.DB.prepare("DROP TRIGGER IF EXISTS hold_repair_verification").run();
@@ -1166,7 +1699,7 @@ describe("per-table authority", () => {
         payload: { id: `row-${String(index).padStart(3, "0")}`, values: { title: String(index) } },
       })),
     });
-    await expect(repairTableProjection(env, member, pageId)).rejects.toMatchObject({
+    await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
       code: "table_projection_repairing",
     });
     expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "repairing" });
@@ -1174,6 +1707,7 @@ describe("per-table authority", () => {
       count: 105,
     });
     expect(await runDurableObjectAlarm(env.TABLE.getByName(pageId))).toBe(true);
+    await finishAlarmRepair(pageId);
     expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
     expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "do" });
   });
@@ -1695,8 +2229,10 @@ describe("per-table authority", () => {
     expect(await env.DB.prepare("SELECT text_value FROM table_cells WHERE column_id='title'").first()).toEqual({
       text_value: "Original",
     });
-    await tableInternal(env, pageId, "/purge", {});
-    await expect(queryTable(env, member, pageId)).rejects.toMatchObject({ code: "table_purged" });
+    await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(pageId).run();
+    const deletion = await acceptPageDeletion(env, member.workspace.id, member.user.id, pageId);
+    await processDeletionJob(env, deletion.jobId);
+    await expect(tableInternal(env, pageId, "/verify")).rejects.toMatchObject({ code: "table_purged" });
   });
   it.each(["create", "rename", "archive"] as const)(
     "drains pending task %s effects before repairing and preserves failed retries",
@@ -1787,6 +2323,53 @@ describe("per-table authority", () => {
       status: 409,
       code: "table_seed_conflict",
     });
+  });
+  it("rejects stale seed uploads and leaves committed cells and computed stamps unchanged", async () => {
+    const { pageId, member } = await fixture();
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO table_columns(id,page_id,name,type,position) VALUES('seed-number',?,'Number','number',0)",
+      ).bind(pageId),
+      env.DB.prepare(
+        "INSERT INTO table_rows(id,page_id,position,created_by,created_at,updated_at) VALUES('seed-row',?,0,?,1,1)",
+      ).bind(pageId, member.user.id),
+      env.DB.prepare(
+        "INSERT INTO table_cells(row_id,column_id,number_value,updated_at) VALUES('seed-row','seed-number',1,1)",
+      ),
+    ]);
+    await enableTableAuthority(env, member, pageId);
+    const baseline = (await queryTable(env, member, pageId)).rows;
+    await write(pageId, member, "create_column", {
+      id: "seed-formula",
+      name: "Formula",
+      type: "formula",
+      source: 'prop("Number") * 2',
+    });
+    await write(pageId, member, "update_cells", { rowId: "seed-row", values: { "seed-number": 7 } });
+    const current = await queryTable(env, member, pageId);
+    await expect(tableInternal(env, pageId, "/seed-rows", { generation: 1, rows: baseline })).rejects.toMatchObject({
+      status: 409,
+      code: "table_seed_conflict",
+    });
+    await expect(tableInternal(env, pageId, "/seed-finish", {})).rejects.toMatchObject({
+      status: 409,
+      code: "table_seed_conflict",
+    });
+    expect(await queryTable(env, member, pageId)).toEqual(current);
+    expect((await verifyTableProjection(env, pageId)).projectionMatches).toBe(true);
+  });
+  it("verifies a completed event-free seed without performing another projection write", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    const before = await tableInternal(env, pageId, "/verify");
+    await env.DB.prepare(
+      "CREATE TRIGGER completed_seed_readonly BEFORE INSERT ON table_projection_context BEGIN SELECT RAISE(ABORT,'completed_seed_must_be_readonly'); END",
+    ).run();
+    try {
+      expect(await tableInternal(env, pageId, "/seed-finish", {})).toEqual(before);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS completed_seed_readonly").run();
+    }
   });
   it("invalidates direct and transitive formula views when the edited formula changes result type", async () => {
     const { pageId, member } = await fixture();

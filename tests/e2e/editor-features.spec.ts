@@ -19,6 +19,29 @@ async function features(page: Page) {
   });
 }
 
+test("migrated code text converges through real disconnected editor bindings without duplicating tails", async ({
+  page,
+}) => {
+  await signInOwner(page);
+  const results = await page.evaluate(async () => {
+    const path = "/tests/e2e/fixtures/editor-code-reconciliation.mjs";
+    const { reconcileCodeReplicas } = await import(path);
+    return reconcileCodeReplicas();
+  });
+  expect(results).toHaveLength(2);
+  for (const result of results) {
+    expect(result.disconnected).toEqual(["left\nright A", "left\nright B"]);
+    expect(result.merged[0]).toBe(result.merged[1]);
+    expect(result.merged[0]).toMatch(/^left\nright (?:A B|B A)$/);
+    expect(result.identitiesRetained).toBe(true);
+    expect(result.anchorsRetained).toBe(true);
+    expect(result.annotationsRetained, JSON.stringify(result.annotationDeltas)).toBe(true);
+    expect(result.annotationAliasesRetained, JSON.stringify(result.annotationDeltas)).toBe(true);
+    expect(result.undone).toEqual(["left\nright B", "left\nright B"]);
+    expect(result.redone).toEqual(result.merged);
+  }
+});
+
 test("HTML code imports preserve whitespace and reopen with plain text line breaks", async ({ page }) => {
   await signInOwner(page);
   const toggle = page.getByRole("button", { name: "Open navigation" });
