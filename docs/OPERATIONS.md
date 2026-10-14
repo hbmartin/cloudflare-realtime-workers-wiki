@@ -92,6 +92,8 @@ for the drain rates that tell "stuck" from "backed off".
 
 Permanent deletion returns `202` and commits a job. The job purges each document epoch's Durable Object,
 then deletes exact attachment keys and complete `documents/{pageId}/` prefixes.
+If table evidence cannot be captured, acceptance returns `503 / deletion_evidence_unavailable`;
+retry shortly. Ownership changes return `409 / deletion_pending`. Neither response accepts the deletion.
 
 ```sh
 pnpm wrangler d1 execute DB --env production --remote --command \

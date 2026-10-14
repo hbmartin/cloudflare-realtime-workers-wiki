@@ -19,6 +19,8 @@ import {
 import { enableTableAuthority, queryTable, tableInternal } from "./table-service";
 import { acceptedPageDeletionSql } from "./deletion-policy";
 import { mutateTask, taskListStatements } from "./tasks";
+import { classifyError, HttpError } from "./http";
+import { logger } from "./observability";
 
 beforeEach(async () => {
   await applyD1Migrations(env.DB, env.TEST_MIGRATIONS!);
@@ -352,22 +354,223 @@ describe("deletion handoff policy", () => {
       expect(targets.results.map(({ target }) => JSON.parse(target))).toEqual([
         expect.objectContaining({ version: 1 }),
       ]);
-      const paths: string[] = [];
+      const generation = history === "registered" ? 1 : null;
+      const paths: string[] = [],
+        replies: Array<{ generation: number | null }> = [],
+        replays: Array<{ ok: boolean; body: unknown }> = [];
       const bindings = {
         ...env,
         TABLE: {
           getByName: (name: string) => ({
-            fetch: (request: Request) => {
-              paths.push(new URL(request.url).pathname);
-              return env.TABLE.getByName(name).fetch(request);
+            fetch: async (request: Request) => {
+              const path = new URL(request.url).pathname;
+              const replayRequest = request.clone();
+              paths.push(path);
+              const response = await env.TABLE.getByName(name).fetch(request);
+              expect(response.ok).toBe(true);
+              replies.push(await response.clone().json<{ generation: number | null }>());
+              if (path === "/purge") {
+                await evictDurableObject(env.TABLE.getByName(name));
+                const replay = await env.TABLE.getByName(name).fetch(replayRequest as Request);
+                replays.push({ ok: replay.ok, body: await replay.json() });
+              }
+              return response;
             },
           }),
         },
       } as unknown as Env;
       await processDeletionJob(bindings, whole.jobId);
       expect(paths).toEqual(["/stop-repair-for-deletion", "/purge"]);
+      expect(replies).toEqual([
+        expect.objectContaining({ generation, stopped: true }),
+        expect.objectContaining({ generation, purged: true }),
+      ]);
+      expect(replays).toEqual([{ ok: true, body: replies[1] }]);
+      await runInDurableObject(env.TABLE.getByName(f.listId), (_instance, state) => {
+        const tombstone = [...state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=2")][0]!;
+        expect(JSON.parse(tombstone.value)).toMatchObject({ generation, stopped: true, purged: true });
+      });
+      expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).toBeNull();
+      expect(await env.DB.prepare("SELECT id FROM deletion_jobs WHERE id=?").bind(whole.jobId).first()).toBeNull();
     },
   );
+
+  it.each([
+    "empty",
+    "text",
+    "unreadable",
+    "invalid JSON",
+    "null JSON",
+    "array JSON",
+    "malformed error",
+    "wrong status",
+    "invalid success body",
+    "network",
+    "timeout",
+  ])("returns a retryable acceptance error for %s evidence failures", async (failure) => {
+    const f = await fixture();
+    await archiveTable(f);
+    const fetch = vi.fn(async () => {
+      if (failure === "network") throw new TypeError("Actor connection failed");
+      if (failure === "timeout") throw new DOMException("Actor request timed out", "TimeoutError");
+      if (failure === "unreadable")
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new Error("Unreadable actor response"));
+            },
+          }),
+          { status: 503 },
+        );
+      const bodies: Record<string, string | null> = {
+        empty: null,
+        text: "Actor overloaded",
+        "invalid JSON": "{",
+        "null JSON": "null",
+        "array JSON": "[]",
+        "malformed error": '{"error":"table_not_seeded"}',
+        "wrong status": '{"error":{"code":"table_not_seeded"}}',
+        "invalid success body": "{",
+      };
+      return new Response(bodies[failure], {
+        status: failure === "wrong status" ? 500 : failure === "invalid success body" ? 200 : 503,
+      });
+    });
+    const bindings = { ...env, TABLE: { getByName: () => ({ fetch }) } } as unknown as Env;
+    const error = await acceptPageDeletion(bindings, f.member.workspace.id, f.member.user.id, f.listId).catch(
+      (caught: unknown) => caught,
+    );
+    expect(classifyError(error)).toMatchObject({
+      status: 503,
+      body: { error: { code: "deletion_evidence_unavailable" } },
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(await env.DB.prepare("SELECT id FROM deletion_jobs").all()).toMatchObject({ results: [] });
+    expect(await env.DB.prepare("SELECT page_id FROM deletion_job_pages").all()).toMatchObject({ results: [] });
+    expect(await env.DB.prepare("SELECT target FROM deletion_targets").all()).toMatchObject({ results: [] });
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).not.toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.detailId).first()).not.toBeNull();
+    expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id=?").bind(f.rowId).first()).toEqual({
+      id: f.rowId,
+    });
+  });
+
+  it("accepts evidence fallback only for the explicit unseeded-table response", async () => {
+    const f = await fixture(false);
+    await archiveTable(f);
+    await env.DB.prepare("INSERT INTO table_authority(page_id,state,generation) VALUES(?,'seeding',1)")
+      .bind(f.listId)
+      .run();
+    const fetch = vi.fn(async () => Response.json({ error: { code: "table_not_seeded" } }, { status: 503 }));
+    const accepted = await acceptPageDeletion(
+      { ...env, TABLE: { getByName: () => ({ fetch }) } } as unknown as Env,
+      f.member.workspace.id,
+      f.member.user.id,
+      f.listId,
+    );
+    expect(await env.DB.prepare("SELECT phase FROM deletion_jobs WHERE id=?").bind(accepted.jobId).first()).toEqual({
+      phase: "rows",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).not.toBeNull();
+  });
+
+  it.each(["snapshot", "checkpoint"])("preserves ownership conflicts at the evidence %s", async (conflict) => {
+    const f = await fixture();
+    await archiveTable(f);
+    const bindings = {
+      ...env,
+      TABLE: {
+        getByName: (name: string) => ({
+          fetch: async (request: Request) => {
+            const response = await env.TABLE.getByName(name).fetch(request);
+            expect(response.ok).toBe(true);
+            if (conflict === "snapshot") {
+              const snapshot = await response.json<{ generation: number }>();
+              return Response.json({ ...snapshot, generation: snapshot.generation + 1 });
+            }
+            await env.DB.prepare("UPDATE pages SET archive_operation_id='changed-owner' WHERE id=?")
+              .bind(f.listId)
+              .run();
+            return response;
+          },
+        }),
+      },
+    } as unknown as Env;
+    await expect(acceptPageDeletion(bindings, f.member.workspace.id, f.member.user.id, f.listId)).rejects.toMatchObject(
+      { status: 409, code: "deletion_pending" },
+    );
+    expect(await env.DB.prepare("SELECT id FROM deletion_jobs").all()).toMatchObject({ results: [] });
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).not.toBeNull();
+  });
+
+  it.each([false, true])("preserves existing evidence HttpErrors (transported=%s)", async (transported) => {
+    const f = await fixture();
+    await archiveTable(f);
+    const error = new HttpError(403, "table_forbidden", "Table access changed.");
+    const thrown = transported
+      ? JSON.parse(JSON.stringify(error, ["transportKind", "status", "code", "message"]))
+      : error;
+    const bindings = {
+      ...env,
+      TABLE: {
+        getByName: () => ({
+          fetch: async () => {
+            throw thrown;
+          },
+        }),
+      },
+    } as unknown as Env;
+    const result = await acceptPageDeletion(bindings, f.member.workspace.id, f.member.user.id, f.listId).catch(
+      (caught: unknown) => caught,
+    );
+    expect(result).toBe(thrown);
+    expect(classifyError(result)).toMatchObject({ status: 403, body: { error: { code: "table_forbidden" } } });
+    expect(await env.DB.prepare("SELECT id FROM deletion_jobs").all()).toMatchObject({ results: [] });
+  });
+
+  it("keeps the classified evidence failure when secondary staging cleanup fails", async () => {
+    const f = await fixture();
+    await archiveTable(f);
+    const warning = vi.spyOn(logger, "warn");
+    const cleanupError = new Error("Staging database unavailable");
+    const db = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) =>
+            sql === "DELETE FROM deletion_jobs WHERE id=? AND phase='staging'"
+              ? ({
+                  bind: () => ({
+                    run: async () => {
+                      throw cleanupError;
+                    },
+                  }),
+                } as unknown as D1PreparedStatement)
+              : target.prepare(sql);
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const bindings = {
+      ...env,
+      DB: db,
+      TABLE: { getByName: () => ({ fetch: async () => new Response(null, { status: 503 }) }) },
+    } as unknown as Env;
+    await expect(acceptPageDeletion(bindings, f.member.workspace.id, f.member.user.id, f.listId)).rejects.toMatchObject(
+      { status: 503, code: "deletion_evidence_unavailable" },
+    );
+    expect(warning).toHaveBeenCalledWith(
+      "deletion.staging.cleanup_failed",
+      "cleanup",
+      expect.any(String),
+      { jobId: expect.any(String) },
+      cleanupError,
+    );
+    expect(await env.DB.prepare("SELECT phase FROM deletion_jobs").all()).toMatchObject({
+      results: [{ phase: "staging" }],
+    });
+    expect(await env.DB.prepare("SELECT id FROM pages WHERE id=?").bind(f.listId).first()).not.toBeNull();
+  });
 
   it("bounds canonical-only external evidence and excludes details owned by the whole job", async () => {
     const f = await fixture();

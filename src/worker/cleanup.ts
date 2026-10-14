@@ -1,7 +1,7 @@
 import type { Env } from "./env";
 import { locationHint } from "./http";
-import { correlationHeaders, safeTelemetryErrorMessage } from "./observability";
-import { HttpError } from "./http";
+import { correlationHeaders, logger, safeTelemetryErrorMessage } from "./observability";
+import { HttpError, safeHttpError } from "./http";
 import type { PageRow } from "./page-access";
 import { acceptedPageDeletionSql } from "./deletion-policy";
 
@@ -116,8 +116,8 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
           }),
         );
         if (!response.ok) {
-          const error = await response.json<{ error?: { code?: string } }>();
-          if (response.status === 503 && error.error?.code === "table_not_seeded") break;
+          const error = await response.json<{ error?: { code?: unknown } } | null>().catch(() => null);
+          if (response.status === 503 && error?.error?.code === "table_not_seeded") break;
           throw new Error(`Deletion evidence snapshot failed with ${response.status}`);
         }
         const snapshot = await response.json<{
@@ -137,7 +137,7 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
           snapshot.rows.length > 100 ||
           (snapshot.nextCursor !== null && (typeof snapshot.nextCursor !== "string" || snapshot.nextCursor === after))
         )
-          throw new Error("Deletion evidence snapshot ownership changed");
+          throw new HttpError(409, "deletion_pending", "The page subtree changed. Reload before retrying.");
         revision = snapshot.revision;
         for (const row of snapshot.rows)
           if (row.detailPageId && !ownedPages.has(row.detailPageId))
@@ -200,7 +200,8 @@ async function captureExternalRowEvidence(env: Env, job: DeletionJobRow, leaseUn
           index,
         )
         .run();
-      if (!inserted.meta.changes) throw new Error("Deletion evidence snapshot ownership changed");
+      if (!inserted.meta.changes)
+        throw new HttpError(409, "deletion_pending", "The page subtree changed. Reload before retrying.");
     }
   }
 }
@@ -645,9 +646,12 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
         Number.MAX_SAFE_INTEGER,
       );
     } catch (error) {
-      if ((error as Error).message.includes("snapshot ownership changed"))
-        throw new HttpError(409, "deletion_pending", "The page subtree changed. Reload before retrying.");
-      throw error;
+      if (safeHttpError(error)) throw error;
+      throw new HttpError(
+        503,
+        "deletion_evidence_unavailable",
+        "Table deletion evidence is temporarily unavailable. Please retry shortly.",
+      );
     }
     if (await captureRowHandoffs(env, { dependentJobId: jobId }))
       throw new HttpError(409, "deletion_pending", "The containing table deletion changed. Retry after it completes.");
@@ -713,7 +717,17 @@ export async function acceptPageDeletion(env: Env, workspaceId: string, actorId:
     }
     return { jobId, pageIds };
   } catch (error) {
-    await env.DB.prepare("DELETE FROM deletion_jobs WHERE id=? AND phase='staging'").bind(jobId).run();
+    try {
+      await env.DB.prepare("DELETE FROM deletion_jobs WHERE id=? AND phase='staging'").bind(jobId).run();
+    } catch (cleanupError) {
+      logger.warn(
+        "deletion.staging.cleanup_failed",
+        "cleanup",
+        "Unaccepted deletion staging could not be removed.",
+        { jobId },
+        cleanupError,
+      );
+    }
     throw error;
   }
 }

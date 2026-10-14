@@ -34,6 +34,73 @@ function legacyDocument(content: ProseMirrorJson[]) {
 }
 
 describe("legacy code content normalization", () => {
+  it.each(["cjs", "esm"])("uses consistent snapshot preflight modes in the %s patch", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y = require("yjs"), p = require("y-prosemirror");'
+        : 'import * as Y from "yjs"; import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const doc = new Y.Doc({ gc: false }), root = doc.getXmlFragment("document-store"), code = new Y.XmlElement("codeBlock");
+      const texts = ["left", "", "right"].map(value => { const text = new Y.XmlText(); text.insert(0, value); return text; });
+      texts[0].format(0, 4, { "comment--0123abcd": { threadId: "thread", orphan: false } });
+      code.insert(0, texts); root.insert(0, [code]);
+      texts[0].insertEmbed(2, { unsupported: "image" });
+      const bad = Y.snapshot(doc); texts[0].delete(2, 1); const clean = Y.snapshot(doc);
+      const results = [];
+      const check = (name, args, rejected) => {
+        const before = Buffer.from(Y.encodeStateAsUpdate(doc));
+        try { p.assertSupportedCodeContent(root, ...args); if (rejected) throw Error("Expected rejection: " + name); }
+        catch (error) { if (!rejected || !(error instanceof p.UnsupportedCodeContentError)) throw error; }
+        if (!Buffer.from(Y.encodeStateAsUpdate(doc)).equals(before)) throw Error("Preflight changed shared bytes");
+        if (code.length !== texts.length || texts.some((text, index) => code.get(index) !== text)) throw Error("Preflight changed text identities");
+        results.push(name);
+      };
+      check("live", [], false);
+      check("snapshot-only", [bad], false);
+      check("previous-only", [undefined, bad], false);
+      check("clean-history", [clean, clean], false);
+      check("invalid-history", [clean, bad], true);
+      const atom = new Y.XmlElement("hardBreak"); code.insert(1, [atom]); const atomHistory = Y.snapshot(doc); code.delete(1, 1);
+      check("deleted-child-live", [], false);
+      check("deleted-child-snapshot-only", [atomHistory], false);
+      check("deleted-child-previous-only", [undefined, atomHistory], false);
+      check("invalid-child-history", [Y.snapshot(doc), atomHistory], true);
+      texts[2].insertEmbed(2, { unsupported: "image" });
+      check("invalid-live", [], true);
+      check("invalid-live-snapshot-only", [clean], true);
+      check("invalid-live-previous-only", [undefined, clean], true);
+      check("clean-history-with-invalid-live", [clean, clean], false);
+      console.log(JSON.stringify({ results, commentKeys: Object.keys(texts[0].toDelta()[0].attributes), emptySegment: texts[1].length }));
+      doc.destroy();`,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(JSON.parse(output)).toEqual({
+      results: [
+        "live",
+        "snapshot-only",
+        "previous-only",
+        "clean-history",
+        "invalid-history",
+        "deleted-child-live",
+        "deleted-child-snapshot-only",
+        "deleted-child-previous-only",
+        "invalid-child-history",
+        "invalid-live",
+        "invalid-live-snapshot-only",
+        "invalid-live-previous-only",
+        "clean-history-with-invalid-live",
+      ],
+      commentKeys: ["comment--0123abcd"],
+      emptySegment: 0,
+    });
+  });
+
   it.each(["cjs", "esm"])(
     "preflights unsupported code before the %s reader or writer changes shared content",
     (format) => {

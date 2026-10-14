@@ -1512,21 +1512,22 @@ function editorOptions(
 }
 
 function CollaborativeEditor(props: React.ComponentProps<typeof MountedCollaborativeEditor>) {
-  const [contentError, setContentError] = useState<UnsupportedCodeContentError | null>(null);
+  const doc = props.bundle.doc;
+  const [contentError, setContentError] = useState<{ doc: Y.Doc; error: UnsupportedCodeContentError } | null>(null);
   useEffect(() => {
-    const unsubscribe = observeUnsupportedCodeContent(props.bundle.doc, setContentError);
+    const unsubscribe = observeUnsupportedCodeContent(doc, (error) => setContentError({ doc, error }));
     // Check again after subscribing: a received update can arrive before the
     // binding or this effect is mounted. Both checks leave shared content intact.
     try {
-      assertSupportedCodeContent(props.bundle.doc.getXmlFragment("document-store"));
+      assertSupportedCodeContent(doc.getXmlFragment("document-store"));
     } catch (error) {
       unsubscribe();
       throw error;
     }
     return unsubscribe;
-  }, [props.bundle]);
-  if (contentError) throw contentError;
-  assertSupportedCodeContent(props.bundle.doc.getXmlFragment("document-store"));
+  }, [doc]);
+  if (contentError?.doc === doc) throw contentError.error;
+  assertSupportedCodeContent(doc.getXmlFragment("document-store"));
   return <MountedCollaborativeEditor {...props} />;
 }
 
