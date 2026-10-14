@@ -34,6 +34,84 @@ function legacyDocument(content: ProseMirrorJson[]) {
 }
 
 describe("legacy code content normalization", () => {
+  it.each(["cjs", "esm"])("invalidates an active unbound %s preflight after observer mutations", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y = require("yjs"), { Schema } = require("prosemirror-model"), p = require("y-prosemirror");'
+        : 'import * as Y from "yjs"; import { Schema } from "prosemirror-model"; import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema = new Schema({ nodes: { doc: { content: "paragraph codeBlock" }, paragraph: { content: "text*" }, codeBlock: { content: "text*" }, text: {} } });
+      const doc = new Y.Doc(), root = doc.getXmlFragment("document-store"), paragraph = new Y.XmlElement("paragraph"), code = new Y.XmlElement("codeBlock"), text = new Y.XmlText();
+      const paragraphTexts = ["left", "right"].map(value => { const part = new Y.XmlText(); part.insert(0, value); return part; });
+      paragraph.insert(0, paragraphTexts); text.insert(0, "safe code"); code.insert(0, [text]); root.insert(0, [paragraph, code]);
+      let injected = false;
+      root.observeDeep(() => { if (!injected) { injected = true; text.insertEmbed(2, false); } });
+      const observers = () => [...doc._observers.values()].reduce((sum, listeners) => sum + listeners.size, 0), count = observers();
+      let rejected = false;
+      try { p.initProseMirrorDoc(root, schema); } catch (error) { if (!(error instanceof p.UnsupportedCodeContentError)) throw error; rejected = true; }
+      console.log(JSON.stringify({ injected, rejected, retained: code.get(0) === text && text.toDelta().some(delta => delta.insert === false), observersCleaned: observers() === count }));
+      doc.destroy();`,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(JSON.parse(output)).toEqual({ injected: true, rejected: true, retained: true, observersCleaned: true });
+  });
+
+  it.each(["cjs", "esm"])("shares recursive preflight and invalidates binding scopes in the %s patch", (format) => {
+    const imports =
+      format === "cjs"
+        ? 'const Y = require("yjs"), { Schema } = require("prosemirror-model"), p = require("y-prosemirror");'
+        : 'import * as Y from "yjs"; import { Schema } from "prosemirror-model"; import * as p from "y-prosemirror";';
+    const output = execFileSync(
+      process.execPath,
+      [
+        ...(format === "esm" ? ["--input-type=module"] : []),
+        "-e",
+        `${imports}
+      const schema = new Schema({ nodes: { doc: { content: "section" }, section: { content: "block+" }, paragraph: { content: "text*", group: "block" }, codeBlock: { content: "text*", group: "block" }, text: {} } });
+      const doc = new Y.Doc(), root = doc.getXmlFragment("document-store"), section = new Y.XmlElement("section"), paragraph = new Y.XmlElement("paragraph"), plain = new Y.XmlText();
+      paragraph.insert(0, [plain]); section.insert(0, [paragraph]); root.insert(0, [section]);
+      const counts = Array(100).fill(0), texts = counts.map((_, index) => {
+        const text = new Y.XmlText(), code = new Y.XmlElement("codeBlock"); text.insert(0, "code"); code.insert(0, [text]); section.insert(section.length, [code]);
+        const delta = text.toDelta.bind(text); text.toDelta = (...args) => { counts[index]++; return delta(...args); }; return text;
+      });
+      const result = {}, inspect = () => [Math.min(...counts), Math.max(...counts)], reset = () => counts.fill(0);
+      const { doc: pm, meta } = p.initProseMirrorDoc(root, schema); result.initialReader = inspect(); reset();
+      p.updateYFragment(doc, root, pm, meta); result.unboundWriter = inspect(); reset();
+      const observers = () => [...doc._observers.values()].reduce((sum, listeners) => sum + listeners.size, 0), originalObservers = observers();
+      const binding = new p.ProsemirrorBinding(root, meta.mapping);
+      // Keep a real mounted binding and real Yjs observers; rendering itself is
+      // separately exercised by the BlockNote two-editor tests.
+      binding.beforeAllTransactions = () => {};
+      binding._observeFunction = () => binding._checkCodeContent(root);
+      binding.initView({}); binding._checkCodeContent(root); result.bindingStartup = inspect(); reset();
+      plain.insert(0, "paragraph"); doc.getMap("presence").set("cursor", 1); result.unrelated = inspect(); reset();
+      texts[0].insert(1, "!"); result.changedCode = [counts[0], ...inspect().slice(0, 1), Math.max(...counts.slice(1))]; reset();
+      const added = new Y.XmlElement("paragraph"); section.insert(section.length, [added]); result.structural = inspect(); reset();
+      doc.emit("beforeObserverCalls", [{ changed: new Map([[new Y.XmlFragment(), new Set([null])]]) }, doc]);
+      binding._checkCodeContent(root); result.unknown = inspect(); reset();
+      binding.destroy(); result.observersRetained = observers() === originalObservers;
+      console.log(JSON.stringify(result)); doc.destroy();`,
+      ],
+      { encoding: "utf8" },
+    );
+    expect(JSON.parse(output)).toEqual({
+      initialReader: [2, 2],
+      unboundWriter: [1, 1],
+      bindingStartup: [1, 1],
+      unrelated: [0, 0],
+      changedCode: [1, 0, 0],
+      structural: [1, 1],
+      unknown: [1, 1],
+      observersRetained: true,
+    });
+  });
+
   it.each(["cjs", "esm"])("uses consistent snapshot preflight modes in the %s patch", (format) => {
     const imports =
       format === "cjs"

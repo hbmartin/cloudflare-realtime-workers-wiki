@@ -1512,7 +1512,11 @@ function editorOptions(
 }
 
 function CollaborativeEditor(props: React.ComponentProps<typeof MountedCollaborativeEditor>) {
-  const doc = props.bundle.doc;
+  const doc = useMemo(() => {
+    const nextDoc = props.bundle.doc;
+    assertSupportedCodeContent(nextDoc.getXmlFragment("document-store"));
+    return nextDoc;
+  }, [props.bundle.doc]);
   const [contentError, setContentError] = useState<{ doc: Y.Doc; error: UnsupportedCodeContentError } | null>(null);
   useEffect(() => {
     const unsubscribe = observeUnsupportedCodeContent(doc, (error) => setContentError({ doc, error }));
@@ -1527,7 +1531,6 @@ function CollaborativeEditor(props: React.ComponentProps<typeof MountedCollabora
     return unsubscribe;
   }, [doc]);
   if (contentError?.doc === doc) throw contentError.error;
-  assertSupportedCodeContent(doc.getXmlFragment("document-store"));
   return <MountedCollaborativeEditor {...props} />;
 }
 

@@ -1,5 +1,6 @@
 import type { Env, MemberContext } from "./env";
-import { HttpError, type HttpErrorStatus } from "./http";
+import { HttpError } from "./http";
+import { decodeTableResponse, tableReadPages } from "./table-transport";
 import { pageForMember, requirePageEditor } from "./page-access";
 import { canonicalJson, sha256Hex } from "../shared/import-integrity";
 import {
@@ -39,13 +40,6 @@ export async function tableRegistry(env: Env, pageId: string) {
 export async function collaborativeTable(env: Env, pageId: string) {
   const registry = await tableRegistry(env, pageId);
   return registry?.state === "do" || registry?.state === "repairing";
-}
-async function parse<T>(response: Response): Promise<T> {
-  if (!response.ok) {
-    const result = await response.json<{ error: { code: string; message: string } }>();
-    throw new HttpError(response.status as HttpErrorStatus, result.error.code, result.error.message);
-  }
-  return response.json<T>();
 }
 export async function tableFetch(
   env: Env,
@@ -109,17 +103,19 @@ export async function tableCommand(
     taskMutation?: true;
   },
 ) {
-  return parse<TableCommandResult>(await tableFetch(env, member, pageId, "/commands", "POST", command, extras));
+  return decodeTableResponse<TableCommandResult>(
+    await tableFetch(env, member, pageId, "/commands", "POST", command, extras),
+  );
 }
 export async function queryTable(env: Env, member: MemberContext, pageId: string, query = "") {
-  const result = await parse<TableQueryResult>(
+  const result = await decodeTableResponse<TableQueryResult>(
     await tableFetch(env, member, pageId, `/query${query ? `?${query}` : ""}`),
   );
   const page = await pageForMember(env, member, pageId);
   return { ...result, taskList: Boolean(page.is_task_list), canEdit: page.effective_role !== "viewer" };
 }
 export async function tableInternal<T>(env: Env, pageId: string, path: string, body?: unknown) {
-  return parse<T>(
+  return decodeTableResponse<T>(
     await env.TABLE.getByName(pageId).fetch(
       new Request(`https://table.internal${path}`, {
         method: body === undefined ? "GET" : "POST",
@@ -162,32 +158,27 @@ export async function tableTemplateSnapshot(env: Env, pageId: string): Promise<T
         .all<{ id: string; name: string }>()
     ).results;
   }
-  do {
-    if (migrated) {
-      const params = new URLSearchParams();
-      if (after) {
-        params.set("after", after);
-        params.set("revision", String(snapshot.revision));
-      }
-      const chunk = await tableInternal<TableSnapshot & { nextCursor: string | null }>(
-        env,
-        pageId,
-        `/export?${params}`,
-      );
+  if (migrated) {
+    for await (const chunk of tableReadPages((params) =>
+      tableInternal<TableSnapshot & { nextCursor: string | null }>(env, pageId, `/export?${params}`),
+    )) {
       snapshot.revision = chunk.revision;
       snapshot.columns = chunk.columns;
       snapshot.views = chunk.views;
       snapshot.people = chunk.people ?? [];
       snapshot.rows.push(...chunk.rows);
-      after = chunk.nextCursor;
-    } else {
+      if (snapshot.rows.length > 20000)
+        throw new HttpError(422, "table_limit", "This table exceeds the template row limit.");
+    }
+  } else {
+    do {
       const rows = await projectionRows(env, pageId, after);
       snapshot.rows.push(...rows);
       after = rows.length === 100 ? rows.at(-1)!.id : null;
-    }
-    if (snapshot.rows.length > 20000)
-      throw new HttpError(422, "table_limit", "This table exceeds the template row limit.");
-  } while (after);
+      if (snapshot.rows.length > 20000)
+        throw new HttpError(422, "table_limit", "This table exceeds the template row limit.");
+    } while (after);
+  }
   if (!migrated) {
     const current = await env.DB.prepare("SELECT revision FROM table_state WHERE page_id=?")
       .bind(pageId)

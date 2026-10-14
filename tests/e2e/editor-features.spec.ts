@@ -63,6 +63,23 @@ test("unsupported initial and received code embeds preserve shared bytes and blo
   ]);
 });
 
+test("ordinary edits inspect only changed code scopes and structural changes retain full validation", async ({
+  page,
+}) => {
+  await signInOwner(page);
+  const result = await page.evaluate(async () => {
+    const path = "/tests/e2e/fixtures/editor-code-reconciliation.mjs";
+    const { inspectChangedCodeScopes } = await import(path);
+    return inspectChangedCodeScopes();
+  });
+  expect(result.unrelated).toEqual([0, 0]);
+  expect(result.affected).toBeGreaterThan(0);
+  expect(result.untouched).toBe(0);
+  expect(result.structural).toEqual([1, 1]);
+  expect(result.forced).toEqual([2, 2]);
+  expect(result.listenerRemoved).toBe(true);
+});
+
 test("HTML code imports preserve whitespace and reopen with plain text line breaks", async ({ page }) => {
   await signInOwner(page);
   const toggle = page.getByRole("button", { name: "Open navigation" });

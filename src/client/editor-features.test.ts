@@ -126,6 +126,113 @@ function codeMarkKeys(doc: Y.Doc) {
 }
 
 describe("segmented code collaboration", () => {
+  it.each([false, true])("preflights queued observer mutations before binding reads (new block=%s)", (newBlock) => {
+    const doc = segmentedCodeDocument(225),
+      root = doc.getXmlFragment("document-store"),
+      group = root.get(0) as Y.XmlElement,
+      originalCode = codeElement(doc),
+      paragraph = (group.get(1) as Y.XmlElement).get(0) as Y.XmlElement,
+      plainText = new Y.XmlText();
+    paragraph.insert(0, [plainText]);
+    let armed = false,
+      injected = false,
+      expected: Uint8Array | undefined,
+      rejectedText = originalCode.get(2) as Y.XmlText;
+    const earlierObserver = () => {
+      if (!armed || injected) return;
+      injected = true;
+      doc.transact(() => {
+        if (newBlock) {
+          const container = new Y.XmlElement("blockContainer"),
+            code = new Y.XmlElement("codeBlock");
+          rejectedText = new Y.XmlText();
+          container.setAttribute("id", "queued-code");
+          rejectedText.insert(0, "safe");
+          code.insert(0, [rejectedText]);
+          container.insert(0, [code]);
+          group.insert(0, [container]);
+        }
+        // A supported Yjs falsy embed makes upstream schema.text throw. The
+        // preflight must catch it before that recovery deletes shared text.
+        rejectedText.insertEmbed(2, false);
+      });
+      expected = Y.encodeStateAsUpdate(doc);
+    };
+    root.observeDeep(earlierObserver);
+    const mounted = mountSegmentedEditor(doc),
+      errors: UnsupportedCodeContentError[] = [];
+    const unsubscribe = observeUnsupportedCodeContent(doc, (error) => errors.push(error));
+    try {
+      plainText.insert(0, "prime ");
+      armed = true;
+      plainText.insert(0, "ordinary paragraph");
+      expect(injected).toBe(true);
+      expect(errors).toHaveLength(1);
+      expect(errors[0]).toBeInstanceOf(UnsupportedCodeContentError);
+      expect(Y.encodeStateAsUpdate(doc)).toEqual(expected);
+      expect(rejectedText.toDelta().some((delta: { insert: unknown }) => delta.insert === false)).toBe(true);
+      expect(rejectedText.parent).toBeInstanceOf(Y.XmlElement);
+      expect((rejectedText.parent as Y.XmlElement).toArray()).toContain(rejectedText);
+      expect(mounted.editor.prosemirrorState.doc.textContent).not.toContain("ordinary paragraph");
+    } finally {
+      unsubscribe();
+      root.unobserveDeep(earlierObserver);
+      mounted.dispose();
+    }
+  });
+
+  it("validates changed code scopes before observers without scanning unrelated code", () => {
+    const doc = segmentedCodeDocument(224),
+      root = doc.getXmlFragment("document-store"),
+      group = root.get(0) as Y.XmlElement;
+    const paragraph = (group.get(1) as Y.XmlElement).get(0) as Y.XmlElement,
+      paragraphText = new Y.XmlText();
+    paragraph.insert(0, [paragraphText]);
+    const other = new Y.XmlElement("blockContainer"),
+      otherCode = new Y.XmlElement("codeBlock"),
+      otherText = new Y.XmlText();
+    other.setAttribute("id", "other-code");
+    otherText.insert(0, "untouched");
+    otherCode.insert(0, [otherText]);
+    other.insert(0, [otherCode]);
+    group.insert(1, [other]);
+    const mounted = mountSegmentedEditor(doc),
+      code = codeElement(doc),
+      changedText = code.get(0) as Y.XmlText;
+    const originalInspect = vi.spyOn(changedText, "toDelta"),
+      otherInspect = vi.spyOn(otherText, "toDelta");
+    const observerCount = doc["_observers"].get("beforeObserverCalls")?.size ?? 0;
+    try {
+      paragraphText.insert(0, "paragraph only");
+      doc.getMap("presence").set("cursor", 1);
+      expect(originalInspect).not.toHaveBeenCalled();
+      expect(otherInspect).not.toHaveBeenCalled();
+      changedText.insert(1, "!");
+      expect(originalInspect.mock.calls.length).toBeGreaterThan(0);
+      expect(otherInspect).not.toHaveBeenCalled();
+      originalInspect.mockClear();
+      // Replacing a child is structural and must revisit every code scope.
+      const added = new Y.XmlElement("blockContainer");
+      added.setAttribute("id", "structural");
+      added.insert(0, [new Y.XmlElement("paragraph")]);
+      group.insert(2, [added]);
+      expect(originalInspect.mock.calls.length).toBeGreaterThan(0);
+      expect(otherInspect.mock.calls.length).toBeGreaterThan(0);
+      originalInspect.mockClear();
+      otherInspect.mockClear();
+      const binding = ySyncPluginKey.getState(mounted.editor.prosemirrorState).binding;
+      Reflect.get(binding, "_forceRerender").call(binding);
+      expect(originalInspect.mock.calls.length).toBeGreaterThan(0);
+      expect(otherInspect.mock.calls.length).toBeGreaterThan(0);
+      mounted.editor.unmount();
+      expect(doc["_observers"].get("beforeObserverCalls")?.size ?? 0).toBeLessThan(observerCount);
+    } finally {
+      originalInspect.mockRestore();
+      otherInspect.mockRestore();
+      mounted.dispose();
+    }
+  });
+
   it("rejects initial embedded code without deleting shared text", () => {
     const doc = segmentedCodeDocument(221),
       code = codeElement(doc);

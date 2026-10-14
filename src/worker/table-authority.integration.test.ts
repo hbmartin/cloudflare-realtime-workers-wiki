@@ -137,6 +137,226 @@ async function addEffect(pageId: string, revision: number) {
 }
 
 describe("per-table authority", () => {
+  it("captures 20,000 linked identities in 20 indexed manifest pages without table-content reads", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    const jobId = crypto.randomUUID(),
+      target = JSON.stringify({ version: 1, pageId, workspaceId: member.workspace.id, generation: 1, stage: "stop" });
+    await env.DB.batch([
+      env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(pageId),
+      env.DB.prepare(
+        "INSERT INTO deletion_jobs(id,workspace_id,root_page_id,created_at,updated_at,next_attempt_at,phase) VALUES(?,?,?,1,1,0,'staging')",
+      ).bind(jobId, member.workspace.id, pageId),
+      env.DB.prepare("INSERT INTO deletion_job_pages(job_id,page_id,archived_at) VALUES(?,?,1)").bind(jobId, pageId),
+      env.DB.prepare("INSERT INTO deletion_targets(job_id,kind,target) VALUES(?,'table_do',?)").bind(jobId, target),
+    ]);
+    const stub = env.TABLE.getByName(pageId);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.transactionSync(() => {
+        for (let index = 0; index < 20_000; index++)
+          state.storage.sql.exec(
+            "INSERT INTO rows VALUES(?,?,1,NULL,1,NULL,?)",
+            `linked-${String(index).padStart(5, "0")}`,
+            index,
+            `detail-${index}`,
+          );
+        state.storage.sql.exec("INSERT INTO rows VALUES('unlinked',20001,1,NULL,1,NULL,NULL)");
+      });
+      expect(
+        state.storage.sql
+          .exec(
+            "EXPLAIN QUERY PLAN SELECT id,detail_page_id FROM rows WHERE detail_page_id IS NOT NULL AND id>? ORDER BY id LIMIT 1001",
+            "",
+          )
+          .toArray()
+          .some((row) => String(row.detail).includes("rows_linked")),
+      ).toBe(true);
+    });
+    let after: string | null = null,
+      calls = 0;
+    const ids: string[] = [];
+    do {
+      const params = new URLSearchParams({ deletionJob: jobId, generation: "1", stopTarget: target, revision: "1" });
+      if (after) params.set("after", after);
+      const response = await runInDurableObject(stub, async (instance, state) => {
+        const exec = state.storage.sql.exec.bind(state.storage.sql),
+          statements: string[] = [];
+        const spy = vi.spyOn(state.storage.sql, "exec").mockImplementation((sql, ...binds) => {
+          statements.push(sql);
+          return exec(sql, ...binds);
+        });
+        try {
+          const result = await instance.fetch(
+            new Request(`https://table.internal/deletion-evidence?${params}`, {
+              headers: { "x-table-internal": env.BETTER_AUTH_SECRET },
+            }),
+          );
+          expect(statements.every((sql) => !/\b(cells|computed|properties|views|people)\b/.test(sql))).toBe(true);
+          return result;
+        } finally {
+          spy.mockRestore();
+        }
+      });
+      expect(response.status).toBe(200);
+      const raw = await response.text();
+      expect(new TextEncoder().encode(raw).byteLength).toBeLessThanOrEqual(1_000_000);
+      const manifest = JSON.parse(raw);
+      expect(manifest).toMatchObject({ pageId, workspaceId: member.workspace.id, generation: 1, revision: 1 });
+      expect(manifest.rows).toHaveLength(1000);
+      expect(Object.keys(manifest.rows[0])).toEqual(["id", "detailPageId"]);
+      ids.push(...manifest.rows.map((row: { id: string }) => row.id));
+      after = manifest.nextCursor;
+      calls++;
+    } while (after);
+    expect(calls).toBe(20);
+    expect(new Set(ids).size).toBe(20_000);
+    await expect(
+      tableInternal(
+        env,
+        pageId,
+        `/deletion-evidence?${new URLSearchParams({
+          deletionJob: jobId,
+          generation: "1",
+          stopTarget: target,
+          revision: "2",
+        })}`,
+      ),
+    ).rejects.toMatchObject({ code: "table_snapshot_changed" });
+  });
+  it("permits exact accepted unfinished deletion evidence after eviction without stopping or advancing", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await env.DB.prepare("UPDATE pages SET archived_at=1 WHERE id=?").bind(pageId).run();
+    const { jobId } = await acceptPageDeletion(env, member.workspace.id, member.user.id, pageId);
+    const { target } = (await env.DB.prepare(
+      "SELECT target FROM deletion_targets WHERE job_id=? AND kind='table_do' AND json_extract(target,'$.stage')='stop'",
+    )
+      .bind(jobId)
+      .first<{ target: string }>())!;
+    const stub = env.TABLE.getByName(pageId);
+    await runInDurableObject(stub, (_instance, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO meta VALUES(2,?)",
+        JSON.stringify({
+          jobId,
+          pageId,
+          workspaceId: member.workspace.id,
+          generation: 1,
+          stopped: false,
+          purged: false,
+        }),
+      );
+    });
+    await evictDurableObject(stub);
+    const params = new URLSearchParams({ deletionJob: jobId, generation: "1", stopTarget: target });
+    expect(await tableInternal(env, pageId, `/deletion-evidence?${params}`)).toMatchObject({ rows: [], revision: 1 });
+    await runInDurableObject(stub, (_instance, state) => {
+      expect(
+        JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=2").one().value),
+      ).toMatchObject({ stopped: false, purged: false });
+      expect(
+        JSON.parse(state.storage.sql.exec<{ value: string }>("SELECT value FROM meta WHERE id=1").one().value),
+      ).toMatchObject({ revision: 1, projectedRevision: 1 });
+    });
+    params.set("deletionJob", crypto.randomUUID());
+    await expect(tableInternal(env, pageId, `/deletion-evidence?${params}`)).rejects.toMatchObject({ status: 403 });
+  });
+  it("replays exact purged-row proof after eviction and rejects unknown generations or changed archive ownership", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    const source = (await env.DB.prepare("SELECT space_id FROM pages WHERE id=?")
+        .bind(pageId)
+        .first<{ space_id: string }>())!,
+      detailPageId = `proof-detail-${crypto.randomUUID()}`,
+      jobId = crypto.randomUUID(),
+      purgeJobId = crypto.randomUUID(),
+      leaseUntil = Date.now() + 900_000,
+      rowId = "purged-proof-row",
+      target = JSON.stringify({ tableId: pageId, rowId, detailPageId, generation: 1, preservedField: "exact" });
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at,archived_at,archive_operation_id) VALUES(?,?,?,'document','a1','Detail',?,1,1,2,'detail-archive')",
+      ).bind(detailPageId, member.workspace.id, source.space_id, member.user.id),
+      env.DB.prepare(
+        "INSERT INTO deletion_jobs(id,workspace_id,root_page_id,created_at,updated_at,next_attempt_at,phase) VALUES(?,?,?,1,1,?,'rows')",
+      ).bind(jobId, member.workspace.id, detailPageId, leaseUntil),
+      env.DB.prepare(
+        "INSERT INTO deletion_job_pages(job_id,page_id,archived_at,archive_operation_id) VALUES(?,?,2,'detail-archive')",
+      ).bind(jobId, detailPageId),
+      env.DB.prepare("INSERT INTO deletion_targets(job_id,kind,target) VALUES(?,'table_row',?)").bind(jobId, target),
+      env.DB.prepare("INSERT INTO table_projection_context VALUES(?,1)").bind(pageId),
+      env.DB.prepare("DELETE FROM pages WHERE id=?").bind(pageId),
+      env.DB.prepare("DELETE FROM table_projection_context WHERE page_id=?").bind(pageId),
+    ]);
+    const stub = env.TABLE.getByName(pageId),
+      tombstone = {
+        jobId: purgeJobId,
+        pageId,
+        workspaceId: member.workspace.id,
+        generation: 1,
+        stopped: true,
+        purged: true,
+      };
+    const setTombstone = async (generation: number | null) => {
+      await runInDurableObject(stub, (_instance, state) => {
+        state.storage.sql.exec("DELETE FROM meta");
+        state.storage.sql.exec("INSERT INTO meta VALUES(2,?)", JSON.stringify({ ...tombstone, generation }));
+      });
+      await evictDurableObject(stub);
+    };
+    const body = {
+      jobId,
+      pageId,
+      workspaceId: member.workspace.id,
+      generation: 1,
+      rowId,
+      detailPageId,
+      target,
+      leaseUntil,
+    };
+    await setTombstone(1);
+    const proof = await tableInternal(env, pageId, "/row-deletion-proof", body);
+    expect(proof).toEqual({
+      purged: true,
+      pageId,
+      workspaceId: member.workspace.id,
+      generation: 1,
+      purgeJobId,
+      archivedAt: 2,
+      archiveOperationId: "detail-archive",
+    });
+    await evictDurableObject(stub);
+    expect(await tableInternal(env, pageId, "/row-deletion-proof", body)).toEqual(proof);
+    await expect(tableInternal(env, pageId, "/row-deletion-proof", { ...body, generation: 2 })).rejects.toMatchObject({
+      code: "table_generation_conflict",
+    });
+    await expect(
+      tableInternal(env, pageId, "/row-deletion-proof", { ...body, leaseUntil: leaseUntil + 1 }),
+    ).rejects.toMatchObject({ code: "deletion_pending" });
+    await expect(
+      tableInternal(env, pageId, "/row-deletion-proof", { ...body, target: `${target} ` }),
+    ).rejects.toMatchObject({ code: "deletion_pending" });
+    await env.DB.prepare("UPDATE pages SET archive_operation_id='new-archive' WHERE id=?").bind(detailPageId).run();
+    await expect(tableInternal(env, pageId, "/row-deletion-proof", body)).rejects.toMatchObject({
+      code: "deletion_pending",
+    });
+    await env.DB.prepare("UPDATE pages SET archive_operation_id='detail-archive' WHERE id=?").bind(detailPageId).run();
+    await setTombstone(null);
+    await expect(tableInternal(env, pageId, "/row-deletion-proof", body)).rejects.toMatchObject({
+      status: 503,
+      code: "table_deletion_proof_unavailable",
+    });
+    await setTombstone(1);
+    expect(await tableInternal(env, pageId, "/row-deletion-proof", body)).toEqual(proof);
+    await env.DB.prepare(
+      "INSERT INTO pages(id,workspace_id,space_id,kind,position,title,created_by,created_at,updated_at) VALUES(?,?,?,'table','a2','New table',?,1,1)",
+    )
+      .bind(pageId, member.workspace.id, source.space_id, member.user.id)
+      .run();
+    await expect(tableInternal(env, pageId, "/row-deletion-proof", body)).rejects.toMatchObject({
+      code: "deletion_pending",
+    });
+  });
   it("preserves dependencies when a bulk updates old cells before adding new properties", async () => {
     const { pageId, member } = await fixture();
     await enableTableAuthority(env, member, pageId);
@@ -1619,6 +1839,140 @@ describe("per-table authority", () => {
       await env.DB.prepare("DROP TRIGGER IF EXISTS hold_atomic_artifact").run();
     }
   });
+  it("blocks an originally atomic cancellable artifact that normalization splits before any D1 effects", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await write(pageId, member, "create_column", { id: "split-title", name: "Title", type: "text" });
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_split_artifact BEFORE INSERT ON table_cells BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    try {
+      const pending = await tableCommand(
+        env,
+        member,
+        pageId,
+        {
+          kind: "create_row",
+          operationId: "split-cancel",
+          payload: { id: "split-row", values: { "split-title": "Keep" } },
+        },
+        { cancelRowOnPublicationFailure: "split-row" },
+      );
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        const statements = JSON.parse(
+          state.storage.sql
+            .exec<{ value: string }>(
+              "SELECT value FROM projection_steps WHERE revision=? AND position=0",
+              pending.revision,
+            )
+            .one().value,
+        ) as ProjectionStatement[];
+        const sql = statements.find((statement) => statement.sql.startsWith("INSERT INTO table_cells("))!.sql;
+        const content = '"'.repeat(1000);
+        const expanded = Array.from({ length: 100 }, () => ({
+          sql,
+          binds: ["split-row", "split-title", content, content, null, null, null, null, JSON.stringify(content), 1, 1],
+        }));
+        expect(new TextEncoder().encode(JSON.stringify(expanded)).byteLength).toBeLessThan(1_000_000);
+        state.storage.sql.exec(
+          "UPDATE projection_steps SET value=? WHERE revision=? AND position=0",
+          JSON.stringify(expanded),
+          pending.revision,
+        );
+        state.storage.sql.exec("UPDATE events SET value='[]' WHERE revision=?", pending.revision);
+      });
+      await env.DB.prepare("DROP TRIGGER hold_split_artifact").run();
+      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
+        code: "table_projection_blocked",
+      });
+      expect((await queryTable(env, member, pageId)).rows[0]?.cells["split-title"]).toBe("Keep");
+      expect(await tableRegistryForTest(pageId)).toMatchObject({ projected_revision: pending.revision - 1 });
+      expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id='split-row'").first()).toBeNull();
+      await runInDurableObject(env.TABLE.getByName(pageId), (_instance, state) => {
+        expect(
+          state.storage.sql
+            .exec("SELECT count(*) count FROM projection_steps WHERE revision=? AND position>=0", pending.revision)
+            .one(),
+        ).toEqual({ count: 2 });
+        expect(state.storage.sql.exec("SELECT next_step FROM events WHERE revision=?", pending.revision).one()).toEqual(
+          { next_step: 0 },
+        );
+      });
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_split_artifact").run();
+    }
+  });
+  it("preserves a published canonical row when an atomic commit acknowledgment reports a conflict", async () => {
+    const { pageId, member } = await fixture();
+    await enableTableAuthority(env, member, pageId);
+    await env.DB.prepare(
+      "CREATE TRIGGER hold_lost_publication BEFORE INSERT ON table_rows BEGIN SELECT RAISE(ABORT,'temporary_failure'); END",
+    ).run();
+    try {
+      const pending = await tableCommand(
+        env,
+        member,
+        pageId,
+        {
+          kind: "create_row",
+          operationId: "lost-publication",
+          payload: { id: "published-row" },
+        },
+        { cancelRowOnPublicationFailure: "published-row" },
+      );
+      await env.DB.prepare("DROP TRIGGER hold_lost_publication").run();
+      await runInDurableObject(env.TABLE.getByName(pageId), async (instance, state) => {
+        const internal = instance as unknown as { env: Env; project(): Promise<boolean> },
+          original = internal.env;
+        let committed = false;
+        internal.env = {
+          ...original,
+          DB: new Proxy(original.DB, {
+            get(target, property) {
+              if (property === "batch")
+                return async (statements: D1PreparedStatement[]) => {
+                  const result = await target.batch(statements);
+                  if (!committed) {
+                    committed = true;
+                    throw Object.assign(new Error("Lost committed publication acknowledgment"), {
+                      status: 409,
+                      code: "table_publication_conflict",
+                    });
+                  }
+                  return result;
+                };
+              const value = Reflect.get(target, property);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          }),
+        };
+        try {
+          await expect(internal.project()).rejects.toMatchObject({ code: "table_publication_conflict" });
+          expect(state.storage.sql.exec("SELECT id FROM rows WHERE id='published-row'").one()).toEqual({
+            id: "published-row",
+          });
+          expect(
+            state.storage.sql.exec("SELECT next_step FROM events WHERE revision=?", pending.revision).one(),
+          ).toEqual({ next_step: 0 });
+          const receipt = JSON.parse(
+            state.storage.sql
+              .exec<{ result: string }>("SELECT result FROM receipts WHERE operation_id='lost-publication'")
+              .one().result,
+          );
+          expect(receipt.result.publicationFailed).toBeUndefined();
+          expect(await tableRegistryForTest(pageId)).toMatchObject({ projected_revision: pending.revision });
+        } finally {
+          internal.env = original;
+        }
+      });
+      expect(await env.DB.prepare("SELECT id FROM table_rows WHERE id='published-row'").first()).toEqual({
+        id: "published-row",
+      });
+      expect((await queryTable(env, member, pageId)).rowCount).toBe(1);
+    } finally {
+      await env.DB.prepare("DROP TRIGGER IF EXISTS hold_lost_publication").run();
+    }
+  });
   it("bounds header validation and publication to100 entities per repair turn", async () => {
     const { pageId, member } = await fixture();
     await env.DB.batch([
@@ -1989,8 +2343,26 @@ describe("per-table authority", () => {
     try {
       await requestRepairTableProjection(env, member, pageId);
       await runDurableObjectAlarm(stub);
-      await expect(requestRepairTableProjection(env, member, pageId)).rejects.toMatchObject({
-        code: "table_projection_mismatch",
+      await runInDurableObject(stub, async (instance, state) => {
+        const clock = Date.now() + 1_000_000,
+          now = vi.spyOn(Date, "now").mockReturnValue(clock);
+        try {
+          const response = await instance.fetch(
+            new Request("https://table.internal/repair", {
+              method: "POST",
+              headers: { "x-table-internal": env.BETTER_AUTH_SECRET },
+              body: "{}",
+            }),
+          );
+          expect(response.status).toBe(202);
+          expect(await response.json()).toMatchObject({
+            repair: { state: "pending", phase: "headers" },
+            verification: null,
+          });
+          expect(await state.storage.getAlarm()).toBe(clock + 1000);
+        } finally {
+          now.mockRestore();
+        }
       });
       expect(await tableRegistryForTest(pageId)).toMatchObject({ state: "repairing", generation: 1 });
       await runInDurableObject(stub, (_instance, state) => {

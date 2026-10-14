@@ -339,6 +339,43 @@ describe("EditorPage close reconciliation", () => {
     expect(replacement["_observers"].get("unsupported-code-content")?.size ?? 0).toBe(0);
   });
 
+  it("does not repeat startup code traversal for unrelated renders", async () => {
+    mocks.realDocument = true;
+    mocks.api.mockResolvedValue({ page });
+    let ready!: () => void;
+    mocks.ready = new Promise<void>((resolve) => (ready = resolve));
+    const props = {
+      page,
+      member,
+      onPageChanged: vi.fn(),
+      onPageUnavailable: vi.fn(),
+      onAccessDenied: vi.fn(),
+      onSelectPage: vi.fn(),
+      backlinksRevision: 0,
+    };
+    const view = render(<EditorPage {...props} />);
+    const doc = mocks.documents.at(-1)!,
+      code = new Y.XmlElement("codeBlock"),
+      container = new Y.XmlElement("blockContainer"),
+      group = new Y.XmlElement("blockGroup"),
+      text = new Y.XmlText();
+    text.insert(0, "preserved");
+    code.insert(0, [text]);
+    container.setAttribute("id", "code");
+    container.insert(0, [code]);
+    group.insert(0, [container]);
+    doc.transact(() => doc.getXmlFragment("document-store").insert(0, [group]), mocks.provider);
+    const inspect = vi.spyOn(text, "toDelta");
+    await act(async () => ready());
+    const startupInspections = inspect.mock.calls.length;
+    expect(startupInspections).toBeGreaterThan(0);
+    for (let revision = 1; revision <= 4; revision++) {
+      await act(async () => view.rerender(<EditorPage {...props} backlinksRevision={revision} />));
+    }
+    expect(inspect).toHaveBeenCalledTimes(startupInspections);
+    expect(doc["_observers"].get("unsupported-code-content")?.size).toBe(1);
+  });
+
   it.each([
     ["?page=page-1&compareFrom=first&compareTo=last", true, true],
     ["?page=other&compareFrom=first&compareTo=last", true, false],
